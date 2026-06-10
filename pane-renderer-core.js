@@ -1,9 +1,10 @@
 export function createPaneRendererState() {
   return {
-    seenAssistantMessages: new Set(),
     seenToolExecutionIds: new Set(),
+    renderedAssistantCount: 0,
     currentAssistantStreamed: false,
     lineOpen: false,
+    currentTurnHandled: false,
   };
 }
 
@@ -18,14 +19,6 @@ export function stableStringify(value) {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`)
     .join(",")}}`;
-}
-
-export function signatureForMessage(message) {
-  try {
-    return stableStringify(message);
-  } catch {
-    return String(message);
-  }
 }
 
 function ensureTrailingNewline(state, write) {
@@ -56,9 +49,7 @@ export function renderToolSummary(name, args, write, state = createPaneRendererS
 
 export function renderAssistantMessage(message, write, state) {
   if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
-  const signature = signatureForMessage(message);
-  if (state.seenAssistantMessages.has(signature)) return;
-  state.seenAssistantMessages.add(signature);
+  state.renderedAssistantCount += 1;
 
   for (const part of message.content) {
     if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
@@ -73,6 +64,7 @@ export function handlePaneRendererEvent(event, write, state) {
     case "message_start":
       if (event.message?.role === "assistant") {
         state.currentAssistantStreamed = false;
+        state.currentTurnHandled = false;
       }
       break;
     case "message_update":
@@ -82,14 +74,29 @@ export function handlePaneRendererEvent(event, write, state) {
       }
       break;
     case "message_end":
-    case "turn_end":
       if (state.currentAssistantStreamed) {
         ensureTrailingNewline(state, write);
-        state.seenAssistantMessages.add(signatureForMessage(event.message));
+        state.renderedAssistantCount += 1;
         state.currentAssistantStreamed = false;
       } else {
         renderAssistantMessage(event.message, write, state);
       }
+      state.currentTurnHandled = true;
+      break;
+    case "turn_end":
+      if (state.currentTurnHandled) {
+        state.currentAssistantStreamed = false;
+        state.currentTurnHandled = false;
+        break;
+      }
+      if (state.currentAssistantStreamed) {
+        ensureTrailingNewline(state, write);
+        state.renderedAssistantCount += 1;
+        state.currentAssistantStreamed = false;
+      } else {
+        renderAssistantMessage(event.message, write, state);
+      }
+      state.currentTurnHandled = false;
       break;
     case "tool_execution_start": {
       ensureTrailingNewline(state, write);
@@ -103,7 +110,10 @@ export function handlePaneRendererEvent(event, write, state) {
     }
     case "agent_end":
       if (Array.isArray(event.messages)) {
-        for (const message of event.messages) renderAssistantMessage(message, write, state);
+        const assistantMessages = event.messages.filter((message) => message?.role === "assistant");
+        for (const message of assistantMessages.slice(state.renderedAssistantCount)) {
+          renderAssistantMessage(message, write, state);
+        }
       }
       break;
     default:

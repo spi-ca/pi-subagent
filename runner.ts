@@ -36,6 +36,8 @@ const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
+const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
+const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
 const PI_OFFLINE_ENV = "PI_OFFLINE";
 const PANE_RENDERER_PATH = fileURLToPath(new URL("./pane-renderer.js", import.meta.url));
 
@@ -284,8 +286,9 @@ async function focusPaneId(paneId: string, signal?: AbortSignal): Promise<void> 
   await runCommandCapture("zellij", ["action", "focus-pane-id", paneId], { signal });
 }
 
-async function closePaneId(paneId: string, signal?: AbortSignal): Promise<void> {
-  await runCommandCapture("zellij", ["action", "close-pane", "--pane-id", paneId], { signal });
+async function closePaneId(paneId: string, signal?: AbortSignal): Promise<boolean> {
+  const result = await runCommandCapture("zellij", ["action", "close-pane", "--pane-id", paneId], { signal });
+  return result.exitCode === 0;
 }
 
 async function getPaneInfoById(paneId: string, signal?: AbortSignal): Promise<ZellijPaneDescriptor | null | undefined> {
@@ -374,6 +377,35 @@ function cleanupTempDir(dir: string | null): void {
 
 const inheritedCliArgs = parseInheritedCliArgs(process.argv);
 
+function canonicalizePathForTrust(value: string): string {
+  const resolved = path.resolve(value);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function findNearestProjectAgentsDirForRunner(cwd: string): string | null {
+  let dir = cwd;
+  while (true) {
+    const candidate = path.join(dir, ".pi", "agents");
+    try {
+      if (fs.statSync(candidate).isDirectory()) return candidate;
+    } catch {
+      // ignore
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function getProjectRootForCwd(cwd: string): string | null {
+  const projectAgentsDir = findNearestProjectAgentsDirForRunner(cwd);
+  return projectAgentsDir ? canonicalizePathForTrust(path.dirname(path.dirname(projectAgentsDir))) : null;
+}
+
 function buildPiArgs(
   agent: AgentConfig,
   systemPromptPath: string | null,
@@ -443,6 +475,10 @@ export interface RunAgentOptions {
   paneTitleSuffix?: string;
   /** Optional pane id to restore focus to after creating a Zellij pane. */
   restoreFocusPaneId?: string;
+  /** Trusted project roots to propagate to child processes as temporary approvals. */
+  trustedProjectRoots?: string[];
+  /** Denied project roots to propagate to child processes as temporary denials. */
+  deniedProjectRoots?: string[];
   /** Serialized parent session snapshot used when delegationMode is "fork". */
   forkSessionSnapshotJsonl?: string;
   /** Current delegation depth of the caller process. */
@@ -479,6 +515,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     zellijPane,
     paneTitleSuffix,
     restoreFocusPaneId,
+    trustedProjectRoots,
+    deniedProjectRoots,
     forkSessionSnapshotJsonl,
     parentDepth,
     parentAgentStack,
@@ -575,6 +613,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       delegationMode,
       forkSessionTmpPath,
     );
+    const effectiveCwd = taskCwd ?? cwd;
+    const effectiveProjectRoot = getProjectRootForCwd(effectiveCwd);
+    const trustedForCwd = Boolean(effectiveProjectRoot && (trustedProjectRoots ?? []).some((trustedRoot) => canonicalizePathForTrust(trustedRoot) === effectiveProjectRoot));
+    const deniedForCwd = Boolean(effectiveProjectRoot && (deniedProjectRoots ?? []).some((deniedRoot) => canonicalizePathForTrust(deniedRoot) === effectiveProjectRoot));
+    if (trustedForCwd) piArgs.push("--approve");
+    else if (deniedForCwd) piArgs.push("--no-approve");
     if (terminalMode === "zellij-pane") {
       return await runAgentInZellijPane({
         result,
@@ -591,6 +635,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         zellijPane: zellijPane ?? {},
         paneTitleSuffix,
         restoreFocusPaneId,
+        trustedProjectRoots,
+        deniedProjectRoots,
       });
     }
     return await runAgentInline({
@@ -604,6 +650,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentAgentStack,
       maxDepth,
       preventCycles,
+      trustedProjectRoots,
+      deniedProjectRoots,
       makeDetails,
     });
   } finally {
@@ -623,6 +671,8 @@ interface RunAgentExecutionOptions {
   parentAgentStack: string[];
   maxDepth: number;
   preventCycles: boolean;
+  trustedProjectRoots?: string[];
+  deniedProjectRoots?: string[];
   makeDetails: (results: SingleResult[]) => SubagentDetails;
 }
 
@@ -743,8 +793,12 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     parentAgentStack,
     maxDepth,
     preventCycles,
+    trustedProjectRoots,
+    deniedProjectRoots,
   } = opts;
 
+  const trustedProjectsEnv = JSON.stringify(trustedProjectRoots ?? []);
+  const deniedProjectsEnv = JSON.stringify(deniedProjectRoots ?? []);
   const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
   const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
   const propagatedStack = [...parentAgentStack, result.agent];
@@ -759,6 +813,8 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
       [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
       [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
       [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
+      [SUBAGENT_TRUSTED_PROJECTS_ENV]: trustedProjectsEnv,
+      [SUBAGENT_DENIED_PROJECTS_ENV]: deniedProjectsEnv,
       [PI_OFFLINE_ENV]: "1",
     },
   });
@@ -796,6 +852,8 @@ async function runAgentInZellijPane(
     zellijPane,
     paneTitleSuffix,
     restoreFocusPaneId,
+    trustedProjectRoots,
+    deniedProjectRoots,
   } = opts;
 
   if (!isInsideZellij()) {
@@ -807,6 +865,8 @@ async function runAgentInZellijPane(
   }
 
   const effectiveCwd = taskCwd ?? cwd;
+  const trustedProjectsEnv = JSON.stringify(trustedProjectRoots ?? []);
+  const deniedProjectsEnv = JSON.stringify(deniedProjectRoots ?? []);
   const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
   const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
   const propagatedStack = [...parentAgentStack, result.agent];
@@ -830,13 +890,17 @@ async function runAgentInZellijPane(
       [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
       [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
       [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
+      [SUBAGENT_TRUSTED_PROJECTS_ENV]: trustedProjectsEnv,
+      [SUBAGENT_DENIED_PROJECTS_ENV]: deniedProjectsEnv,
       [PI_OFFLINE_ENV]: "1",
     }).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
     `printf '%s\\n' ${shellQuote(`Subagent pane: ${paneDisplayName}`)}`,
     `printf '%s\\n' ${shellQuote(`Mode: ${opts.parentAgentStack.length > 0 ? "nested" : "root"} / ${opts.piArgs.includes("--session") ? "fork" : "spawn"}`)}`,
     `printf '%s\\n' ${shellQuote(`CWD: ${effectiveCwd}`)}`,
-    `printf '%s\\n' ${shellQuote(`Streaming JSON through FIFO: ${stdoutPipePath}`)}`,
-    `${buildShellCommand(childCommand)} 2> >(tee -a ${shellQuote(stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, stdoutPipePath, result.task])}`,
+    `printf '%s\\n' ${shellQuote(`Task: ${result.task}`)}`,
+    `printf '%s\\n' '---'`,
+    `printf '%s\\n' 'Live output bridge ready'`,
+    `${buildShellCommand(childCommand)} 2> >(tee -a ${shellQuote(stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, stdoutPipePath])}`,
     "status=$?",
     `printf '\\nSubagent exited with status %s\\n' \"$status\"`,
     `printf '%s\n' \"$status\" > ${shellQuote(statusPath)}`,
@@ -937,9 +1001,11 @@ async function runAgentInZellijPane(
       fileExists: () => fileExists(statusPath),
       getPaneInfo: () => (paneId ? getPaneInfoById(paneId, signal?.aborted ? undefined : signal) : Promise.resolve(null)),
       closePane: async () => {
-        if (paneId) await closePaneId(paneId);
+        if (!paneId) return true;
+        return await closePaneId(paneId);
       },
       delay,
+      maxQueryFailures: 50,
     });
     const statusSeen = lifecycle.statusSeen;
     wasAborted = lifecycle.wasAborted;

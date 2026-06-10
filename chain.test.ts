@@ -27,11 +27,12 @@ describe("mixed chain helpers", () => {
   });
 
   test("evaluates conditions from accumulated chain state", () => {
-    assert.equal(shouldRunStage(undefined, { hadError: false, hadCompletedWithErrors: false } as any), true);
-    assert.equal(shouldRunStage("on_success", { hadError: true, hadCompletedWithErrors: true } as any), false);
-    assert.equal(shouldRunStage("on_error", { hadError: true, hadCompletedWithErrors: false } as any), true);
-    assert.equal(shouldRunStage("on_completed_with_errors", { hadError: true, hadCompletedWithErrors: true } as any), true);
-    assert.equal(shouldRunStage("always", { hadError: true, hadCompletedWithErrors: false } as any), true);
+    assert.equal(shouldRunStage(undefined, { hadError: false, hadCompletedWithErrors: false, hadBlockingError: false } as any), true);
+    assert.equal(shouldRunStage("on_success", { hadError: true, hadCompletedWithErrors: true, hadBlockingError: true } as any), false);
+    assert.equal(shouldRunStage("on_success", { hadError: true, hadCompletedWithErrors: true, hadBlockingError: false } as any), true);
+    assert.equal(shouldRunStage("on_error", { hadError: true, hadCompletedWithErrors: false, hadBlockingError: false } as any), true);
+    assert.equal(shouldRunStage("on_completed_with_errors", { hadError: true, hadCompletedWithErrors: true, hadBlockingError: false } as any), true);
+    assert.equal(shouldRunStage("always", { hadError: true, hadCompletedWithErrors: false, hadBlockingError: true } as any), true);
   });
 
   test("omits skipped stages from injected task context", () => {

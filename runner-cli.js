@@ -156,6 +156,12 @@ export function parseInheritedCliArgs(argv) {
       continue;
     }
 
+    if (["--approve", "-a", "--no-approve", "-na"].includes(flagName)) {
+      const [, skip] = getValue();
+      i += skip;
+      continue;
+    }
+
     if (
       [
         "--no-skills",

@@ -21,7 +21,7 @@ describe("runner core helpers", () => {
   test("marks manual pane disappearance after the grace interval", () => {
     const start = 1000;
     const initial = updatePaneWatchState(
-      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false },
+      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false, closeRequested: false, queryFailureCount: 0 },
       { now: start, abortWaitMs: 3000, signalAborted: false, paneInfo: null, paneId: "terminal_1" },
     );
     assert.equal(initial.shouldBreak, false);
@@ -40,7 +40,7 @@ describe("runner core helpers", () => {
   test("propagates exited pane status after the grace interval", () => {
     const start = 2000;
     const initial = updatePaneWatchState(
-      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false },
+      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false, closeRequested: false, queryFailureCount: 0 },
       { now: start, abortWaitMs: 3000, signalAborted: false, paneInfo: { exited: true, exitStatus: 7 }, paneId: "terminal_3" },
     );
     assert.equal(initial.shouldBreak, false);
@@ -59,7 +59,7 @@ describe("runner core helpers", () => {
 
   test("resets exited timing when pane becomes missing before reappearing as exited", () => {
     const firstExit = updatePaneWatchState(
-      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false },
+      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false, closeRequested: false, queryFailureCount: 0 },
       { now: 1000, abortWaitMs: 3000, signalAborted: false, paneInfo: { exited: true, exitStatus: 9 }, paneId: "terminal_4" },
     );
     const missing = updatePaneWatchState(firstExit.state, {
@@ -94,6 +94,7 @@ describe("runner core helpers", () => {
       getPaneInfo: async () => paneInfoCalls.shift(),
       closePane: async () => {
         closed.push("closed");
+        return true;
       },
       delay: async () => undefined,
       now: (() => {
@@ -116,7 +117,7 @@ describe("runner core helpers", () => {
       pollIntervalMs: 1,
       fileExists: async () => false,
       getPaneInfo: async () => sequence.shift() ?? null,
-      closePane: async () => undefined,
+      closePane: async () => true,
       delay: async () => undefined,
       now: (() => {
         let now = 1000;
@@ -127,9 +128,29 @@ describe("runner core helpers", () => {
     assert.equal(result.manualExitError, "Zellij pane terminal_6 closed before writing subagent status.");
   });
 
+  test("fails after repeated pane query errors", () => {
+    const first = updatePaneWatchState(
+      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false, closeRequested: false, queryFailureCount: 0 },
+      { now: 1, abortWaitMs: 3000, signalAborted: false, paneInfo: undefined, paneId: "terminal_7", maxQueryFailures: 2 },
+    );
+    assert.equal(first.shouldBreak, false);
+    assert.equal(first.queryFailed, true);
+
+    const second = updatePaneWatchState(first.state, {
+      now: 2,
+      abortWaitMs: 3000,
+      signalAborted: false,
+      paneInfo: undefined,
+      paneId: "terminal_7",
+      maxQueryFailures: 2,
+    });
+    assert.equal(second.shouldBreak, true);
+    assert.equal(second.manualExitError, "Zellij pane terminal_7 could not be queried after 2 attempts.");
+  });
+
   test("breaks aborted pane polling even when pane queries keep failing", () => {
     const outcome = updatePaneWatchState(
-      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false },
+      { abortDeadline: null, paneExitedAt: null, paneMissingAt: null, wasAborted: false, closeRequested: false, queryFailureCount: 0 },
       { now: 5000, abortWaitMs: 3000, signalAborted: true, paneInfo: undefined, paneId: "terminal_2" },
     );
     assert.equal(outcome.shouldClosePane, true);

@@ -25,7 +25,7 @@ describe("pane-renderer CLI", () => {
 
     const lines: string[] = [];
     const consumer = startJsonlPipeConsumer(pipePath, (line) => lines.push(line));
-    const proc = spawn(process.execPath, ["./pane-renderer.js", pipePath, "Inspect task output"], {
+    const proc = spawn(process.execPath, ["./pane-renderer.js", pipePath], {
       cwd: process.cwd(),
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
@@ -55,7 +55,7 @@ describe("pane-renderer CLI", () => {
 
     assert.equal(exitCode, 0);
     assert.equal(stderr, "");
-    assert.match(stdout, /Task: Inspect task output\n---\nHello\n→ read README\.md\n/);
+    assert.match(stdout, /Hello\n→ read README\.md\n/);
     assert.deepEqual(lines, [
       '{"type":"message_start","message":{"role":"assistant","content":[]}}',
       '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hel"}}',

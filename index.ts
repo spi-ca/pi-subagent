@@ -38,7 +38,7 @@ import {
   type ChainTaskStage,
   validateChainStages,
 } from "./chain-helpers.js";
-import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir, mergeAgents } from "./agents.js";
+import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir } from "./agents.js";
 import { renderCall, renderResult } from "./render.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { mapConcurrent, runAgent } from "./runner.js";
@@ -71,6 +71,8 @@ const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
+const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
+const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
 
 // ---------------------------------------------------------------------------
 // Tool parameter schema
@@ -161,6 +163,15 @@ const SubagentParams = Type.Object({
       default: DEFAULT_DELEGATION_MODE,
     }),
   ),
+  terminal: Type.Optional(
+    Type.Union([
+      Type.Literal("inline"),
+      Type.Literal("zellij-pane"),
+    ], {
+      description:
+        "Execution surface override for delegated runs. If omitted, subagent auto-selects 'zellij-pane' inside Zellij and 'inline' otherwise.",
+    }),
+  ),
   zellij: Type.Optional(
     Type.Object({
       pane: Type.Optional(Type.Object(ZellijPaneOptionsShape, {
@@ -208,6 +219,14 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
   if (normalized === "spawn" || normalized === "fork") {
     return normalized;
   }
+  return null;
+}
+
+function parseTerminalMode(raw: unknown): TerminalMode | null {
+  if (raw === undefined) return getDefaultTerminalModeFromEnv();
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "inline" || normalized === "zellij-pane") return normalized;
   return null;
 }
 
@@ -439,7 +458,7 @@ function makeDetailsFactory(
 ) {
   return (
     mode: "single" | "parallel" | "chain",
-    extras: Partial<Pick<SubagentDetails, "chainStageCount" | "chainCompletedCount" | "chainSkippedCount">> = {},
+    extras: Partial<Pick<SubagentDetails, "chainStageCount" | "chainCompletedCount" | "chainSkippedCount" | "chainFailedCount" | "chainCompletedWithErrorsCount">> = {},
   ) =>
     (results: SingleResult[]): SubagentDetails => ({
       mode,
@@ -457,7 +476,19 @@ function formatAgentNames(agents: AgentConfig[]): string {
 }
 
 function countCompletedChainStages(stages: ChainStageRecord[]): number {
-  return stages.filter((stage) => stage.status === "completed" || stage.status === "completed_with_errors").length;
+  return stages.filter((stage) => stage.status === "completed").length;
+}
+
+function countDoneChainStages(stages: ChainStageRecord[]): number {
+  return stages.filter((stage) => stage.status !== "skipped").length;
+}
+
+function countFailedChainStages(stages: ChainStageRecord[]): number {
+  return stages.filter((stage) => stage.status === "failed").length;
+}
+
+function countCompletedWithErrorChainStages(stages: ChainStageRecord[]): number {
+  return stages.filter((stage) => stage.status === "completed_with_errors").length;
 }
 
 function getCycleViolations(
@@ -475,8 +506,17 @@ function getRequestedProjectAgents(
   requestedNames: Set<string>,
 ): AgentConfig[] {
   return Array.from(requestedNames)
-    .map((name) => agents.find((a) => a.name === name))
+    .map((name) => {
+      const matches = agents.filter((a) => a.name === name);
+      return matches.find((a) => a.source === "project") ?? matches[0];
+    })
     .filter((a): a is AgentConfig => a?.source === "project");
+}
+
+function inferInvocationMode(params: { agent?: unknown; task?: unknown; tasks?: unknown[]; chain?: unknown[] }): "single" | "parallel" | "chain" {
+  if ((params.tasks?.length ?? 0) > 0) return "parallel";
+  if ((params.chain?.length ?? 0) > 0) return "chain";
+  return "single";
 }
 
 /**
@@ -518,7 +558,34 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
 
+  const parseProjectRootEnv = (name: string): string[] => {
+    try {
+      const raw = process.env[name];
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const sessionTrustedProjectDirs = new Set<string>(parseProjectRootEnv(SUBAGENT_TRUSTED_PROJECTS_ENV));
+  const sessionDeniedProjectDirs = new Set<string>(parseProjectRootEnv(SUBAGENT_DENIED_PROJECTS_ENV));
+
+  const getTrustOverrideFromArgv = (): boolean | null => {
+    if (process.argv.includes("--approve") || process.argv.includes("-a")) return true;
+    if (process.argv.includes("--no-approve") || process.argv.includes("-na")) return false;
+    return null;
+  };
+
+  const getProjectRootFromAgentsDir = (projectAgentsDir: string | null): string | null => {
+    return projectAgentsDir ? path.dirname(path.dirname(projectAgentsDir)) : null;
+  };
+
   const isProjectTrustedInContext = (ctx: unknown, projectAgentsDir: string | null): boolean => {
+    const projectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
+    if (projectRoot && sessionDeniedProjectDirs.has(projectRoot)) return false;
+    if (projectRoot && sessionTrustedProjectDirs.has(projectRoot)) return true;
     if (typeof (ctx as { isProjectTrusted?: unknown }).isProjectTrusted === "function") {
       return Boolean((ctx as { isProjectTrusted: () => boolean }).isProjectTrusted());
     }
@@ -530,10 +597,21 @@ export default function (pi: ExtensionAPI) {
     if (!canDelegate) return;
 
     const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
+    const sessionProjectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
+    const argvTrustOverride = getTrustOverrideFromArgv();
+    if (sessionProjectRoot && argvTrustOverride === true) {
+      sessionDeniedProjectDirs.delete(sessionProjectRoot);
+      sessionTrustedProjectDirs.add(sessionProjectRoot);
+    }
+    if (sessionProjectRoot && argvTrustOverride === false) {
+      sessionTrustedProjectDirs.delete(sessionProjectRoot);
+      sessionDeniedProjectDirs.add(sessionProjectRoot);
+    }
     const trustedProject = isProjectTrustedInContext(ctx, projectAgentsDir);
+    const untrustedProjectAgents = trustedProject ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
     const starterDiscovery = trustedProject
       ? discoverAgentsWithStarter(ctx.cwd)
-      : projectAgentsDir
+      : untrustedProjectAgents.length > 0
         ? { discovery: discoverAgents(ctx.cwd, "user"), createdAgentPath: null }
         : discoverAgentsWithStarterForScope(ctx.cwd, "user");
     const discovery = starterDiscovery.discovery;
@@ -579,9 +657,10 @@ Context behavior is controlled by optional 'mode':
 - 'spawn' (default): child receives only the provided task prompt. Best for isolated, reproducible tasks with lower token/cost and less context leakage.
 - 'fork': child receives a forked snapshot of current session context plus the task prompt. Best for follow-up tasks that rely on prior context; usually higher token/cost and may include sensitive context.
 
-Execution surface is selected automatically:
+Execution surface defaults automatically when 'terminal' is omitted:
 - inside Zellij: use 'zellij-pane'
 - outside Zellij: use 'inline'
+- override with 'terminal: "inline"' or 'terminal: "zellij-pane"'
 - \`zellij.pane\` options apply whenever the effective mode is 'zellij-pane'
 
 **Single mode** — delegate one task:
@@ -630,51 +709,82 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
         "",
         "Execution surface:",
-        "  terminal mode is auto-selected: \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
+        "  terminal omitted            -> auto-select \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
+        "  terminal: \"inline\"      -> force direct child execution and parent-side streaming.",
+        "  terminal: \"zellij-pane\" -> force a Zellij pane with FIFO bridge and human-readable pane output.",
         "  zellij.pane options apply whenever the effective terminal mode resolves to \"zellij-pane\".",
         "",
         'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
-        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
+        'Example single override: { agent: "writer", task: "Rewrite README.md", mode: "spawn", terminal: "inline" }',
+        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork", terminal: "zellij-pane" }',
         'Example chain:    { chain: [{ label: "discover", type: "parallel", tasks: [{ agent: "scout", task: "Inspect" }, { agent: "researcher", task: "Check docs" }] }, { label: "plan", agent: "planner", task: "Plan from discovery" }], mode: "spawn" }',
       ].join("\n"),
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
+        const sessionProjectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
+        const argvTrustOverride = getTrustOverrideFromArgv();
+        if (sessionProjectRoot && argvTrustOverride === true) {
+          sessionDeniedProjectDirs.delete(sessionProjectRoot);
+          sessionTrustedProjectDirs.add(sessionProjectRoot);
+        }
+        if (sessionProjectRoot && argvTrustOverride === false) {
+          sessionTrustedProjectDirs.delete(sessionProjectRoot);
+          sessionDeniedProjectDirs.add(sessionProjectRoot);
+        }
         const trustedProjectAtStart = isProjectTrustedInContext(ctx, projectAgentsDir);
+        const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
           ? discoverAgentsWithStarter(ctx.cwd).discovery
           : {
-            agents: mergeAgents(
-              discoverAgentsWithStarterForScope(ctx.cwd, "user").discovery.agents,
-              discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents,
-            ),
+            agents: (untrustedProjectAgents.length > 0 ? discoverAgents(ctx.cwd, "user") : discoverAgentsWithStarterForScope(ctx.cwd, "user").discovery).agents,
             projectAgentsDir,
           };
         const { agents } = discovery;
+        const visibleAgents = trustedProjectAtStart ? agents : discoverAgents(ctx.cwd, "user").agents;
 
         const delegationMode = parseDelegationMode(params.mode);
-        const terminalMode = getDefaultTerminalModeFromEnv();
-        if (!delegationMode) {
+        const terminalMode = parseTerminalMode((params as { terminal?: unknown }).terminal);
+        const intendedMode = inferInvocationMode(params);
+        if (!delegationMode || !terminalMode) {
           const fallbackDetails = makeDetailsFactory(
             discovery.projectAgentsDir,
             DEFAULT_DELEGATION_MODE,
-            DEFAULT_TERMINAL_MODE,
+            terminalMode ?? getDefaultTerminalModeFromEnv(),
           );
+          const validationError = !delegationMode
+            ? `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".`
+            : `Invalid terminal \"${String((params as { terminal?: unknown }).terminal)}\". Expected \"inline\" or \"zellij-pane\".`;
           return {
             content: [
               {
                 type: "text",
-                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".\nAvailable agents: ${formatAgentNames(agents)}`,
+                text: `${validationError}\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
               },
             ],
-            details: fallbackDetails("single")([]),
+            details: fallbackDetails(intendedMode)([]),
             isError: true,
           };
         }
 
         const zellijPane = ((params as { zellij?: { pane?: ZellijPaneOptions } }).zellij?.pane ?? {}) as ZellijPaneOptions;
+        const detailsExtras = intendedMode === "chain" && Array.isArray(params.chain)
+          ? { chainStageCount: params.chain.length }
+          : {};
         let runnableAgents = agents;
+        const trustedProjectRoots = Array.from(sessionTrustedProjectDirs);
+        const deniedProjectRoots = Array.from(sessionDeniedProjectDirs);
+        const currentProjectRoot = getProjectRootFromAgentsDir(discovery.projectAgentsDir);
+        if (trustedProjectAtStart && currentProjectRoot && !trustedProjectRoots.includes(currentProjectRoot)) {
+          trustedProjectRoots.push(currentProjectRoot);
+        }
+        if (currentProjectRoot) {
+          const deniedIndex = deniedProjectRoots.indexOf(currentProjectRoot);
+          if (trustedProjectRoots.includes(currentProjectRoot) && deniedIndex !== -1) {
+            deniedProjectRoots.splice(deniedIndex, 1);
+          }
+        }
 
         const makeDetails = makeDetailsFactory(
           discovery.projectAgentsDir,
@@ -694,7 +804,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
                   text: "Cannot use mode=\"fork\": failed to snapshot current session context.",
                 },
               ],
-              details: makeDetails("single")([]),
+              details: makeDetails(intendedMode, detailsExtras)([]),
               isError: true,
             };
           }
@@ -709,10 +819,10 @@ Use single mode for one task, parallel mode when tasks are independent and can r
             content: [
               {
                 type: "text",
-                text: `Invalid parameters. Provide exactly one invocation shape.\nAvailable agents: ${formatAgentNames(agents)}`,
+                text: `Invalid parameters. Provide exactly one invocation shape.\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
               },
             ],
-            details: makeDetails("single")([]),
+            details: makeDetails(intendedMode)([]),
             isError: true,
           };
         }
@@ -725,7 +835,7 @@ Use single mode for one task, parallel mode when tasks are independent and can r
           if (chainValidationError) {
             return {
               content: [{ type: "text", text: chainValidationError }],
-              details: makeDetails("chain")([]),
+              details: makeDetails("chain", { chainStageCount: params.chain.length })([]),
               isError: true,
             };
           }
@@ -759,9 +869,34 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           }
         }
 
+        const hiddenProjectShadowedUserAgents = !trustedProjectAtStart
+          ? Array.from(requested).filter((name) =>
+            visibleAgents.some((agent) => agent.name === name && agent.source === "user") &&
+            untrustedProjectAgents.some((agent) => agent.name === name),
+          )
+          : [];
+        if (hiddenProjectShadowedUserAgents.length > 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Blocked: hidden project agent name collision for ${hiddenProjectShadowedUserAgents.join(", ")}. Trust the project first or rename one of the colliding agents before calling it by name.`,
+              },
+            ],
+            details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+            isError: true,
+          };
+        }
+        const requestedProjectAgentNames = trustedProjectAtStart
+          ? requested
+          : new Set(
+            Array.from(requested).filter((name) =>
+              !visibleAgents.some((agent) => agent.name === name && agent.source === "user"),
+            ),
+          );
         const requestedProjectAgents = getRequestedProjectAgents(
-          agents,
-          requested,
+          trustedProjectAtStart ? agents : [...agents, ...untrustedProjectAgents],
+          requestedProjectAgentNames,
         );
         // Project-local agents are repository-controlled prompts. Respect the
         // current session trust state, including temporary trust decisions and
@@ -776,6 +911,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               ctx,
             );
             if (!approved) {
+              const projectRoot = getProjectRootFromAgentsDir(discovery.projectAgentsDir);
+              if (projectRoot) {
+                sessionTrustedProjectDirs.delete(projectRoot);
+                sessionDeniedProjectDirs.add(projectRoot);
+              }
               return {
                 content: [
                   {
@@ -786,6 +926,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
                 isError: true,
               };
+            }
+            const projectRoot = getProjectRootFromAgentsDir(discovery.projectAgentsDir);
+            if (projectRoot) {
+              sessionDeniedProjectDirs.delete(projectRoot);
+              sessionTrustedProjectDirs.add(projectRoot);
+              trustedProjectRoots.push(projectRoot);
             }
           } else if (!ctx.hasUI && shouldPrompt) {
             const names = requestedProjectAgents.map((a) => a.name).join(", ");
@@ -814,6 +960,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             delegationMode,
             terminalMode,
             zellijPane,
+            trustedProjectRoots,
+            deniedProjectRoots,
             forkSessionSnapshotJsonl,
             runnableAgents,
             ctx.cwd,
@@ -832,6 +980,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             delegationMode,
             terminalMode,
             zellijPane,
+            trustedProjectRoots,
+            deniedProjectRoots,
             forkSessionSnapshotJsonl,
             runnableAgents,
             ctx.cwd,
@@ -850,6 +1000,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             delegationMode,
             terminalMode,
             zellijPane,
+            trustedProjectRoots,
+            deniedProjectRoots,
             forkSessionSnapshotJsonl,
             runnableAgents,
             ctx.cwd,
@@ -887,6 +1039,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
     zellijPane: ZellijPaneOptions,
+    trustedProjectRoots: string[],
+    deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
@@ -903,6 +1057,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       delegationMode,
       terminalMode,
       zellijPane,
+      trustedProjectRoots,
+      deniedProjectRoots,
       forkSessionSnapshotJsonl,
       parentDepth: currentDepth,
       parentAgentStack: ancestorAgentStack,
@@ -942,6 +1098,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
     zellijPane: ZellijPaneOptions,
+    trustedProjectRoots: string[],
+    deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
@@ -973,7 +1131,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
     const stages: ChainStageRecord[] = [];
     const flattenedResults: SingleResult[] = [];
-    const state: ChainExecutionState = { hadError: false, hadCompletedWithErrors: false };
+    const state: ChainExecutionState = { hadError: false, hadCompletedWithErrors: false, hadBlockingError: false };
 
     const emitProgress = (running?: SingleResult[]) => {
       if (!onUpdate) return;
@@ -992,6 +1150,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           chainStageCount: chain.length,
           chainCompletedCount: countCompletedChainStages(stages),
           chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+          chainFailedCount: countFailedChainStages(stages),
+          chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
         })(displayedResults),
       });
     };
@@ -1050,6 +1210,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               zellijPane,
               paneTitleSuffix: `#${taskIndex + 1}`,
               restoreFocusPaneId: sharedRestoreFocusPaneId,
+              trustedProjectRoots,
+              deniedProjectRoots,
               forkSessionSnapshotJsonl,
               parentDepth: currentDepth,
               parentAgentStack: ancestorAgentStack,
@@ -1065,6 +1227,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                       chainStageCount: chain.length,
                       chainCompletedCount: countCompletedChainStages(stages),
                       chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+                      chainFailedCount: countFailedChainStages(stages),
+                      chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
                     })([...flattenedResults, ...runningResults]),
                   });
                 }
@@ -1088,6 +1252,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         if (stageHasError) {
           state.hadError = true;
           if (continueOnError) state.hadCompletedWithErrors = true;
+          else state.hadBlockingError = true;
         }
         emitProgress();
 
@@ -1103,6 +1268,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               chainStageCount: chain.length,
               chainCompletedCount: countCompletedChainStages(stages),
               chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+              chainFailedCount: countFailedChainStages(stages),
+              chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
             })(flattenedResults),
             isError: true,
           };
@@ -1133,6 +1300,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         delegationMode,
         terminalMode,
         zellijPane,
+        trustedProjectRoots,
+        deniedProjectRoots,
         forkSessionSnapshotJsonl,
         parentDepth: currentDepth,
         parentAgentStack: ancestorAgentStack,
@@ -1147,6 +1316,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 chainStageCount: chain.length,
                 chainCompletedCount: countCompletedChainStages(stages),
                 chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+                chainFailedCount: countFailedChainStages(stages),
+                chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
               })([...flattenedResults, partial.details.results[0]]),
             });
           }
@@ -1165,6 +1336,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       if (stageHasError) {
         state.hadError = true;
         if (continueOnError) state.hadCompletedWithErrors = true;
+        else state.hadBlockingError = true;
       }
       emitProgress();
 
@@ -1180,6 +1352,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             chainStageCount: chain.length,
             chainCompletedCount: countCompletedChainStages(stages),
             chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+            chainFailedCount: countFailedChainStages(stages),
+            chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
           })(flattenedResults),
           isError: true,
         };
@@ -1187,20 +1361,24 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     }
 
     const completed = countCompletedChainStages(stages);
-    const skipped = stages.length - completed;
+    const completedWithErrors = countCompletedWithErrorChainStages(stages);
+    const skipped = stages.filter((stage) => stage.status === "skipped").length;
+    const failed = countFailedChainStages(stages);
     return {
       content: [
         {
           type: "text" as const,
-          text: `Chain: ${completed}/${chain.length} stages completed${skipped ? `, ${skipped} skipped` : ""}\n\n${formatChainStageSummaries(stages)}`,
+          text: `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}\n\n${formatChainStageSummaries(stages)}`,
         },
       ],
       details: makeDetails("chain", {
         chainStageCount: chain.length,
         chainCompletedCount: completed,
         chainSkippedCount: skipped,
+        chainFailedCount: countFailedChainStages(stages),
+        chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
       })(flattenedResults),
-      isError: state.hadError && !state.hadCompletedWithErrors ? true : undefined,
+      isError: state.hadError || state.hadCompletedWithErrors ? true : undefined,
     };
   }
 
@@ -1209,6 +1387,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
     zellijPane: ZellijPaneOptions,
+    trustedProjectRoots: string[],
+    deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
@@ -1284,6 +1464,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             zellijPane,
             paneTitleSuffix: `#${index + 1}`,
             restoreFocusPaneId: sharedRestoreFocusPaneId,
+            trustedProjectRoots,
+            deniedProjectRoots,
             forkSessionSnapshotJsonl,
             parentDepth: currentDepth,
             parentAgentStack: ancestorAgentStack,

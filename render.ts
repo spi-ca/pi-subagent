@@ -46,7 +46,7 @@ function formatUsage(usage: Partial<UsageStats>, model?: string): string {
 	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
 	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx(last):${formatTokens(usage.contextTokens)}`);
 	if (model) parts.push(model);
 	return parts.join(" ");
 }
@@ -64,11 +64,14 @@ function normalizeDelegationMode(raw: unknown): DelegationMode {
 	return raw === "fork" ? "fork" : DEFAULT_DELEGATION_MODE;
 }
 
-function normalizeTerminalMode(raw: unknown, inferFromEnv = true): TerminalMode {
+function normalizeTerminalMode(raw: unknown, inferFromEnv = true): TerminalMode | "invalid" {
 	if (raw === undefined) {
 		return inferFromEnv ? getDefaultTerminalModeFromEnv() : DEFAULT_TERMINAL_MODE;
 	}
-	return raw === "zellij-pane" ? "zellij-pane" : DEFAULT_TERMINAL_MODE;
+	if (typeof raw !== "string") return "invalid";
+	const normalized = raw.trim().toLowerCase();
+	if (normalized === "inline" || normalized === "zellij-pane") return normalized;
+	return "invalid";
 }
 
 type ThemeFg = (color: ThemeColor, text: string) => string;
@@ -180,7 +183,8 @@ function formatModeTitle(toolLabel: string, mode: "single" | "parallel" | "chain
 
 export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }): Text {
 	const delegationMode = normalizeDelegationMode(args.mode);
-	const terminalMode = getDefaultTerminalModeFromEnv();
+	const normalizedTerminalMode = args.terminal === undefined ? getDefaultTerminalModeFromEnv() : normalizeTerminalMode(args.terminal);
+	const terminalMode = normalizedTerminalMode === "invalid" ? String(args.terminal) : normalizedTerminalMode;
 	const modeBadge = theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`);
 	const toolTitle = theme.fg("toolTitle", theme.bold(`${SUBAGENT_TOOL_LABEL} `));
 
@@ -236,10 +240,11 @@ export function renderResult(
 	const delegationMode = normalizeDelegationMode(
 		(details as Partial<SubagentDetails>).delegationMode,
 	);
-	const terminalMode = normalizeTerminalMode(
+	const normalizedTerminalMode = normalizeTerminalMode(
 		(details as Partial<SubagentDetails>).terminalMode,
 		false,
 	);
+	const terminalMode = normalizedTerminalMode === "invalid" ? DEFAULT_TERMINAL_MODE : normalizedTerminalMode;
 	if (details.mode === "single") {
 		return renderSingleResult(details.toolLabel || SUBAGENT_TOOL_LABEL, details.results[0], delegationMode, terminalMode, expanded, theme);
 	}
@@ -384,6 +389,9 @@ function renderParallelResult(
 		? details.chainCompletedCount ?? successCount + failCount
 		: successCount;
 	const chainSkipped = details.mode === "chain" ? details.chainSkippedCount ?? 0 : 0;
+	const chainFailed = details.mode === "chain" ? details.chainFailedCount ?? 0 : 0;
+	const chainCompletedWithErrors = details.mode === "chain" ? details.chainCompletedWithErrorsCount ?? 0 : 0;
+	const chainDone = chainCompleted + chainCompletedWithErrors + chainFailed;
 
 	const icon = isRunning
 		? theme.fg("warning", "⏳")
@@ -394,8 +402,8 @@ function renderParallelResult(
 	const itemLabel = details.mode === "chain" ? "steps" : "tasks";
 	const status = details.mode === "chain"
 		? isRunning
-			? `${chainCompleted}/${chainTotal} stages done, ${running} running`
-			: `${chainCompleted}/${chainTotal} stages completed${chainSkipped ? `, ${chainSkipped} skipped` : ""}`
+			? `${chainDone + chainSkipped}/${chainTotal} stages done, 1 stage running`
+			: `${chainCompleted + chainCompletedWithErrors}/${chainTotal} stages completed${chainCompletedWithErrors ? `, ${chainCompletedWithErrors} completed with errors` : ""}${chainSkipped ? `, ${chainSkipped} skipped` : ""}${chainFailed ? `, ${chainFailed} failed` : ""}`
 		: isRunning
 			? `${successCount + failCount}/${details.results.length} done, ${running} running`
 			: `${successCount}/${details.results.length} ${itemLabel}`;
@@ -453,7 +461,8 @@ function renderParallelExpanded(
 		if (finalOutput) {
 			container.addChild(new Spacer(1));
 			container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-		} else if (isResultError(r)) {
+		}
+		if (isResultError(r)) {
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("error", getResultSummaryText(r)), 0, 0));
 		}
@@ -493,6 +502,9 @@ function renderParallelCollapsed(
 			text += `\n${theme.fg(r.exitCode === -1 ? "muted" : isResultError(r) ? "error" : "muted", r.exitCode === -1 ? "(running...)" : getResultSummaryText(r))}`;
 		} else {
 			text += `\n${renderDisplayItems(displayItems, false, theme, COLLAPSED_PARALLEL_LINE_COUNT)}`;
+			if (isResultError(r)) {
+				text += `\n${theme.fg("error", getResultSummaryText(r))}`;
+			}
 		}
 	}
 

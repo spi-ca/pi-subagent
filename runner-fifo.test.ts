@@ -63,7 +63,9 @@ describe("runner FIFO helpers", () => {
     await consumer.completed;
 
     assert.equal(seenLines.length, 2);
+    assert.equal(result.messages.length, 1);
     assert.equal(getFinalOutput(result.messages as any), "DONE");
+    assert.equal(result.usage.turns, 1);
     assert.equal((result as any).sawAgentEnd, true);
   });
 

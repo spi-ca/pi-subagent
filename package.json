@@ -15,6 +15,7 @@
     "pane-renderer-core.ts",
     "render.ts",
     "chain-helpers.ts",
+    "metadata-frontmatter.ts",
     "runner-core.ts",
     "types.ts",
     "agents/*.md",

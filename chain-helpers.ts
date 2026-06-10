@@ -31,6 +31,7 @@ export interface ChainStageRecord {
 export interface ChainExecutionState {
   hadError: boolean;
   hadCompletedWithErrors: boolean;
+  hadBlockingError: boolean;
 }
 
 export function getChainStageType(stage: ChainStage): "chain" | "parallel" {
@@ -86,7 +87,7 @@ export function shouldRunStage(condition: StepConditionName | undefined, state: 
     case "always":
       return true;
     case "on_success":
-      return !state.hadError;
+      return !state.hadBlockingError;
     case "on_error":
       return state.hadError;
     case "on_completed_with_errors":

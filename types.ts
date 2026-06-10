@@ -42,7 +42,7 @@ export function getDefaultTerminalModeFromEnv(): TerminalMode {
 	return isInsideZellij() ? "zellij-pane" : DEFAULT_TERMINAL_MODE;
 }
 
-/** Aggregated token usage from a subagent run. */
+/** Aggregated token usage from a subagent run. `contextTokens` tracks the latest assistant turn context size. */
 export interface UsageStats {
 	input: number;
 	output: number;
@@ -80,6 +80,8 @@ export interface SubagentDetails {
 	chainStageCount?: number;
 	chainCompletedCount?: number;
 	chainSkippedCount?: number;
+	chainFailedCount?: number;
+	chainCompletedWithErrorsCount?: number;
 }
 
 /** A display-friendly representation of a message part. */
@@ -101,7 +103,6 @@ export function aggregateUsage(results: SingleResult[]): UsageStats {
 		total.cacheRead += r.usage.cacheRead;
 		total.cacheWrite += r.usage.cacheWrite;
 		total.cost += r.usage.cost;
-		total.contextTokens += r.usage.contextTokens;
 		total.turns += r.usage.turns;
 	}
 	return total;

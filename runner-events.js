@@ -2,16 +2,36 @@
  * Helpers for parsing Pi JSON mode events and summarizing subagent results.
  */
 
-function getSeenMessageSignatures(result) {
-  if (!Object.prototype.hasOwnProperty.call(result, "__seenMessageSignatures")) {
-    Object.defineProperty(result, "__seenMessageSignatures", {
-      value: new Set(),
+function getProcessedAssistantCount(result) {
+  if (!Object.prototype.hasOwnProperty.call(result, "__processedAssistantCount")) {
+    Object.defineProperty(result, "__processedAssistantCount", {
+      value: 0,
       enumerable: false,
-      configurable: false,
-      writable: false,
+      configurable: true,
+      writable: true,
     });
   }
-  return result.__seenMessageSignatures;
+  return result.__processedAssistantCount;
+}
+
+function setProcessedAssistantCount(result, count) {
+  result.__processedAssistantCount = count;
+}
+
+function getCurrentTurnHandled(result) {
+  if (!Object.prototype.hasOwnProperty.call(result, "__currentTurnHandled")) {
+    Object.defineProperty(result, "__currentTurnHandled", {
+      value: false,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return result.__currentTurnHandled;
+}
+
+function setCurrentTurnHandled(result, handled) {
+  result.__currentTurnHandled = handled;
 }
 
 function stableStringify(value) {
@@ -33,6 +53,22 @@ function getMessageSignature(message) {
   return stableStringify(message);
 }
 
+function getProcessedAssistantSignatures(result) {
+  if (!Object.prototype.hasOwnProperty.call(result, "__processedAssistantSignatures")) {
+    Object.defineProperty(result, "__processedAssistantSignatures", {
+      value: [],
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return result.__processedAssistantSignatures;
+}
+
+function pushProcessedAssistantSignature(result, signature) {
+  getProcessedAssistantSignatures(result).push(signature);
+}
+
 function updateAssistantMetadata(result, message) {
   if (!message || message.role !== "assistant") return;
   if (!result.model && message.model) result.model = message.model;
@@ -44,12 +80,6 @@ function addAssistantMessage(result, message) {
   if (!message || message.role !== "assistant") return false;
 
   updateAssistantMetadata(result, message);
-
-  const signature = getMessageSignature(message);
-  const seen = getSeenMessageSignatures(result);
-  if (seen.has(signature)) return false;
-  seen.add(signature);
-
   result.messages.push(message);
 
   result.usage.turns++;
@@ -63,15 +93,36 @@ function addAssistantMessage(result, message) {
     result.usage.contextTokens = usage.totalTokens || 0;
   }
 
+  pushProcessedAssistantSignature(result, getMessageSignature(message));
   return true;
 }
 
 function addAssistantMessages(result, messages) {
   if (!Array.isArray(messages)) return false;
-  let changed = false;
-  for (const message of messages) {
-    if (addAssistantMessage(result, message)) changed = true;
+  const assistantMessages = messages.filter((message) => message?.role === "assistant");
+  const processedSignatures = getProcessedAssistantSignatures(result);
+  const incomingSignatures = assistantMessages.map((message) => getMessageSignature(message));
+  const maxOverlap = Math.min(processedSignatures.length, incomingSignatures.length);
+  let overlap = 0;
+  for (let candidate = maxOverlap; candidate > 0; candidate--) {
+    let matches = true;
+    for (let index = 0; index < candidate; index++) {
+      if (processedSignatures[processedSignatures.length - candidate + index] !== incomingSignatures[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      overlap = candidate;
+      break;
+    }
   }
+
+  let changed = false;
+  for (let index = overlap; index < assistantMessages.length; index++) {
+    if (addAssistantMessage(result, assistantMessages[index])) changed = true;
+  }
+  setProcessedAssistantCount(result, processedSignatures.length + (assistantMessages.length - overlap));
   return changed;
 }
 
@@ -79,11 +130,33 @@ export function processPiEvent(event, result) {
   if (!event || typeof event !== "object") return false;
 
   switch (event.type) {
-    case "message_end":
-      return addAssistantMessage(result, event.message);
+    case "message_start":
+      if (event.message?.role === "assistant") {
+        setCurrentTurnHandled(result, false);
+      }
+      return false;
 
-    case "turn_end":
-      return addAssistantMessage(result, event.message);
+    case "message_end": {
+      const changed = addAssistantMessage(result, event.message);
+      if (changed) {
+        setProcessedAssistantCount(result, getProcessedAssistantCount(result) + 1);
+        setCurrentTurnHandled(result, true);
+      }
+      return changed;
+    }
+
+    case "turn_end": {
+      if (getCurrentTurnHandled(result)) {
+        setCurrentTurnHandled(result, false);
+        return false;
+      }
+      const changed = addAssistantMessage(result, event.message);
+      if (changed) {
+        setProcessedAssistantCount(result, getProcessedAssistantCount(result) + 1);
+      }
+      setCurrentTurnHandled(result, false);
+      return changed;
+    }
 
     case "agent_end":
       result.sawAgentEnd = true;
@@ -116,10 +189,11 @@ export function getFinalAssistantText(messages) {
       continue;
     }
 
-    for (const part of message.content) {
-      if (part?.type === "text" && typeof part.text === "string" && part.text.length > 0) {
-        return part.text;
-      }
+    const textParts = message.content
+      .filter((part) => part?.type === "text" && typeof part.text === "string" && part.text.length > 0)
+      .map((part) => part.text);
+    if (textParts.length > 0) {
+      return textParts.join("\n");
     }
   }
 
@@ -127,20 +201,25 @@ export function getFinalAssistantText(messages) {
 }
 
 export function getResultSummaryText(result) {
-  const finalText = getFinalAssistantText(result?.messages);
-  if (finalText) return finalText;
-
-  if (typeof result?.errorMessage === "string" && result.errorMessage.trim()) {
-    return result.errorMessage.trim();
-  }
-
   const isError =
     (typeof result?.exitCode === "number" && result.exitCode > 0) ||
     result?.stopReason === "error" ||
     result?.stopReason === "aborted";
 
-  if (isError && typeof result?.stderr === "string" && result.stderr.trim()) {
-    return result.stderr.trim();
+  if (isError) {
+    if (typeof result?.errorMessage === "string" && result.errorMessage.trim()) {
+      return result.errorMessage.trim();
+    }
+    if (typeof result?.stderr === "string" && result.stderr.trim()) {
+      return result.stderr.trim();
+    }
+  }
+
+  const finalText = getFinalAssistantText(result?.messages);
+  if (finalText) return finalText;
+
+  if (typeof result?.errorMessage === "string" && result.errorMessage.trim()) {
+    return result.errorMessage.trim();
   }
 
   return "(no output)";

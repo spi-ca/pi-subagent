@@ -34,6 +34,8 @@ export interface PaneWatchState {
   paneExitedAt: number | null;
   paneMissingAt: number | null;
   wasAborted: boolean;
+  closeRequested: boolean;
+  queryFailureCount: number;
 }
 
 export interface PaneWatchUpdateResult {
@@ -60,6 +62,7 @@ export function updatePaneWatchState(
     signalAborted: boolean;
     paneInfo: undefined | null | { exited?: boolean; exitStatus?: number | null };
     paneId: string;
+    maxQueryFailures?: number;
   },
 ): PaneWatchUpdateResult {
   const next: PaneWatchState = { ...state };
@@ -67,20 +70,30 @@ export function updatePaneWatchState(
 
   if (options.signalAborted) {
     next.wasAborted = true;
-    shouldClosePane = true;
+    shouldClosePane = !next.closeRequested;
+    if (shouldClosePane) next.closeRequested = true;
     if (next.abortDeadline === null) {
       next.abortDeadline = options.now + options.abortWaitMs;
     }
   }
 
   if (options.paneInfo === undefined) {
+    next.queryFailureCount += 1;
+    const maxQueryFailures = options.maxQueryFailures ?? Infinity;
     return {
       state: next,
-      shouldBreak: next.abortDeadline !== null && options.now >= next.abortDeadline,
+      shouldBreak:
+        (next.abortDeadline !== null && options.now >= next.abortDeadline) ||
+        next.queryFailureCount >= maxQueryFailures,
       shouldClosePane,
+      manualExitError: next.queryFailureCount >= maxQueryFailures
+        ? `Zellij pane ${options.paneId} could not be queried after ${next.queryFailureCount} attempts.`
+        : undefined,
       queryFailed: true,
     };
   }
+
+  next.queryFailureCount = 0;
 
   if (options.paneInfo === null) {
     next.paneExitedAt = null;
@@ -128,15 +141,18 @@ export async function monitorZellijPaneLifecycle(options: {
   pollIntervalMs: number;
   fileExists: () => Promise<boolean>;
   getPaneInfo: () => Promise<undefined | null | { exited?: boolean; exitStatus?: number | null }>;
-  closePane: () => Promise<void>;
+  closePane: () => Promise<boolean>;
   delay: (ms: number) => Promise<void>;
   now?: () => number;
+  maxQueryFailures?: number;
 }): Promise<MonitorZellijPaneLifecycleResult> {
   let state: PaneWatchState = {
     abortDeadline: null,
     paneExitedAt: null,
     paneMissingAt: null,
     wasAborted: false,
+    closeRequested: false,
+    queryFailureCount: 0,
   };
 
   while (true) {
@@ -155,13 +171,22 @@ export async function monitorZellijPaneLifecycle(options: {
       signalAborted: Boolean(options.signal?.aborted),
       paneInfo,
       paneId: options.paneId,
+      maxQueryFailures: options.maxQueryFailures,
     });
     state = watch.state;
 
     if (watch.shouldClosePane) {
-      await options.closePane();
+      const closeSucceeded = await options.closePane();
+      if (!closeSucceeded) state.closeRequested = false;
     }
     if (watch.manualExitError) {
+      if (watch.queryFailed && await options.fileExists()) {
+        return {
+          statusSeen: true,
+          wasAborted: state.wasAborted,
+          manualExitError: null,
+        };
+      }
       return {
         statusSeen: false,
         wasAborted: state.wasAborted,

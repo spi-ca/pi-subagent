@@ -40,6 +40,23 @@ describe("pane renderer core", () => {
     assert.equal(output, "Hello\n→ read README.md\n");
   });
 
+  test("does not duplicate streamed text when agent_end arrives without turn_end", () => {
+    const state = createPaneRendererState();
+    let output = "";
+    const write = (text: string) => {
+      output += text;
+    };
+
+    handlePaneRendererEvent({ type: "message_start", message: { role: "assistant", content: [] } }, write, state);
+    handlePaneRendererEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "DONE" } }, write, state);
+    const message = { role: "assistant", content: [{ type: "text", text: "DONE" }] };
+    handlePaneRendererEvent({ type: "message_end", message }, write, state);
+    handlePaneRendererEvent({ type: "agent_end", messages: [message] }, write, state);
+    finalizePaneRenderer(state, write);
+
+    assert.equal(output, "DONE\n");
+  });
+
   test("renders finalized assistant messages when no streaming deltas were seen", () => {
     const state = createPaneRendererState();
     let output = "";

@@ -14,6 +14,7 @@ import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readFrontmatterOnly } from "./metadata-frontmatter.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -159,12 +160,12 @@ function parseAgentFile(filePath: string, source: "user" | "project"): AgentConf
 }
 
 function parseAgentMetadataOnly(filePath: string, source: "user" | "project"): AgentConfig | null {
-	let content: string;
-	try { content = fs.readFileSync(filePath, "utf-8"); } catch { return null; }
+	const frontmatterOnly = readFrontmatterOnly(filePath);
+	if (!frontmatterOnly) return null;
 
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
-		parsed = parseFrontmatter<Record<string, unknown>>(content);
+		parsed = parseFrontmatter<Record<string, unknown>>(frontmatterOnly);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		console.warn(`[pi-subagent] Skipping invalid agent metadata in "${filePath}": ${message}`);
@@ -197,13 +198,25 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", options: Dis
 	entries.sort((a, b) => a.name.localeCompare(b.name));
 
 	const agents: AgentConfig[] = [];
+	const normalizedDir = fs.realpathSync.native(dir);
 	for (const entry of entries) {
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
 		const filePath = path.join(dir, entry.name);
+		const metadataFilePath = options.metadataOnly && source === "project" && entry.isSymbolicLink()
+			? (() => {
+				try {
+					const resolved = fs.realpathSync.native(filePath);
+					return resolved === normalizedDir || resolved.startsWith(`${normalizedDir}${path.sep}`) ? resolved : null;
+				} catch {
+					return null;
+				}
+			})()
+			: filePath;
+		if (!metadataFilePath) continue;
 		const agent = options.metadataOnly
-			? parseAgentMetadataOnly(filePath, source)
+			? parseAgentMetadataOnly(metadataFilePath, source)
 			: parseAgentFile(filePath, source);
 		if (agent) agents.push(agent);
 	}

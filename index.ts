@@ -38,7 +38,7 @@ import {
   type ChainTaskStage,
   validateChainStages,
 } from "./chain-helpers.js";
-import { type AgentConfig, discoverAgents, discoverAgentsWithStarter } from "./agents.js";
+import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir, mergeAgents } from "./agents.js";
 import { renderCall, renderResult } from "./render.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { mapConcurrent, runAgent } from "./runner.js";
@@ -53,7 +53,6 @@ import {
   SUBAGENT_TOOL_LABEL,
   emptyUsage,
   getDefaultTerminalModeFromEnv,
-  isInsideZellij,
   isResultError,
   isResultSuccess,
 } from "./types.js";
@@ -162,15 +161,6 @@ const SubagentParams = Type.Object({
       default: DEFAULT_DELEGATION_MODE,
     }),
   ),
-  terminal: Type.Optional(
-    Type.Union([
-      Type.Literal("inline"),
-      Type.Literal("zellij-pane"),
-    ], {
-      description:
-        "Execution surface override for delegated runs. If omitted, subagent auto-selects 'zellij-pane' inside Zellij and 'inline' otherwise. Set 'inline' or 'zellij-pane' only to override that default. 'zellij-pane' requires running inside Zellij, bridges JSON back through a FIFO, renders human-readable pane output, and applies zellij.pane options whenever the effective terminal mode resolves to zellij-pane.",
-    }),
-  ),
   zellij: Type.Optional(
     Type.Object({
       pane: Type.Optional(Type.Object(ZellijPaneOptionsShape, {
@@ -216,18 +206,6 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
   if (typeof raw !== "string") return null;
   const normalized = raw.trim().toLowerCase();
   if (normalized === "spawn" || normalized === "fork") {
-    return normalized;
-  }
-  return null;
-}
-
-function parseTerminalMode(raw: unknown): TerminalMode | null {
-  if (raw === undefined) {
-    return getDefaultTerminalModeFromEnv();
-  }
-  if (typeof raw !== "string") return null;
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "inline" || normalized === "zellij-pane") {
     return normalized;
   }
   return null;
@@ -459,7 +437,10 @@ function makeDetailsFactory(
   delegationMode: DelegationMode,
   terminalMode: TerminalMode,
 ) {
-  return (mode: "single" | "parallel" | "chain") =>
+  return (
+    mode: "single" | "parallel" | "chain",
+    extras: Partial<Pick<SubagentDetails, "chainStageCount" | "chainCompletedCount" | "chainSkippedCount">> = {},
+  ) =>
     (results: SingleResult[]): SubagentDetails => ({
       mode,
       toolLabel: SUBAGENT_TOOL_LABEL,
@@ -467,11 +448,16 @@ function makeDetailsFactory(
       terminalMode,
       projectAgentsDir,
       results,
+      ...extras,
     });
 }
 
 function formatAgentNames(agents: AgentConfig[]): string {
   return agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+}
+
+function countCompletedChainStages(stages: ChainStageRecord[]): number {
+  return stages.filter((stage) => stage.status === "completed" || stage.status === "completed_with_errors").length;
 }
 
 function getCycleViolations(
@@ -532,11 +518,24 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
 
+  const isProjectTrustedInContext = (ctx: unknown, projectAgentsDir: string | null): boolean => {
+    if (typeof (ctx as { isProjectTrusted?: unknown }).isProjectTrusted === "function") {
+      return Boolean((ctx as { isProjectTrusted: () => boolean }).isProjectTrusted());
+    }
+    return isTrustedProjectAgentsDir(projectAgentsDir);
+  };
+
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
     if (!canDelegate) return;
 
-    const starterDiscovery = discoverAgentsWithStarter(ctx.cwd);
+    const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
+    const trustedProject = isProjectTrustedInContext(ctx, projectAgentsDir);
+    const starterDiscovery = trustedProject
+      ? discoverAgentsWithStarter(ctx.cwd)
+      : projectAgentsDir
+        ? { discovery: discoverAgents(ctx.cwd, "user"), createdAgentPath: null }
+        : discoverAgentsWithStarterForScope(ctx.cwd, "user");
     const discovery = starterDiscovery.discovery;
     discoveredAgents = discovery.agents;
 
@@ -580,24 +579,24 @@ Context behavior is controlled by optional 'mode':
 - 'spawn' (default): child receives only the provided task prompt. Best for isolated, reproducible tasks with lower token/cost and less context leakage.
 - 'fork': child receives a forked snapshot of current session context plus the task prompt. Best for follow-up tasks that rely on prior context; usually higher token/cost and may include sensitive context.
 
-Execution surface can be overridden with optional 'terminal':
-- omitted (default): auto-select 'zellij-pane' inside Zellij and 'inline' otherwise.
-- 'inline': launch the child pi process directly and stream stdout.
-- 'zellij-pane': launch the child in a new Zellij pane, bridge JSON stdout back through a FIFO, and render human-readable progress in the pane while structured progress stays in the parent TUI. This override requires running inside Zellij.
+Execution surface is selected automatically:
+- inside Zellij: use 'zellij-pane'
+- outside Zellij: use 'inline'
+- \`zellij.pane\` options apply whenever the effective mode is 'zellij-pane'
 
 **Single mode** — delegate one task:
 \`\`\`json
-{ "agent": "agent-name", "task": "Detailed task...", "mode": "spawn", "terminal": "inline" }
+{ "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
 \`\`\`
 
 **Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task/chain):
 \`\`\`json
-{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork", "terminal": "zellij-pane" }
+{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
 \`\`\`
 
 **Chain mode** — run ordered stages sequentially (do NOT also set agent/task/tasks). A stage can be a sequential agent step or a parallel group:
 \`\`\`json
-{ "chain": [{ "label": "discover", "type": "parallel", "tasks": [{ "agent": "scout", "task": "Inspect code" }, { "agent": "researcher", "task": "Check docs" }] }, { "label": "plan", "agent": "planner", "task": "Plan from discovery" }], "mode": "spawn", "terminal": "inline" }
+{ "chain": [{ "label": "discover", "type": "parallel", "tasks": [{ "agent": "scout", "task": "Inspect code" }, { "agent": "researcher", "task": "Check docs" }] }, { "label": "plan", "agent": "planner", "task": "Plan from discovery" }], "mode": "spawn" }
 \`\`\`
 
 Use single mode for one task, parallel mode when tasks are independent and can run simultaneously, and chain mode when later stages depend on earlier outputs. In chain stages, omitted type means a sequential chain step. Optional fields: label, condition, continueOnError.
@@ -630,38 +629,43 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         "  mode: \"fork\"            -> child gets current session context + your task prompt.",
         "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
         "",
-        "Optional execution surface override:",
-        "  terminal omitted            -> auto-select \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
-        "  terminal: \"inline\"      -> launch child pi directly and stream stdout.",
-        "  terminal: \"zellij-pane\" -> launch child pi in a new Zellij pane, bridge JSON through a FIFO, and render human-readable pane output while structured progress stays in the parent TUI (requires Zellij).",
+        "Execution surface:",
+        "  terminal mode is auto-selected: \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
+        "  zellij.pane options apply whenever the effective terminal mode resolves to \"zellij-pane\".",
         "",
-        'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn", terminal: "inline" }',
-        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork", terminal: "zellij-pane" }',
-        'Example chain:    { chain: [{ label: "discover", type: "parallel", tasks: [{ agent: "scout", task: "Inspect" }, { agent: "researcher", task: "Check docs" }] }, { label: "plan", agent: "planner", task: "Plan from discovery" }], mode: "spawn", terminal: "inline" }',
+        'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
+        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
+        'Example chain:    { chain: [{ label: "discover", type: "parallel", tasks: [{ agent: "scout", task: "Inspect" }, { agent: "researcher", task: "Check docs" }] }, { label: "plan", agent: "planner", task: "Plan from discovery" }], mode: "spawn" }',
       ].join("\n"),
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
-        const starterDiscovery = discoverAgentsWithStarter(ctx.cwd);
-        const discovery = starterDiscovery.discovery;
+        const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
+        const trustedProjectAtStart = isProjectTrustedInContext(ctx, projectAgentsDir);
+        const discovery = trustedProjectAtStart
+          ? discoverAgentsWithStarter(ctx.cwd).discovery
+          : {
+            agents: mergeAgents(
+              discoverAgentsWithStarterForScope(ctx.cwd, "user").discovery.agents,
+              discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents,
+            ),
+            projectAgentsDir,
+          };
         const { agents } = discovery;
 
         const delegationMode = parseDelegationMode(params.mode);
-        const terminalMode = parseTerminalMode((params as { terminal?: unknown }).terminal);
-        if (!delegationMode || !terminalMode) {
+        const terminalMode = getDefaultTerminalModeFromEnv();
+        if (!delegationMode) {
           const fallbackDetails = makeDetailsFactory(
             discovery.projectAgentsDir,
             DEFAULT_DELEGATION_MODE,
             DEFAULT_TERMINAL_MODE,
           );
-          const validationError = !delegationMode
-            ? `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".`
-            : `Invalid terminal \"${String((params as { terminal?: unknown }).terminal)}\". Expected \"inline\" or \"zellij-pane\".`;
           return {
             content: [
               {
                 type: "text",
-                text: `${validationError}\nAvailable agents: ${formatAgentNames(agents)}`,
+                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".\nAvailable agents: ${formatAgentNames(agents)}`,
               },
             ],
             details: fallbackDetails("single")([]),
@@ -670,25 +674,13 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         }
 
         const zellijPane = ((params as { zellij?: { pane?: ZellijPaneOptions } }).zellij?.pane ?? {}) as ZellijPaneOptions;
+        let runnableAgents = agents;
 
         const makeDetails = makeDetailsFactory(
           discovery.projectAgentsDir,
           delegationMode,
           terminalMode,
         );
-
-        if (terminalMode === "zellij-pane" && !isInsideZellij()) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Cannot use terminal=\"zellij-pane\" outside a Zellij session.",
-              },
-            ],
-            details: makeDetails("single")([]),
-            isError: true,
-          };
-        }
 
         let forkSessionSnapshotJsonl: string | undefined;
         if (delegationMode === "fork") {
@@ -775,9 +767,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         // current session trust state, including temporary trust decisions and
         // CLI trust overrides.
         if (requestedProjectAgents.length > 0) {
-          const trustedProject = typeof (ctx as { isProjectTrusted?: unknown }).isProjectTrusted === "function"
-            ? Boolean((ctx as unknown as { isProjectTrusted: () => boolean }).isProjectTrusted())
-            : isTrustedProjectAgentsDir(discovery.projectAgentsDir);
+          const trustedProject = isProjectTrustedInContext(ctx, discovery.projectAgentsDir);
           const shouldPrompt = !trustedProject;
           if (ctx.hasUI && shouldPrompt) {
             const approved = await confirmProjectAgentsIfNeeded(
@@ -794,6 +784,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                   },
                 ],
                 details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+                isError: true,
               };
             }
           } else if (!ctx.hasUI && shouldPrompt) {
@@ -810,6 +801,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               isError: true,
             };
           }
+
+          const fullDiscovery = discoverAgents(ctx.cwd, "both");
+          runnableAgents = fullDiscovery.agents;
+          discoveredAgents = fullDiscovery.agents;
         }
 
         // ── Parallel mode ──
@@ -820,7 +815,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             terminalMode,
             zellijPane,
             forkSessionSnapshotJsonl,
-            agents,
+            runnableAgents,
             ctx.cwd,
             signal,
             onUpdate,
@@ -838,7 +833,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             terminalMode,
             zellijPane,
             forkSessionSnapshotJsonl,
-            agents,
+            runnableAgents,
             ctx.cwd,
             signal,
             onUpdate,
@@ -856,7 +851,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             terminalMode,
             zellijPane,
             forkSessionSnapshotJsonl,
-            agents,
+            runnableAgents,
             ctx.cwd,
             signal,
             onUpdate,
@@ -962,7 +957,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             text: `Too many chain stages (${chain.length}). Max is ${MAX_CHAIN_STEPS}.`,
           },
         ],
-        details: makeDetails("chain")([]),
+        details: makeDetails("chain", { chainStageCount: chain.length })([]),
         isError: true,
       };
     }
@@ -971,7 +966,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     if (validationError) {
       return {
         content: [{ type: "text" as const, text: validationError }],
-        details: makeDetails("chain")([]),
+        details: makeDetails("chain", { chainStageCount: chain.length })([]),
         isError: true,
       };
     }
@@ -993,7 +988,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             text: `Chain: ${stages.length}/${chain.length} stages done${runningText}`,
           },
         ],
-        details: makeDetails("chain")(displayedResults),
+        details: makeDetails("chain", {
+          chainStageCount: chain.length,
+          chainCompletedCount: countCompletedChainStages(stages),
+          chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+        })(displayedResults),
       });
     };
 
@@ -1062,7 +1061,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                   runningResults[taskIndex] = partial.details.results[0];
                   onUpdate?.({
                     content: partial.content,
-                    details: makeDetails("chain")([...flattenedResults, ...runningResults]),
+                    details: makeDetails("chain", {
+                      chainStageCount: chain.length,
+                      chainCompletedCount: countCompletedChainStages(stages),
+                      chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+                    })([...flattenedResults, ...runningResults]),
                   });
                 }
               },
@@ -1096,7 +1099,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
               },
             ],
-            details: makeDetails("chain")(flattenedResults),
+            details: makeDetails("chain", {
+              chainStageCount: chain.length,
+              chainCompletedCount: countCompletedChainStages(stages),
+              chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+            })(flattenedResults),
             isError: true,
           };
         }
@@ -1136,7 +1143,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           if (partial.details?.results[0]) {
             onUpdate?.({
               content: partial.content,
-              details: makeDetails("chain")([...flattenedResults, partial.details.results[0]]),
+              details: makeDetails("chain", {
+                chainStageCount: chain.length,
+                chainCompletedCount: countCompletedChainStages(stages),
+                chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+              })([...flattenedResults, partial.details.results[0]]),
             });
           }
         },
@@ -1165,13 +1176,17 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
             },
           ],
-          details: makeDetails("chain")(flattenedResults),
+          details: makeDetails("chain", {
+            chainStageCount: chain.length,
+            chainCompletedCount: countCompletedChainStages(stages),
+            chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+          })(flattenedResults),
           isError: true,
         };
       }
     }
 
-    const completed = stages.filter((stage) => stage.status !== "skipped").length;
+    const completed = countCompletedChainStages(stages);
     const skipped = stages.length - completed;
     return {
       content: [
@@ -1180,7 +1195,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           text: `Chain: ${completed}/${chain.length} stages completed${skipped ? `, ${skipped} skipped` : ""}\n\n${formatChainStageSummaries(stages)}`,
         },
       ],
-      details: makeDetails("chain")(flattenedResults),
+      details: makeDetails("chain", {
+        chainStageCount: chain.length,
+        chainCompletedCount: completed,
+        chainSkippedCount: skipped,
+      })(flattenedResults),
       isError: state.hadError && !state.hadCompletedWithErrors ? true : undefined,
     };
   }
@@ -1206,6 +1225,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           },
         ],
         details: makeDetails("parallel")([]),
+        isError: true,
       };
     }
 
@@ -1300,6 +1320,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         },
       ],
       details: makeDetails("parallel")(results),
+      isError: successCount !== results.length ? true : undefined,
     };
   }
 }

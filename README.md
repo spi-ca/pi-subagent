@@ -1,6 +1,6 @@
 # Pi Subagent
 
-**Delegate tasks to specialized subagents with configurable context modes (`spawn` / `fork`) and execution surfaces (`inline` / `zellij-pane`).**
+**Delegate tasks to specialized subagents with configurable context modes (`spawn` / `fork`) and environment-selected execution surfaces.**
 
 There are many subagent extensions for pi, this one is mine.
 
@@ -10,7 +10,7 @@ There are many subagent extensions for pi, this one is mine.
 
 **Context Control** — Choose `spawn` (fresh context) or `fork` (inherit current session context), depending on the task.
 
-**Execution Surface Control** — Choose `inline` (direct child process) or `zellij-pane` (new Zellij pane + FIFO bridge + human-readable pane renderer), depending on whether you want classic in-process streaming or a separate Zellij pane while keeping structured progress in the parent TUI.
+**Execution Surface Auto-Selection** — Use `zellij-pane` inside Zellij and `inline` elsewhere, without requiring an explicit terminal argument, while keeping structured progress in the parent TUI.
 
 **Parallel Execution** — Run multiple independent agents at once.
 
@@ -111,18 +111,11 @@ If omitted, mode defaults to `spawn`.
 
 ### Execution Surface (`inline` vs `zellij-pane`)
 
-`subagent` also supports an optional top-level `terminal` override:
+`subagent` auto-selects the execution surface:
 
-- omitted (default) — Auto-select `zellij-pane` when running inside Zellij, otherwise `inline`.
-- `inline` — Launch the child `pi` process directly and stream stdout back to the parent.
-- `zellij-pane` — When running inside Zellij, launch the child in a new pane, bridge JSON stdout back through a FIFO (named pipe), and render human-readable progress in the pane. Explicitly selecting this outside Zellij is an error. Structured progress still renders in the parent TUI. Pane titles use `label(agent)` for explicitly labeled chain stages, `step-N(agent)` for unlabeled chain stages, and `subagent-agent` for non-chain runs without a custom name; concurrent parallel runs may append a ` #N` suffix for disambiguation.
-
-Quick rule of thumb:
-
-- Omit `terminal` unless you specifically want to override the environment-based default.
-- Use `zellij-pane` when you want a separate pane with readable progress for long-running delegated work.
-- Use `inline` when you want everything to stay in the parent Pi view.
-- Use `inline` when you want classic in-process streaming even inside Zellij.
+- inside Zellij — use `zellij-pane`
+- outside Zellij — use `inline`
+- when the effective mode is `zellij-pane`, pane titles use `label(agent)` for explicitly labeled chain stages, `step-N(agent)` for unlabeled chain stages, and `subagent-agent` for non-chain runs without a custom name; concurrent parallel runs may append a ` #N` suffix for disambiguation
 
 Examples:
 
@@ -131,18 +124,17 @@ Examples:
 ```
 
 ```json
-{ "agent": "review", "task": "Double-check this migration", "mode": "fork", "terminal": "inline" }
+{ "agent": "review", "task": "Double-check this migration", "mode": "fork" }
 ```
 
 ### Zellij Pane Options
 
-When the effective terminal mode is `zellij-pane` (either explicitly selected or auto-selected inside Zellij), you can optionally pass:
+When the effective terminal mode is `zellij-pane`, you can optionally pass:
 
 ```json
 {
   "agent": "worker",
   "task": "Run tests",
-  "terminal": "zellij-pane",
   "zellij": {
     "pane": {
       "direction": "right",
@@ -170,12 +162,12 @@ Use exactly one invocation shape per `subagent` call. Do not mix `agent`/`task`,
 Use single mode for one focused delegation.
 
 ```json
-{ "agent": "writer", "task": "Rewrite README.md", "mode": "spawn", "terminal": "inline" }
+{ "agent": "writer", "task": "Rewrite README.md", "mode": "spawn" }
 ```
 
 #### Parallel
 
-Use parallel mode when tasks are independent and can run at the same time. All entries share the top-level `mode` and `terminal`. The extension runs up to 4 child processes concurrently and rejects more than 8 tasks in one call.
+Use parallel mode when tasks are independent and can run at the same time. All entries share the top-level `mode`. The execution surface is auto-selected from the environment. The extension runs up to 4 child processes concurrently and rejects more than 8 tasks in one call.
 
 ```json
 {
@@ -184,8 +176,7 @@ Use parallel mode when tasks are independent and can run at the same time. All e
     { "agent": "security-reviewer", "task": "Review auth and secret handling" },
     { "agent": "reviewer", "task": "Check maintainability risks" }
   ],
-  "mode": "spawn",
-  "terminal": "inline"
+  "mode": "spawn"
 }
 ```
 
@@ -229,8 +220,7 @@ Optional stage fields:
       ]
     }
   ],
-  "mode": "spawn",
-  "terminal": "inline"
+  "mode": "spawn"
 }
 ```
 
@@ -248,7 +238,7 @@ Subagents are defined as Markdown files with YAML frontmatter.
 **User Agents:** `~/.pi/agent/agents/*.md` by default, or `$PI_CODING_AGENT_DIR/agents/*.md` when `PI_CODING_AGENT_DIR` is set
 **Project Agents:** `.pi/agents/*.md`
 
-`PI_CODING_AGENT_DIR` follows Pi's config-dir override semantics: when it is set, the extension uses `$PI_CODING_AGENT_DIR/agents` as the user/global agent directory instead of `~/.pi/agent/agents`. Project agents are still loaded in addition to the active user/global directory, and project agents win on name conflicts. When project agents are requested, Pi will prompt for confirmation before running them.
+`PI_CODING_AGENT_DIR` follows Pi's config-dir override semantics: when it is set, the extension uses `$PI_CODING_AGENT_DIR/agents` as the user/global agent directory instead of `~/.pi/agent/agents`. Project agents are still loaded in addition to the active user/global directory, and project agents win on name conflicts. When project agents are requested, Pi will prompt for confirmation before running them. In untrusted projects, project-agent metadata is held back from the main prompt until trust is granted, so explicit project-agent requests may require the caller to already know the agent name.
 
 #### Starter Agent
 
@@ -391,7 +381,7 @@ Parallel: 3/3 succeeded
 Example TUI card lines:
 
 ```
-Subagent parallel: 3 tasks 3/3 tasks [spawn, inline]
+Subagent parallel: 3 tasks 3/3 tasks [spawn, zellij-pane]
 ─── writer ✓
 Task: Draft the API usage guide
 ```
@@ -427,7 +417,7 @@ Chain: 4/4 stages completed
 Example TUI card lines:
 
 ```
-Subagent chain: 2 stages 2/2 steps [spawn, inline]
+Subagent chain: 2 stages 2/2 steps [spawn, zellij-pane]
 ─── discovery(scout) ✓
 Task: Inspect local code and summarize the architecture
 ```
@@ -436,7 +426,7 @@ Task: Inspect local code and summarize the architecture
 
 - **Auto-Discovery** — Agents are found at startup and their descriptions are injected into the main agent's system prompt.
 - **Context Mode Switch** — `spawn` (fresh context) and `fork` (session snapshot + task) per call.
-- **Execution Surface Switch** — `inline` (direct child process) and `zellij-pane` (new Zellij pane + FIFO bridge + human-readable pane renderer) per call.
+- **Execution Surface Auto-Selection** — `zellij-pane` inside Zellij and `inline` otherwise, with optional `zellij.pane` settings when pane mode is active.
 - **Depth + Cycle Guards** — Depth limiting and ancestry-cycle checks prevent runaway recursive delegation by default.
 - **Streaming Updates** — Parent TUI updates continue to follow the structured subagent event stream, while Zellij-pane runs expose a separate pane with human-readable progress.
 - **Rich TUI Rendering** — Collapsed/expanded views for single, parallel, and chain runs with usage stats, task previews, tool call previews, stage-aware labels, and markdown output.
@@ -449,8 +439,10 @@ index.ts       — Extension entry point: lifecycle hooks, tool registration, mo
 agents.ts      — Agent discovery: reads and parses .md files from the active Pi config dir and project directories
 runner-cli.js  — Parent CLI inheritance: parses and normalizes flags forwarded to child processes
 runner.ts      — Process runner: launches inline or Zellij-pane subagents, manages FIFO/status plumbing, and coordinates lifecycle handling
+runner-core.ts — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
 runner-events.js — Shared JSON event parsing and result summarization used by the parent transport path
 pane-renderer.js — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
+pane-renderer-core.ts — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
 render.ts      — TUI rendering: renderCall and renderResult for the subagent tool
 types.ts       — Shared types and pure helper functions
 ```

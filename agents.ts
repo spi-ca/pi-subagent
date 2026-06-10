@@ -33,6 +33,10 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
+export interface DiscoverAgentOptions {
+	metadataOnly?: boolean;
+}
+
 export interface StarterAgentDiscoveryResult {
 	discovery: AgentDiscoveryResult;
 	createdAgentPath: string | null;
@@ -91,7 +95,7 @@ export function getUserAgentsDir(): string {
 }
 
 /** Walk up from `cwd` looking for a `.pi/agents` directory. */
-function findNearestProjectAgentsDir(cwd: string): string | null {
+export function findNearestProjectAgentsDir(cwd: string): string | null {
 	let dir = cwd;
 	while (true) {
 		const candidate = path.join(dir, ".pi", "agents");
@@ -154,8 +158,38 @@ function parseAgentFile(filePath: string, source: "user" | "project"): AgentConf
 	};
 }
 
+function parseAgentMetadataOnly(filePath: string, source: "user" | "project"): AgentConfig | null {
+	let content: string;
+	try { content = fs.readFileSync(filePath, "utf-8"); } catch { return null; }
+
+	let parsed: { frontmatter: Record<string, unknown>; body: string };
+	try {
+		parsed = parseFrontmatter<Record<string, unknown>>(content);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.warn(`[pi-subagent] Skipping invalid agent metadata in "${filePath}": ${message}`);
+		return null;
+	}
+
+	const frontmatter = parsed.frontmatter ?? {};
+	const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
+	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+	if (!name || !description) return null;
+
+	return {
+		name,
+		description,
+		tools: undefined,
+		model: undefined,
+		thinking: undefined,
+		systemPrompt: "",
+		source,
+		filePath,
+	};
+}
+
 /** Load all agent definitions from a directory. */
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgentsFromDir(dir: string, source: "user" | "project", options: DiscoverAgentOptions = {}): AgentConfig[] {
 	if (!fs.existsSync(dir)) return [];
 
 	let entries: fs.Dirent[];
@@ -167,13 +201,16 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
-		const agent = parseAgentFile(path.join(dir, entry.name), source);
+		const filePath = path.join(dir, entry.name);
+		const agent = options.metadataOnly
+			? parseAgentMetadataOnly(filePath, source)
+			: parseAgentFile(filePath, source);
 		if (agent) agents.push(agent);
 	}
 	return agents;
 }
 
-function mergeAgents(...groups: AgentConfig[][]): AgentConfig[] {
+export function mergeAgents(...groups: AgentConfig[][]): AgentConfig[] {
 	const agentMap = new Map<string, AgentConfig>();
 	for (const group of groups) {
 		for (const agent of group) agentMap.set(agent.name, agent);
@@ -214,12 +251,12 @@ function writeStarterAgentFile(filePath: string): void {
  *
  * Precedence is: user < project.
  */
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+export function discoverAgents(cwd: string, scope: AgentScope, options: DiscoverAgentOptions = {}): AgentDiscoveryResult {
 	const userAgentsDir = getUserAgentsDir();
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userAgentsDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userAgentsDir, "user", options);
+	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", options);
 
 	if (scope === "user") {
 		return { agents: userAgents, projectAgentsDir };
@@ -240,8 +277,8 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
  * starter will be recreated on the next discovery that needs runnable agents.
  * Existing files are never overwritten.
  */
-export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryResult {
-	const initial = discoverAgents(cwd, "both");
+export function discoverAgentsWithStarterForScope(cwd: string, scope: AgentScope, options: DiscoverAgentOptions = {}): StarterAgentDiscoveryResult {
+	const initial = discoverAgents(cwd, scope, options);
 	if (initial.agents.length > 0) {
 		return { discovery: initial, createdAgentPath: null };
 	}
@@ -252,7 +289,7 @@ export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryRes
 		fs.mkdirSync(userAgentsDir, { recursive: true });
 
 		for (let attempt = 0; attempt < 100; attempt++) {
-			const latest = attempt === 0 ? initial : discoverAgents(cwd, "both");
+			const latest = attempt === 0 ? initial : discoverAgents(cwd, scope, options);
 			if (latest.agents.length > 0) {
 				return { discovery: latest, createdAgentPath: null };
 			}
@@ -261,7 +298,7 @@ export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryRes
 			try {
 				writeStarterAgentFile(filePath);
 				return {
-					discovery: discoverAgents(cwd, "both"),
+					discovery: discoverAgents(cwd, scope, options),
 					createdAgentPath: filePath,
 				};
 			} catch (err) {
@@ -283,4 +320,8 @@ export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryRes
 			error: `Could not create starter agent in ${userAgentsDir}: ${message}`,
 		};
 	}
+}
+
+export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryResult {
+	return discoverAgentsWithStarterForScope(cwd, "both");
 }

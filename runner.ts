@@ -4,7 +4,7 @@
  * Spawns isolated `pi` processes and streams results back via callbacks.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AgentConfig } from "./agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
+import { createJsonLineChunkProcessor, monitorZellijPaneLifecycle } from "./runner-core.js";
 import { processPiJsonLine } from "./runner-events.js";
 import {
   type DelegationMode,
@@ -104,7 +105,7 @@ async function waitForFile(filePath: string, timeoutMs: number): Promise<boolean
   return false;
 }
 
-async function createNamedPipe(filePath: string, signal?: AbortSignal): Promise<void> {
+export async function createNamedPipe(filePath: string, signal?: AbortSignal): Promise<void> {
   try {
     await fs.promises.rm(filePath, { force: true });
   } catch {
@@ -116,7 +117,7 @@ async function createNamedPipe(filePath: string, signal?: AbortSignal): Promise<
   }
 }
 
-function startJsonlPipeConsumer(
+export function startJsonlPipeConsumer(
   filePath: string,
   onLine: (line: string) => void,
 ): { completed: Promise<void>; close: () => void } {
@@ -203,7 +204,7 @@ function parseZellijPaneList(json: string): ZellijPaneDescriptor[] {
   return panes;
 }
 
-async function runCommandCapture(
+export async function runCommandCapture(
   command: string,
   args: string[],
   options: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
@@ -625,46 +626,14 @@ interface RunAgentExecutionOptions {
   makeDetails: (results: SingleResult[]) => SubagentDetails;
 }
 
-async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleResult> {
-  const {
-    result,
-    cwd,
-    taskCwd,
-    piArgs,
-    signal,
-    onUpdate,
-    parentDepth,
-    parentAgentStack,
-    maxDepth,
-    preventCycles,
-  } = opts;
-
+export async function monitorInlineProcess(
+  proc: ChildProcessWithoutNullStreams,
+  result: SingleResult,
+  signal: AbortSignal | undefined,
+  onUpdate: () => void,
+): Promise<{ exitCode: number; wasAborted: boolean }> {
   let wasAborted = false;
   const exitCode = await new Promise<number>((resolve) => {
-    const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
-    const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
-    const propagatedStack = [...parentAgentStack, result.agent];
-    const { command, prefixArgs } = resolvePiSpawn();
-    const proc = spawn(command, [...prefixArgs, ...piArgs], {
-      cwd: taskCwd ?? cwd,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        [SUBAGENT_DEPTH_ENV]: String(nextDepth),
-        [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
-        [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
-        [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
-        [PI_OFFLINE_ENV]: "1",
-      },
-    });
-
-    proc.stdin.on("error", () => {
-      /* ignore broken pipe on fast exits */
-    });
-    proc.stdin.end();
-
-    let buffer = "";
     let didClose = false;
     let settled = false;
     let abortHandler: (() => void) | undefined;
@@ -710,21 +679,14 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
       maybeFinishFromAgentEnd();
     };
 
-    const flushBufferedLines = (text: string) => {
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim()) flushLine(line);
-      }
-    };
+    const chunkProcessor = createJsonLineChunkProcessor(flushLine);
 
     const maybeFinishFromAgentEnd = () => {
       if (!result.sawAgentEnd || didClose || settled) return;
       clearSemanticCompletionTimer();
       semanticCompletionTimer = setTimeout(() => {
         if (didClose || settled || !result.sawAgentEnd) return;
-        if (buffer.trim()) {
-          flushBufferedLines(buffer);
-          buffer = "";
-        }
+        chunkProcessor.flushRemainder();
         proc.stdout.removeListener("data", onStdoutData);
         proc.stderr.removeListener("data", onStderrData);
         finish(0);
@@ -734,10 +696,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     };
 
     const onStdoutData = (chunk: Buffer) => {
-      buffer += chunk.toString();
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
-      for (const line of lines) flushLine(line);
+      chunkProcessor.pushChunk(chunk.toString());
     };
 
     const onStderrData = (chunk: Buffer) => {
@@ -749,7 +708,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
 
     proc.on("close", (code) => {
       didClose = true;
-      if (buffer.trim()) flushBufferedLines(buffer);
+      chunkProcessor.flushRemainder();
       finish(code ?? 0);
     });
 
@@ -769,6 +728,47 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     }
   });
 
+  return { exitCode, wasAborted };
+}
+
+async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleResult> {
+  const {
+    result,
+    cwd,
+    taskCwd,
+    piArgs,
+    signal,
+    onUpdate,
+    parentDepth,
+    parentAgentStack,
+    maxDepth,
+    preventCycles,
+  } = opts;
+
+  const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
+  const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
+  const propagatedStack = [...parentAgentStack, result.agent];
+  const { command, prefixArgs } = resolvePiSpawn();
+  const proc = spawn(command, [...prefixArgs, ...piArgs], {
+    cwd: taskCwd ?? cwd,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      [SUBAGENT_DEPTH_ENV]: String(nextDepth),
+      [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
+      [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
+      [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
+      [PI_OFFLINE_ENV]: "1",
+    },
+  });
+
+  proc.stdin.on("error", () => {
+    /* ignore broken pipe on fast exits */
+  });
+  proc.stdin.end();
+
+  const { exitCode, wasAborted } = await monitorInlineProcess(proc, result, signal, onUpdate);
   result.exitCode = exitCode;
   return normalizeCompletedResult(result, wasAborted);
 }
@@ -801,7 +801,7 @@ async function runAgentInZellijPane(
   if (!isInsideZellij()) {
     result.exitCode = 1;
     result.stopReason = "error";
-    result.errorMessage = "terminal=\"zellij-pane\" requires running inside a Zellij session.";
+    result.errorMessage = "Zellij pane mode requires running inside a Zellij session.";
     result.stderr = result.errorMessage;
     return result;
   }
@@ -835,10 +835,8 @@ async function runAgentInZellijPane(
     `printf '%s\\n' ${shellQuote(`Subagent pane: ${paneDisplayName}`)}`,
     `printf '%s\\n' ${shellQuote(`Mode: ${opts.parentAgentStack.length > 0 ? "nested" : "root"} / ${opts.piArgs.includes("--session") ? "fork" : "spawn"}`)}`,
     `printf '%s\\n' ${shellQuote(`CWD: ${effectiveCwd}`)}`,
-    `printf '%s\\n' ${shellQuote(`Task: ${result.task}`)}`,
-    `printf '%s\\n' '---'`,
     `printf '%s\\n' ${shellQuote(`Streaming JSON through FIFO: ${stdoutPipePath}`)}`,
-    `${buildShellCommand(childCommand)} 2> >(tee -a ${shellQuote(stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, stdoutPipePath])}`,
+    `${buildShellCommand(childCommand)} 2> >(tee -a ${shellQuote(stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, stdoutPipePath, result.task])}`,
     "status=$?",
     `printf '\\nSubagent exited with status %s\\n' \"$status\"`,
     `printf '%s\n' \"$status\" > ${shellQuote(statusPath)}`,
@@ -931,51 +929,22 @@ async function runAgentInZellijPane(
       await focusPaneId(focusedPaneId, signal);
     }
 
-    let statusSeen = false;
-    let abortDeadline: number | null = null;
-    let paneExitedAt: number | null = null;
-    let paneMissingAt: number | null = null;
-    while (true) {
-      if (await fileExists(statusPath)) {
-        statusSeen = true;
-        break;
-      }
-
-      const paneInfo = paneId ? await getPaneInfoById(paneId, signal?.aborted ? undefined : signal) : null;
-      if (signal?.aborted) {
-        wasAborted = true;
+    const lifecycle = await monitorZellijPaneLifecycle({
+      paneId: paneId ?? "(unknown)",
+      signal,
+      abortWaitMs: ABORT_WAIT_MS,
+      pollIntervalMs: POLL_INTERVAL_MS,
+      fileExists: () => fileExists(statusPath),
+      getPaneInfo: () => (paneId ? getPaneInfoById(paneId, signal?.aborted ? undefined : signal) : Promise.resolve(null)),
+      closePane: async () => {
         if (paneId) await closePaneId(paneId);
-        if (abortDeadline === null) abortDeadline = Date.now() + ABORT_WAIT_MS;
-      }
-      if (paneInfo === undefined) {
-        if (abortDeadline !== null && Date.now() >= abortDeadline) break;
-        await delay(POLL_INTERVAL_MS);
-        continue;
-      }
-      if (paneId && paneInfo === null) {
-        paneMissingAt ??= Date.now();
-        if (Date.now() - paneMissingAt >= ABORT_WAIT_MS) {
-          manualExitError = `Zellij pane ${paneId} closed before writing subagent status.`;
-          break;
-        }
-      } else {
-        paneMissingAt = null;
-      }
-      if (paneInfo?.exited) {
-        paneExitedAt ??= Date.now();
-        if (Date.now() - paneExitedAt >= ABORT_WAIT_MS) {
-          manualExitError = `Zellij pane ${paneId} exited without writing subagent status.`;
-          if (typeof paneInfo.exitStatus === "number") result.exitCode = paneInfo.exitStatus;
-          break;
-        }
-      } else {
-        paneExitedAt = null;
-      }
-
-      if (abortDeadline !== null && Date.now() >= abortDeadline) break;
-
-      await delay(POLL_INTERVAL_MS);
-    }
+      },
+      delay,
+    });
+    const statusSeen = lifecycle.statusSeen;
+    wasAborted = lifecycle.wasAborted;
+    manualExitError = lifecycle.manualExitError;
+    if (typeof lifecycle.exitCode === "number") result.exitCode = lifecycle.exitCode;
 
     if (statusSeen) {
       await delay(AGENT_END_GRACE_MS);

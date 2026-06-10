@@ -77,6 +77,9 @@ export interface SubagentDetails {
 	terminalMode: TerminalMode;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	chainStageCount?: number;
+	chainCompletedCount?: number;
+	chainSkippedCount?: number;
 }
 
 /** A display-friendly representation of a message part. */
@@ -98,6 +101,7 @@ export function aggregateUsage(results: SingleResult[]): UsageStats {
 		total.cacheRead += r.usage.cacheRead;
 		total.cacheWrite += r.usage.cacheWrite;
 		total.cost += r.usage.cost;
+		total.contextTokens += r.usage.contextTokens;
 		total.turns += r.usage.turns;
 	}
 	return total;

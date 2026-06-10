@@ -17,7 +17,6 @@ import {
 	DEFAULT_TERMINAL_MODE,
 	SUBAGENT_TOOL_LABEL,
 	getDefaultTerminalModeFromEnv,
-	isInsideZellij,
 	aggregateUsage,
 	getDisplayItems,
 	getFinalOutput,
@@ -181,7 +180,7 @@ function formatModeTitle(toolLabel: string, mode: "single" | "parallel" | "chain
 
 export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }): Text {
 	const delegationMode = normalizeDelegationMode(args.mode);
-	const terminalMode = normalizeTerminalMode(args.terminal);
+	const terminalMode = getDefaultTerminalModeFromEnv();
 	const modeBadge = theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`);
 	const toolTitle = theme.fg("toolTitle", theme.bold(`${SUBAGENT_TOOL_LABEL} `));
 
@@ -380,6 +379,11 @@ function renderParallelResult(
 	const successCount = details.results.filter((r) => isResultSuccess(r)).length;
 	const failCount = details.results.filter((r) => isResultError(r)).length;
 	const isRunning = running > 0;
+	const chainTotal = details.mode === "chain" ? details.chainStageCount ?? details.results.length : details.results.length;
+	const chainCompleted = details.mode === "chain"
+		? details.chainCompletedCount ?? successCount + failCount
+		: successCount;
+	const chainSkipped = details.mode === "chain" ? details.chainSkippedCount ?? 0 : 0;
 
 	const icon = isRunning
 		? theme.fg("warning", "⏳")
@@ -388,9 +392,13 @@ function renderParallelResult(
 			: theme.fg("success", "✓");
 
 	const itemLabel = details.mode === "chain" ? "steps" : "tasks";
-	const status = isRunning
-		? `${successCount + failCount}/${details.results.length} done, ${running} running`
-		: `${successCount}/${details.results.length} ${itemLabel}`;
+	const status = details.mode === "chain"
+		? isRunning
+			? `${chainCompleted}/${chainTotal} stages done, ${running} running`
+			: `${chainCompleted}/${chainTotal} stages completed${chainSkipped ? `, ${chainSkipped} skipped` : ""}`
+		: isRunning
+			? `${successCount + failCount}/${details.results.length} done, ${running} running`
+			: `${successCount}/${details.results.length} ${itemLabel}`;
 
 	if (expanded && !isRunning) {
 		return renderParallelExpanded(details, toolLabel, delegationMode, terminalMode, icon, status, theme);
@@ -421,7 +429,7 @@ function renderParallelExpanded(
 	const container = new Container();
 	container.addChild(
 		new Text(
-			`${icon} ${theme.fg("toolTitle", theme.bold(`${formatModeTitle(toolLabel, details.mode, details.results.length)} `))}${theme.fg("accent", status)}${theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`)}`,
+			`${icon} ${theme.fg("toolTitle", theme.bold(`${formatModeTitle(toolLabel, details.mode, details.mode === "chain" ? details.chainStageCount ?? details.results.length : details.results.length)} `))}${theme.fg("accent", status)}${theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`)}`,
 			0,
 			0,
 		),
@@ -474,7 +482,7 @@ function renderParallelCollapsed(
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
 ): Text {
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold(`${formatModeTitle(toolLabel, details.mode, details.results.length)} `))}${theme.fg("accent", status)}${theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`)}`;
+	let text = `${icon} ${theme.fg("toolTitle", theme.bold(`${formatModeTitle(toolLabel, details.mode, details.mode === "chain" ? details.chainStageCount ?? details.results.length : details.results.length)} `))}${theme.fg("accent", status)}${theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`)}`;
 
 	for (const r of details.results) {
 		const rIcon = statusIcon(r, theme);

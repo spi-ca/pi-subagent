@@ -1,0 +1,79 @@
+{
+  "name": "@mjakl/pi-subagent",
+  "version": "2.1.0-local.0",
+  "description": "Subagent extension for Pi coding agent. Delegate tasks to specialized agents. Local editable fork.",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "agents.ts",
+    "runner.ts",
+    "runner-cli.js",
+    "runner-events.js",
+    "pane-renderer.js",
+    "render.ts",
+    "chain-helpers.ts",
+    "types.ts",
+    "agents/*.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test --pass-with-no-tests",
+    "check": "bunx tsc --noEmit",
+    "ci": "bun run check && bun test --pass-with-no-tests"
+  },
+  "keywords": [
+    "pi",
+    "subagent",
+    "delegation",
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "local:/home/spi-ca/.pi/agent/local-packages/pi-subagent"
+  },
+  "bugs": {
+    "url": "https://github.com/mjakl/pi-subagent/issues"
+  },
+  "homepage": "https://github.com/mjakl/pi-subagent#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "private": true,
+  "packageManager": "bun@1.3.14"
+}

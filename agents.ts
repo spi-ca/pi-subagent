@@ -15,6 +15,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readFrontmatterOnly } from "./metadata-frontmatter.js";
+import {
+	findNearestProjectAgentsDirWithinRoot,
+	getProjectAgentConfigFilePath,
+	isProjectAgentsDirWithinRoot,
+	resolveProjectAgentFilePathWithinRoot,
+} from "./project-agent-paths.js";
+import { getProjectRootFromAgentsDir } from "./subagent-config.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -86,10 +93,6 @@ Keep the response concise, structured, and optimized for agent handoff.
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function isDirectory(p: string): boolean {
-	try { return fs.statSync(p).isDirectory(); } catch { return false; }
-}
-
 export function getUserAgentsDir(): string {
 	const configDir = process.env["PI_CODING_AGENT_DIR"]?.trim() || path.join(os.homedir(), ".pi", "agent");
 	return path.join(configDir, "agents");
@@ -97,14 +100,7 @@ export function getUserAgentsDir(): string {
 
 /** Walk up from `cwd` looking for a `.pi/agents` directory. */
 export function findNearestProjectAgentsDir(cwd: string): string | null {
-	let dir = cwd;
-	while (true) {
-		const candidate = path.join(dir, ".pi", "agents");
-		if (isDirectory(candidate)) return candidate;
-		const parent = path.dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
-	}
+	return findNearestProjectAgentsDirWithinRoot(cwd);
 }
 
 /** Parse a single agent markdown file into an AgentConfig. Returns null on skip. */
@@ -197,28 +193,44 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", options: Dis
 	try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
 	entries.sort((a, b) => a.name.localeCompare(b.name));
 
+	const projectRoot = source === "project" ? getProjectRootFromAgentsDir(dir) : null;
+	if (source === "project") {
+		if (!projectRoot) return [];
+		if (!isProjectAgentsDirWithinRoot(dir, projectRoot)) {
+			console.warn(
+				`[pi-subagent] Ignoring project agents directory "${dir}" because it resolves outside project root "${projectRoot}".`,
+			);
+			return [];
+		}
+	}
+
 	const agents: AgentConfig[] = [];
-	const normalizedDir = fs.realpathSync.native(dir);
 	for (const entry of entries) {
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
 		const filePath = path.join(dir, entry.name);
-		const metadataFilePath = options.metadataOnly && source === "project" && entry.isSymbolicLink()
-			? (() => {
-				try {
-					const resolved = fs.realpathSync.native(filePath);
-					return resolved === normalizedDir || resolved.startsWith(`${normalizedDir}${path.sep}`) ? resolved : null;
-				} catch {
-					return null;
-				}
-			})()
+		const parsePath = source === "project" && projectRoot
+			? resolveProjectAgentFilePathWithinRoot(filePath, projectRoot)
 			: filePath;
-		if (!metadataFilePath) continue;
+		if (!parsePath) {
+			if (source === "project" && projectRoot) {
+				console.warn(
+					`[pi-subagent] Ignoring project agent file "${filePath}" because it resolves outside project root "${projectRoot}".`,
+				);
+			}
+			continue;
+		}
 		const agent = options.metadataOnly
-			? parseAgentMetadataOnly(metadataFilePath, source)
-			: parseAgentFile(filePath, source);
-		if (agent) agents.push(agent);
+			? parseAgentMetadataOnly(parsePath, source)
+			: parseAgentFile(parsePath, source);
+		if (agent) {
+			// Preserve the logical project-agent path for trust checks. `parsePath` may be a
+			// realpath inside the project when `.pi/agents` or an agent file is a symlink;
+			// deriving the project root from that realpath can break exact-root trust.
+			if (source === "project") agent.filePath = getProjectAgentConfigFilePath(filePath);
+			agents.push(agent);
+		}
 	}
 	return agents;
 }

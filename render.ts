@@ -183,8 +183,7 @@ function formatModeTitle(toolLabel: string, mode: "single" | "parallel" | "chain
 
 export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }): Text {
 	const delegationMode = normalizeDelegationMode(args.mode);
-	const normalizedTerminalMode = args.terminal === undefined ? getDefaultTerminalModeFromEnv() : normalizeTerminalMode(args.terminal);
-	const terminalMode = normalizedTerminalMode === "invalid" ? String(args.terminal) : normalizedTerminalMode;
+	const terminalMode = getDefaultTerminalModeFromEnv();
 	const modeBadge = theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`);
 	const toolTitle = theme.fg("toolTitle", theme.bold(`${SUBAGENT_TOOL_LABEL} `));
 

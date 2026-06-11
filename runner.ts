@@ -11,33 +11,46 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import {
+  getAmbiguousInheritedCliApiKeyMessage,
+  getProviderFromModelSpecifier,
+  resolveInheritedCliApiKeyEnvBinding,
+  type InheritedCliApiKeyEnvBinding,
+  type InheritedCliAuthContext,
+} from "./provider-auth.js";
 import type { AgentConfig } from "./agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { createJsonLineChunkProcessor, monitorZellijPaneLifecycle } from "./runner-core.js";
 import { processPiJsonLine } from "./runner-events.js";
+import { isTrustedProjectAgentsDirWithSessionOverrides } from "./project-trust.js";
 import {
   type DelegationMode,
   type SingleResult,
   type SubagentDetails,
   type TerminalMode,
-  type ZellijPaneOptions,
   emptyUsage,
   getFinalOutput,
   isInsideZellij,
   normalizeCompletedResult,
 } from "./types.js";
+import { canonicalizePathForTrust } from "./trust-path.js";
 
 const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;
 const AGENT_END_GRACE_MS = 250;
 const POLL_INTERVAL_MS = 100;
 const ABORT_WAIT_MS = 3000;
+const ZELLIJ_SECRET_ENV_DIR_JANITOR_DELAY_SECONDS = 5;
+const ZELLIJ_PRESERVED_ARTIFACT_JANITOR_DELAY_SECONDS = 24 * 60 * 60;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
+const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+const SUBAGENT_ORIGINAL_AGENT_DIR_ENV = "PI_SUBAGENT_ORIGINAL_AGENT_DIR";
+const SUBAGENT_INHERITED_API_KEY_ENV = "PI_SUBAGENT_INHERITED_API_KEY";
 const PI_OFFLINE_ENV = "PI_OFFLINE";
 const PANE_RENDERER_PATH = fileURLToPath(new URL("./pane-renderer.js", import.meta.url));
 
@@ -313,15 +326,9 @@ function applyPaneTitleSuffix(baseName: string, suffix?: string): string {
 function buildZellijNewPaneArgs(
   commandArgs: string[],
   taskCwd: string,
-  zellijPane: ZellijPaneOptions,
+  paneName: string,
 ): string[] {
-  const args = ["action", "new-pane"];
-  if (zellijPane.direction) args.push("--direction", zellijPane.direction);
-  if (zellijPane.floating) args.push("--floating");
-  if (zellijPane.closeOnExit) args.push("--close-on-exit");
-  if (zellijPane.name) args.push("--name", zellijPane.name);
-  args.push("--cwd", taskCwd, "--", ...commandArgs);
-  return args;
+  return ["action", "new-pane", "--name", paneName, "--cwd", taskCwd, "--", ...commandArgs];
 }
 
 // ---------------------------------------------------------------------------
@@ -350,15 +357,14 @@ function writeForkSessionToTempFile(
   return { dir: tmpDir, filePath };
 }
 
-function writeExecutableTempFile(
+function writeTaskToTempFile(
   agentName: string,
-  suffix: string,
-  content: string,
+  task: string,
 ): { dir: string; filePath: string } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
   const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tmpDir, `${suffix}-${safeName}.sh`);
-  fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o700 });
+  const filePath = path.join(tmpDir, `task-${safeName}.md`);
+  fs.writeFileSync(filePath, `Task: ${task}`, { encoding: "utf-8", mode: 0o600 });
   return { dir: tmpDir, filePath };
 }
 
@@ -371,20 +377,94 @@ function cleanupTempDir(dir: string | null): void {
   }
 }
 
+export function scheduleDelayedTempDirCleanup(
+  dir: string | null,
+  options: {
+    delaySeconds?: number;
+    spawnDetached?: typeof spawn;
+    label?: string;
+  } = {},
+): "skipped" | "scheduled" | "timer" {
+  if (!dir) return "skipped";
+
+  const delaySeconds = Math.max(0, Math.floor(options.delaySeconds ?? ZELLIJ_SECRET_ENV_DIR_JANITOR_DELAY_SECONDS));
+  const spawnDetached = options.spawnDetached ?? spawn;
+
+  try {
+    const janitor = spawnDetached(
+      "sh",
+      [
+        "-c",
+        'sleep "$1"; rmdir "$2" 2>/dev/null || rm -rf "$2" 2>/dev/null || true',
+        options.label ?? "pi-subagent-temp-dir-janitor",
+        String(delaySeconds),
+        dir,
+      ],
+      {
+        detached: true,
+        stdio: "ignore",
+        env: { PATH: "/usr/bin:/bin" },
+      },
+    );
+    janitor.unref();
+    return "scheduled";
+  } catch {
+    const timer = setTimeout(() => cleanupTempDir(dir), delaySeconds * 1000);
+    timer.unref?.();
+    return "timer";
+  }
+}
+
+export function scheduleDelayedInheritedApiKeyEnvDirCleanup(
+  dir: string | null,
+  options: {
+    delaySeconds?: number;
+    spawnDetached?: typeof spawn;
+  } = {},
+): "skipped" | "scheduled" | "timer" {
+  return scheduleDelayedTempDirCleanup(dir, {
+    ...options,
+    label: "pi-subagent-env-dir-janitor",
+  });
+}
+
+export function cleanupZellijTempArtifacts(opts: {
+  wrapperDir: string | null;
+  logDir: string | null;
+  inheritedApiKeyEnvDir?: string | null;
+  inputTempDirs?: string[];
+  preservedInputTempDirs?: string[];
+  preserveTempArtifacts: boolean;
+  scheduleInheritedApiKeyEnvDirCleanup?: (dir: string | null) => unknown;
+  schedulePreservedArtifactDirCleanup?: (dir: string | null) => unknown;
+}): void {
+  if (opts.preserveTempArtifacts) {
+    const scheduleSecretCleanup = opts.scheduleInheritedApiKeyEnvDirCleanup ?? scheduleDelayedInheritedApiKeyEnvDirCleanup;
+    const scheduleArtifactCleanup = opts.schedulePreservedArtifactDirCleanup ?? ((dir: string | null) =>
+      scheduleDelayedTempDirCleanup(dir, {
+        delaySeconds: ZELLIJ_PRESERVED_ARTIFACT_JANITOR_DELAY_SECONDS,
+        label: "pi-subagent-preserved-artifact-janitor",
+      }));
+    scheduleSecretCleanup(opts.inheritedApiKeyEnvDir ?? null);
+    for (const dir of opts.inputTempDirs ?? []) scheduleArtifactCleanup(dir);
+    for (const dir of opts.preservedInputTempDirs ?? []) scheduleArtifactCleanup(dir);
+    scheduleArtifactCleanup(opts.wrapperDir);
+    scheduleArtifactCleanup(opts.logDir);
+    return;
+  }
+
+  cleanupTempDir(opts.inheritedApiKeyEnvDir ?? null);
+  for (const dir of opts.inputTempDirs ?? []) cleanupTempDir(dir);
+  for (const dir of opts.preservedInputTempDirs ?? []) cleanupTempDir(dir);
+  cleanupTempDir(opts.wrapperDir);
+  cleanupTempDir(opts.logDir);
+}
+
 // ---------------------------------------------------------------------------
 // Build pi CLI arguments
 // ---------------------------------------------------------------------------
 
 const inheritedCliArgs = parseInheritedCliArgs(process.argv);
-
-function canonicalizePathForTrust(value: string): string {
-  const resolved = path.resolve(value);
-  try {
-    return fs.realpathSync.native(resolved);
-  } catch {
-    return resolved;
-  }
-}
 
 function findNearestProjectAgentsDirForRunner(cwd: string): string | null {
   let dir = cwd;
@@ -406,10 +486,329 @@ function getProjectRootForCwd(cwd: string): string | null {
   return projectAgentsDir ? canonicalizePathForTrust(path.dirname(path.dirname(projectAgentsDir))) : null;
 }
 
-function buildPiArgs(
+function buildPropagatedSubagentEnv(opts: {
+  agentName: string;
+  parentDepth: number;
+  parentAgentStack: string[];
+  maxDepth: number;
+  preventCycles: boolean;
+  trustedProjectRoots?: string[];
+  deniedProjectRoots?: string[];
+}): Record<string, string> {
+  const trustedProjectsEnv = JSON.stringify(opts.trustedProjectRoots ?? []);
+  const deniedProjectsEnv = JSON.stringify(opts.deniedProjectRoots ?? []);
+  const nextDepth = Math.max(0, Math.floor(opts.parentDepth)) + 1;
+  const propagatedMaxDepth = Math.max(0, Math.floor(opts.maxDepth));
+  const propagatedStack = [...opts.parentAgentStack, opts.agentName];
+
+  return {
+    [SUBAGENT_DEPTH_ENV]: String(nextDepth),
+    [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
+    [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
+    [SUBAGENT_PREVENT_CYCLES_ENV]: opts.preventCycles ? "1" : "0",
+    [SUBAGENT_TRUSTED_PROJECTS_ENV]: trustedProjectsEnv,
+    [SUBAGENT_DENIED_PROJECTS_ENV]: deniedProjectsEnv,
+    [PI_OFFLINE_ENV]: "1",
+  };
+}
+
+export function resolveInheritedCliApiKeyForChild(
+  inheritedCliArgs: InheritedCliAuthContext,
+  agent?: Pick<AgentConfig, "source" | "model">,
+  options: { projectAgentTrusted?: boolean } = {},
+): { inheritedApiKeyBinding: InheritedCliApiKeyEnvBinding | null; warningMessage: string | null } {
+  const parentExplicitProvider = inheritedCliArgs.provider?.trim().toLowerCase() || null;
+  const parentModelProvider = getProviderFromModelSpecifier(inheritedCliArgs.fallbackModel);
+  const parentAuthoritativeProvider = parentExplicitProvider ?? parentModelProvider;
+  const parentHasAuthoritativeProviderHint = Boolean(parentAuthoritativeProvider);
+  const agentModelProvider = getProviderFromModelSpecifier(agent?.model);
+  if (inheritedCliArgs.apiKey?.trim() && parentExplicitProvider && parentModelProvider && parentExplicitProvider !== parentModelProvider) {
+    return {
+      inheritedApiKeyBinding: null,
+      warningMessage: `Inherited CLI --api-key was not propagated because the parent provider hint (${parentExplicitProvider}) conflicts with the parent model provider (${parentModelProvider}). Use provider-specific environment variables or align the parent provider and model.`,
+    };
+  }
+  if (inheritedCliArgs.apiKey?.trim() && parentAuthoritativeProvider && agentModelProvider && parentAuthoritativeProvider !== agentModelProvider) {
+    return {
+      inheritedApiKeyBinding: null,
+      warningMessage: `Inherited CLI --api-key was not propagated because the parent provider hint (${parentAuthoritativeProvider}) conflicts with the child model provider (${agentModelProvider}). Use provider-specific environment variables or align the parent provider/model with the subagent model.`,
+    };
+  }
+  const canUseAgentModelProvider =
+    !parentHasAuthoritativeProviderHint &&
+    agentModelProvider &&
+    (
+      agent?.source === "user" ||
+      (agent?.source === "project" && options.projectAgentTrusted === true)
+    )
+      ? agentModelProvider
+      : null;
+  const providerHintModel =
+    agent?.source === "user" &&
+    !agentModelProvider &&
+    !parentHasAuthoritativeProviderHint
+      ? agent.model
+      : undefined;
+
+  const resolution = resolveInheritedCliApiKeyEnvBinding({
+    ...inheritedCliArgs,
+    provider: parentExplicitProvider ?? inheritedCliArgs.provider ?? canUseAgentModelProvider ?? undefined,
+    providerHintModel,
+  });
+  if (resolution.state === "ambiguous") {
+    return {
+      inheritedApiKeyBinding: null,
+      warningMessage: getAmbiguousInheritedCliApiKeyMessage(resolution),
+    };
+  }
+
+  return {
+    inheritedApiKeyBinding: resolution.state === "resolved" ? resolution.binding : null,
+    warningMessage: null,
+  };
+}
+
+function getDefaultPiAgentDir(baseEnv: NodeJS.ProcessEnv = process.env): string {
+  return baseEnv[PI_AGENT_DIR_ENV] || path.join(os.homedir(), ".pi", "agent");
+}
+
+export function prepareInheritedApiKeyAgentDir(
+  binding: InheritedCliApiKeyEnvBinding | null | undefined,
+  options: {
+    baseEnv?: NodeJS.ProcessEnv;
+    mkdtempSync?: (prefix: string) => string;
+    readdirSync?: typeof fs.readdirSync;
+    symlinkSync?: typeof fs.symlinkSync;
+    writeFileSync?: typeof fs.writeFileSync;
+  } = {},
+): string | null {
+  if (!binding) return null;
+  const baseEnv = options.baseEnv ?? process.env;
+  const sourceAgentDir = baseEnv[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] || getDefaultPiAgentDir(baseEnv);
+  const mkdtempSync = options.mkdtempSync ?? fs.mkdtempSync;
+  const readdirSync = options.readdirSync ?? fs.readdirSync;
+  const symlinkSync = options.symlinkSync ?? fs.symlinkSync;
+  const writeFileSync = options.writeFileSync ?? fs.writeFileSync;
+  const overlayDir = mkdtempSync(path.join(os.tmpdir(), "pi-subagent-agent-"));
+
+  try {
+    for (const entry of readdirSync(sourceAgentDir, { withFileTypes: true })) {
+      if (entry.name === "auth.json") continue;
+      symlinkSync(path.join(sourceAgentDir, entry.name), path.join(overlayDir, entry.name));
+    }
+  } catch {
+    // Missing/unreadable agent dirs are acceptable; the child will see an
+    // otherwise empty agent dir with just the inherited auth override.
+  }
+
+  try {
+    const auth: Record<string, unknown> = {
+      [binding.provider]: { type: "api_key", key: `$${SUBAGENT_INHERITED_API_KEY_ENV}` },
+    };
+    writeFileSync(path.join(overlayDir, "auth.json"), `${JSON.stringify(auth, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+    return overlayDir;
+  } catch (error) {
+    cleanupTempDir(overlayDir);
+    throw error;
+  }
+}
+
+export function buildChildProcessEnv(opts: {
+  agentName: string;
+  parentDepth: number;
+  parentAgentStack: string[];
+  maxDepth: number;
+  preventCycles: boolean;
+  trustedProjectRoots?: string[];
+  deniedProjectRoots?: string[];
+  inheritedApiKeyBinding?: InheritedCliApiKeyEnvBinding | null;
+  inheritedApiKeyAgentDir?: string | null;
+  baseEnv?: NodeJS.ProcessEnv;
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...(opts.baseEnv ?? process.env),
+    ...buildPropagatedSubagentEnv(opts),
+  };
+
+  if (opts.inheritedApiKeyAgentDir) {
+    env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] = env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] || getDefaultPiAgentDir(opts.baseEnv ?? process.env);
+    env[PI_AGENT_DIR_ENV] = opts.inheritedApiKeyAgentDir;
+    if (opts.inheritedApiKeyBinding) env[SUBAGENT_INHERITED_API_KEY_ENV] = opts.inheritedApiKeyBinding.value;
+  } else {
+    delete env[SUBAGENT_INHERITED_API_KEY_ENV];
+    if (env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV]) {
+      env[PI_AGENT_DIR_ENV] = env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV];
+      delete env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV];
+    } else if (opts.inheritedApiKeyBinding) {
+      env[opts.inheritedApiKeyBinding.name] = opts.inheritedApiKeyBinding.value;
+    }
+  }
+
+  return env;
+}
+
+export function buildZellijWrapperScript(opts: {
+  propagatedEnv: Record<string, string>;
+  inheritedApiKeyEnvFilePath?: string | null;
+  paneDisplayName: string;
+  isNested: boolean;
+  isFork: boolean;
+  effectiveCwd: string;
+  task: string;
+  childCommand: string[];
+  stderrLogPath: string;
+  stdoutPipePath: string;
+  statusPath: string;
+  cleanupDirs?: string[];
+}): string {
+  return [
+    "#!/usr/bin/env bash",
+    "set -uo pipefail",
+    ...(opts.cleanupDirs?.length
+      ? [
+          "cleanup_subagent_temp() {",
+          ...opts.cleanupDirs.map((dir) => `  rm -rf ${shellQuote(dir)} 2>/dev/null || true`),
+          "}",
+          "trap cleanup_subagent_temp EXIT",
+        ]
+      : []),
+    ...(opts.inheritedApiKeyEnvFilePath
+      ? [
+          `. ${shellQuote(opts.inheritedApiKeyEnvFilePath)}`,
+          `rm -f ${shellQuote(opts.inheritedApiKeyEnvFilePath)}`,
+        ]
+      : []),
+    ...Object.entries(opts.propagatedEnv).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+    `printf '%s\\n' ${shellQuote(`Subagent pane: ${opts.paneDisplayName}`)}`,
+    `printf '%s\\n' ${shellQuote(`Mode: ${opts.isNested ? "nested" : "root"} / ${opts.isFork ? "fork" : "spawn"}`)}`,
+    `printf '%s\\n' ${shellQuote(`CWD: ${opts.effectiveCwd}`)}`,
+    `printf '%s\\n' 'Task: provided via temporary prompt file'`,
+    `printf '%s\\n' '---'`,
+    `printf '%s\\n' 'Live output bridge ready'`,
+    `${buildShellCommand(opts.childCommand)} 2> >(tee -a ${shellQuote(opts.stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, opts.stdoutPipePath])}`,
+    "status=$?",
+    `printf '\\nSubagent exited with status %s\\n' \"$status\"`,
+    `printf '%s\n' \"$status\" > ${shellQuote(opts.statusPath)}`,
+    "exit \"$status\"",
+    "",
+  ].filter((line): line is string => line !== null).join("\n");
+}
+
+interface PreparedZellijTempArtifacts {
+  logDir: string;
+  stdoutPipePath: string;
+  stderrLogPath: string;
+  statusPath: string;
+  wrapperTmp: { dir: string; filePath: string };
+  inheritedApiKeyEnvDir: string | null;
+  inheritedApiKeyEnvFilePath: string | null;
+}
+
+export function prepareZellijTempArtifacts(opts: {
+  agentName: string;
+  inheritedApiKeyBinding?: InheritedCliApiKeyEnvBinding | null;
+  buildWrapperScript: (paths: {
+    stdoutPipePath: string;
+    stderrLogPath: string;
+    statusPath: string;
+    inheritedApiKeyEnvFilePath: string | null;
+  }) => string;
+  tempRootDir?: string;
+  mkdtempSync?: (prefix: string) => string;
+  writeFileSync?: (filePath: string, contents: string, options: { encoding: BufferEncoding; mode: number }) => void;
+}): PreparedZellijTempArtifacts {
+  const mkdtempSync = opts.mkdtempSync ?? fs.mkdtempSync;
+  const writeFileSync = opts.writeFileSync ?? ((filePath, contents, options) => {
+    fs.writeFileSync(filePath, contents, options);
+  });
+  const safeName = opts.agentName.replace(/[^\w.-]+/g, "_");
+  const tmpPrefix = path.join(opts.tempRootDir ?? os.tmpdir(), "pi-subagent-");
+
+  let logDir: string | null = null;
+  let wrapperDir: string | null = null;
+  let inheritedApiKeyEnvDir: string | null = null;
+
+  try {
+    logDir = mkdtempSync(tmpPrefix);
+    const stdoutPipePath = path.join(logDir, `stdout-${safeName}.pipe`);
+    const stderrLogPath = path.join(logDir, `stderr-${safeName}.log`);
+    const statusPath = path.join(logDir, `status-${safeName}.txt`);
+
+    wrapperDir = mkdtempSync(tmpPrefix);
+    const wrapperPath = path.join(wrapperDir, `zellij-wrapper-${safeName}.sh`);
+
+    inheritedApiKeyEnvDir = opts.inheritedApiKeyBinding ? mkdtempSync(tmpPrefix) : null;
+    const inheritedApiKeyEnvFilePath = opts.inheritedApiKeyBinding && inheritedApiKeyEnvDir
+      ? path.join(inheritedApiKeyEnvDir, `zellij-env-${safeName}.sh`)
+      : null;
+    if (opts.inheritedApiKeyBinding && inheritedApiKeyEnvFilePath) {
+      writeFileSync(
+        inheritedApiKeyEnvFilePath,
+        `export ${SUBAGENT_INHERITED_API_KEY_ENV}=${shellQuote(opts.inheritedApiKeyBinding.value)}\n`,
+        { encoding: "utf-8", mode: 0o600 },
+      );
+    }
+
+    writeFileSync(
+      wrapperPath,
+      opts.buildWrapperScript({
+        stdoutPipePath,
+        stderrLogPath,
+        statusPath,
+        inheritedApiKeyEnvFilePath,
+      }),
+      { encoding: "utf-8", mode: 0o700 },
+    );
+
+    if (!logDir || !wrapperDir) {
+      throw new Error("Failed to prepare Zellij temp artifacts.");
+    }
+
+    return {
+      logDir,
+      stdoutPipePath,
+      stderrLogPath,
+      statusPath,
+      wrapperTmp: { dir: wrapperDir, filePath: wrapperPath },
+      inheritedApiKeyEnvDir,
+      inheritedApiKeyEnvFilePath,
+    };
+  } catch (error) {
+    cleanupZellijTempArtifacts({
+      wrapperDir,
+      logDir,
+      inheritedApiKeyEnvDir,
+      preserveTempArtifacts: false,
+    });
+    throw error;
+  }
+}
+
+function stripFlagWithValue(argv: string[], flagName: string): string[] {
+  const filtered: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === flagName) {
+      i += 1;
+      continue;
+    }
+    filtered.push(argv[i]!);
+  }
+  return filtered;
+}
+
+export function getInheritedCliArgsForAgent(
+  agent: Pick<AgentConfig, "source" | "model">,
+  alwaysProxy: string[] = inheritedCliArgs.alwaysProxy,
+  fallbackModel: string | undefined = inheritedCliArgs.fallbackModel,
+): string[] {
+  if (!getProviderFromModelSpecifier(agent.model ?? fallbackModel)) return alwaysProxy;
+  return stripFlagWithValue(alwaysProxy, "--provider");
+}
+
+export function buildPiArgs(
   agent: AgentConfig,
   systemPromptPath: string | null,
-  task: string,
+  taskFilePath: string,
   delegationMode: DelegationMode,
   forkSessionPath: string | null,
 ): string[] {
@@ -417,7 +816,7 @@ function buildPiArgs(
     "--mode",
     "json",
     ...inheritedCliArgs.extensionArgs,
-    ...inheritedCliArgs.alwaysProxy,
+    ...getInheritedCliArgsForAgent(agent),
     "-p",
   ];
 
@@ -444,8 +843,20 @@ function buildPiArgs(
   }
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
-  args.push(`Task: ${task}`);
+  args.push(`@${taskFilePath}`);
   return args;
+}
+
+function isProjectAgentExplicitlyTrusted(
+  agent: Pick<AgentConfig, "source" | "filePath"> | undefined,
+  trustedProjectRoots?: string[],
+  deniedProjectRoots?: string[],
+): boolean {
+  if (!agent || agent.source !== "project") return false;
+  return isTrustedProjectAgentsDirWithSessionOverrides(path.dirname(agent.filePath), {
+    sessionTrustedProjectRoots: trustedProjectRoots,
+    sessionDeniedProjectRoots: deniedProjectRoots,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -469,8 +880,6 @@ export interface RunAgentOptions {
   delegationMode: DelegationMode;
   /** Execution surface for child runs. */
   terminalMode: TerminalMode;
-  /** Zellij pane options when terminalMode is zellij-pane. */
-  zellijPane?: ZellijPaneOptions;
   /** Optional suffix appended to pane titles to disambiguate concurrent runs. */
   paneTitleSuffix?: string;
   /** Optional pane id to restore focus to after creating a Zellij pane. */
@@ -512,7 +921,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     taskCwd,
     delegationMode,
     terminalMode,
-    zellijPane,
     paneTitleSuffix,
     restoreFocusPaneId,
     trustedProjectRoots,
@@ -587,6 +995,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
   };
 
+  const { inheritedApiKeyBinding, warningMessage: inheritedApiKeyWarningMessage } =
+    resolveInheritedCliApiKeyForChild(inheritedCliArgs, agent, {
+      projectAgentTrusted: isProjectAgentExplicitlyTrusted(agent, trustedProjectRoots, deniedProjectRoots),
+    });
+  if (inheritedApiKeyWarningMessage) {
+    console.warn(`[pi-subagent] ${inheritedApiKeyWarningMessage}`);
+  }
+
   // Write system prompt to temp file if needed
   let promptTmpDir: string | null = null;
   let promptTmpPath: string | null = null;
@@ -605,11 +1021,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     forkSessionTmpPath = tmp.filePath;
   }
 
+  // Keep delegated task text out of child process argv and Zellij wrapper scripts.
+  const taskTmp = writeTaskToTempFile(agent.name, task);
+  let inheritedApiKeyAgentDir: string | null = null;
+  let zellijOwnsInputTempDirs = false;
+
   try {
+    inheritedApiKeyAgentDir = prepareInheritedApiKeyAgentDir(inheritedApiKeyBinding);
     const piArgs = buildPiArgs(
       agent,
       promptTmpPath,
-      task,
+      taskTmp.filePath,
       delegationMode,
       forkSessionTmpPath,
     );
@@ -620,6 +1042,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     if (trustedForCwd) piArgs.push("--approve");
     else if (deniedForCwd) piArgs.push("--no-approve");
     if (terminalMode === "zellij-pane") {
+      zellijOwnsInputTempDirs = true;
       return await runAgentInZellijPane({
         result,
         cwd,
@@ -632,11 +1055,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         maxDepth,
         preventCycles,
         makeDetails,
-        zellijPane: zellijPane ?? {},
         paneTitleSuffix,
         restoreFocusPaneId,
         trustedProjectRoots,
         deniedProjectRoots,
+        inheritedApiKeyBinding,
+        inheritedApiKeyAgentDir,
+        inputTempDirs: [promptTmpDir, forkSessionTmpDir, taskTmp.dir].filter((dir): dir is string => Boolean(dir)),
+        preservedInputTempDirs: [inheritedApiKeyAgentDir].filter((dir): dir is string => Boolean(dir)),
       });
     }
     return await runAgentInline({
@@ -653,10 +1079,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       trustedProjectRoots,
       deniedProjectRoots,
       makeDetails,
+      inheritedApiKeyBinding,
+      inheritedApiKeyAgentDir,
     });
   } finally {
-    cleanupTempDir(promptTmpDir);
-    cleanupTempDir(forkSessionTmpDir);
+    if (!zellijOwnsInputTempDirs) {
+      cleanupTempDir(promptTmpDir);
+      cleanupTempDir(forkSessionTmpDir);
+      cleanupTempDir(taskTmp.dir);
+      cleanupTempDir(inheritedApiKeyAgentDir);
+    }
   }
 }
 
@@ -673,7 +1105,11 @@ interface RunAgentExecutionOptions {
   preventCycles: boolean;
   trustedProjectRoots?: string[];
   deniedProjectRoots?: string[];
+  inheritedApiKeyBinding?: InheritedCliApiKeyEnvBinding | null;
+  inheritedApiKeyAgentDir?: string | null;
   makeDetails: (results: SingleResult[]) => SubagentDetails;
+  inputTempDirs?: string[];
+  preservedInputTempDirs?: string[];
 }
 
 export async function monitorInlineProcess(
@@ -795,28 +1231,26 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     preventCycles,
     trustedProjectRoots,
     deniedProjectRoots,
+    inheritedApiKeyBinding,
+    inheritedApiKeyAgentDir,
   } = opts;
 
-  const trustedProjectsEnv = JSON.stringify(trustedProjectRoots ?? []);
-  const deniedProjectsEnv = JSON.stringify(deniedProjectRoots ?? []);
-  const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
-  const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
-  const propagatedStack = [...parentAgentStack, result.agent];
   const { command, prefixArgs } = resolvePiSpawn();
   const proc = spawn(command, [...prefixArgs, ...piArgs], {
     cwd: taskCwd ?? cwd,
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      [SUBAGENT_DEPTH_ENV]: String(nextDepth),
-      [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
-      [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
-      [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
-      [SUBAGENT_TRUSTED_PROJECTS_ENV]: trustedProjectsEnv,
-      [SUBAGENT_DENIED_PROJECTS_ENV]: deniedProjectsEnv,
-      [PI_OFFLINE_ENV]: "1",
-    },
+    env: buildChildProcessEnv({
+      agentName: result.agent,
+      parentDepth,
+      parentAgentStack,
+      maxDepth,
+      preventCycles,
+      trustedProjectRoots,
+      deniedProjectRoots,
+      inheritedApiKeyBinding,
+      inheritedApiKeyAgentDir,
+    }),
   });
 
   proc.stdin.on("error", () => {
@@ -830,7 +1264,6 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
 }
 
 interface RunAgentInZellijPaneOptions extends RunAgentExecutionOptions {
-  zellijPane: ZellijPaneOptions;
   paneTitleSuffix?: string;
   restoreFocusPaneId?: string;
 }
@@ -849,11 +1282,14 @@ async function runAgentInZellijPane(
     parentAgentStack,
     maxDepth,
     preventCycles,
-    zellijPane,
     paneTitleSuffix,
     restoreFocusPaneId,
     trustedProjectRoots,
     deniedProjectRoots,
+    inheritedApiKeyBinding,
+    inheritedApiKeyAgentDir,
+    inputTempDirs,
+    preservedInputTempDirs,
   } = opts;
 
   if (!isInsideZellij()) {
@@ -865,49 +1301,34 @@ async function runAgentInZellijPane(
   }
 
   const effectiveCwd = taskCwd ?? cwd;
-  const trustedProjectsEnv = JSON.stringify(trustedProjectRoots ?? []);
-  const deniedProjectsEnv = JSON.stringify(deniedProjectRoots ?? []);
-  const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
-  const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
-  const propagatedStack = [...parentAgentStack, result.agent];
+  const propagatedEnv = buildPropagatedSubagentEnv({
+    agentName: result.agent,
+    parentDepth,
+    parentAgentStack,
+    maxDepth,
+    preventCycles,
+    trustedProjectRoots,
+    deniedProjectRoots,
+  });
+  const originalAgentDir = process.env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] || getDefaultPiAgentDir();
+  if (inheritedApiKeyAgentDir) {
+    propagatedEnv[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] = originalAgentDir;
+    propagatedEnv[PI_AGENT_DIR_ENV] = inheritedApiKeyAgentDir;
+  } else {
+    propagatedEnv[SUBAGENT_INHERITED_API_KEY_ENV] = "";
+    if (process.env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV]) {
+      propagatedEnv[SUBAGENT_ORIGINAL_AGENT_DIR_ENV] = "";
+      propagatedEnv[PI_AGENT_DIR_ENV] = process.env[SUBAGENT_ORIGINAL_AGENT_DIR_ENV]!;
+    }
+  }
   const { command: piCommand, prefixArgs } = resolvePiSpawn();
   const childCommand = [piCommand, ...prefixArgs, ...piArgs];
   const paneDisplayName = applyPaneTitleSuffix(
-    zellijPane.name ?? getDefaultZellijPaneName(result),
+    getDefaultZellijPaneName(result),
     paneTitleSuffix,
   );
 
-  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = result.agent.replace(/[^\w.-]+/g, "_");
-  const stdoutPipePath = path.join(logDir, `stdout-${safeName}.pipe`);
-  const stderrLogPath = path.join(logDir, `stderr-${safeName}.log`);
-  const statusPath = path.join(logDir, `status-${safeName}.txt`);
-  const wrapperScript = [
-    "#!/usr/bin/env bash",
-    "set -uo pipefail",
-    ...Object.entries({
-      [SUBAGENT_DEPTH_ENV]: String(nextDepth),
-      [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
-      [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
-      [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
-      [SUBAGENT_TRUSTED_PROJECTS_ENV]: trustedProjectsEnv,
-      [SUBAGENT_DENIED_PROJECTS_ENV]: deniedProjectsEnv,
-      [PI_OFFLINE_ENV]: "1",
-    }).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
-    `printf '%s\\n' ${shellQuote(`Subagent pane: ${paneDisplayName}`)}`,
-    `printf '%s\\n' ${shellQuote(`Mode: ${opts.parentAgentStack.length > 0 ? "nested" : "root"} / ${opts.piArgs.includes("--session") ? "fork" : "spawn"}`)}`,
-    `printf '%s\\n' ${shellQuote(`CWD: ${effectiveCwd}`)}`,
-    `printf '%s\\n' ${shellQuote(`Task: ${result.task}`)}`,
-    `printf '%s\\n' '---'`,
-    `printf '%s\\n' 'Live output bridge ready'`,
-    `${buildShellCommand(childCommand)} 2> >(tee -a ${shellQuote(stderrLogPath)} >&2) | ${buildShellCommand([resolveJsRuntimeCommand(), PANE_RENDERER_PATH, stdoutPipePath])}`,
-    "status=$?",
-    `printf '\\nSubagent exited with status %s\\n' \"$status\"`,
-    `printf '%s\n' \"$status\" > ${shellQuote(statusPath)}`,
-    "exit \"$status\"",
-    "",
-  ].join("\n");
-  const wrapperTmp = writeExecutableTempFile(result.agent, "zellij-wrapper", wrapperScript);
+  let tempArtifacts: PreparedZellijTempArtifacts | null = null;
 
   let paneId: string | null = null;
   let focusedPaneId: string | null = null;
@@ -929,15 +1350,38 @@ async function runAgentInZellijPane(
         ]);
       }
     }
-    const stderrText = await readFileIfExists(stderrLogPath);
+    const stderrText = tempArtifacts ? await readFileIfExists(tempArtifacts.stderrLogPath) : "";
     if (stderrText.trim()) result.stderr = stderrText;
     if (pipeConsumerError && !result.stderr.trim()) result.stderr = pipeConsumerError;
   };
 
   try {
     try {
-      await createNamedPipe(stdoutPipePath, signal);
-      pipeConsumer = startJsonlPipeConsumer(stdoutPipePath, (line) => {
+      tempArtifacts = prepareZellijTempArtifacts({
+        agentName: result.agent,
+        inheritedApiKeyBinding,
+        buildWrapperScript: ({
+          stdoutPipePath,
+          stderrLogPath,
+          statusPath,
+          inheritedApiKeyEnvFilePath,
+        }) => buildZellijWrapperScript({
+          propagatedEnv,
+          inheritedApiKeyEnvFilePath,
+          paneDisplayName,
+          isNested: parentAgentStack.length > 0,
+          isFork: piArgs.includes("--session"),
+          effectiveCwd,
+          task: result.task,
+          childCommand,
+          stderrLogPath,
+          stdoutPipePath,
+          statusPath,
+          cleanupDirs: [...(inputTempDirs ?? []), ...(preservedInputTempDirs ?? [])],
+        }),
+      });
+      await createNamedPipe(tempArtifacts.stdoutPipePath, signal);
+      pipeConsumer = startJsonlPipeConsumer(tempArtifacts.stdoutPipePath, (line) => {
         pipeSawData = true;
         if (processPiJsonLine(line, result)) onUpdate();
       });
@@ -953,13 +1397,19 @@ async function runAgentInZellijPane(
       return normalizeCompletedResult(result, wasAborted);
     }
 
+    const zellijTempArtifacts = tempArtifacts;
+    if (!zellijTempArtifacts) {
+      result.exitCode = wasAborted ? 130 : 1;
+      result.stopReason = wasAborted ? "aborted" : "error";
+      result.errorMessage = "Failed to prepare Zellij temp artifacts.";
+      if (!result.stderr.trim()) result.stderr = result.errorMessage;
+      return normalizeCompletedResult(result, wasAborted);
+    }
+
     focusedPaneId = restoreFocusPaneId ?? await getFocusedPaneId(signal);
     const paneCreate = await runCommandCapture(
       "zellij",
-      buildZellijNewPaneArgs([wrapperTmp.filePath], effectiveCwd, {
-        ...zellijPane,
-        name: paneDisplayName,
-      }),
+      buildZellijNewPaneArgs([zellijTempArtifacts.wrapperTmp.filePath], effectiveCwd, paneDisplayName),
       { cwd: effectiveCwd, signal },
     );
 
@@ -998,7 +1448,7 @@ async function runAgentInZellijPane(
       signal,
       abortWaitMs: ABORT_WAIT_MS,
       pollIntervalMs: POLL_INTERVAL_MS,
-      fileExists: () => fileExists(statusPath),
+      fileExists: () => fileExists(zellijTempArtifacts.statusPath),
       getPaneInfo: () => (paneId ? getPaneInfoById(paneId, signal?.aborted ? undefined : signal) : Promise.resolve(null)),
       closePane: async () => {
         if (!paneId) return true;
@@ -1022,7 +1472,7 @@ async function runAgentInZellijPane(
         if (!result.stderr.trim()) result.stderr = pipeConsumerError;
         return normalizeCompletedResult(result, wasAborted);
       }
-      const statusText = (await readFileIfExists(statusPath)).trim();
+      const statusText = (await readFileIfExists(zellijTempArtifacts.statusPath)).trim();
       const parsedExit = Number.parseInt(statusText, 10);
       if (!Number.isFinite(parsedExit)) {
         result.exitCode = 1;
@@ -1051,10 +1501,14 @@ async function runAgentInZellijPane(
       const paneInfo = await getPaneInfoById(paneId);
       preserveTempArtifacts = Boolean(paneInfo && !paneInfo.exited);
     }
-    if (!preserveTempArtifacts) {
-      cleanupTempDir(wrapperTmp.dir);
-      cleanupTempDir(logDir);
-    }
+    cleanupZellijTempArtifacts({
+      wrapperDir: tempArtifacts?.wrapperTmp.dir ?? null,
+      logDir: tempArtifacts?.logDir ?? null,
+      inheritedApiKeyEnvDir: tempArtifacts?.inheritedApiKeyEnvDir ?? null,
+      inputTempDirs,
+      preservedInputTempDirs,
+      preserveTempArtifacts,
+    });
   }
 }
 

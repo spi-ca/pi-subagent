@@ -11,13 +11,6 @@ export type DelegationMode = "spawn" | "fork";
 /** Execution surface for delegated runs. */
 export type TerminalMode = "inline" | "zellij-pane";
 
-export interface ZellijPaneOptions {
-	direction?: "right" | "down";
-	floating?: boolean;
-	closeOnExit?: boolean;
-	name?: string;
-}
-
 /** Display label for the subagent tool. */
 export const SUBAGENT_TOOL_LABEL = "Subagent";
 

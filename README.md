@@ -10,7 +10,7 @@ There are many subagent extensions for pi, this one is mine.
 
 **Context Control** — Choose `spawn` (fresh context) or `fork` (inherit current session context), depending on the task.
 
-**Execution Surface Auto-Selection** — Use `zellij-pane` inside Zellij and `inline` elsewhere by default, while still allowing per-call overrides with `terminal: "inline"` or `terminal: "zellij-pane"` when needed and keeping structured progress in the parent TUI.
+**Execution Surface Auto-Selection** — Use `zellij-pane` inside Zellij and `inline` elsewhere automatically, while keeping structured progress in the parent TUI.
 
 **Parallel Execution** — Run multiple independent agents at once.
 
@@ -74,8 +74,8 @@ Internal env vars managed by the extension and propagated to child processes:
 - `PI_SUBAGENT_MAX_DEPTH`
 - `PI_SUBAGENT_STACK` (JSON array of ancestor agent names, e.g. `["scout","planner"]`)
 - `PI_SUBAGENT_PREVENT_CYCLES`
-- `PI_SUBAGENT_TRUSTED_PROJECTS` (JSON array of temporarily approved project roots propagated to child processes)
-- `PI_SUBAGENT_DENIED_PROJECTS` (JSON array of temporarily denied project roots propagated to child processes)
+- `PI_SUBAGENT_TRUSTED_PROJECTS` (JSON array of temporarily approved canonical project roots propagated to child processes)
+- `PI_SUBAGENT_DENIED_PROJECTS` (JSON array of temporarily denied canonical project roots propagated to child processes; if a root is later approved in the same session it is removed before child propagation)
 
 Recommended extension-integration note:
 
@@ -113,53 +113,17 @@ If omitted, mode defaults to `spawn`.
 
 ### Execution Surface (`inline` vs `zellij-pane`)
 
-`subagent` auto-selects the execution surface when `terminal` is omitted:
+`subagent` auto-selects the execution surface:
 
 - inside Zellij — use `zellij-pane`
 - outside Zellij — use `inline`
-- when the effective mode is `zellij-pane`, pane titles use `label(agent)` for explicitly labeled chain stages, `step-N(agent)` for unlabeled chain stages, and `subagent-agent` for non-chain runs without a custom name; concurrent parallel runs may append a ` #N` suffix for disambiguation
+- when the effective mode is `zellij-pane`, pane titles use `label(agent)` for explicitly labeled chain stages, `step-N(agent)` for unlabeled chain stages, and `subagent-agent` for non-chain runs; concurrent parallel runs may append a ` #N` suffix for disambiguation
 
-You can override the default per call with `terminal: "inline"` or `terminal: "zellij-pane"`. The `zellij-pane` override only works when running inside Zellij.
-
-Examples:
+Example:
 
 ```json
 { "agent": "writer", "task": "Document the API", "mode": "spawn" }
 ```
-
-```json
-{ "agent": "writer", "task": "Document the API", "mode": "spawn", "terminal": "inline" }
-```
-
-```json
-{ "agent": "review", "task": "Double-check this migration", "mode": "fork", "terminal": "zellij-pane" }
-```
-
-### Zellij Pane Options
-
-When the effective terminal mode is `zellij-pane`, you can optionally pass:
-
-```json
-{
-  "agent": "worker",
-  "task": "Run tests",
-  "zellij": {
-    "pane": {
-      "direction": "right",
-      "floating": false,
-      "closeOnExit": false,
-      "name": "tests"
-    }
-  }
-}
-```
-
-Supported `zellij.pane` fields:
-
-- `direction` — pane split direction: `right` or `down`
-- `floating` — open as a floating pane
-- `closeOnExit` — close the pane immediately when the child command exits
-- `name` — override the default pane title (`label(agent)` for labeled chain stages, `step-N(agent)` for unlabeled chain stages, otherwise `subagent-agent`; concurrent parallel runs may append a ` #N` suffix for disambiguation)
 
 ### Invocation Shapes: Single, Parallel, Chain
 
@@ -175,7 +139,7 @@ Use single mode for one focused delegation.
 
 #### Parallel
 
-Use parallel mode when tasks are independent and can run at the same time. All entries share the top-level `mode`. The execution surface is auto-selected from the environment when `terminal` is omitted, and can still be overridden explicitly when needed. The extension runs up to 4 child processes concurrently and rejects more than 8 tasks in one call.
+Use parallel mode when tasks are independent and can run at the same time. All entries share the top-level `mode`. The execution surface is auto-selected from the environment. The extension runs up to 4 child processes concurrently and rejects more than 8 tasks in one call.
 
 ```json
 {
@@ -246,7 +210,7 @@ Subagents are defined as Markdown files with YAML frontmatter.
 **User Agents:** `~/.pi/agent/agents/*.md` by default, or `$PI_CODING_AGENT_DIR/agents/*.md` when `PI_CODING_AGENT_DIR` is set
 **Project Agents:** `.pi/agents/*.md`
 
-`PI_CODING_AGENT_DIR` follows Pi's config-dir override semantics: when it is set, the extension uses `$PI_CODING_AGENT_DIR/agents` as the user/global agent directory instead of `~/.pi/agent/agents`. Project agents are still loaded in addition to the active user/global directory, and project agents win on name conflicts after trust is granted. When project agents are requested, Pi will prompt for confirmation before running them. In untrusted projects, project-agent metadata is held back from the main prompt until trust is granted, and hidden project-agent name collisions are blocked until the project is trusted or the colliding agents are renamed. Newly trusted project agents become available for execution immediately, and the parent prompt’s advertised subagent list is refreshed on the next top-level turn in the current session.
+`PI_CODING_AGENT_DIR` follows Pi's config-dir override semantics: when it is set, the extension uses `$PI_CODING_AGENT_DIR/agents` as the user/global agent directory instead of `~/.pi/agent/agents`. Project agents are still loaded in addition to the active user/global directory, and project agents win on name conflicts after trust is granted. Trust is matched against the exact canonical project root that owns the nearest `.pi/agents` directory. The extension does not treat Pi's generic boolean project-trust state as evidence because Pi does not expose which root that trust applies to. Instead, project agents are trusted only via persisted exact-root `trust.json` entries, explicit session approvals/denials tracked by this extension, or explicit `--approve` / `--no-approve` for the current nearest project-agent root. When project agents are requested in the UI, Pi prompts for confirmation before running them unless that exact root is already approved for the current session or in persisted trust. In non-UI mode, unapproved project agents are blocked unless the session already carries that exact-root approval (for example via a prior approval or explicit `--approve` for the current root). Explicit denials and approvals are propagated to child subagents through `PI_SUBAGENT_DENIED_PROJECTS` / `PI_SUBAGENT_TRUSTED_PROJECTS`. In untrusted projects, project-agent metadata is held back from the main prompt until trust is granted, hidden project-agent name collisions are blocked until the project is trusted or the colliding agents are renamed, and project-agent discovery rejects `.pi/agents` directories or agent files whose realpaths escape the canonical project root boundary. Newly trusted project agents become available for execution immediately, and the parent prompt’s advertised subagent list is refreshed on the next top-level turn in the current session.
 
 #### Starter Agent
 
@@ -317,7 +281,7 @@ Each subagent always runs in a **separate `pi` process**:
 - ❌ No visibility into sibling subagents
 - ✅ Its own model/tool/runtime loop
 - ✅ Started with `PI_OFFLINE=1` to skip startup network operations and reduce spawn latency
-- ✅ Inherits relevant parent CLI configuration such as extensions, provider/theme/skill flags, resolves inherited relative resource paths against the parent cwd, and reuses parent `--model` / `--thinking` / `--tools` values when the agent file does not override them
+- ✅ Inherits allowlisted non-secret parent CLI configuration such as extensions plus provider/theme/skill/tool-related flags, resolves only explicit path-like inherited asset values (and explicit file-like values) against the parent cwd while keeping bare `--skill` / `--prompt-template` / `--theme` names verbatim, and reuses parent `--model` / `--thinking` / `--tools` values when the agent file does not override them (`--system-prompt`, unknown flags, and `--api-key` are never forwarded on child command lines. When a CLI key can be mapped safely, the child receives a temporary `$PI_CODING_AGENT_DIR` overlay whose `auth.json` contains an env-var reference for the resolved provider while the rest of the parent agent dir is symlinked through; the actual key is supplied only to the child process environment. This keeps the secret out of argv and Zellij wrapper scripts while preserving Pi's `auth.json`-before-environment auth precedence for the child. A fully-qualified agent `model` that determines the child provider removes any inherited `--provider` from child args. It may provide the API-key mapping hint for user agents and trusted project agents only when it does not conflict with an explicit parent `--provider` or fully-qualified parent `--model`; conflicting hints cause the child to skip inheriting the CLI key. Parent `--models` is not used as an API-key mapping hint. If the CLI key cannot be mapped safely, the child simply does not inherit that CLI key and instead falls back to any existing provider-specific env vars or other configured auth. The temporary overlay is best-effort cleaned after inline runs and scheduled for delayed cleanup when preserved for an abortable live Zellij pane.)
 
 What it can see depends on `mode`:
 
@@ -434,7 +398,7 @@ Task: Inspect local code and summarize the architecture
 
 - **Auto-Discovery** — Agents are found at startup and their descriptions are injected into the main agent's system prompt.
 - **Context Mode Switch** — `spawn` (fresh context) and `fork` (session snapshot + task) per call.
-- **Execution Surface Auto-Selection** — `zellij-pane` inside Zellij and `inline` otherwise when `terminal` is omitted, with optional explicit `terminal` overrides and `zellij.pane` settings when pane mode is active.
+- **Execution Surface Auto-Selection** — `zellij-pane` inside Zellij and `inline` otherwise.
 - **Depth + Cycle Guards** — Depth limiting and ancestry-cycle checks prevent runaway recursive delegation by default.
 - **Streaming Updates** — Parent TUI updates continue to follow the structured subagent event stream, while Zellij-pane runs expose a separate pane with human-readable progress.
 - **Rich TUI Rendering** — Collapsed/expanded views for single, parallel, and chain runs with usage stats, task previews, tool call previews, stage-aware labels, and markdown output.
@@ -443,16 +407,21 @@ Task: Inspect local code and summarize the architecture
 ## Project Structure
 
 ```
-index.ts       — Extension entry point: lifecycle hooks, tool registration, mode orchestration
-agents.ts      — Agent discovery: reads and parses .md files from the active Pi config dir and project directories
-runner-cli.js  — Parent CLI inheritance: parses and normalizes flags forwarded to child processes
-runner.ts      — Process runner: launches inline or Zellij-pane subagents, manages FIFO/status plumbing, and coordinates lifecycle handling
-runner-core.ts — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
-runner-events.js — Shared JSON event parsing and result summarization used by the parent transport path
-pane-renderer.js — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
-pane-renderer-core.ts — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
-render.ts      — TUI rendering: renderCall and renderResult for the subagent tool
-types.ts       — Shared types and pure helper functions
+index.ts               — Extension entry point: lifecycle hooks, tool registration, trust gating, mode orchestration
+subagent-config.ts     — Tool schema and canonical project-root environment parsing
+agents.ts              — Agent discovery: reads/parses .md files from the active Pi config dir and project directories
+project-agent-paths.ts — Project-agent path boundary checks for nearest `.pi/agents` lookup and symlink escape rejection
+project-trust.ts       — Exact-root project trust and session approval/denial helpers
+trust-path.ts          — Canonical path and within-root trust-boundary helpers
+provider-auth.ts       — Provider/API-key mapping and ambiguity handling for inherited CLI credentials
+runner-cli.js          — Parent CLI inheritance: allowlisted flag parsing, asset handling, git source sanitization
+runner.ts              — Process runner: inline/Zellij launch, auth overlays, FIFO/status plumbing, lifecycle cleanup
+runner-core.ts         — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
+runner-events.js       — Shared JSON event parsing and result summarization used by the parent transport path
+pane-renderer.js       — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
+pane-renderer-core.ts  — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
+render.ts              — TUI rendering: renderCall and renderResult for the subagent tool
+types.ts               — Shared types and pure helper functions
 ```
 
 ## Attribution

@@ -19,10 +19,6 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { Type } from "typebox";
 import {
   buildChainTaskFromStages,
   collectRequestedAgentNamesFromChain,
@@ -41,13 +37,14 @@ import {
 import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir } from "./agents.js";
 import { renderCall, renderResult } from "./render.js";
 import { getResultSummaryText } from "./runner-events.js";
+import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./project-trust.js";
 import { mapConcurrent, runAgent } from "./runner.js";
+import { SubagentParams, getProjectRootFromAgentsDir, parseProjectRootEnvValue } from "./subagent-config.js";
 import {
   type DelegationMode,
   type SingleResult,
   type SubagentDetails,
   type TerminalMode,
-  type ZellijPaneOptions,
   DEFAULT_DELEGATION_MODE,
   DEFAULT_TERMINAL_MODE,
   SUBAGENT_TOOL_LABEL,
@@ -75,127 +72,6 @@ const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
 
 // ---------------------------------------------------------------------------
-// Tool parameter schema
-// ---------------------------------------------------------------------------
-
-const TaskItem = Type.Object({
-  agent: Type.String({
-    description: "Name of an available agent (must match exactly)",
-  }),
-  task: Type.String({
-    description:
-      "Task description for this delegated run. In spawn mode include all required context; in fork mode the subagent also sees your current session context.",
-  }),
-  cwd: Type.Optional(
-    Type.String({ description: "Working directory for this agent's process" }),
-  ),
-});
-
-const StepCondition = Type.Union([
-  Type.Literal("always"),
-  Type.Literal("on_success"),
-  Type.Literal("on_error"),
-  Type.Literal("on_completed_with_errors"),
-]);
-
-const ChainTaskStep = Type.Object({
-  type: Type.Optional(Type.Literal("chain")),
-  label: Type.Optional(Type.String({ description: "Human-readable step label. Must be unique within a chain when provided." })),
-  agent: Type.String({ description: "Name of an available agent (must match exactly)." }),
-  task: Type.String({ description: "Task for this sequential chain step." }),
-  cwd: Type.Optional(Type.String({ description: "Working directory for this agent's process" })),
-  condition: Type.Optional(StepCondition),
-  continueOnError: Type.Optional(Type.Boolean({ description: "Continue later chain steps when this step fails. Default false." })),
-});
-
-const ChainParallelStep = Type.Object({
-  type: Type.Literal("parallel"),
-  label: Type.Optional(Type.String({ description: "Human-readable step label. Must be unique within a chain when provided." })),
-  tasks: Type.Array(TaskItem, { description: "Independent tasks to run concurrently within this chain stage." }),
-  condition: Type.Optional(StepCondition),
-  continueOnError: Type.Optional(Type.Boolean({ description: "Continue later chain steps if one or more parallel tasks fail. Default false." })),
-});
-
-const ChainStep = Type.Union([ChainTaskStep, ChainParallelStep]);
-
-const ZellijPaneOptionsShape = {
-  direction: Type.Optional(Type.Union([
-    Type.Literal("right"),
-    Type.Literal("down"),
-  ], { description: "Direction to open the new pane in." })),
-  floating: Type.Optional(Type.Boolean({ description: "Open the new pane in floating mode." })),
-  closeOnExit: Type.Optional(Type.Boolean({ description: "Close the pane immediately when its command exits." })),
-  name: Type.Optional(Type.String({ description: "Override the pane title. When the effective terminal mode is zellij-pane, labeled chain stages default to label(agent), unlabeled chain stages to step-N(agent), non-chain runs to subagent-agent, and concurrent parallel runs may append a #N suffix for disambiguation." })),
-};
-
-const SubagentParams = Type.Object({
-  agent: Type.Optional(
-    Type.String({
-      description:
-        "Agent name for single mode. Must match an available agent name exactly.",
-    }),
-  ),
-  task: Type.Optional(
-    Type.String({
-      description:
-        "Task description for single mode. In spawn mode it must be self-contained; in fork mode the subagent also receives your current session context.",
-    }),
-  ),
-  tasks: Type.Optional(
-    Type.Array(TaskItem, {
-      description:
-        "For parallel mode: array of {agent, task} objects. Each task runs in an isolated process concurrently. Do NOT set agent/task/chain when using this.",
-    }),
-  ),
-  chain: Type.Optional(
-    Type.Array(ChainStep, {
-      description:
-        "For chain mode: ordered stages. Omit type or set type='chain' for one sequential agent; set type='parallel' with tasks for a parallel stage. Stages run sequentially and receive summaries of previous stages. Supports label, condition, and continueOnError. Do NOT set agent/task/tasks when using this.",
-    }),
-  ),
-  mode: Type.Optional(
-    Type.Union([
-      Type.Literal("spawn"),
-      Type.Literal("fork"),
-    ], {
-      description:
-        "Context mode for delegated runs. 'spawn' (default) sends only the task prompt (best for isolated, reproducible work with lower token/cost and less context leakage). 'fork' adds a snapshot of current session context plus the task prompt (best for follow-up work that depends on prior context; usually higher token/cost and may include sensitive context).",
-      default: DEFAULT_DELEGATION_MODE,
-    }),
-  ),
-  terminal: Type.Optional(
-    Type.Union([
-      Type.Literal("inline"),
-      Type.Literal("zellij-pane"),
-    ], {
-      description:
-        "Execution surface override for delegated runs. If omitted, subagent auto-selects 'zellij-pane' inside Zellij and 'inline' otherwise.",
-    }),
-  ),
-  zellij: Type.Optional(
-    Type.Object({
-      pane: Type.Optional(Type.Object(ZellijPaneOptionsShape, {
-        description: "Optional Zellij pane settings applied whenever the effective terminal mode resolves to zellij-pane.",
-      })),
-    }, {
-      description: "Optional Zellij execution settings applied whenever the effective terminal mode resolves to zellij-pane.",
-    }),
-  ),
-  confirmProjectAgents: Type.Optional(
-    Type.Boolean({
-      description:
-        "Deprecated compatibility field. Ignored; project-local trust checks still apply regardless of this value.",
-      default: true,
-    }),
-  ),
-  cwd: Type.Optional(
-    Type.String({
-      description: "Working directory for the agent process (single mode only)",
-    }),
-  ),
-});
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -219,14 +95,6 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
   if (normalized === "spawn" || normalized === "fork") {
     return normalized;
   }
-  return null;
-}
-
-function parseTerminalMode(raw: unknown): TerminalMode | null {
-  if (raw === undefined) return getDefaultTerminalModeFromEnv();
-  if (typeof raw !== "string") return null;
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "inline" || normalized === "zellij-pane") return normalized;
   return null;
 }
 
@@ -265,37 +133,6 @@ function parseBoolean(raw: unknown): boolean | null {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return null;
-}
-
-function getConfigDir(): string {
-  return process.env["PI_CODING_AGENT_DIR"]?.trim() || path.join(os.homedir(), ".pi", "agent");
-}
-
-function readJsonObject(filePath: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function isTrustedProjectAgentsDir(projectAgentsDir: string | null): boolean {
-  if (!projectAgentsDir) return false;
-
-  const trust = readJsonObject(path.join(getConfigDir(), "trust.json"));
-  if (!trust) return false;
-
-  const projectRoot = path.dirname(path.dirname(projectAgentsDir));
-  let dir = projectRoot;
-  while (true) {
-    if (trust[dir] === true) return true;
-    const parent = path.dirname(dir);
-    if (parent === dir) return false;
-    dir = parent;
-  }
 }
 
 function parseAgentStack(raw: unknown): string[] | null {
@@ -523,7 +360,7 @@ function inferInvocationMode(params: { agent?: unknown; task?: unknown; tasks?: 
  * Prompt the user to confirm project-local agents if needed.
  * Returns false if the user declines.
  */
-async function confirmProjectAgentsIfNeeded(
+async function requestProjectAgentApprovalIfNeeded(
   projectAgents: AgentConfig[],
   projectAgentsDir: string | null,
   ctx: { ui: { confirm: (title: string, body: string) => Promise<boolean> } },
@@ -558,19 +395,8 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
 
-  const parseProjectRootEnv = (name: string): string[] => {
-    try {
-      const raw = process.env[name];
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
-    } catch {
-      return [];
-    }
-  };
-
-  const sessionTrustedProjectDirs = new Set<string>(parseProjectRootEnv(SUBAGENT_TRUSTED_PROJECTS_ENV));
-  const sessionDeniedProjectDirs = new Set<string>(parseProjectRootEnv(SUBAGENT_DENIED_PROJECTS_ENV));
+  const sessionTrustedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_TRUSTED_PROJECTS_ENV]));
+  const sessionDeniedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_DENIED_PROJECTS_ENV]));
 
   const getTrustOverrideFromArgv = (): boolean | null => {
     if (process.argv.includes("--approve") || process.argv.includes("-a")) return true;
@@ -578,36 +404,27 @@ export default function (pi: ExtensionAPI) {
     return null;
   };
 
-  const getProjectRootFromAgentsDir = (projectAgentsDir: string | null): string | null => {
-    return projectAgentsDir ? path.dirname(path.dirname(projectAgentsDir)) : null;
-  };
+  const applyArgvTrustOverride = (projectAgentsDir: string | null): string | null =>
+    applySessionProjectTrustOverride(
+      projectAgentsDir,
+      getTrustOverrideFromArgv(),
+      sessionTrustedProjectDirs,
+      sessionDeniedProjectDirs,
+    );
 
-  const isProjectTrustedInContext = (ctx: unknown, projectAgentsDir: string | null): boolean => {
-    const projectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
-    if (projectRoot && sessionDeniedProjectDirs.has(projectRoot)) return false;
-    if (projectRoot && sessionTrustedProjectDirs.has(projectRoot)) return true;
-    if (typeof (ctx as { isProjectTrusted?: unknown }).isProjectTrusted === "function") {
-      return Boolean((ctx as { isProjectTrusted: () => boolean }).isProjectTrusted());
-    }
-    return isTrustedProjectAgentsDir(projectAgentsDir);
-  };
+  const isProjectTrustedForSession = (projectAgentsDir: string | null): boolean =>
+    isTrustedProjectAgentsDirWithSessionOverrides(projectAgentsDir, {
+      sessionTrustedProjectRoots: sessionTrustedProjectDirs,
+      sessionDeniedProjectRoots: sessionDeniedProjectDirs,
+    });
 
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
     if (!canDelegate) return;
 
     const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
-    const sessionProjectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
-    const argvTrustOverride = getTrustOverrideFromArgv();
-    if (sessionProjectRoot && argvTrustOverride === true) {
-      sessionDeniedProjectDirs.delete(sessionProjectRoot);
-      sessionTrustedProjectDirs.add(sessionProjectRoot);
-    }
-    if (sessionProjectRoot && argvTrustOverride === false) {
-      sessionTrustedProjectDirs.delete(sessionProjectRoot);
-      sessionDeniedProjectDirs.add(sessionProjectRoot);
-    }
-    const trustedProject = isProjectTrustedInContext(ctx, projectAgentsDir);
+    applyArgvTrustOverride(projectAgentsDir);
+    const trustedProject = isProjectTrustedForSession(projectAgentsDir);
     const untrustedProjectAgents = trustedProject ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
     const starterDiscovery = trustedProject
       ? discoverAgentsWithStarter(ctx.cwd)
@@ -657,11 +474,9 @@ Context behavior is controlled by optional 'mode':
 - 'spawn' (default): child receives only the provided task prompt. Best for isolated, reproducible tasks with lower token/cost and less context leakage.
 - 'fork': child receives a forked snapshot of current session context plus the task prompt. Best for follow-up tasks that rely on prior context; usually higher token/cost and may include sensitive context.
 
-Execution surface defaults automatically when 'terminal' is omitted:
+Execution surface is selected automatically:
 - inside Zellij: use 'zellij-pane'
 - outside Zellij: use 'inline'
-- override with 'terminal: "inline"' or 'terminal: "zellij-pane"'
-- \`zellij.pane\` options apply whenever the effective mode is 'zellij-pane'
 
 **Single mode** — delegate one task:
 \`\`\`json
@@ -709,31 +524,18 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
         "",
         "Execution surface:",
-        "  terminal omitted            -> auto-select \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
-        "  terminal: \"inline\"      -> force direct child execution and parent-side streaming.",
-        "  terminal: \"zellij-pane\" -> force a Zellij pane with FIFO bridge and human-readable pane output.",
-        "  zellij.pane options apply whenever the effective terminal mode resolves to \"zellij-pane\".",
+        "  auto-select \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
         "",
         'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
-        'Example single override: { agent: "writer", task: "Rewrite README.md", mode: "spawn", terminal: "inline" }',
-        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork", terminal: "zellij-pane" }',
+        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
         'Example chain:    { chain: [{ label: "discover", type: "parallel", tasks: [{ agent: "scout", task: "Inspect" }, { agent: "researcher", task: "Check docs" }] }, { label: "plan", agent: "planner", task: "Plan from discovery" }], mode: "spawn" }',
       ].join("\n"),
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
-        const sessionProjectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
-        const argvTrustOverride = getTrustOverrideFromArgv();
-        if (sessionProjectRoot && argvTrustOverride === true) {
-          sessionDeniedProjectDirs.delete(sessionProjectRoot);
-          sessionTrustedProjectDirs.add(sessionProjectRoot);
-        }
-        if (sessionProjectRoot && argvTrustOverride === false) {
-          sessionTrustedProjectDirs.delete(sessionProjectRoot);
-          sessionDeniedProjectDirs.add(sessionProjectRoot);
-        }
-        const trustedProjectAtStart = isProjectTrustedInContext(ctx, projectAgentsDir);
+        applyArgvTrustOverride(projectAgentsDir);
+        const trustedProjectAtStart = isProjectTrustedForSession(projectAgentsDir);
         const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
           ? discoverAgentsWithStarter(ctx.cwd).discovery
@@ -745,22 +547,19 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         const visibleAgents = trustedProjectAtStart ? agents : discoverAgents(ctx.cwd, "user").agents;
 
         const delegationMode = parseDelegationMode(params.mode);
-        const terminalMode = parseTerminalMode((params as { terminal?: unknown }).terminal);
+        const terminalMode = getDefaultTerminalModeFromEnv();
         const intendedMode = inferInvocationMode(params);
-        if (!delegationMode || !terminalMode) {
+        if (!delegationMode) {
           const fallbackDetails = makeDetailsFactory(
             discovery.projectAgentsDir,
             DEFAULT_DELEGATION_MODE,
-            terminalMode ?? getDefaultTerminalModeFromEnv(),
+            terminalMode,
           );
-          const validationError = !delegationMode
-            ? `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".`
-            : `Invalid terminal \"${String((params as { terminal?: unknown }).terminal)}\". Expected \"inline\" or \"zellij-pane\".`;
           return {
             content: [
               {
                 type: "text",
-                text: `${validationError}\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
+                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
               },
             ],
             details: fallbackDetails(intendedMode)([]),
@@ -768,7 +567,6 @@ Use single mode for one task, parallel mode when tasks are independent and can r
           };
         }
 
-        const zellijPane = ((params as { zellij?: { pane?: ZellijPaneOptions } }).zellij?.pane ?? {}) as ZellijPaneOptions;
         const detailsExtras = intendedMode === "chain" && Array.isArray(params.chain)
           ? { chainStageCount: params.chain.length }
           : {};
@@ -899,23 +697,24 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           requestedProjectAgentNames,
         );
         // Project-local agents are repository-controlled prompts. Respect the
-        // current session trust state, including temporary trust decisions and
-        // CLI trust overrides.
+        // extension-managed exact-root trust state, including temporary trust
+        // decisions and CLI trust overrides.
         if (requestedProjectAgents.length > 0) {
-          const trustedProject = isProjectTrustedInContext(ctx, discovery.projectAgentsDir);
+          const trustedProject = isProjectTrustedForSession(discovery.projectAgentsDir);
           const shouldPrompt = !trustedProject;
           if (ctx.hasUI && shouldPrompt) {
-            const approved = await confirmProjectAgentsIfNeeded(
+            const approved = await requestProjectAgentApprovalIfNeeded(
               requestedProjectAgents,
               discovery.projectAgentsDir,
               ctx,
             );
             if (!approved) {
-              const projectRoot = getProjectRootFromAgentsDir(discovery.projectAgentsDir);
-              if (projectRoot) {
-                sessionTrustedProjectDirs.delete(projectRoot);
-                sessionDeniedProjectDirs.add(projectRoot);
-              }
+              applySessionProjectTrustOverride(
+                discovery.projectAgentsDir,
+                false,
+                sessionTrustedProjectDirs,
+                sessionDeniedProjectDirs,
+              );
               return {
                 content: [
                   {
@@ -927,11 +726,16 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 isError: true,
               };
             }
-            const projectRoot = getProjectRootFromAgentsDir(discovery.projectAgentsDir);
+            const projectRoot = applySessionProjectTrustOverride(
+              discovery.projectAgentsDir,
+              true,
+              sessionTrustedProjectDirs,
+              sessionDeniedProjectDirs,
+            );
             if (projectRoot) {
-              sessionDeniedProjectDirs.delete(projectRoot);
-              sessionTrustedProjectDirs.add(projectRoot);
-              trustedProjectRoots.push(projectRoot);
+              if (!trustedProjectRoots.includes(projectRoot)) trustedProjectRoots.push(projectRoot);
+              const deniedIndex = deniedProjectRoots.indexOf(projectRoot);
+              if (deniedIndex !== -1) deniedProjectRoots.splice(deniedIndex, 1);
             }
           } else if (!ctx.hasUI && shouldPrompt) {
             const names = requestedProjectAgents.map((a) => a.name).join(", ");
@@ -940,7 +744,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               content: [
                 {
                   type: "text",
-                  text: `Blocked: project-local agent confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRun from an interactive trusted session or pass --approve so the current session trust state allows project-local agents.`,
+                  text: `Blocked: project-local agent confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRun from an interactive session and approve this exact project root, or pass --approve to trust the current nearest project-agent root for this session.`,
                 },
               ],
               details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
@@ -959,7 +763,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             params.tasks,
             delegationMode,
             terminalMode,
-            zellijPane,
             trustedProjectRoots,
             deniedProjectRoots,
             forkSessionSnapshotJsonl,
@@ -979,7 +782,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             params.chain as ChainStage[],
             delegationMode,
             terminalMode,
-            zellijPane,
             trustedProjectRoots,
             deniedProjectRoots,
             forkSessionSnapshotJsonl,
@@ -999,7 +801,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             params.cwd,
             delegationMode,
             terminalMode,
-            zellijPane,
             trustedProjectRoots,
             deniedProjectRoots,
             forkSessionSnapshotJsonl,
@@ -1038,7 +839,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     cwd: string | undefined,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
-    zellijPane: ZellijPaneOptions,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
@@ -1056,7 +856,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       taskCwd: cwd,
       delegationMode,
       terminalMode,
-      zellijPane,
       trustedProjectRoots,
       deniedProjectRoots,
       forkSessionSnapshotJsonl,
@@ -1097,7 +896,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     chain: ChainStage[],
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
-    zellijPane: ZellijPaneOptions,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
@@ -1207,7 +1005,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               taskCwd: task.cwd,
               delegationMode,
               terminalMode,
-              zellijPane,
               paneTitleSuffix: `#${taskIndex + 1}`,
               restoreFocusPaneId: sharedRestoreFocusPaneId,
               trustedProjectRoots,
@@ -1299,7 +1096,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         taskCwd: taskStage.cwd,
         delegationMode,
         terminalMode,
-        zellijPane,
         trustedProjectRoots,
         deniedProjectRoots,
         forkSessionSnapshotJsonl,
@@ -1386,7 +1182,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     tasks: Array<{ agent: string; task: string; cwd?: string }>,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
-    zellijPane: ZellijPaneOptions,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
@@ -1461,7 +1256,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             taskCwd: t.cwd,
             delegationMode,
             terminalMode,
-            zellijPane,
             paneTitleSuffix: `#${index + 1}`,
             restoreFocusPaneId: sharedRestoreFocusPaneId,
             trustedProjectRoots,

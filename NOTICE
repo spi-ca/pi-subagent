@@ -1,0 +1,13 @@
+Pi Subagent local fork
+
+This repository is based on code from:
+
+  mjakl/pi-subagent
+  https://github.com/mjakl/pi-subagent
+
+The upstream project is licensed under the MIT License.
+Original copyright notice:
+
+  Copyright (c) 2026 Michael Jakl
+
+Local modifications are maintained as a private/local editable Pi package.

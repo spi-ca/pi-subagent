@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldRunStage } from "./chain-helpers";
+import { shouldRunStage } from "../../src/core/chain-helpers";
 
 describe("continueOnError semantics", () => {
   test("default on_success stages still run after completed_with_errors", () => {

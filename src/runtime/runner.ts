@@ -17,12 +17,12 @@ import {
   resolveInheritedCliApiKeyEnvBinding,
   type InheritedCliApiKeyEnvBinding,
   type InheritedCliAuthContext,
-} from "./provider-auth.js";
-import type { AgentConfig } from "./agents.js";
+} from "../core/provider-auth.js";
+import type { AgentConfig } from "../core/agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { createJsonLineChunkProcessor, monitorZellijPaneLifecycle } from "./runner-core.js";
-import { processPiJsonLine } from "./runner-events.js";
-import { isTrustedProjectAgentsDirWithSessionOverrides } from "./project-trust.js";
+import { processPiJsonLine } from "../core/runner-events.js";
+import { isTrustedProjectAgentsDirWithSessionOverrides } from "../core/project-trust.js";
 import {
   type DelegationMode,
   type SingleResult,
@@ -32,8 +32,8 @@ import {
   getFinalOutput,
   isInsideZellij,
   normalizeCompletedResult,
-} from "./types.js";
-import { canonicalizePathForTrust } from "./trust-path.js";
+} from "../core/types.js";
+import { canonicalizePathForTrust } from "../core/trust-path.js";
 
 const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;

@@ -7,7 +7,7 @@ import {
   SubagentParams,
   getProjectRootFromAgentsDir,
   parseProjectRootEnvValue,
-} from "./subagent-config";
+} from "../../src/core/subagent-config";
 
 describe("subagent tool schema", () => {
   test("does not expose removed top-level execution or approval fields", () => {

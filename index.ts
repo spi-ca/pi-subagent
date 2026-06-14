@@ -33,13 +33,13 @@ import {
   type ChainStageStatus,
   type ChainTaskStage,
   validateChainStages,
-} from "./chain-helpers.js";
-import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir } from "./agents.js";
-import { renderCall, renderResult } from "./render.js";
-import { getResultSummaryText } from "./runner-events.js";
-import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./project-trust.js";
-import { mapConcurrent, runAgent } from "./runner.js";
-import { SubagentParams, getProjectRootFromAgentsDir, parseProjectRootEnvValue } from "./subagent-config.js";
+} from "./src/core/chain-helpers.js";
+import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir } from "./src/core/agents.js";
+import { renderCall, renderResult } from "./src/ui/render.js";
+import { getResultSummaryText } from "./src/core/runner-events.js";
+import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./src/core/project-trust.js";
+import { mapConcurrent, runAgent } from "./src/runtime/runner.js";
+import { SubagentParams, getProjectRootFromAgentsDir, parseProjectRootEnvValue } from "./src/core/subagent-config.js";
 import {
   type DelegationMode,
   type SingleResult,
@@ -52,7 +52,7 @@ import {
   getDefaultTerminalModeFromEnv,
   isResultError,
   isResultSuccess,
-} from "./types.js";
+} from "./src/core/types.js";
 
 // ---------------------------------------------------------------------------
 // Limits

@@ -1,6 +1,6 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { getDefaultTerminalModeFromEnv, isInsideZellij } from "./types";
+import { getDefaultTerminalModeFromEnv, isInsideZellij } from "../../src/core/types";
 
 const ORIGINAL_ZELLIJ = process.env.ZELLIJ;
 const ORIGINAL_ZELLIJ_PANE_ID = process.env.ZELLIJ_PANE_ID;

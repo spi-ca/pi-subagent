@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { createNamedPipe, startJsonlPipeConsumer } from "./runner";
+import { createNamedPipe, startJsonlPipeConsumer } from "../../src/runtime/runner";
 
 const tempDirs: string[] = [];
 
@@ -25,7 +25,7 @@ describe("pane-renderer CLI", () => {
 
     const lines: string[] = [];
     const consumer = startJsonlPipeConsumer(pipePath, (line) => lines.push(line));
-    const proc = spawn(process.execPath, ["./pane-renderer.js", pipePath], {
+    const proc = spawn(process.execPath, ["./src/runtime/pane-renderer.js", pipePath], {
       cwd: process.cwd(),
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,

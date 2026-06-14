@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { createPaneRendererState, finalizePaneRenderer, handlePaneRendererEvent } from "./pane-renderer-core";
+import { createPaneRendererState, finalizePaneRenderer, handlePaneRendererEvent } from "../../src/runtime/pane-renderer-core";
 
 describe("pane renderer core", () => {
   test("renders text deltas and tool execution summaries without duplicating final assistant messages", () => {

@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { createJsonLineChunkProcessor, monitorZellijPaneLifecycle, updatePaneWatchState } from "./runner-core";
+import { createJsonLineChunkProcessor, monitorZellijPaneLifecycle, updatePaneWatchState } from "../../src/runtime/runner-core";
 
 describe("runner core helpers", () => {
   test("splits chunked JSONL lines like the inline runner", () => {

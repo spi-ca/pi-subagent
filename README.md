@@ -414,30 +414,24 @@ Task: Inspect local code and summarize the architecture
 ## Project Structure
 
 ```
-index.ts                 — Extension entry point: lifecycle hooks, tool registration, trust gating, mode orchestration
-subagent-config.ts       — Tool schema and canonical project-root environment parsing
-agents.ts                — Agent discovery: reads/parses .md files from the active Pi config dir and project directories
-metadata-frontmatter.ts  — Frontmatter-only reads for faster/safer agent metadata loading
-project-agent-paths.ts   — Project-agent path boundary checks for nearest `.pi/agents` lookup and symlink escape rejection
-project-trust.ts         — Exact-root project trust and session approval/denial helpers
-trust-path.ts            — Canonical path and within-root trust-boundary helpers
-provider-auth.ts         — Provider/API-key mapping and ambiguity handling for inherited CLI credentials
-chain-helpers.ts         — Chain stage validation, condition handling, and previous-summary task construction
-runner-cli.js            — Parent CLI inheritance: allowlisted flag parsing, asset handling, git source sanitization
-runner.ts                — Process runner: inline/Zellij launch, auth overlays, FIFO/status plumbing, lifecycle cleanup
-runner-core.ts           — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
-runner-events.js         — Shared JSON event parsing and result summarization used by the parent transport path
-pane-renderer.js         — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
-pane-renderer-core.ts    — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
-render.ts                — TUI rendering: renderCall and renderResult for the subagent tool
-types.ts                 — Shared types and pure helper functions
-*.test.ts                — Bun/node:test coverage for discovery, runner helpers, trust, metadata, pane rendering, and chain behavior
+index.ts                    — Stable Pi extension entry point kept at the package root for local package filters
+src/core/                   — Agent discovery, trust/path checks, tool schema, chain helpers, event parsing, shared types
+src/runtime/                — Child process runner, CLI inheritance, FIFO helpers, pane renderer, Zellij lifecycle helpers
+src/ui/                     — TUI rendering for subagent tool calls and results
+test/core/                  — Unit tests for discovery, trust, metadata, chain behavior, and shared types
+test/runtime/               — Unit/integration tests for runner, auth propagation, FIFO, CLI parsing, and pane rendering
+test/entrypoint/            — Tests for the public extension/tool entrypoint contracts
 ```
+
+The root `index.ts` intentionally remains in place because Pi settings commonly select this package with `extensions: ["+index.ts"]`. Internal modules live under `src/` and tests mirror the same domain/runtime split under `test/`.
 
 ## Attribution
 
-Inspired by implementations from [vaayne/agent-kit](https://github.com/vaayne/agent-kit) and [mariozechner/pi-mono](https://github.com/badlogic/pi-mono).
+This local fork is based on [`mjakl/pi-subagent`](https://github.com/mjakl/pi-subagent), which is licensed under the MIT License.
+The original MIT copyright notice is preserved in `LICENSE`, and additional attribution is recorded in `NOTICE`.
+
+Additional inspiration came from [vaayne/agent-kit](https://github.com/vaayne/agent-kit) and [mariozechner/pi-mono](https://github.com/badlogic/pi-mono).
 
 ## License
 
-MIT
+MIT. See `LICENSE` and `NOTICE`.

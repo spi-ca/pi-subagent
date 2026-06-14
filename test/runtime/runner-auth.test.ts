@@ -13,7 +13,7 @@ import {
   prepareZellijTempArtifacts,
   resolveInheritedCliApiKeyForChild,
   scheduleDelayedInheritedApiKeyEnvDirCleanup,
-} from "./runner";
+} from "../../src/runtime/runner";
 
 const tempDirs: string[] = [];
 

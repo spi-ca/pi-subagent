@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createNamedPipe, runCommandCapture, startJsonlPipeConsumer } from "./runner";
-import { processPiJsonLine } from "./runner-events";
-import { emptyUsage, getFinalOutput } from "./types";
+import { createNamedPipe, runCommandCapture, startJsonlPipeConsumer } from "../../src/runtime/runner";
+import { processPiJsonLine } from "../../src/core/runner-events";
+import { emptyUsage, getFinalOutput } from "../../src/core/types";
 
 const tempDirs: string[] = [];
 

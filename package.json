@@ -6,25 +6,10 @@
   "main": "index.ts",
   "files": [
     "index.ts",
-    "subagent-config.ts",
-    "agents.ts",
-    "runner.ts",
-    "runner-cli.js",
-    "runner-events.js",
-    "pane-renderer.js",
-    "pane-renderer-core.js",
-    "pane-renderer-core.ts",
-    "provider-auth.ts",
-    "project-agent-paths.ts",
-    "project-trust.ts",
-    "render.ts",
-    "chain-helpers.ts",
-    "metadata-frontmatter.ts",
-    "runner-core.ts",
-    "trust-path.ts",
-    "types.ts",
+    "src/**/*",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [

@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveInheritedCliApiKeyEnvBinding } from "./provider-auth";
-import { parseInheritedCliArgs } from "./runner-cli.js";
+import { resolveInheritedCliApiKeyEnvBinding } from "../../src/core/provider-auth";
+import { parseInheritedCliArgs } from "../../src/runtime/runner-cli.js";
 
 async function withTempCwd<T>(run: (cwd: string) => Promise<T> | T): Promise<T> {
   const originalCwd = process.cwd();

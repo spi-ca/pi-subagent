@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildChainTaskFromStages, shouldRunStage, validateChainStages } from "./chain-helpers";
+import { buildChainTaskFromStages, shouldRunStage, validateChainStages } from "../../src/core/chain-helpers";
 
 describe("mixed chain helpers", () => {
   test("accepts sequential stages and parallel stages", () => {

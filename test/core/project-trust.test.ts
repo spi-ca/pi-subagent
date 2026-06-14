@@ -7,7 +7,7 @@ import {
   applySessionProjectTrustOverride,
   isTrustedProjectAgentsDir,
   isTrustedProjectAgentsDirWithSessionOverrides,
-} from "./project-trust";
+} from "../../src/core/project-trust";
 
 describe("project trust boundaries", () => {
   test("requires an exact trusted project root for the nearest .pi/agents directory", async () => {

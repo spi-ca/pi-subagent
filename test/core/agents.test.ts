@@ -7,7 +7,7 @@ import {
   findNearestProjectAgentsDirWithinRoot,
   getProjectAgentConfigFilePath,
   resolveProjectAgentFilePathWithinRoot,
-} from "./project-agent-paths";
+} from "../../src/core/project-agent-paths";
 
 describe("project agent discovery hardening", () => {
   test("ignores a nearest .pi/agents symlink that escapes the project root", async () => {

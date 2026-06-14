@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { getResultSummaryText, processPiEvent } from "./runner-events";
-import { emptyUsage, getFinalOutput } from "./types";
+import { getResultSummaryText, processPiEvent } from "../../src/core/runner-events";
+import { emptyUsage, getFinalOutput } from "../../src/core/types";
 
 describe("runner event summaries", () => {
   test("prefers explicit error details over assistant text on failures", () => {

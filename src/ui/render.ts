@@ -5,7 +5,7 @@
 import * as os from "node:os";
 import { getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { getResultSummaryText } from "./runner-events.js";
+import { getResultSummaryText } from "../core/runner-events.js";
 import {
 	type DelegationMode,
 	type DisplayItem,
@@ -22,7 +22,7 @@ import {
 	getFinalOutput,
 	isResultError,
 	isResultSuccess,
-} from "./types.js";
+} from "../core/types.js";
 
 const COLLAPSED_LINE_COUNT = 10;
 const COLLAPSED_PARALLEL_LINE_COUNT = 5;

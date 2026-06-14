@@ -1,8 +1,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { monitorInlineProcess } from "./runner";
-import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "./types";
+import { monitorInlineProcess } from "../../src/runtime/runner";
+import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "../../src/core/types";
 
 describe("inline runner path", () => {
   test("preserves semantic completion across chunked JSONL output", async () => {

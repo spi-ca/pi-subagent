@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { extractFrontmatterBlock, readFrontmatterOnly } from "./metadata-frontmatter";
+import { extractFrontmatterBlock, readFrontmatterOnly } from "../../src/core/metadata-frontmatter";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

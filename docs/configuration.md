@@ -1,23 +1,34 @@
 # 설정
 
-이 패키지는 Pi의 로컬 편집 가능 확장 패키지로 사용할 수 있습니다.
+이 패키지는 Pi의 GitHub 패키지 설치 방식으로 사용할 수 있습니다.
 
-## 로컬 패키지로 설치
+## GitHub 패키지로 설치
 
-사용자 수준 Pi 설정 파일(보통 `~/.pi/agent/settings.json`)에 패키지 디렉터리를 추가합니다.
+사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 다음 명령을 실행합니다.
+
+```bash
+pi install git:github.com/spi-ca/pi-subagent
+```
+
+Pi는 설정에 다음과 같은 패키지 항목을 추가하고 저장소를 `~/.pi/agent/git/github.com/spi-ca/pi-subagent` 아래에 클론합니다.
 
 ```json
 {
-  "packages": [
-    {
-      "source": "~/.pi/agent/local-packages/pi-subagent",
-      "extensions": ["+index.ts"]
-    }
-  ]
+  "packages": ["git:github.com/spi-ca/pi-subagent"]
 }
 ```
 
-`source`에는 실제 체크아웃 경로를 넣습니다. Pi는 로컬 패키지 디렉터리를 직접 로드하므로 npm publish 단계가 필요하지 않습니다.
+프로젝트 수준 설정(`.pi/settings.json`)에 설치하려면 `-l`을 사용합니다.
+
+```bash
+pi install -l git:github.com/spi-ca/pi-subagent
+```
+
+특정 태그나 커밋으로 고정하려면 ref를 붙입니다.
+
+```bash
+pi install git:github.com/spi-ca/pi-subagent@<tag-or-commit>
+```
 
 ## 위임 보호 장치
 

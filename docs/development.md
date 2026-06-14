@@ -33,7 +33,7 @@ bun run ci
 ## 프로젝트 구조
 
 ```text
-index.ts                    — 로컬 패키지 필터를 위해 패키지 루트에 유지하는 Pi 확장 진입점
+index.ts                    — Pi 패키지 manifest가 참조하는 확장 진입점
 src/core/                   — 에이전트 발견, 신뢰/경로 검사, 스키마, 체인 헬퍼, 이벤트 파싱, 공통 타입
 src/runtime/                — 자식 프로세스 runner, CLI 상속, FIFO 헬퍼, pane renderer, Zellij lifecycle 헬퍼
 src/ui/                     — subagent 도구 호출과 결과를 위한 TUI 렌더링
@@ -44,7 +44,7 @@ docs/                       — 주제별 문서
 docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 ```
 
-루트 `index.ts`는 의도적으로 그대로 둡니다. Pi 설정에서 이 패키지를 `extensions: ["+index.ts"]`로 선택하는 경우가 많기 때문입니다. 내부 모듈은 `src/` 아래에 있고, 테스트는 같은 core/runtime 구분을 `test/` 아래에서 따릅니다.
+루트 `index.ts`는 의도적으로 그대로 둡니다. `package.json`의 Pi 패키지 manifest가 이 파일을 확장 진입점으로 참조하기 때문입니다. 내부 모듈은 `src/` 아래에 있고, 테스트는 같은 core/runtime 구분을 `test/` 아래에서 따릅니다.
 
 ## 문서 작성 방식
 

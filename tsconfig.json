@@ -18,5 +18,5 @@
       "typebox": ["../../npm/node_modules/typebox/build/index.d.mts"]
     }
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "*.js"]
 }

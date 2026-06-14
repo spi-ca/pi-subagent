@@ -20,27 +20,34 @@ There are many subagent extensions for pi, this one is mine.
 
 ## Install
 
-This checkout is used as a local editable Pi package:
+This checkout is intended to be used as a **local editable Pi package**. Add the package directory to the user-level Pi settings file (`~/.pi/agent/settings.json` by default):
 
 ```json
-"/home/spi-ca/.pi/agent/local-packages/pi-subagent"
+{
+  "packages": [
+    {
+      "source": "~/.pi/agent/local-packages/pi-subagent",
+      "extensions": ["+index.ts"]
+    }
+  ]
+}
 ```
 
-The user-level Pi settings file is:
-
-```text
-/home/spi-ca/.pi/agent/settings.json
-```
+Use the actual checkout path for `source`; this repository is private/local and is not meant to be published to npm.
 
 For local development:
 
 ```bash
-cd /home/spi-ca/.pi/agent/local-packages/pi-subagent
+cd ~/.pi/agent/local-packages/pi-subagent
 bun install
 bun run ci
 ```
 
 Pi loads local package directories directly; no npm publish step is required.
+
+### Development Assumptions
+
+This package is developed inside an existing Pi installation. Type checking relies on the sibling Pi package tree referenced from `tsconfig.json` (for example `../../npm/node_modules/@earendil-works/...`). If you move this checkout outside that layout, install or map the Pi packages before running `bun run check`.
 
 ## Configuration
 
@@ -407,21 +414,24 @@ Task: Inspect local code and summarize the architecture
 ## Project Structure
 
 ```
-index.ts               — Extension entry point: lifecycle hooks, tool registration, trust gating, mode orchestration
-subagent-config.ts     — Tool schema and canonical project-root environment parsing
-agents.ts              — Agent discovery: reads/parses .md files from the active Pi config dir and project directories
-project-agent-paths.ts — Project-agent path boundary checks for nearest `.pi/agents` lookup and symlink escape rejection
-project-trust.ts       — Exact-root project trust and session approval/denial helpers
-trust-path.ts          — Canonical path and within-root trust-boundary helpers
-provider-auth.ts       — Provider/API-key mapping and ambiguity handling for inherited CLI credentials
-runner-cli.js          — Parent CLI inheritance: allowlisted flag parsing, asset handling, git source sanitization
-runner.ts              — Process runner: inline/Zellij launch, auth overlays, FIFO/status plumbing, lifecycle cleanup
-runner-core.ts         — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
-runner-events.js       — Shared JSON event parsing and result summarization used by the parent transport path
-pane-renderer.js       — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
-pane-renderer-core.ts  — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
-render.ts              — TUI rendering: renderCall and renderResult for the subagent tool
-types.ts               — Shared types and pure helper functions
+index.ts                 — Extension entry point: lifecycle hooks, tool registration, trust gating, mode orchestration
+subagent-config.ts       — Tool schema and canonical project-root environment parsing
+agents.ts                — Agent discovery: reads/parses .md files from the active Pi config dir and project directories
+metadata-frontmatter.ts  — Frontmatter-only reads for faster/safer agent metadata loading
+project-agent-paths.ts   — Project-agent path boundary checks for nearest `.pi/agents` lookup and symlink escape rejection
+project-trust.ts         — Exact-root project trust and session approval/denial helpers
+trust-path.ts            — Canonical path and within-root trust-boundary helpers
+provider-auth.ts         — Provider/API-key mapping and ambiguity handling for inherited CLI credentials
+chain-helpers.ts         — Chain stage validation, condition handling, and previous-summary task construction
+runner-cli.js            — Parent CLI inheritance: allowlisted flag parsing, asset handling, git source sanitization
+runner.ts                — Process runner: inline/Zellij launch, auth overlays, FIFO/status plumbing, lifecycle cleanup
+runner-core.ts           — Pure runner helpers for chunked JSONL processing and Zellij pane watch-state decisions
+runner-events.js         — Shared JSON event parsing and result summarization used by the parent transport path
+pane-renderer.js         — FIFO bridge helper that mirrors raw JSONL to the parent and renders human-readable pane output
+pane-renderer-core.ts    — Pure pane-rendering helpers reused by the CLI wrapper and automated tests
+render.ts                — TUI rendering: renderCall and renderResult for the subagent tool
+types.ts                 — Shared types and pure helper functions
+*.test.ts                — Bun/node:test coverage for discovery, runner helpers, trust, metadata, pane rendering, and chain behavior
 ```
 
 ## Attribution

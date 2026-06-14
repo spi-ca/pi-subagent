@@ -23,7 +23,6 @@
     "runner-core.ts",
     "trust-path.ts",
     "types.ts",
-    "agents/*.md",
     "README.md",
     "LICENSE"
   ],
@@ -43,17 +42,6 @@
     "delegation",
     "pi-package"
   ],
-  "repository": {
-    "type": "git",
-    "url": "local:/home/spi-ca/.pi/agent/local-packages/pi-subagent"
-  },
-  "bugs": {
-    "url": "https://github.com/mjakl/pi-subagent/issues"
-  },
-  "homepage": "https://github.com/mjakl/pi-subagent#readme",
-  "publishConfig": {
-    "access": "public"
-  },
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.2.3",

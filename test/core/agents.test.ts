@@ -9,6 +9,24 @@ import {
   resolveProjectAgentFilePathWithinRoot,
 } from "../../src/core/project-agent-paths";
 
+describe("agent discovery", () => {
+  test("does not include starter agent creation code", async () => {
+    const agentsSource = await fs.readFile(
+      path.join(process.cwd(), "src", "core", "agents.ts"),
+      "utf-8",
+    );
+    const extensionSource = await fs.readFile(
+      path.join(process.cwd(), "index.ts"),
+      "utf-8",
+    );
+
+    assert.equal(agentsSource.includes("discoverAgentsWithStarter"), false);
+    assert.equal(agentsSource.includes("STARTER_AGENT"), false);
+    assert.equal(agentsSource.includes("writeStarterAgentFile"), false);
+    assert.equal(extensionSource.includes("discoverAgentsWithStarter"), false);
+  });
+});
+
 describe("project agent discovery hardening", () => {
   test("ignores a nearest .pi/agents symlink that escapes the project root", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-agents-"));

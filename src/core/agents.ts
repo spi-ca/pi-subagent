@@ -45,50 +45,6 @@ export interface DiscoverAgentOptions {
 	metadataOnly?: boolean;
 }
 
-export interface StarterAgentDiscoveryResult {
-	discovery: AgentDiscoveryResult;
-	createdAgentPath: string | null;
-	error?: string;
-}
-
-export const STARTER_AGENT_NAME = "explorer";
-export const STARTER_AGENT_FILE_NAME = "explorer.md";
-
-const STARTER_AGENT_MARKDOWN = `---
-name: explorer
-description: Read-only codebase exploration specialist for focused searches, repository reconnaissance, and evidence-backed summaries. Use when you need fast context from files without edits.
-tools: read, grep, find, ls
----
-
-You are a codebase exploration specialist. Your job is to quickly gather reliable,
-targeted context from the local repository and return it in a form another agent
-can use without repeating the same search.
-
-## Operating mode
-
-- Work read-only.
-- Never create, edit, delete, or commit files.
-- Do not make changes to the environment or repository state.
-- Prefer fast discovery first, then selective reading.
-- Keep scope tight to the task; do not broaden the investigation unless needed.
-
-## Search strategy
-
-1. Start broad: find likely files, symbols, call sites, configs, tests, and docs.
-2. Narrow down: read only the most relevant files or sections.
-3. Stop when you have enough evidence; avoid exhaustive exploration unless asked.
-
-## Output rules
-
-- Return file paths as absolute paths when possible.
-- Include line ranges whenever you rely on file contents.
-- Be factual and precise.
-- Distinguish facts supported by inspected files from inferences.
-- If something is not found, say what you checked.
-
-Keep the response concise, structured, and optimized for agent handoff.
-`;
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -243,30 +199,6 @@ export function mergeAgents(...groups: AgentConfig[][]): AgentConfig[] {
 	return Array.from(agentMap.values());
 }
 
-function getStarterAgentFileName(attempt: number): string {
-	if (attempt === 0) return STARTER_AGENT_FILE_NAME;
-	if (attempt === 1) return "explorer-starter.md";
-	return `explorer-starter-${attempt}.md`;
-}
-
-function isFileExistsError(err: unknown): boolean {
-	return (
-		typeof err === "object" &&
-		err !== null &&
-		"code" in err &&
-		(err as { code?: unknown }).code === "EEXIST"
-	);
-}
-
-function writeStarterAgentFile(filePath: string): void {
-	const fd = fs.openSync(filePath, "wx", 0o600);
-	try {
-		fs.writeFileSync(fd, STARTER_AGENT_MARKDOWN, { encoding: "utf-8" });
-	} finally {
-		fs.closeSync(fd);
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -295,58 +227,3 @@ export function discoverAgents(cwd: string, scope: AgentScope, options: Discover
 	};
 }
 
-/**
- * Discover user/project agents, creating a starter user agent when none exist.
- *
- * This intentionally has no marker file: if a user deletes every agent, the
- * starter will be recreated on the next discovery that needs runnable agents.
- * Existing files are never overwritten.
- */
-export function discoverAgentsWithStarterForScope(cwd: string, scope: AgentScope, options: DiscoverAgentOptions = {}): StarterAgentDiscoveryResult {
-	const initial = discoverAgents(cwd, scope, options);
-	if (initial.agents.length > 0) {
-		return { discovery: initial, createdAgentPath: null };
-	}
-
-	const userAgentsDir = getUserAgentsDir();
-
-	try {
-		fs.mkdirSync(userAgentsDir, { recursive: true });
-
-		for (let attempt = 0; attempt < 100; attempt++) {
-			const latest = attempt === 0 ? initial : discoverAgents(cwd, scope, options);
-			if (latest.agents.length > 0) {
-				return { discovery: latest, createdAgentPath: null };
-			}
-
-			const filePath = path.join(userAgentsDir, getStarterAgentFileName(attempt));
-			try {
-				writeStarterAgentFile(filePath);
-				return {
-					discovery: discoverAgents(cwd, scope, options),
-					createdAgentPath: filePath,
-				};
-			} catch (err) {
-				if (isFileExistsError(err)) continue;
-				throw err;
-			}
-		}
-
-		return {
-			discovery: initial,
-			createdAgentPath: null,
-			error: `Could not find an unused starter agent filename in ${userAgentsDir}.`,
-		};
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return {
-			discovery: initial,
-			createdAgentPath: null,
-			error: `Could not create starter agent in ${userAgentsDir}: ${message}`,
-		};
-	}
-}
-
-export function discoverAgentsWithStarter(cwd: string): StarterAgentDiscoveryResult {
-	return discoverAgentsWithStarterForScope(cwd, "both");
-}

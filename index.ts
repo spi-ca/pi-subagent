@@ -34,7 +34,7 @@ import {
   type ChainTaskStage,
   validateChainStages,
 } from "./src/core/chain-helpers.js";
-import { type AgentConfig, discoverAgents, discoverAgentsWithStarter, discoverAgentsWithStarterForScope, findNearestProjectAgentsDir } from "./src/core/agents.js";
+import { type AgentConfig, discoverAgents, findNearestProjectAgentsDir } from "./src/core/agents.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./src/core/project-trust.js";
@@ -425,28 +425,10 @@ export default function (pi: ExtensionAPI) {
     const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
     applyArgvTrustOverride(projectAgentsDir);
     const trustedProject = isProjectTrustedForSession(projectAgentsDir);
-    const untrustedProjectAgents = trustedProject ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
-    const starterDiscovery = trustedProject
-      ? discoverAgentsWithStarter(ctx.cwd)
-      : untrustedProjectAgents.length > 0
-        ? { discovery: discoverAgents(ctx.cwd, "user"), createdAgentPath: null }
-        : discoverAgentsWithStarterForScope(ctx.cwd, "user");
-    const discovery = starterDiscovery.discovery;
+    const discovery = trustedProject
+      ? discoverAgents(ctx.cwd, "both")
+      : discoverAgents(ctx.cwd, "user");
     discoveredAgents = discovery.agents;
-
-    if (ctx.hasUI) {
-      if (starterDiscovery.createdAgentPath) {
-        ctx.ui.notify(
-          `Created starter subagent "explorer" at:\n${starterDiscovery.createdAgentPath}\n\nEdit this file or add more agents in the same directory to customize delegation.`,
-          "info",
-        );
-      } else if (starterDiscovery.error && discoveredAgents.length === 0) {
-        ctx.ui.notify(
-          `No subagents found. ${starterDiscovery.error}`,
-          "info",
-        );
-      }
-    }
   });
 
   // Inject available agents into the system prompt
@@ -538,9 +520,9 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         const trustedProjectAtStart = isProjectTrustedForSession(projectAgentsDir);
         const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
-          ? discoverAgentsWithStarter(ctx.cwd).discovery
+          ? discoverAgents(ctx.cwd, "both")
           : {
-            agents: (untrustedProjectAgents.length > 0 ? discoverAgents(ctx.cwd, "user") : discoverAgentsWithStarterForScope(ctx.cwd, "user").discovery).agents,
+            agents: discoverAgents(ctx.cwd, "user").agents,
             projectAgentsDir,
           };
         const { agents } = discovery;

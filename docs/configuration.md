@@ -131,5 +131,8 @@ Pi의 일반적인 boolean 프로젝트 신뢰 상태는 충분한 근거로 보
 - `PI_SUBAGENT_PREVENT_CYCLES`
 - `PI_SUBAGENT_TRUSTED_PROJECTS` — 세션 중 임시 승인된 canonical 프로젝트 루트의 JSON 배열
 - `PI_SUBAGENT_DENIED_PROJECTS` — 세션 중 임시 거부된 canonical 프로젝트 루트의 JSON 배열
+- `PI_SUBAGENT_ORIGINAL_AGENT_DIR` — 부모 프로세스의 원래 에이전트 디렉터리
+- `PI_SUBAGENT_INHERITED_API_KEY` — 부모 프로세스에서 상속한 API key 전달용 내부 값
+- `PI_OFFLINE` — 하위 에이전트에서 업데이트 확인, 패키지 업데이트 확인, install/update telemetry 같은 Pi 시작 시 네트워크 작업을 건너뛰도록 설정되는 Pi 런타임 플래그
 
 다른 확장이 위임된 하위 에이전트 프로세스 안에서 실행 중인지 확인해야 한다면 `PI_SUBAGENT_DEPTH`를 확인하세요. `PI_SUBAGENT_DEPTH > 0`이면 "이 Pi 프로세스는 하위 에이전트"로 취급하면 됩니다.

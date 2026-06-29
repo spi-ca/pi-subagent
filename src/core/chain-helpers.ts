@@ -3,7 +3,7 @@ import { isResultError, type SingleResult } from "./types.js";
 
 export type StepConditionName = "always" | "on_success" | "on_error" | "on_completed_with_errors";
 
-export type ChainTask = { agent: string; task: string; cwd?: string };
+export type ChainTask = { agent: string; task: string; cwd?: string; model?: string };
 export type ChainTaskStage = ChainTask & {
   type?: "chain";
   label?: string;

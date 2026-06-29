@@ -4,10 +4,11 @@
  * Delegates tasks to specialized subagents, each running as an isolated `pi`
  * process.
  *
- * Supports two invocation shapes:
+ * Supports four invocation shapes:
  *   - Single:   { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain:    { chain: [{ agent: "name", task: "..." }, ...] }
+ *   - Action:   { action: "status" | "cancel", id?: "..." }
  *
  * And two context modes:
  *   - spawn (default): child gets only the task prompt.
@@ -39,7 +40,31 @@ import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./src/core/project-trust.js";
 import { mapConcurrent, runAgent } from "./src/runtime/runner.js";
-import { SubagentParams, getProjectRootFromAgentsDir, parseProjectRootEnvValue } from "./src/core/subagent-config.js";
+import {
+  BACKGROUND_BEHAVIOR_GUIDANCE,
+  cancelBackgroundJobs,
+  compactBackgroundJobResult,
+  createBackgroundJobRecord,
+  extractToolText,
+  formatUntrustedToolText,
+  formatBackgroundJobListEntry,
+  formatBackgroundJobStatusText,
+  formatInvalidInvocationShapeMessage,
+  formatSubagentSystemPrompt,
+  formatSubagentToolDescription,
+  getBackgroundJobSnapshot,
+  truncateAgentDescription,
+  listBackgroundJobSnapshots,
+  parseBackgroundAction,
+  parseBackgroundFlag,
+  pruneBackgroundJobs,
+  type BackgroundJobRecord,
+  type BackgroundJobStatus,
+  type BackgroundJobToolResult,
+  SubagentParams,
+  getProjectRootFromAgentsDir,
+  parseProjectRootEnvValue,
+} from "./src/core/subagent-config.js";
 import {
   type DelegationMode,
   type SingleResult,
@@ -86,6 +111,94 @@ interface DelegationDepthConfig {
 interface SessionSnapshotSource {
   getHeader: () => unknown;
   getBranch: () => unknown[];
+}
+
+const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
+const MAX_RUNNING_BACKGROUND_JOBS = 4;
+const backgroundJobs = new Map<string, BackgroundJobRecord>();
+
+function countRunningBackgroundJobs(): number {
+  return Array.from(backgroundJobs.values()).filter(
+    (job) => job.status === "running" || job.status === "cancelling",
+  ).length;
+}
+
+function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): void {
+  const details = {
+    jobId: job.id,
+    status: job.status,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+  };
+  const detailText = job.status === "cancelled" ? "" : extractToolText(job.result);
+  const untrustedOutput = detailText
+    ? `\n\n${formatUntrustedToolText(detailText)}`
+    : "";
+  const errorText = job.error ? `\n\n${formatUntrustedToolText(job.error)}` : "";
+  const content = `Background subagent job ${job.id} ${job.status}.${untrustedOutput || errorText}`;
+
+  try {
+    pi.sendMessage(
+      {
+        customType: BACKGROUND_RESULT_CUSTOM_TYPE,
+        content,
+        display: true,
+        details,
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch (error) {
+    console.warn(
+      `[pi-subagent] Failed to deliver background result for job ${job.id}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function finalizeBackgroundJob(
+  pi: ExtensionAPI,
+  job: BackgroundJobRecord,
+  result: BackgroundJobToolResult | undefined,
+  fallbackError: string | undefined,
+): void {
+  const cancellationRequested = job.status === "cancelling";
+  const status: BackgroundJobStatus = cancellationRequested && (fallbackError || result?.isError)
+    ? "cancelled"
+    : result?.isError
+      ? "failed"
+      : fallbackError
+        ? "failed"
+        : "completed";
+  const error = fallbackError;
+
+  job.status = status;
+  job.completedAt = Date.now();
+  job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result);
+  job.error = status === "cancelled" ? undefined : error;
+  backgroundJobs.set(job.id, job);
+  pruneBackgroundJobs(backgroundJobs);
+  notifyBackgroundJobResult(pi, job);
+}
+
+function startBackgroundJob(
+  pi: ExtensionAPI,
+  job: BackgroundJobRecord,
+  run: (signal: AbortSignal) => Promise<BackgroundJobToolResult>,
+): void {
+  pruneBackgroundJobs(backgroundJobs);
+  backgroundJobs.set(job.id, job);
+
+  void run(job.controller.signal)
+    .then((result) => {
+      finalizeBackgroundJob(pi, job, result, undefined);
+    })
+    .catch((error) => {
+      finalizeBackgroundJob(
+        pi,
+        job,
+        undefined,
+        error instanceof Error ? error.message : String(error),
+      );
+    });
 }
 
 function parseDelegationMode(raw: unknown): DelegationMode | null {
@@ -328,6 +441,27 @@ function countCompletedWithErrorChainStages(stages: ChainStageRecord[]): number 
   return stages.filter((stage) => stage.status === "completed_with_errors").length;
 }
 
+function makeUnstartedAbortResult(
+  agent: string,
+  task: string,
+  stageLabel?: string,
+  model?: string,
+): SingleResult {
+  return {
+    agent,
+    agentSource: "unknown",
+    task,
+    stageLabel,
+    exitCode: 1,
+    messages: [],
+    stderr: "Subagent task was not started because the parent invocation was aborted before it reached the concurrency queue.",
+    usage: emptyUsage(),
+    model,
+    stopReason: "aborted",
+    errorMessage: "Not started: parent invocation was aborted.",
+  };
+}
+
 function getCycleViolations(
   requestedNames: Set<string>,
   ancestorAgentStack: string[],
@@ -437,52 +571,18 @@ export default function (pi: ExtensionAPI) {
     if (discoveredAgents.length === 0) return;
 
     const agentList = discoveredAgents
-      .map((a) => `- **${a.name}**: ${a.description}`)
+      .map((a) => JSON.stringify({ name: a.name, description: truncateAgentDescription(a.description) }))
       .join("\n");
     return {
       systemPrompt:
         event.systemPrompt +
-        `\n\n## Available Subagents
-
-The following subagents are available via the \`subagent\` tool:
-
-${agentList}
-
-### How to call the subagent tool
-
-Each subagent runs in an **isolated process**.
-
-Context behavior is controlled by optional 'mode':
-- 'spawn' (default): child receives only the provided task prompt. Best for isolated, reproducible tasks with lower token/cost and less context leakage.
-- 'fork': child receives a forked snapshot of current session context plus the task prompt. Best for follow-up tasks that rely on prior context; usually higher token/cost and may include sensitive context.
-
-Execution surface is selected automatically:
-- inside Zellij: use 'zellij-pane'
-- outside Zellij: use 'inline'
-
-**Single mode** — delegate one task:
-\`\`\`json
-{ "agent": "agent-name", "task": "Detailed task...", "mode": "spawn" }
-\`\`\`
-
-**Parallel mode** — run multiple tasks concurrently (do NOT also set agent/task/chain):
-\`\`\`json
-{ "tasks": [{ "agent": "agent-name", "task": "..." }, { "agent": "other-agent", "task": "..." }], "mode": "fork" }
-\`\`\`
-
-**Chain mode** — run ordered stages sequentially (do NOT also set agent/task/tasks). A stage can be a sequential agent step or a parallel group:
-\`\`\`json
-{ "chain": [{ "label": "discover", "type": "parallel", "tasks": [{ "agent": "scout", "task": "Inspect code" }, { "agent": "researcher", "task": "Check docs" }] }, { "label": "plan", "agent": "planner", "task": "Plan from discovery" }], "mode": "spawn" }
-\`\`\`
-
-Use single mode for one task, parallel mode when tasks are independent and can run simultaneously, and chain mode when later stages depend on earlier outputs. In chain stages, omitted type means a sequential chain step. Optional fields: label, condition, continueOnError.
-
-### Runtime delegation guards
-
-- Max depth: current depth ${currentDepth}, max depth ${maxDepth}
-- Cycle prevention: ${preventCycles ? "enabled" : "disabled"}
-- Current delegation stack: ${ancestorAgentStack.length > 0 ? ancestorAgentStack.join(" -> ") : "(root)"}
-`,
+        formatSubagentSystemPrompt({
+          agentList,
+          currentDepth,
+          maxDepth,
+          preventCycles,
+          stack: JSON.stringify(ancestorAgentStack.length > 0 ? ancestorAgentStack : ["root"]),
+        }),
     };
   });
 
@@ -491,32 +591,168 @@ Use single mode for one task, parallel mode when tasks are independent and can r
     pi.registerTool({
       name: "subagent",
       label: SUBAGENT_TOOL_LABEL,
-      description: [
-        "Delegate work to specialized subagents running in isolated pi processes.",
-        "",
-        "IMPORTANT: Use exactly ONE invocation shape:",
-        "  Single mode:   set `agent` and `task` (both required together).",
-        "  Parallel mode: set `tasks` array (do NOT also set `agent`/`task`/`chain`).",
-        "  Chain mode:    set `chain` array (do NOT also set `agent`/`task`/`tasks`). Chain stages can mix sequential steps and parallel groups.",
-        "",
-        "Optional context mode switch:",
-        "  mode: \"spawn\" (default) -> child gets only your task prompt.",
-        "                             Best for isolated/reproducible work; lower token/cost and less context leakage.",
-        "  mode: \"fork\"            -> child gets current session context + your task prompt.",
-        "                             Best for follow-up work that depends on prior context; higher token/cost and may include sensitive context.",
-        "",
-        "Execution surface:",
-        "  auto-select \"zellij-pane\" inside Zellij and \"inline\" otherwise.",
-        "",
-        'Example single:   { agent: "writer", task: "Rewrite README.md", mode: "spawn" }',
-        'Example parallel: { tasks: [{ agent: "writer", task: "..." }, { agent: "tester", task: "..." }], mode: "fork" }',
-        'Example chain:    { chain: [{ label: "discover", type: "parallel", tasks: [{ agent: "scout", task: "Inspect" }, { agent: "researcher", task: "Check docs" }] }, { label: "plan", agent: "planner", task: "Plan from discovery" }], mode: "spawn" }',
-      ].join("\n"),
+      description: formatSubagentToolDescription(),
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
         applyArgvTrustOverride(projectAgentsDir);
+        const earlyToolDetails = makeDetailsFactory(
+          projectAgentsDir,
+          DEFAULT_DELEGATION_MODE,
+          getDefaultTerminalModeFromEnv(),
+        )("single")([]);
+
+        const hasTasks = (params.tasks?.length ?? 0) > 0;
+        const hasChain = (params.chain?.length ?? 0) > 0;
+        const hasSingle = Boolean(params.agent && params.task);
+        const action = parseBackgroundAction(params.action);
+        const background = parseBackgroundFlag(params.background);
+
+        if (params.action !== undefined && !action) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Invalid action \"${String(params.action)}\". Expected \"status\" or \"cancel\".`,
+              },
+            ],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+
+        if (background === null) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Invalid background value \"${String(params.background)}\". Expected true or false.`,
+              },
+            ],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+
+        if (action) {
+          const hasExecutionField = params.agent !== undefined || params.task !== undefined || params.model !== undefined || params.tasks !== undefined || params.chain !== undefined || params.cwd !== undefined || params.mode !== undefined;
+          if (hasExecutionField) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid parameters. action cannot be combined with agent/task, tasks, or chain.",
+                },
+              ],
+              details: earlyToolDetails,
+              isError: true,
+            };
+          }
+          if (params.id !== undefined && typeof params.id !== "string") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid parameters. id must be a string when provided with action=\"status\" or action=\"cancel\".",
+                },
+              ],
+              details: earlyToolDetails,
+              isError: true,
+            };
+          }
+          if (params.background !== undefined) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Invalid parameters. background cannot be combined with action.",
+                },
+              ],
+              details: earlyToolDetails,
+              isError: true,
+            };
+          }
+          pruneBackgroundJobs(backgroundJobs);
+          if (action === "status") {
+            if (typeof params.id === "string") {
+              const job = getBackgroundJobSnapshot(params.id, backgroundJobs);
+              if (!job) {
+                return {
+                  content: [{ type: "text", text: `Background subagent job ${params.id} was not found.` }],
+                  details: earlyToolDetails,
+                  isError: true,
+                };
+              }
+              return {
+                content: [{ type: "text", text: formatBackgroundJobStatusText(job) }],
+                details: earlyToolDetails,
+              };
+            }
+
+            const jobs = listBackgroundJobSnapshots(backgroundJobs);
+            return {
+              content: [{
+                type: "text",
+                text: jobs.length > 0
+                  ? `Background subagent jobs (${jobs.length}):\n${jobs.map((job) => formatBackgroundJobListEntry(job)).join("\n")}`
+                  : "No background subagent jobs.",
+              }],
+              details: earlyToolDetails,
+            };
+          }
+
+          const cancellation = cancelBackgroundJobs(backgroundJobs, typeof params.id === "string" ? params.id : undefined);
+          if (!cancellation.found) {
+            return {
+              content: [{ type: "text", text: `Background subagent job ${String(params.id)} was not found.` }],
+              details: earlyToolDetails,
+              isError: true,
+            };
+          }
+          if (typeof params.id === "string") {
+            if (cancellation.cancelled.length > 0) {
+              return {
+                content: [{ type: "text", text: `Requested cancellation for background subagent job ${params.id}.` }],
+                details: earlyToolDetails,
+              };
+            }
+            const terminalJob = cancellation.terminal[0];
+            return {
+              content: [{
+                type: "text",
+                text: terminalJob
+                  ? `Background subagent job ${terminalJob.id} is already ${terminalJob.status}.`
+                  : `Background subagent job ${params.id} is not running.`,
+              }],
+              details: earlyToolDetails,
+            };
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: cancellation.cancelled.length > 0
+                ? `Requested cancellation for ${cancellation.cancelled.length} background subagent job(s): ${cancellation.cancelled.map((job) => job.id).join(", ")}.`
+                : "No running background subagent jobs.",
+            }],
+            details: earlyToolDetails,
+          };
+        }
+
+        if (params.id !== undefined) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Invalid parameters. id can only be used with action=\"status\" or action=\"cancel\".",
+              },
+            ],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+
         const trustedProjectAtStart = isProjectTrustedForSession(projectAgentsDir);
         const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
@@ -591,15 +827,25 @@ Use single mode for one task, parallel mode when tasks are independent and can r
         }
 
         // Validate: exactly one invocation shape must be specified
-        const hasTasks = (params.tasks?.length ?? 0) > 0;
-        const hasChain = (params.chain?.length ?? 0) > 0;
-        const hasSingle = Boolean(params.agent && params.task);
         if (Number(hasTasks) + Number(hasChain) + Number(hasSingle) !== 1) {
           return {
             content: [
               {
                 type: "text",
-                text: `Invalid parameters. Provide exactly one invocation shape.\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
+                text: formatInvalidInvocationShapeMessage(formatAgentNames(visibleAgents)),
+              },
+            ],
+            details: makeDetails(intendedMode)([]),
+            isError: true,
+          };
+        }
+
+        if (params.model !== undefined && !hasSingle) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Invalid parameters. top-level model can only be used with single {agent, task} invocations; put model on each task item for parallel or chain calls.",
               },
             ],
             details: makeDetails(intendedMode)([]),
@@ -739,70 +985,107 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           discoveredAgents = fullDiscovery.agents;
         }
 
-        // ── Parallel mode ──
-        if (params.tasks && params.tasks.length > 0) {
-          return executeParallel(
-            params.tasks,
-            delegationMode,
-            terminalMode,
-            trustedProjectRoots,
-            deniedProjectRoots,
-            forkSessionSnapshotJsonl,
-            runnableAgents,
-            ctx.cwd,
-            signal,
-            onUpdate,
-            makeDetails,
-          );
-        }
+        const runInvocation = (
+          executionSignal: AbortSignal | undefined,
+          executionOnUpdate: ((partial: any) => void) | undefined,
+        ) => {
+          if (params.tasks && params.tasks.length > 0) {
+            return executeParallel(
+              params.tasks,
+              delegationMode,
+              terminalMode,
+              trustedProjectRoots,
+              deniedProjectRoots,
+              forkSessionSnapshotJsonl,
+              runnableAgents,
+              ctx.cwd,
+              executionSignal,
+              executionOnUpdate,
+              makeDetails,
+            );
+          }
 
+          if (params.chain && params.chain.length > 0) {
+            return executeChain(
+              params.chain as ChainStage[],
+              delegationMode,
+              terminalMode,
+              trustedProjectRoots,
+              deniedProjectRoots,
+              forkSessionSnapshotJsonl,
+              runnableAgents,
+              ctx.cwd,
+              executionSignal,
+              executionOnUpdate,
+              makeDetails,
+            );
+          }
 
+          if (params.agent && params.task) {
+            return executeSingle(
+              params.agent,
+              params.task,
+              params.cwd,
+              params.model,
+              delegationMode,
+              terminalMode,
+              trustedProjectRoots,
+              deniedProjectRoots,
+              forkSessionSnapshotJsonl,
+              runnableAgents,
+              ctx.cwd,
+              executionSignal,
+              executionOnUpdate,
+              makeDetails,
+            );
+          }
 
-        // ── Chain mode ──
-        if (params.chain && params.chain.length > 0) {
-          return executeChain(
-            params.chain as ChainStage[],
-            delegationMode,
-            terminalMode,
-            trustedProjectRoots,
-            deniedProjectRoots,
-            forkSessionSnapshotJsonl,
-            runnableAgents,
-            ctx.cwd,
-            signal,
-            onUpdate,
-            makeDetails,
-          );
-        }
-
-        // ── Single mode ──
-        if (params.agent && params.task) {
-          return executeSingle(
-            params.agent,
-            params.task,
-            params.cwd,
-            delegationMode,
-            terminalMode,
-            trustedProjectRoots,
-            deniedProjectRoots,
-            forkSessionSnapshotJsonl,
-            runnableAgents,
-            ctx.cwd,
-            signal,
-            onUpdate,
-            makeDetails,
-          );
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid parameters. Available agents: ${formatAgentNames(agents)}`,
-            },
-          ],
-          details: makeDetails("single")([]),
+          return Promise.resolve({
+            content: [
+              {
+                type: "text" as const,
+                text: `Invalid parameters. Available agents: ${formatAgentNames(agents)}`,
+              },
+            ],
+            details: makeDetails("single")([]),
+          });
         };
+
+        if (background) {
+          pruneBackgroundJobs(backgroundJobs);
+          if (countRunningBackgroundJobs() >= MAX_RUNNING_BACKGROUND_JOBS) {
+            return {
+              content: [{
+                type: "text",
+                text: `Cannot start background subagent job: ${MAX_RUNNING_BACKGROUND_JOBS} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
+              }],
+              details: makeDetails(intendedMode, detailsExtras)([]),
+              isError: true,
+            };
+          }
+
+          const job = createBackgroundJobRecord({
+            mode: intendedMode,
+            agent: params.agent,
+            task: params.task,
+            taskCount: params.tasks?.length,
+            chainStageCount: params.chain?.length,
+          });
+          startBackgroundJob(pi, job, (jobSignal) => runInvocation(jobSignal, undefined));
+          return {
+            content: [{
+              type: "text",
+              text: `Started background subagent job ${job.id}. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
+            }],
+            details: {
+              ...makeDetails(intendedMode, detailsExtras)([]),
+              jobId: job.id,
+              status: job.status,
+            },
+          };
+        }
+
+        return runInvocation(signal, onUpdate);
       },
 
       renderCall: (args, theme) => renderCall(args, theme),
@@ -819,6 +1102,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     agentName: string,
     task: string,
     cwd: string | undefined,
+    model: string | undefined,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
     trustedProjectRoots: string[],
@@ -836,6 +1120,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       agentName,
       task,
       taskCwd: cwd,
+      model,
       delegationMode,
       terminalMode,
       trustedProjectRoots,
@@ -944,6 +1229,32 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       const label = getStageLabel(stage, index);
       const continueOnError = stage.continueOnError ?? false;
 
+      if (signal?.aborted) {
+        stages.push({
+          label,
+          type: stageType,
+          status: "failed",
+          results: [],
+          reason: "parent invocation aborted before this stage started",
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Chain aborted before stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+            },
+          ],
+          details: makeDetails("chain", {
+            chainStageCount: chain.length,
+            chainCompletedCount: countCompletedChainStages(stages),
+            chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
+            chainFailedCount: countFailedChainStages(stages),
+            chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
+          })(flattenedResults),
+          isError: true,
+        };
+      }
+
       if (!shouldRunStage(stage.condition, state)) {
         stages.push({
           label,
@@ -967,6 +1278,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           messages: [],
           stderr: "",
           usage: emptyUsage(),
+          model: task.model,
         }));
         emitProgress(runningResults);
 
@@ -974,7 +1286,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           ? getCurrentZellijPaneIdFromEnv()
           : undefined;
 
-        const stageResults = await mapConcurrent(
+        const maybeStageResults = await mapConcurrent(
           parallel.tasks,
           MAX_CONCURRENCY,
           async (task, taskIndex) => {
@@ -985,6 +1297,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               task: buildChainTaskFromStages(task.task, stages),
               stageLabel: label,
               taskCwd: task.cwd,
+              model: task.model,
               delegationMode,
               terminalMode,
               paneTitleSuffix: `#${taskIndex + 1}`,
@@ -1018,6 +1331,15 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             emitProgress(runningResults);
             return result;
           },
+          { signal },
+        );
+        const stageResults = maybeStageResults.map((result, taskIndex) =>
+          result ?? makeUnstartedAbortResult(
+            parallel.tasks[taskIndex].agent,
+            buildChainTaskFromStages(parallel.tasks[taskIndex].task, stages),
+            label,
+            parallel.tasks[taskIndex].model,
+          ),
         );
 
         flattenedResults.push(...stageResults);
@@ -1066,6 +1388,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         messages: [],
         stderr: "",
         usage: emptyUsage(),
+        model: taskStage.model,
       };
       emitProgress([runningResult]);
 
@@ -1076,6 +1399,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         task: buildChainTaskFromStages(taskStage.task, stages),
         stageLabel: label,
         taskCwd: taskStage.cwd,
+        model: taskStage.model,
         delegationMode,
         terminalMode,
         trustedProjectRoots,
@@ -1161,7 +1485,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
   }
 
   async function executeParallel(
-    tasks: Array<{ agent: string; task: string; cwd?: string }>,
+    tasks: Array<{ agent: string; task: string; cwd?: string; model?: string }>,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
     trustedProjectRoots: string[],
@@ -1187,7 +1511,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     }
 
     // Initialize placeholder results for streaming
-    const allResults: SingleResult[] = tasks.map((t) => ({
+    let allResults: SingleResult[] = tasks.map((t) => ({
       agent: t.agent,
       agentSource: "unknown" as const,
       task: t.task,
@@ -1195,6 +1519,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       messages: [],
       stderr: "",
       usage: emptyUsage(),
+      model: t.model,
     }));
 
     const emitProgress = () => {
@@ -1226,7 +1551,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         ? getCurrentZellijPaneIdFromEnv()
         : undefined;
 
-      results = await mapConcurrent(
+      const maybeResults = await mapConcurrent(
         tasks,
         MAX_CONCURRENCY,
         async (t, index) => {
@@ -1236,6 +1561,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             agentName: t.agent,
             task: t.task,
             taskCwd: t.cwd,
+            model: t.model,
             delegationMode,
             terminalMode,
             paneTitleSuffix: `#${index + 1}`,
@@ -1260,7 +1586,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           emitProgress();
           return result;
         },
+        { signal },
       );
+      results = maybeResults.map((result, index) =>
+        result ?? makeUnstartedAbortResult(tasks[index].agent, tasks[index].task, undefined, tasks[index].model),
+      );
+      allResults = results;
     } finally {
       if (heartbeat) clearInterval(heartbeat);
     }

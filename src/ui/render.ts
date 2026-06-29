@@ -187,6 +187,12 @@ export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold
 	const modeBadge = theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`);
 	const toolTitle = theme.fg("toolTitle", theme.bold(`${SUBAGENT_TOOL_LABEL} `));
 
+	if (args.action) {
+		const idText = typeof args.id === "string" && args.id.length > 0 ? ` ${args.id}` : " all";
+		const text = toolTitle + theme.fg("accent", `background ${args.action}`) + theme.fg("dim", idText);
+		return new Text(text, 0, 0);
+	}
+
 	if (args.tasks && args.tasks.length > 0) {
 		let text = toolTitle + theme.fg("accent", `parallel: ${args.tasks.length} tasks`) + modeBadge;
 		for (const t of args.tasks.slice(0, 3)) {

@@ -800,8 +800,9 @@ export function getInheritedCliArgsForAgent(
   agent: Pick<AgentConfig, "source" | "model">,
   alwaysProxy: string[] = inheritedCliArgs.alwaysProxy,
   fallbackModel: string | undefined = inheritedCliArgs.fallbackModel,
+  modelOverride?: string,
 ): string[] {
-  if (!getProviderFromModelSpecifier(agent.model ?? fallbackModel)) return alwaysProxy;
+  if (!getProviderFromModelSpecifier(modelOverride ?? agent.model ?? fallbackModel)) return alwaysProxy;
   return stripFlagWithValue(alwaysProxy, "--provider");
 }
 
@@ -811,12 +812,13 @@ export function buildPiArgs(
   taskFilePath: string,
   delegationMode: DelegationMode,
   forkSessionPath: string | null,
+  modelOverride?: string,
 ): string[] {
   const args: string[] = [
     "--mode",
     "json",
     ...inheritedCliArgs.extensionArgs,
-    ...getInheritedCliArgsForAgent(agent),
+    ...getInheritedCliArgsForAgent(agent, inheritedCliArgs.alwaysProxy, inheritedCliArgs.fallbackModel, modelOverride),
     "-p",
   ];
 
@@ -826,7 +828,7 @@ export function buildPiArgs(
     args.push("--session", forkSessionPath);
   }
 
-  const model = agent.model ?? inheritedCliArgs.fallbackModel;
+  const model = modelOverride ?? agent.model ?? inheritedCliArgs.fallbackModel;
   if (model) args.push("--model", model);
 
   const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
@@ -876,6 +878,8 @@ export interface RunAgentOptions {
   stageLabel?: string;
   /** Optional override working directory. */
   taskCwd?: string;
+  /** Optional per-call model override. */
+  model?: string;
   /** Context mode: spawn (fresh) or fork (session snapshot + task). */
   delegationMode: DelegationMode;
   /** Execution surface for child runs. */
@@ -919,6 +923,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     task,
     stageLabel,
     taskCwd,
+    model: modelOverride,
     delegationMode,
     terminalMode,
     paneTitleSuffix,
@@ -947,6 +952,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       messages: [],
       stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
       usage: emptyUsage(),
+      model: modelOverride,
     };
   }
 
@@ -964,7 +970,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       stderr:
         "Cannot run in fork mode: missing parent session snapshot context.",
       usage: emptyUsage(),
-      model: agent.model,
+      model: modelOverride ?? agent.model,
       stopReason: "error",
       errorMessage:
         "Cannot run in fork mode: missing parent session snapshot context.",
@@ -980,7 +986,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     messages: [],
     stderr: "",
     usage: emptyUsage(),
-    model: agent.model,
+    model: modelOverride ?? agent.model,
   };
 
   const emitUpdate = () => {
@@ -996,9 +1002,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   const { inheritedApiKeyBinding, warningMessage: inheritedApiKeyWarningMessage } =
-    resolveInheritedCliApiKeyForChild(inheritedCliArgs, agent, {
-      projectAgentTrusted: isProjectAgentExplicitlyTrusted(agent, trustedProjectRoots, deniedProjectRoots),
-    });
+    resolveInheritedCliApiKeyForChild(
+      inheritedCliArgs,
+      modelOverride ? { ...agent, model: modelOverride } : agent,
+      {
+        projectAgentTrusted: isProjectAgentExplicitlyTrusted(agent, trustedProjectRoots, deniedProjectRoots),
+      },
+    );
   if (inheritedApiKeyWarningMessage) {
     console.warn(`[pi-subagent] ${inheritedApiKeyWarningMessage}`);
   }
@@ -1034,6 +1044,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       taskTmp.filePath,
       delegationMode,
       forkSessionTmpPath,
+      modelOverride,
     );
     const effectiveCwd = taskCwd ?? cwd;
     const effectiveProjectRoot = getProjectRootForCwd(effectiveCwd);
@@ -1523,16 +1534,19 @@ export async function mapConcurrent<TIn, TOut>(
   items: TIn[],
   concurrency: number,
   fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
+  options: { signal?: AbortSignal } = {},
+): Promise<Array<TOut | undefined>> {
   if (items.length === 0) return [];
   const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
+  const results: Array<TOut | undefined> = new Array(items.length);
   let nextIndex = 0;
 
   const worker = async () => {
     while (true) {
+      if (options.signal?.aborted) return;
       const i = nextIndex++;
       if (i >= items.length) return;
+      if (options.signal?.aborted) return;
       results[i] = await fn(items[i], i);
     }
   };

@@ -12,6 +12,7 @@ import {
   prepareInheritedApiKeyAgentDir,
   prepareZellijTempArtifacts,
   resolveInheritedCliApiKeyForChild,
+  runAgent,
   scheduleDelayedInheritedApiKeyEnvDirCleanup,
 } from "../../src/runtime/runner";
 
@@ -300,6 +301,68 @@ describe("subagent auth propagation", () => {
       ),
       ["--provider", "openrouter", "--theme", "night-owl"],
     );
+  });
+
+  test("uses per-call model override when deciding child model args and inherited provider flags", () => {
+    assert.deepEqual(
+      getInheritedCliArgsForAgent(
+        { source: "user", model: "claude-3-5-sonnet" },
+        ["--provider", "openrouter", "--theme", "night-owl"],
+        undefined,
+        "anthropic/claude-sonnet-4",
+      ),
+      ["--theme", "night-owl"],
+    );
+
+    const args = buildPiArgs(
+      {
+        name: "worker",
+        description: "Worker",
+        systemPrompt: "",
+        source: "user",
+        filePath: "/tmp/worker.md",
+        model: "openai/gpt-4.1",
+      },
+      null,
+      "/tmp/task-worker.md",
+      "spawn",
+      null,
+      "anthropic/claude-sonnet-4",
+    );
+
+    assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), [
+      "--model",
+      "anthropic/claude-sonnet-4",
+    ]);
+    assert.equal(args.includes("openai/gpt-4.1"), false);
+  });
+
+  test("keeps per-call model override on early unknown-agent results", async () => {
+    const result = await runAgent({
+      cwd: process.cwd(),
+      agents: [],
+      agentName: "missing",
+      task: "Do work",
+      model: "anthropic/claude-sonnet-4",
+      delegationMode: "spawn",
+      terminalMode: "inline",
+      parentDepth: 0,
+      parentAgentStack: [],
+      maxDepth: 3,
+      preventCycles: true,
+      makeDetails: (results) => ({
+        mode: "single",
+        toolLabel: "Subagent",
+        delegationMode: "spawn",
+        terminalMode: "inline",
+        projectAgentsDir: null,
+        results,
+      }),
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.model, "anthropic/claude-sonnet-4");
+    assert.match(result.stderr, /Unknown agent/);
   });
 
   test("passes delegated task via @file instead of argv text", () => {

@@ -23,6 +23,7 @@ export type InheritedCliApiKeyEnvResolution =
 
 // Built-in provider env var names documented by Pi in docs/providers.md.
 export const PROVIDER_API_KEY_ENV_VAR_MAP: Record<string, string> = {
+  "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
   "ant-ling": "ANT_LING_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   "azure-openai-responses": "AZURE_OPENAI_API_KEY",
@@ -43,6 +44,7 @@ export const PROVIDER_API_KEY_ENV_VAR_MAP: Record<string, string> = {
   "opencode-go": "OPENCODE_API_KEY",
   openai: "OPENAI_API_KEY",
   openrouter: "OPENROUTER_API_KEY",
+  radius: "RADIUS_API_KEY",
   together: "TOGETHER_API_KEY",
   "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
   xai: "XAI_API_KEY",

@@ -9,7 +9,6 @@
     "checkJs": false,
     "skipLibCheck": true,
     "types": ["node"],
-    "baseUrl": ".",
     "paths": {
       "@earendil-works/pi-agent-core": ["../../npm/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"],
       "@earendil-works/pi-ai": ["../../npm/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cmux_version": "0.64.20",
+  "new_split_response": {
+    "workspace_id": "2FF1CE1C-5160-461B-9412-A5630EA19054",
+    "pane_id": "ACDC865F-C84C-4C55-A88F-052B7E8DBDA3",
+    "surface_id": "0F61DF95-D7D5-44D4-B251-B2B44DF0CF8B"
+  },
+  "new_surface_response": {
+    "workspace_id": "2FF1CE1C-5160-461B-9412-A5630EA19054",
+    "pane_id": "ACDC865F-C84C-4C55-A88F-052B7E8DBDA3",
+    "surface_id": "376BE831-7124-4889-B937-C17A46435E40"
+  },
+  "last_surface_pane": "removed",
+  "capabilities": {
+    "surface.create": true,
+    "surface.close": true,
+    "surface.send_key": true,
+    "surface.respawn": true
+  }
+}

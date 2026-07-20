@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -131,6 +131,7 @@ describe("project trust boundaries", () => {
       const nestedAgentsDir = path.join(nestedRoot, ".pi", "agents");
       await fs.mkdir(nestedAgentsDir, { recursive: true });
 
+      const canonicalNestedRoot = await fs.realpath(nestedRoot);
       const trustedRoots = new Set<string>();
       const deniedRoots = new Set<string>([nestedRoot]);
 
@@ -149,8 +150,8 @@ describe("project trust boundaries", () => {
         trustedRoots,
         deniedRoots,
       );
-      assert.equal(approvedRoot, nestedRoot);
-      assert.deepEqual(Array.from(trustedRoots), [nestedRoot]);
+      assert.equal(approvedRoot, canonicalNestedRoot);
+      assert.deepEqual(Array.from(trustedRoots), [canonicalNestedRoot]);
       assert.deepEqual(Array.from(deniedRoots), []);
       assert.equal(
         isTrustedProjectAgentsDirWithSessionOverrides(nestedAgentsDir, {

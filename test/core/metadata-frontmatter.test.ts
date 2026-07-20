@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { extractFrontmatterBlock, readFrontmatterOnly } from "../../src/core/metadata-frontmatter";
 import * as fs from "node:fs";

@@ -9,7 +9,7 @@ import { getFinalAssistantText } from "./runner-events.js";
 export type DelegationMode = "spawn" | "fork";
 
 /** Execution surface for delegated runs. */
-export type TerminalMode = "inline" | "zellij-pane";
+export type TerminalMode = "inline" | "cmux-pane" | "tmux-pane";
 
 /** Display label for the subagent tool. */
 export const SUBAGENT_TOOL_LABEL = "Subagent";
@@ -20,19 +20,29 @@ export const DEFAULT_DELEGATION_MODE: DelegationMode = "spawn";
 /** Default execution surface for delegated runs. */
 export const DEFAULT_TERMINAL_MODE: TerminalMode = "inline";
 
-function hasNonEmptyEnvVar(name: "ZELLIJ" | "ZELLIJ_PANE_ID"): boolean {
-	const raw = process.env[name];
-	return typeof raw === "string" && raw.trim().length > 0;
+const CMUX_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TMUX_PANE_ID_RE = /^%(?:0|[1-9][0-9]*)$/;
+const CANONICAL_POSITIVE_PID_RE = /^[1-9][0-9]*$/;
+
+/** Whether the current process has stable cmux UUID identity (refs are not identity). */
+export function isInsideCmux(env: NodeJS.ProcessEnv = process.env): boolean {
+	return CMUX_UUID_RE.test(env.CMUX_WORKSPACE_ID?.trim() ?? "") && CMUX_UUID_RE.test(env.CMUX_SURFACE_ID?.trim() ?? "");
 }
 
-/** Whether the current process is running inside a Zellij session. */
-export function isInsideZellij(): boolean {
-	return hasNonEmptyEnvVar("ZELLIJ") || hasNonEmptyEnvVar("ZELLIJ_PANE_ID");
+/** Whether the current process has a canonical tmux pane identity. */
+export function isInsideTmux(env: NodeJS.ProcessEnv = process.env): boolean {
+	// Keep this canonical parser local to avoid a core↔runtime dependency cycle.
+	// The opaque socket prefix may be empty or contain whitespace and commas;
+	// only the numeric right-side fields are structural.
+	const match = /^(.*),\s*(\d+)\s*,\s*(\d+)\s*$/.exec(env.TMUX ?? "");
+	return Boolean(match) && CANONICAL_POSITIVE_PID_RE.test(match?.[2] ?? "") && Number.isSafeInteger(Number(match?.[2])) && TMUX_PANE_ID_RE.test(env.TMUX_PANE?.trim() ?? "");
 }
 
 /** Default execution surface inferred from the current environment. */
-export function getDefaultTerminalModeFromEnv(): TerminalMode {
-	return isInsideZellij() ? "zellij-pane" : DEFAULT_TERMINAL_MODE;
+export function getDefaultTerminalModeFromEnv(env: NodeJS.ProcessEnv = process.env, platform = process.platform): TerminalMode {
+	if (platform === "win32") return DEFAULT_TERMINAL_MODE;
+	if (isInsideCmux(env)) return "cmux-pane";
+	return isInsideTmux(env) ? "tmux-pane" : DEFAULT_TERMINAL_MODE;
 }
 
 /** Aggregated token usage from a subagent run. `contextTokens` tracks the latest assistant turn context size. */

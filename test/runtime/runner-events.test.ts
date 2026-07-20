@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { getResultSummaryText, processPiEvent } from "../../src/core/runner-events";
 import { emptyUsage, getFinalOutput } from "../../src/core/types";

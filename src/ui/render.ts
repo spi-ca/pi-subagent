@@ -70,7 +70,7 @@ function normalizeTerminalMode(raw: unknown, inferFromEnv = true): TerminalMode 
 	}
 	if (typeof raw !== "string") return "invalid";
 	const normalized = raw.trim().toLowerCase();
-	if (normalized === "inline" || normalized === "zellij-pane") return normalized;
+	if (normalized === "inline" || normalized === "cmux-pane" || normalized === "tmux-pane") return normalized;
 	return "invalid";
 }
 

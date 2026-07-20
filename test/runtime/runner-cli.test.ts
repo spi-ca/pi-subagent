@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -12,7 +12,7 @@ async function withTempCwd<T>(run: (cwd: string) => Promise<T> | T): Promise<T> 
 
   try {
     process.chdir(tempDir);
-    return await run(tempDir);
+    return await run(process.cwd());
   } finally {
     process.chdir(originalCwd);
     await fs.promises.rm(tempDir, { recursive: true, force: true });

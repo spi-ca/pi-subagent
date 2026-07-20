@@ -1,10 +1,32 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { monitorInlineProcess } from "../../src/runtime/runner";
+import { monitorInlineProcess, signalUnixProcessTree } from "../../src/runtime/runner";
 import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "../../src/core/types";
 
 describe("inline runner path", () => {
+  test("signals the Unix process group before falling back to the direct child", () => {
+    const calls: Array<[number | string, string]> = [];
+    const proc = {
+      pid: 123,
+      kill(signal: string) {
+        calls.push(["direct", signal]);
+        return true;
+      },
+    };
+    signalUnixProcessTree(proc as any, "SIGTERM", (pid, signal) => {
+      calls.push([pid, signal]);
+      return true;
+    });
+    assert.deepEqual(calls, [[-123, "SIGTERM"]]);
+
+    calls.length = 0;
+    signalUnixProcessTree(proc as any, "SIGKILL", () => {
+      throw new Error("missing process group");
+    });
+    assert.deepEqual(calls, [["direct", "SIGKILL"]]);
+  });
+
   test("preserves semantic completion across chunked JSONL output", async () => {
     const script = [
       'process.stdout.write("{\\"type\\":\\"message_end\\",\\"message\\":{\\"role\\":\\"assistant\\",\\"content\\":[{\\"type\\":\\"text\\",\\"text\\":\\"DO");',

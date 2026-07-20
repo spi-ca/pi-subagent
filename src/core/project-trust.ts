@@ -53,6 +53,12 @@ function canonicalizeProjectRootSet(roots: Iterable<string> | undefined): Set<st
   return new Set(Array.from(roots ?? [], (root) => canonicalizePathForTrust(root)));
 }
 
+function canonicalizeMutableProjectRootSet(roots: Set<string>): void {
+  const canonical = canonicalizeProjectRootSet(roots);
+  roots.clear();
+  for (const root of canonical) roots.add(root);
+}
+
 export function applySessionProjectTrustOverride(
   projectAgentsDir: string | null,
   trustOverride: boolean | null,
@@ -62,6 +68,8 @@ export function applySessionProjectTrustOverride(
   const projectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
   if (!projectRoot || trustOverride === null) return projectRoot;
 
+  canonicalizeMutableProjectRootSet(sessionTrustedProjectRoots);
+  canonicalizeMutableProjectRootSet(sessionDeniedProjectRoots);
   if (trustOverride) {
     sessionDeniedProjectRoots.delete(projectRoot);
     sessionTrustedProjectRoots.add(projectRoot);

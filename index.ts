@@ -14,9 +14,9 @@
  *   - spawn (default): child gets only the task prompt.
  *   - fork: child gets a forked snapshot of current session context + task prompt.
  *
- * Plus two execution surfaces:
- *   - inline (non-Zellij fallback): child pi runs directly and streams stdout.
- *   - zellij-pane: child pi runs in a new Zellij pane, JSON is bridged back through a FIFO, and the pane renders human-readable progress.
+ * Plus three execution surfaces:
+ *   - inline: child pi runs headlessly and streams JSON stdout.
+ *   - cmux-pane / tmux-pane: child pi runs as an interactive TUI in a managed pane.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,7 +39,8 @@ import { type AgentConfig, discoverAgents, findNearestProjectAgentsDir } from ".
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./src/core/project-trust.js";
-import { mapConcurrent, runAgent } from "./src/runtime/runner.js";
+import { beginInteractiveShutdownForSession, getInteractiveShutdownGenerationForTest, mapConcurrent, reapStaleInteractiveRuns, resetInteractiveShutdownForSession, runAgent, shutdownActiveInteractiveRuns } from "./src/runtime/runner.js";
+import { resolveInteractivePaneLayout, type InteractivePaneLayout } from "./src/runtime/interactive-layout.js";
 import {
   BACKGROUND_BEHAVIOR_GUIDANCE,
   cancelBackgroundJobs,
@@ -83,11 +84,11 @@ import {
 // Limits
 // ---------------------------------------------------------------------------
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CHAIN_STEPS = 8;
-const MAX_CONCURRENCY = 4;
+const MAX_PARALLEL_TASKS = 50;
+const MAX_CHAIN_STEPS = 12;
+const MAX_CONCURRENCY = 16;
 const PARALLEL_HEARTBEAT_MS = 1000;
-const DEFAULT_MAX_DELEGATION_DEPTH = 3;
+const DEFAULT_MAX_DELEGATION_DEPTH = 5;
 const DEFAULT_PREVENT_CYCLE_DELEGATION = true;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
@@ -115,7 +116,9 @@ interface SessionSnapshotSource {
 
 const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
 const MAX_RUNNING_BACKGROUND_JOBS = 4;
+const BACKGROUND_SHUTDOWN_SETTLE_MS = 3_000;
 const backgroundJobs = new Map<string, BackgroundJobRecord>();
+const backgroundJobSettlements = new Map<string, Promise<void>>();
 
 function countRunningBackgroundJobs(): number {
   return Array.from(backgroundJobs.values()).filter(
@@ -187,7 +190,7 @@ function startBackgroundJob(
   pruneBackgroundJobs(backgroundJobs);
   backgroundJobs.set(job.id, job);
 
-  void run(job.controller.signal)
+  const settlement = run(job.controller.signal)
     .then((result) => {
       finalizeBackgroundJob(pi, job, result, undefined);
     })
@@ -198,7 +201,21 @@ function startBackgroundJob(
         undefined,
         error instanceof Error ? error.message : String(error),
       );
+    })
+    .finally(() => {
+      backgroundJobSettlements.delete(job.id);
     });
+  backgroundJobSettlements.set(job.id, settlement);
+}
+
+/** Await post-abort background settlement without allowing session shutdown to hang. */
+async function settleBackgroundJobsForShutdown(): Promise<void> {
+  const settlements = Array.from(backgroundJobSettlements.values());
+  if (settlements.length === 0) return;
+  await Promise.race([
+    Promise.allSettled(settlements).then(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, BACKGROUND_SHUTDOWN_SETTLE_MS)),
+  ]);
 }
 
 function parseDelegationMode(raw: unknown): DelegationMode | null {
@@ -209,14 +226,6 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
     return normalized;
   }
   return null;
-}
-
-function getCurrentZellijPaneIdFromEnv(): string | undefined {
-  const raw = process.env["ZELLIJ_PANE_ID"]?.trim();
-  if (!raw) return undefined;
-  if (/^(terminal|plugin)_\d+$/.test(raw)) return raw;
-  if (/^\d+$/.test(raw)) return `terminal_${raw}`;
-  return undefined;
 }
 
 function buildForkSessionSnapshotJsonl(
@@ -504,8 +513,8 @@ async function requestProjectAgentApprovalIfNeeded(
   const names = projectAgents.map((a) => a.name).join(", ");
   const dir = projectAgentsDir ?? "(unknown)";
   return ctx.ui.confirm(
-    "Run project-local agents?",
-    `Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+    "Approve project-local agent prompts?",
+    `Agents: ${names}\nSource: ${dir}\n\nThis approves only these repo-controlled agent prompts. Child Pi runs remain project-unapproved and do not load .pi settings, extensions, packages, or themes.`,
   );
 }
 
@@ -515,7 +524,7 @@ async function requestProjectAgentApprovalIfNeeded(
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("subagent-max-depth", {
-    description: "Maximum allowed subagent delegation depth (default: 3).",
+    description: "Maximum allowed subagent delegation depth (default: 5).",
     type: "string",
   });
   pi.registerFlag("subagent-prevent-cycles", {
@@ -523,11 +532,19 @@ export default function (pi: ExtensionAPI) {
       "Block delegating to agents already in the current delegation stack (default: true).",
     type: "boolean",
   });
+  pi.registerFlag("subagent-pane-layout", {
+    description: "Interactive pane layout: auto (shared pane/window) or split (per-run split).",
+    type: "string",
+  });
+  // Resolve at extension initialization so an invalid inherited child value
+  // cannot wait until a later tool invocation to fail.
+  const interactivePaneLayout = resolveInteractivePaneLayout(pi.getFlag("subagent-pane-layout"));
   const depthConfig = resolveDelegationDepthConfig(pi);
   const { currentDepth, maxDepth, canDelegate, ancestorAgentStack, preventCycles } =
     depthConfig;
 
   let discoveredAgents: AgentConfig[] = [];
+  let sessionShuttingDown = false;
 
   const sessionTrustedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_TRUSTED_PROJECTS_ENV]));
   const sessionDeniedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_DENIED_PROJECTS_ENV]));
@@ -554,6 +571,13 @@ export default function (pi: ExtensionAPI) {
 
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    sessionShuttingDown = false;
+    await resetInteractiveShutdownForSession();
+    if (currentDepth === 0) {
+      await reapStaleInteractiveRuns().catch((error) => {
+        console.warn(`[pi-subagent] Failed to reap stale interactive runs: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     if (!canDelegate) return;
 
     const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
@@ -563,6 +587,16 @@ export default function (pi: ExtensionAPI) {
       ? discoverAgents(ctx.cwd, "both")
       : discoverAgents(ctx.cwd, "user");
     discoveredAgents = discovery.agents;
+  });
+
+  pi.on("session_shutdown", async () => {
+    // Fence before cancellation/settlement so a delayed background callback
+    // cannot start while shutdown is waiting for it.
+    sessionShuttingDown = true;
+    await beginInteractiveShutdownForSession();
+    cancelBackgroundJobs(backgroundJobs);
+    await settleBackgroundJobsForShutdown();
+    await shutdownActiveInteractiveRuns();
   });
 
   // Inject available agents into the system prompt
@@ -602,6 +636,20 @@ export default function (pi: ExtensionAPI) {
           DEFAULT_DELEGATION_MODE,
           getDefaultTerminalModeFromEnv(),
         )("single")([]);
+
+        if (sessionShuttingDown) {
+          return {
+            content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+        // Capture only after the initial session check. A reset deliberately
+        // creates a different generation, so stale approval/background work
+        // can never become valid in the new session.
+        const interactiveShutdownGeneration = getInteractiveShutdownGenerationForTest();
+        const canStartInvocation = () => !sessionShuttingDown
+          && getInteractiveShutdownGenerationForTest() === interactiveShutdownGeneration;
 
         const hasTasks = (params.tasks?.length ?? 0) > 0;
         const hasChain = (params.chain?.length ?? 0) > 0;
@@ -766,6 +814,8 @@ export default function (pi: ExtensionAPI) {
 
         const delegationMode = parseDelegationMode(params.mode);
         const terminalMode = getDefaultTerminalModeFromEnv();
+        const parentSessionId = ctx.sessionManager.getSessionId();
+        const parentSessionFile = ctx.sessionManager.getSessionFile();
         const intendedMode = inferInvocationMode(params);
         if (!delegationMode) {
           const fallbackDetails = makeDetailsFactory(
@@ -972,7 +1022,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               content: [
                 {
                   type: "text",
-                  text: `Blocked: project-local agent confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRun from an interactive session and approve this exact project root, or pass --approve to trust the current nearest project-agent root for this session.`,
+                  text: `Blocked: project-local agent prompt confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRun from an interactive session and approve this exact project-agent root, or pass --approve to approve only its project-agent prompts for this session. Child Pi runs still use --no-approve and do not load other .pi project code.`,
                 },
               ],
               details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
@@ -985,18 +1035,41 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           discoveredAgents = fullDiscovery.agents;
         }
 
+        // Approval can yield to session shutdown. Do not permit its old
+        // invocation capture to start work after the fence/reset.
+        if (!canStartInvocation()) {
+          return {
+            content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
+            details: makeDetails(intendedMode, detailsExtras)([]),
+            isError: true,
+          };
+        }
+
         const runInvocation = (
           executionSignal: AbortSignal | undefined,
           executionOnUpdate: ((partial: any) => void) | undefined,
         ) => {
+          // Recheck immediately before every foreground call and every
+          // background callback. This is intentionally exact, not best effort.
+          if (!canStartInvocation()) {
+            return Promise.resolve({
+              content: [{ type: "text" as const, text: "Cannot start subagents while the parent session is shutting down." }],
+              details: makeDetails(intendedMode, detailsExtras)([]),
+              isError: true,
+            });
+          }
           if (params.tasks && params.tasks.length > 0) {
             return executeParallel(
               params.tasks,
               delegationMode,
               terminalMode,
+              interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
               forkSessionSnapshotJsonl,
+              parentSessionId,
+              parentSessionFile,
+              interactiveShutdownGeneration,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1010,9 +1083,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               params.chain as ChainStage[],
               delegationMode,
               terminalMode,
+              interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
               forkSessionSnapshotJsonl,
+              parentSessionId,
+              parentSessionFile,
+              interactiveShutdownGeneration,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1029,9 +1106,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               params.model,
               delegationMode,
               terminalMode,
+              interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
               forkSessionSnapshotJsonl,
+              parentSessionId,
+              parentSessionFile,
+              interactiveShutdownGeneration,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1052,6 +1133,15 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         };
 
         if (background) {
+          // This check is separate from the callback check above: no job is
+          // published as started after shutdown has fenced the invocation.
+          if (!canStartInvocation()) {
+            return {
+              content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
+              details: makeDetails(intendedMode, detailsExtras)([]),
+              isError: true,
+            };
+          }
           pruneBackgroundJobs(backgroundJobs);
           if (countRunningBackgroundJobs() >= MAX_RUNNING_BACKGROUND_JOBS) {
             return {
@@ -1105,9 +1195,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     model: string | undefined,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
+    interactivePaneLayout: InteractivePaneLayout,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
+    parentSessionId: string,
+    parentSessionFile: string | undefined,
+    interactiveShutdownGeneration: number,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -1123,9 +1217,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       model,
       delegationMode,
       terminalMode,
+      interactivePaneLayout,
       trustedProjectRoots,
       deniedProjectRoots,
       forkSessionSnapshotJsonl,
+      parentSessionId,
+      parentSessionFile,
+      interactiveShutdownGeneration,
       parentDepth: currentDepth,
       parentAgentStack: ancestorAgentStack,
       maxDepth,
@@ -1163,9 +1261,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     chain: ChainStage[],
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
+    interactivePaneLayout: InteractivePaneLayout,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
+    parentSessionId: string,
+    parentSessionFile: string | undefined,
+    interactiveShutdownGeneration: number,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -1282,10 +1384,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         }));
         emitProgress(runningResults);
 
-        const sharedRestoreFocusPaneId = terminalMode === "zellij-pane"
-          ? getCurrentZellijPaneIdFromEnv()
-          : undefined;
-
         const maybeStageResults = await mapConcurrent(
           parallel.tasks,
           MAX_CONCURRENCY,
@@ -1300,11 +1398,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               model: task.model,
               delegationMode,
               terminalMode,
-              paneTitleSuffix: `#${taskIndex + 1}`,
-              restoreFocusPaneId: sharedRestoreFocusPaneId,
+              interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
               forkSessionSnapshotJsonl,
+              parentSessionId,
+              parentSessionFile,
+              interactiveShutdownGeneration,
               parentDepth: currentDepth,
               parentAgentStack: ancestorAgentStack,
               maxDepth,
@@ -1402,9 +1502,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         model: taskStage.model,
         delegationMode,
         terminalMode,
+        interactivePaneLayout,
         trustedProjectRoots,
         deniedProjectRoots,
         forkSessionSnapshotJsonl,
+        parentSessionId,
+        parentSessionFile,
+        interactiveShutdownGeneration,
         parentDepth: currentDepth,
         parentAgentStack: ancestorAgentStack,
         maxDepth,
@@ -1488,9 +1592,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     tasks: Array<{ agent: string; task: string; cwd?: string; model?: string }>,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
+    interactivePaneLayout: InteractivePaneLayout,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
     forkSessionSnapshotJsonl: string | undefined,
+    parentSessionId: string,
+    parentSessionFile: string | undefined,
+    interactiveShutdownGeneration: number,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -1547,10 +1655,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
     let results: SingleResult[];
     try {
-      const sharedRestoreFocusPaneId = terminalMode === "zellij-pane"
-        ? getCurrentZellijPaneIdFromEnv()
-        : undefined;
-
       const maybeResults = await mapConcurrent(
         tasks,
         MAX_CONCURRENCY,
@@ -1564,11 +1668,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             model: t.model,
             delegationMode,
             terminalMode,
-            paneTitleSuffix: `#${index + 1}`,
-            restoreFocusPaneId: sharedRestoreFocusPaneId,
+            interactivePaneLayout,
             trustedProjectRoots,
             deniedProjectRoots,
             forkSessionSnapshotJsonl,
+            parentSessionId,
+            parentSessionFile,
+            interactiveShutdownGeneration,
             parentDepth: currentDepth,
             parentAgentStack: ancestorAgentStack,
             maxDepth,

@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -63,7 +63,8 @@ describe("project agent discovery hardening", () => {
       await fs.symlink(realAgentsDir, logicalAgentsDir, "dir");
 
       const logicalFilePath = path.join(logicalAgentsDir, "worker.md");
-      assert.equal(resolveProjectAgentFilePathWithinRoot(logicalFilePath, projectRoot), path.join(realAgentsDir, "worker.md"));
+      const canonicalWorkerPath = await fs.realpath(path.join(realAgentsDir, "worker.md"));
+      assert.equal(resolveProjectAgentFilePathWithinRoot(logicalFilePath, projectRoot), canonicalWorkerPath);
       assert.equal(getProjectAgentConfigFilePath(logicalFilePath), logicalFilePath);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -95,7 +96,7 @@ describe("project agent discovery hardening", () => {
 
       assert.equal(
         resolveProjectAgentFilePathWithinRoot(localAgentPath, projectRoot),
-        localAgentPath,
+        await fs.realpath(localAgentPath),
       );
       assert.equal(
         resolveProjectAgentFilePathWithinRoot(escapedLinkPath, projectRoot),

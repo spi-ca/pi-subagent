@@ -12,7 +12,7 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 - **병렬 실행** — 서로 독립적인 작업을 여러 하위 에이전트로 동시에 실행합니다.
 - **체인 실행** — 앞 단계의 요약을 다음 단계에 넘기며 순차 워크플로를 구성합니다.
 - **백그라운드 실행** — 선택적 최상위 `background: true`가 호출을 즉시 반환시키고, 완료/실패/취소 결과는 나중에 자동 steer 메시지로 전달됩니다.
-- **실행 환경 자동 선택** — Zellij 안에서는 `zellij-pane`, 그 외 환경에서는 `inline`으로 실행합니다.
+- **실행 환경 자동 선택** — cmux/tmux에서는 실제 child Pi TUI를 열며, 기본 `auto` layout은 cmux의 shared right pane 또는 tmux의 child별 detached window를 사용합니다. `split`은 child별 split 호환 모드입니다.
 - **런타임 보호 장치** — 최대 위임 깊이와 순환 위임 방지로 재귀 실행 위험을 줄입니다.
 - **프로젝트 에이전트 신뢰 확인** — `.pi/agents`의 프로젝트 로컬 에이전트는 명시적으로 승인된 뒤에만 사용합니다.
 
@@ -108,16 +108,21 @@ Pi 안에서 `subagent` 도구를 호출합니다.
 
 ### 실행 환경
 
-확장이 현재 환경을 보고 자동으로 선택합니다.
+확장이 현재 환경을 보고 다음 우선순위로 자동 선택합니다.
 
-- Zellij 내부: `zellij-pane`
+- cmux 내부: `cmux-pane` — 기본 `auto`에서는 root sibling이 하나의 새 오른쪽 pane 안의 surface를 공유하고, nested descendant는 정확한 source pane에 surface로 쌓입니다.
+- tmux 내부: `tmux-pane` — 기본 `auto`에서는 child마다 같은 session의 detached window를 사용합니다.
 - 그 외 환경: `inline`
+
+`--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`로 바꿀 수 있습니다. CLI > 환경 변수 > 기본 `auto` 순이며 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
+
+interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. child는 기본적으로 parent-owned one-shot 실행이며 첫 정상 settle 뒤 결과를 부모에 전달하고 정확한 surface/pane만 닫습니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
 
 ### 위임 보호 장치
 
 기본적으로 다음 보호 장치가 켜져 있습니다.
 
-- 최대 깊이: `--subagent-max-depth` / `PI_SUBAGENT_MAX_DEPTH` (기본값 `3`)
+- 최대 깊이: `--subagent-max-depth` / `PI_SUBAGENT_MAX_DEPTH` (기본값 `5`)
 - 순환 방지: `--subagent-prevent-cycles` / `--no-subagent-prevent-cycles` / `PI_SUBAGENT_PREVENT_CYCLES` (기본값 `true`)
 
 ### 백그라운드 실행 규칙
@@ -142,6 +147,11 @@ README는 진입점만 담고, 세부 내용은 주제별 문서로 나눕니다
 | 도구 호출 형태와 예시 | [`docs/usage.md`](docs/usage.md) |
 | 에이전트 파일 형식과 통신 모델 | [`docs/agents.md`](docs/agents.md) |
 | 개발 워크플로와 프로젝트 구조 | [`docs/development.md`](docs/development.md) |
+| cmux/tmux 기반 실제 Pi TUI 전환 설계 | [`docs/cmux-pi-tui-design.md`](docs/cmux-pi-tui-design.md) |
+| interactive runtime transport 성능 개선 설계(미구현) | [`docs/interactive-runtime-performance-design.md`](docs/interactive-runtime-performance-design.md) |
+| pi-subagent internal hot-path 성능 개선 설계(미구현) | [`docs/pi-subagent-hot-path-performance-design.md`](docs/pi-subagent-hot-path-performance-design.md) |
+| pi-cmux 연동과 운영 정책 | [`docs/pi-cmux-integration.md`](docs/pi-cmux-integration.md) |
+| interactive pane layout 설계·검증 현황 | [`docs/interactive-pane-layout-design.md`](docs/interactive-pane-layout-design.md) |
 | 에이전트용 문서 작성 지침 | [`docs/guidelines/`](docs/guidelines/) |
 
 ## 로컬 개발

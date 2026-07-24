@@ -4,13 +4,33 @@ import { createJsonLineChunkProcessor } from "../../src/runtime/runner-core";
 import { mapConcurrent } from "../../src/runtime/runner";
 
 describe("runner core helpers", () => {
-  test("does not dequeue additional concurrent work after abort", async () => {
+  for (const count of [17, 50]) test(`bounds N=${count} work to 16 workers and preserves result indexes`, async () => {
+    let active = 0;
+    let peak = 0;
+    const results = await mapConcurrent(
+      Array.from({ length: count }, (_, index) => index),
+      16,
+      async (item, index) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        // Yield twice so all initially admitted workers overlap deterministically.
+        await Promise.resolve();
+        await Promise.resolve();
+        active -= 1;
+        return `${index}:${item}`;
+      },
+    );
+
+    assert.ok(peak <= 16);
+    assert.deepEqual(results, Array.from({ length: count }, (_, index) => `${index}:${index}`));
+  });
+
+  for (const count of [17, 50]) test(`does not dequeue N=${count} work after an abort`, async () => {
     const controller = new AbortController();
     const started: number[] = [];
-
     const results = await mapConcurrent(
-      [0, 1, 2, 3],
-      1,
+      Array.from({ length: count }, (_, index) => index),
+      16,
       async (item) => {
         started.push(item);
         controller.abort();
@@ -20,7 +40,7 @@ describe("runner core helpers", () => {
     );
 
     assert.deepEqual(started, [0]);
-    assert.deepEqual(Array.from(results), [0, undefined, undefined, undefined]);
+    assert.deepEqual(Array.from(results), [0, ...Array(count - 1).fill(undefined)]);
   });
 
   test("splits chunked JSONL lines like the inline runner", () => {

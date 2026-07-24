@@ -1,0 +1,16 @@
+{
+  "contract": "cmux-control-v2",
+  "minimum_app_version": "0.64.20",
+  "captured_app_version": "0.64.20",
+  "source": "pinned upstream cmux 0.64.20 control-socket transcript; secrets and request IDs redacted",
+  "capability_request_line": "_cmux_capability_v1 redacted-token {\"id\":1,\"method\":\"system.capabilities\",\"params\":{}}\n",
+  "capabilities_result": {
+    "version": 2,
+    "protocol": "cmux-socket",
+    "access_mode": "automation",
+    "methods": ["system.tree", "surface.split", "surface.create", "surface.respawn", "surface.send_key", "surface.close", "tab.action"]
+  },
+  "identify_result": { "app_bundle_path": "/Applications/cmux.app", "app_version": "0.64.20" },
+  "success_response": { "id": 1, "ok": true, "result": {} },
+  "failure_response": { "id": 2, "ok": false, "error": { "code": "not_found", "message": "Surface not found", "data": {} } }
+}

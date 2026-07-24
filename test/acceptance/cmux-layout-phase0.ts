@@ -4,12 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { cmuxIdsEqual, isCanonicalCmuxId, parseCreatedCmuxSurface, sanitizeCreatedCmuxSurfaceResponse } from "../../src/runtime/cmux.js";
+import { CMUX_LAYOUT_CONTRACT_ID, cmuxIdsEqual, isCanonicalCmuxId, parseCreatedCmuxSurface, sanitizeCreatedCmuxSurfaceResponse } from "../../src/runtime/cmux.js";
+import { MINIMUM_CMUX_VERSION, isStableSemverAtLeast, parseCmuxVersionOutput } from "../../src/runtime/version-policy.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const FIXTURE_PATH = path.join(ROOT, "test/fixtures/cmux-0.64.20-layout-probe.json");
+const FIXTURE_PATH = path.join(ROOT, "test/fixtures/cmux-layout-contract-v1.json");
 const LIVE_GATE = "PI_SUBAGENT_CMUX_LAYOUT_PHASE0";
-const REQUIRED_VERSION = "0.64.20";
 const STABILIZATION_READS = 3;
 const STABILIZATION_DELAY_MS = 50;
 
@@ -29,8 +29,9 @@ function parseArgs(argv: string[]): { dryRun: boolean } {
   return usage();
 }
 
-function exactVersion(stdout: string): boolean {
-  return /^cmux 0\.64\.20(?: \([0-9]+\) \[[0-9a-f]+\])?$/i.test(stdout.trim());
+function supportedVersion(stdout: string): string | null {
+  const detected = parseCmuxVersionOutput(stdout.trim());
+  return detected && isStableSemverAtLeast(detected, MINIMUM_CMUX_VERSION) ? detected : null;
 }
 
 function hasRequiredCapabilities(stdout: string): boolean {
@@ -237,10 +238,11 @@ async function cleanupKnownFailedWorkspace(
     && Boolean(findIdentity(after, caller.workspaceId, caller.surfaceId));
 }
 
-async function atomicallyWriteFixture(splitResponse: unknown, surfaceResponse: unknown, lastSurfacePane: "removed" | "empty"): Promise<void> {
+async function atomicallyWriteFixture(cmuxVersion: string, splitResponse: unknown, surfaceResponse: unknown, lastSurfacePane: "removed" | "empty"): Promise<void> {
   const fixture = {
     schema_version: 1,
-    cmux_version: REQUIRED_VERSION,
+    contract_id: CMUX_LAYOUT_CONTRACT_ID,
+    cmux_version: cmuxVersion,
     new_split_response: splitResponse,
     new_surface_response: surfaceResponse,
     last_surface_pane: lastSurfacePane,
@@ -262,15 +264,18 @@ async function live(): Promise<void> {
   const cmux = process.env.CMUX_BIN?.trim() || "cmux";
   const root = await privateRoot();
   const workspaceName = `pi-subagent-cmux-layout-phase0-${crypto.randomUUID()}`;
-  const evidence: Evidence = { mode: "cmux-layout-phase0", cmuxVersion: REQUIRED_VERSION, workspaceName, commands: [], outcome: "failed" };
+  const evidence: Evidence = { mode: "cmux-layout-phase0", minimumCmuxVersion: MINIMUM_CMUX_VERSION, workspaceName, commands: [], outcome: "failed" };
   let passed = false;
+  let detectedCmuxVersion: string | null = null;
   let caller: Identity | null = null;
   let initial: Identity | null = null;
   let split: Identity | null = null;
   let second: Identity | null = null;
   try {
     const version = await runCommand(cmux, ["--version"], evidence);
-    if (version.code !== 0 || !exactVersion(version.stdout)) throw new Error("cmux layout Phase 0 requires exact version 0.64.20");
+    detectedCmuxVersion = supportedVersion(version.stdout);
+    if (version.code !== 0 || !detectedCmuxVersion) throw new Error(`cmux layout Phase 0 requires stable cmux >= ${MINIMUM_CMUX_VERSION}`);
+    evidence.cmuxVersion = detectedCmuxVersion;
     const capabilities = await runCommand(cmux, ["--json", "capabilities"], evidence);
     if (capabilities.code !== 0 || !hasRequiredCapabilities(capabilities.stdout)) throw new Error("cmux capabilities did not advertise required surface methods");
     evidence.capabilities = "required-surface-methods";
@@ -323,7 +328,7 @@ async function live(): Promise<void> {
     if (finalTopology.some((workspace) => cmuxIdsEqual(workspace.workspaceId, initial!.workspaceId) || workspace.name === workspaceName)) throw new Error("private workspace remains after exact close");
     if (!findIdentity(finalTopology, caller.workspaceId, caller.surfaceId)) throw new Error("caller was not preserved after private workspace close");
 
-    await atomicallyWriteFixture(splitResponse, surfaceResponse, lastSurfacePane);
+    await atomicallyWriteFixture(detectedCmuxVersion, splitResponse, surfaceResponse, lastSurfacePane);
     evidence.outcome = "passed";
     evidence.fixture = path.basename(FIXTURE_PATH);
     passed = true;

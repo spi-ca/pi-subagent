@@ -413,7 +413,7 @@ function renderParallelResult(
 			? `${successCount + failCount}/${details.results.length} done, ${running} running`
 			: `${successCount}/${details.results.length} ${itemLabel}`;
 
-	if (expanded && !isRunning) {
+	if (expanded) {
 		return renderParallelExpanded(details, toolLabel, delegationMode, terminalMode, icon, status, theme);
 	}
 	return renderParallelCollapsed(
@@ -478,8 +478,9 @@ function renderParallelExpanded(
 
 	const totalUsage = formatUsage(aggregateUsage(details.results));
 	if (totalUsage) {
+		const isRunning = details.results.some((result) => result.exitCode === -1);
 		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("dim", `Total: ${totalUsage}`), 0, 0));
+		container.addChild(new Text(theme.fg("dim", `${isRunning ? "Total so far" : "Total"}: ${totalUsage}`), 0, 0));
 	}
 
 	return container;
@@ -511,12 +512,12 @@ function renderParallelCollapsed(
 				text += `\n${theme.fg("error", getResultSummaryText(r))}`;
 			}
 		}
+		const taskUsage = formatUsage(r.usage, r.model);
+		if (taskUsage) text += `\n${theme.fg("dim", taskUsage)}`;
 	}
 
-	if (!isRunning) {
-		const totalUsage = formatUsage(aggregateUsage(details.results));
-		if (totalUsage) text += `\n\n${theme.fg("dim", `Total: ${totalUsage}`)}`;
-	}
+	const totalUsage = formatUsage(aggregateUsage(details.results));
+	if (totalUsage) text += `\n\n${theme.fg("dim", `${isRunning ? "Total so far" : "Total"}: ${totalUsage}`)}`;
 	if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 
 	return new Text(text, 0, 0);

@@ -17,6 +17,7 @@ import {
 	inspectCmuxSurface,
 	parseCmuxCapabilities,
 	parseCreatedCmuxSurface,
+	diagnoseCanonicalCmuxSurfacePane,
 	parseCmuxLayoutPhase0Fixture,
 	resolveCanonicalCmuxSurfacePane,
 	sanitizeCreatedCmuxSurfaceResponse,
@@ -496,15 +497,20 @@ describe("cmux adapter", () => {
 	test("strictly validates only the sanitized Phase 0 fixture schema", () => {
 		const direct = { workspace_id: workspaceId, pane_id: paneId, surface_id: surfaceId };
 		const valid = {
-			schema_version: 1, cmux_version: "0.64.20",
+			schema_version: 1, contract_id: "cmux-layout-v1", cmux_version: "0.64.20",
 			new_split_response: direct,
 			new_surface_response: { result: { ...direct, surface_id: newSurfaceId } },
 			last_surface_pane: "empty",
 			capabilities: { "surface.create": true, "surface.close": true, "surface.send_key": true, "surface.respawn": true },
 		};
 		assert.ok(parseCmuxLayoutPhase0Fixture(valid));
+		assert.equal(parseCmuxLayoutPhase0Fixture({ ...valid, cmux_version: "0.65.0" })?.cmuxVersion, "0.65.0");
 		for (const invalid of [
 			{ ...valid, unknown: true },
+			{ ...valid, contract_id: "cmux-layout-0.64.20" },
+			{ ...valid, cmux_version: "0.64.19" },
+			{ ...valid, cmux_version: "0.65.0-rc1" },
+			{ ...valid, cmux_version: "garbage" },
 			{ ...valid, capabilities: { ...valid.capabilities, unknown: true } },
 			{ ...valid, new_split_response: { ...direct, surface_ref: "surface:7" } },
 			{ ...valid, new_surface_response: { result: { ...direct, surface_id: newSurfaceId }, extra: true } },
@@ -537,6 +543,9 @@ describe("cmux adapter", () => {
 		assert.deepEqual(resolveCanonicalCmuxSurfacePane(JSON.stringify(tree), workspaceId.toUpperCase(), sourceSurfaceId.toUpperCase()), {
 			workspaceId, paneId, surfaceId: sourceSurfaceId,
 		});
+		assert.deepEqual(diagnoseCanonicalCmuxSurfacePane("not-json", workspaceId, sourceSurfaceId), { ok: false, reason: "invalid-json" });
+		assert.deepEqual(diagnoseCanonicalCmuxSurfacePane(JSON.stringify({ windows: [] }), workspaceId, sourceSurfaceId), { ok: false, reason: "source-absent" });
+		assert.deepEqual(diagnoseCanonicalCmuxSurfacePane(JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [] }, { id: workspaceId, panes: [] }] }] }), workspaceId, sourceSurfaceId), { ok: false, reason: "duplicate-identity" });
 		for (const invalid of [
 			{ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: sourceSurfaceId, pane_id: "pane:1" }] }] }] }] },
 			{ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: sourceSurfaceId, pane_id: paneId }] }] }, { id: newSurfaceId, panes: [{ id: sourceSurfaceId, surfaces: [] }] }] }] },
@@ -707,11 +716,12 @@ describe("cmux adapter", () => {
 		]);
 	});
 
-	test("validates the mandatory promoted cmux 0.64.20 Phase 0 fixture", () => {
-		const fixturePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../fixtures/cmux-0.64.20-layout-probe.json");
+	test("validates the mandatory version-independent cmux layout fixture", () => {
+		const fixturePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../fixtures/cmux-layout-contract-v1.json");
 		assert.equal(fs.existsSync(fixturePath), true, "Phase 0 fixture is mandatory; promote it only with the explicitly gated live probe.");
 		const fixture = parseCmuxLayoutPhase0Fixture(JSON.parse(fs.readFileSync(fixturePath, "utf8")));
 		assert.ok(fixture, "fixture must contain sanitized direct canonical IDs, exact envelopes, and exact relationships");
+		assert.equal(fixture.contractId, "cmux-layout-v1");
 		assert.equal(fixture.cmuxVersion, "0.64.20");
 		assert.equal(cmuxIdsEqual(fixture.newSplit.workspaceId, fixture.newSurface.workspaceId), true);
 		assert.equal(cmuxIdsEqual(fixture.newSplit.paneId, fixture.newSurface.paneId), true);

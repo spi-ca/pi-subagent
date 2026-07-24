@@ -1,0 +1,1372 @@
+{
+  "schemaVersion": 4,
+  "tier": "routine-v1",
+  "planId": "phase0-live-routine-v1",
+  "planDigest": "c4e5e3a498c44f13878a67b2da40b14241a3102a01b5bb7496749569c5523260",
+  "phase": "M0-live",
+  "evidenceKind": "gated-provider-transport-benchmark",
+  "capturedAt": "2026-07-24T07:56:30.619Z",
+  "environment": {
+    "os": "darwin",
+    "arch": "arm64",
+    "bunVersion": "1.3.14",
+    "piVersion": "0.81.1",
+    "sourceRevision": "0d41660243c32abe8e43fc8d190632f19d1c97d1",
+    "sourceDirty": true,
+    "worktreeDigest": "723a54e4aa63fe27f06da115564eac61350633c64d9db99539e33e89ddcf80fa"
+  },
+  "requested": {
+    "provider": "openai-codex",
+    "model": "openai-codex/gpt-5.4-mini",
+    "childRuns": 15
+  },
+  "matrix": [
+    {
+      "mode": "inline",
+      "activeRuns": 1,
+      "workload": "idle-wait",
+      "timing": {
+        "monotonicElapsedMs": 10361.864333,
+        "settlementLatencyMs": 5451.1197919999995,
+        "eventLoopDelayMeanMs": 30.12827313385827,
+        "eventLoopDelayMaxMs": 108.060042,
+        "eventLoopDelayP99Ms": 77.791231
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 226320
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 67408,
+            "startedAt": 1784911497000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 67408,
+            "startedAt": 1784911497000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 720,
+          "peakAggregateCpuMs": 800,
+          "peakAggregateRssKiB": 204336,
+          "peakIndividualRssKiB": 204336
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 0,
+        "transportCounters": {
+          "source": "not-applicable:inline",
+          "availability": "not-applicable",
+          "backendRequests": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "backendSpawns": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "requestBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lineBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "byteBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "controlDisconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "reconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "unknownOutcomes": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactSnapshots": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactCleanupMutations": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "residualRecovery": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientCreates": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientRestarts": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "healthyPeriodicStatusQueries": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "notificationToReconcileLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lifecycleCompletionLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          }
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "observed-then-cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "inline",
+      "activeRuns": 1,
+      "workload": "short-response",
+      "timing": {
+        "monotonicElapsedMs": 7719.358124999999,
+        "settlementLatencyMs": 2489.224624999999,
+        "eventLoopDelayMeanMs": 30.613459956989246,
+        "eventLoopDelayMaxMs": 109.917875,
+        "eventLoopDelayP99Ms": 103.481343
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 204192
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 68485,
+            "startedAt": 1784911507000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 68485,
+            "startedAt": 1784911507000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 750,
+          "peakAggregateCpuMs": 820,
+          "peakAggregateRssKiB": 204640,
+          "peakIndividualRssKiB": 204640
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 0,
+        "transportCounters": {
+          "source": "not-applicable:inline",
+          "availability": "not-applicable",
+          "backendRequests": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "backendSpawns": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "requestBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lineBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "byteBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "controlDisconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "reconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "unknownOutcomes": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactSnapshots": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactCleanupMutations": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "residualRecovery": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientCreates": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientRestarts": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "healthyPeriodicStatusQueries": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "notificationToReconcileLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lifecycleCompletionLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          }
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "inline",
+      "activeRuns": 1,
+      "workload": "long-response",
+      "timing": {
+        "monotonicElapsedMs": 11608.872,
+        "settlementLatencyMs": 7283.207541,
+        "eventLoopDelayMeanMs": 30.4372457385159,
+        "eventLoopDelayMaxMs": 112.036958,
+        "eventLoopDelayP99Ms": 79.364095
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 206128
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 69298,
+            "startedAt": 1784911515000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 69298,
+            "startedAt": 1784911515000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 0,
+          "peakAggregateCpuMs": 1140,
+          "peakAggregateRssKiB": 204960,
+          "peakIndividualRssKiB": 204960
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 0,
+        "transportCounters": {
+          "source": "not-applicable:inline",
+          "availability": "not-applicable",
+          "backendRequests": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "backendSpawns": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "requestBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lineBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "byteBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "controlDisconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "reconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "unknownOutcomes": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactSnapshots": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactCleanupMutations": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "residualRecovery": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientCreates": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientRestarts": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "healthyPeriodicStatusQueries": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "notificationToReconcileLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lifecycleCompletionLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          }
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "inline",
+      "activeRuns": 1,
+      "workload": "cancel",
+      "timing": {
+        "monotonicElapsedMs": 5218.412250000005,
+        "settlementLatencyMs": 435.2857079999958,
+        "eventLoopDelayMeanMs": 31.811160859504135,
+        "eventLoopDelayMaxMs": 110.099333,
+        "eventLoopDelayP99Ms": 107.479039
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 208272
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 70502,
+            "startedAt": 1784911526000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 70502,
+            "startedAt": 1784911526000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 750,
+          "peakAggregateCpuMs": 810,
+          "peakAggregateRssKiB": 204576,
+          "peakIndividualRssKiB": 204576
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 0,
+        "transportCounters": {
+          "source": "not-applicable:inline",
+          "availability": "not-applicable",
+          "backendRequests": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "backendSpawns": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "requestBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lineBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "byteBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "controlDisconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "reconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "unknownOutcomes": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactSnapshots": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactCleanupMutations": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "residualRecovery": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientCreates": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientRestarts": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "healthyPeriodicStatusQueries": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "notificationToReconcileLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lifecycleCompletionLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          }
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "inline",
+      "activeRuns": 1,
+      "workload": "external-close",
+      "timing": {
+        "monotonicElapsedMs": 5268.638333999996,
+        "settlementLatencyMs": 462.5633749999979,
+        "eventLoopDelayMeanMs": 31.868290098360653,
+        "eventLoopDelayMaxMs": 107.516542,
+        "eventLoopDelayP99Ms": 104.398847
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 203712
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 71046,
+            "startedAt": 1784911531000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 71046,
+            "startedAt": 1784911531000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 710,
+          "peakAggregateCpuMs": 770,
+          "peakAggregateRssKiB": 201952,
+          "peakIndividualRssKiB": 201952
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 0,
+        "transportCounters": {
+          "source": "not-applicable:inline",
+          "availability": "not-applicable",
+          "backendRequests": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "backendSpawns": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "requestBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lineBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "byteBacklogHighWater": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "controlDisconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "reconnects": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "unknownOutcomes": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactSnapshots": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "exactCleanupMutations": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "residualRecovery": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientCreates": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "persistentClientRestarts": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "healthyPeriodicStatusQueries": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "notificationToReconcileLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          },
+          "lifecycleCompletionLatencyMs": {
+            "notApplicable": true,
+            "reason": "inline-no-interactive-transport"
+          }
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "externally-closed",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "idle-wait",
+      "timing": {
+        "monotonicElapsedMs": 19404.906417,
+        "settlementLatencyMs": 10094.824332999997,
+        "eventLoopDelayMeanMs": 29.76873144742268,
+        "eventLoopDelayMaxMs": 110.167208,
+        "eventLoopDelayP99Ms": 34.439167
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 511680
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 71845,
+            "startedAt": 1784911539000
+          },
+          {
+            "pid": 71792,
+            "startedAt": 1784911538000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 71792,
+            "startedAt": 1784911538000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 550,
+          "peakAggregateCpuMs": 1210,
+          "peakAggregateRssKiB": 211872,
+          "peakIndividualRssKiB": 209280
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 30,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 25,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "observed-then-cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "short-response",
+      "timing": {
+        "monotonicElapsedMs": 12549.19775,
+        "settlementLatencyMs": 3805.183791999996,
+        "eventLoopDelayMeanMs": 30.103089548387096,
+        "eventLoopDelayMaxMs": 111.677209,
+        "eventLoopDelayP99Ms": 35.979263
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 511440
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 74087,
+            "startedAt": 1784911558000
+          },
+          {
+            "pid": 74036,
+            "startedAt": 1784911558000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 74036,
+            "startedAt": 1784911558000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 550,
+          "peakAggregateCpuMs": 1160,
+          "peakAggregateRssKiB": 212976,
+          "peakIndividualRssKiB": 210400
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 25,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 21,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 177
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "long-response",
+      "timing": {
+        "monotonicElapsedMs": 25497.405000000013,
+        "settlementLatencyMs": 16244.760458999997,
+        "eventLoopDelayMeanMs": 30.017206511041007,
+        "eventLoopDelayMaxMs": 106.926458,
+        "eventLoopDelayP99Ms": 34.897919
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 514336
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 75546,
+            "startedAt": 1784911571000
+          },
+          {
+            "pid": 75494,
+            "startedAt": 1784911570000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 75494,
+            "startedAt": 1784911570000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 600,
+          "peakAggregateCpuMs": 1220,
+          "peakAggregateRssKiB": 215520,
+          "peakIndividualRssKiB": 212976
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 25,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 21,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 112
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "cancel",
+      "timing": {
+        "monotonicElapsedMs": 13260.341708000007,
+        "settlementLatencyMs": 4341.312542,
+        "eventLoopDelayMeanMs": 29.954060449848026,
+        "eventLoopDelayMaxMs": 108.085875,
+        "eventLoopDelayP99Ms": 36.831231
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 507920
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 78481,
+            "startedAt": 1784911596000
+          },
+          {
+            "pid": 78432,
+            "startedAt": 1784911596000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 78432,
+            "startedAt": 1784911596000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 570,
+          "peakAggregateCpuMs": 1170,
+          "peakAggregateRssKiB": 214608,
+          "peakIndividualRssKiB": 212064
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 30,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 25,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "external-close",
+      "timing": {
+        "monotonicElapsedMs": 14227.757291999995,
+        "settlementLatencyMs": 5277.193625,
+        "eventLoopDelayMeanMs": 28.260979165311653,
+        "eventLoopDelayMaxMs": 108.845,
+        "eventLoopDelayP99Ms": 35.618815
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 509776
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 80039,
+            "startedAt": 1784911610000
+          },
+          {
+            "pid": 79986,
+            "startedAt": 1784911609000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 79986,
+            "startedAt": 1784911609000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 570,
+          "peakAggregateCpuMs": 1180,
+          "peakAggregateRssKiB": 216512,
+          "peakIndividualRssKiB": 213984
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 32,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 28,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "externally-closed",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "idle-wait",
+      "timing": {
+        "monotonicElapsedMs": 44822.78325000001,
+        "settlementLatencyMs": 39161.466042000015,
+        "eventLoopDelayMeanMs": 27.10844292780083,
+        "eventLoopDelayMaxMs": 75.351334,
+        "eventLoopDelayP99Ms": 32.833535
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 508816
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 81318,
+            "startedAt": 1784911622000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 81412,
+            "startedAt": 1784911623000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 450,
+          "peakAggregateCpuMs": 920,
+          "peakAggregateRssKiB": 207616,
+          "peakIndividualRssKiB": 207616
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 18,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 2,
+          "byteBacklogHighWater": 8101,
+          "controlDisconnects": 0,
+          "reconnects": 1,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 6,
+          "exactCleanupMutations": 1,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 1,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "observed-then-cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "short-response",
+      "timing": {
+        "monotonicElapsedMs": 38098.373500000016,
+        "settlementLatencyMs": 32277.82374999998,
+        "eventLoopDelayMeanMs": 27.0986,
+        "eventLoopDelayMaxMs": 71.542333,
+        "eventLoopDelayP99Ms": 32.325631
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 507584
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 84481,
+            "startedAt": 1784911668000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 84579,
+            "startedAt": 1784911669000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 400,
+          "peakAggregateCpuMs": 980,
+          "peakAggregateRssKiB": 211792,
+          "peakIndividualRssKiB": 211792
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 12,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 1,
+          "byteBacklogHighWater": 7476,
+          "controlDisconnects": 0,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 4,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 6
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "long-response",
+      "timing": {
+        "monotonicElapsedMs": 48984.39508300001,
+        "settlementLatencyMs": 42711.28654100001,
+        "eventLoopDelayMeanMs": 27.423968245022973,
+        "eventLoopDelayMaxMs": 69.739167,
+        "eventLoopDelayP99Ms": 33.308671
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 509584
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 87190,
+            "startedAt": 1784911706000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 87281,
+            "startedAt": 1784911707000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 440,
+          "peakAggregateCpuMs": 990,
+          "peakAggregateRssKiB": 213408,
+          "peakIndividualRssKiB": 213408
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 12,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 1,
+          "byteBacklogHighWater": 7476,
+          "controlDisconnects": 0,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 4,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 6
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "cancel",
+      "timing": {
+        "monotonicElapsedMs": 39829.515167000005,
+        "settlementLatencyMs": 33581.435375,
+        "eventLoopDelayMeanMs": 56.160610270165215,
+        "eventLoopDelayMaxMs": 28515.419791,
+        "eventLoopDelayP99Ms": 35.389439
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 509264
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 90599,
+            "startedAt": 1784911756000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 90696,
+            "startedAt": 1784911757000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 430,
+          "peakAggregateCpuMs": 940,
+          "peakAggregateRssKiB": 212400,
+          "peakIndividualRssKiB": 212400
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 18,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 1,
+          "byteBacklogHighWater": 8101,
+          "controlDisconnects": 0,
+          "reconnects": 1,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 6,
+          "exactCleanupMutations": 1,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 1,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "cancelled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "external-close",
+      "timing": {
+        "monotonicElapsedMs": 41266.43391700002,
+        "settlementLatencyMs": 35541.229500000016,
+        "eventLoopDelayMeanMs": 308.90090696503495,
+        "eventLoopDelayMaxMs": 323903.227375,
+        "eventLoopDelayP99Ms": 31.981567
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 510112
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 93334,
+            "startedAt": 1784911825000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 93425,
+            "startedAt": 1784911826000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 320,
+          "peakAggregateCpuMs": 880,
+          "peakAggregateRssKiB": 212208,
+          "peakIndividualRssKiB": 212208
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 17,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 1,
+          "byteBacklogHighWater": 7477,
+          "controlDisconnects": 0,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 9,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 0
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "externally-closed",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    }
+  ],
+  "cleanup": {
+    "result": "clean",
+    "evidenceRoot": "private-0700",
+    "evidenceFile": "private-0600",
+    "residualDescendantCount": 0,
+    "residualBackendTargetCount": 0
+  }
+}

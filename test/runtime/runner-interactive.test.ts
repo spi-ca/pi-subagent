@@ -1,6 +1,7 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,33 +13,62 @@ import {
 	buildChildProcessEnv,
 	buildInteractivePaneWrapperScript,
 	buildInteractiveChildSessionJsonl,
+	validateForkBranchSourceJsonl,
 	buildPrivateChildEnvironmentScript,
 	buildInteractivePiArgs,
+	buildPiArgs,
 	buildInteractiveExtensionArgs,
+	assertManagedChildToolCompatibility,
+	resolveManagedChildPolicy,
 	resolveCurrentPackageExtensionEntrypoint,
 	applyChildProjectIsolation,
 	closeInteractiveTarget,
+	acquireCmuxTopologyMutationLockForTest,
+	acquireTmuxTopologyMutationLockForTest,
+	advanceTopologyMutationGenerationForTest,
+	getTopologyMutationGenerationForTest,
+	inspectActiveCmuxSnapshotForTest,
+	inspectActiveTmuxSnapshotForTest,
+	isTopologyMutationInvalidatedUndefinedInspectionForTest,
+	focusInteractiveRun,
+	inspectInteractiveRunForUx,
+	keepInteractiveRun,
 	listActiveInteractiveRunIds,
+	listInteractiveRunUxSnapshots,
+	promoteInteractiveRun,
 	registerCommittedInteractiveRun,
+	settleInteractiveTreePermitAfterOwnershipForTest,
+	applyInteractiveOwnershipUnknownResultForTest,
+	releaseRegisteredInteractiveRun,
 	unregisterCommittedInteractiveRun,
-	recoverInteractiveTarget,
 	allocationMatchesInteractiveBackend,
+	applyVerifiedInteractiveCompletion,
 	hasCommittedInteractiveLaunchAuthority,
+	isInteractivePiVersionProofCurrent,
 	isPiVersionAtLeast,
+	resetInteractivePiVersionChecksForTest,
+	verifyInteractivePiVersionCached,
 	shouldRetainBrokerRecoveryMetadata,
 	resolveBrokerRuntime,
 	resolveBackendExecutable,
 	resolveBackendPath,
 	resolveRegularFile,
 	resolveRuntimeInterpreter,
+	resolveSharedCmuxSourcePreflight,
+	CmuxSourcePreflightError,
 	beginInteractiveShutdownForSession,
 	canStartInteractiveRun,
+	createInteractiveResultMutationQueueForTest,
+	cmuxEventsAuthorityKeyForTest,
+	shouldReplaceCmuxEventsAuthorityForTest,
 	getInteractiveShutdownGenerationForTest,
 	resetInteractiveShutdownForSession,
 	publishInteractiveLaunchGate,
 	shutdownActiveInteractiveRuns,
 } from "../../src/runtime/runner";
-import { resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
+import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
+import type { InteractivePaneBackend } from "../../src/runtime/interactive-pane";
+import { acquireTmuxControlLease, snapshotTmuxControlPoolForTest } from "../../src/runtime/tmux-control-pool";
 import {
 	SUBAGENT_CHILD_SESSION_PATH_ENV,
 	SUBAGENT_EXPECTED_PARENT_PID_ENV,
@@ -50,7 +80,12 @@ import {
 	SUBAGENT_RUN_STATE_PATH_ENV,
 	prepareRunArtifactPaths,
 	removeRunArtifacts,
+	getCurrentProcessStartedAt,
 } from "../../src/runtime/run-protocol";
+import { SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV } from "../../src/runtime/lifecycle-socket";
+import { computeSessionCompletionBoundary, computeSessionFailureBoundary, getSessionFileIdentity, setSessionVerificationBufferLimitForTesting } from "../../src/runtime/completion-v3";
+import { LaunchPreflightSingleFlight } from "../../src/runtime/launch-preflight";
+import { getFinalOutput } from "../../src/core/types";
 
 const agent = {
 	name: "reviewer",
@@ -71,11 +106,104 @@ describe("interactive pane runner preparation", () => {
 		assert.throws(() => resolveInteractivePaneLayout("AUTO", {}), /--subagent-pane-layout/);
 	});
 
+	test("shares three cmux source preflights and retries one fresh epoch across a topology mutation", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174000";
+		const paneId = "123e4567-e89b-12d3-a456-426614174001";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174002";
+		const tree = `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }] }] }] }] })}\n`;
+		const singleFlight = new LaunchPreflightSingleFlight();
+		let topologyGeneration = 0, calls = 0, releaseFirst!: () => void;
+		const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const run = async () => {
+			calls += 1;
+			if (calls === 1) await first;
+			return { exitCode: 0, stdout: tree, stderr: "", aborted: false };
+		};
+		const invoke = () => resolveSharedCmuxSourcePreflight({
+			run, singleFlight, shutdownGeneration: 7,
+			socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+			workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+			isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true,
+		});
+		const pending = [invoke(), invoke(), invoke()];
+		while (calls !== 1) await new Promise((resolve) => setTimeout(resolve, 0));
+		topologyGeneration += 1;
+		releaseFirst();
+		const resolved = await Promise.all(pending);
+		assert.equal(calls, 2);
+		assert.ok(resolved.every((value) => value.workspaceId === workspaceId && value.paneId === paneId && value.surfaceId === surfaceId));
+		assert.deepEqual(singleFlight.metrics(), { fetches: 2, joins: 4, failures: 0 });
+	});
+
+	test("invalidates cmux events authority on app or identify generation changes", () => {
+		const authority = { connection: { socketPath: "/private/tmp/cmux.sock", socketDev: "1", socketIno: "2" }, appVersion: "0.64.20", identifyDigest: "a".repeat(64) };
+		const key = cmuxEventsAuthorityKeyForTest(authority);
+		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, authority), false);
+		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, appVersion: "0.65.0" }), true);
+		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, identifyDigest: "b".repeat(64) }), true);
+		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, connection: { ...authority.connection, socketIno: "3" } }), true);
+	});
+
+	test("keys cmux source preflight by shutdown, socket generation, workspace, and surface", async () => {
+		const ids = ["123e4567-e89b-12d3-a456-426614174010", "123e4567-e89b-12d3-a456-426614174011", "123e4567-e89b-12d3-a456-426614174012", "123e4567-e89b-12d3-a456-426614174013", "123e4567-e89b-12d3-a456-426614174014", "123e4567-e89b-12d3-a456-426614174015", "123e4567-e89b-12d3-a456-426614174016"];
+		const [workspaceId, paneId, surfaceId, surfaceTwo, workspaceTwo, paneTwo, surfaceThree] = ids;
+		const tree = `${JSON.stringify({ windows: [{ workspaces: [
+			{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }, { id: surfaceTwo, pane_id: paneId }] }] },
+			{ id: workspaceTwo, panes: [{ id: paneTwo, surfaces: [{ id: surfaceThree, pane_id: paneTwo }] }] },
+		] }] })}\n`;
+		const singleFlight = new LaunchPreflightSingleFlight(); let calls = 0;
+		const base = { run: async () => { calls += 1; return { exitCode: 0, stdout: tree, stderr: "", aborted: false }; }, singleFlight, workspaceId, surfaceId, getTopologyGeneration: () => 0, isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true };
+		await Promise.all([
+			resolveSharedCmuxSourcePreflight({ ...base, shutdownGeneration: 1, socketGeneration: { socketPath: "/tmp/a", socketDev: "1", socketIno: "1" } }),
+			resolveSharedCmuxSourcePreflight({ ...base, shutdownGeneration: 2, socketGeneration: { socketPath: "/tmp/a", socketDev: "1", socketIno: "1" } }),
+			resolveSharedCmuxSourcePreflight({ ...base, shutdownGeneration: 1, socketGeneration: { socketPath: "/tmp/b", socketDev: "2", socketIno: "2" } }),
+			resolveSharedCmuxSourcePreflight({ ...base, surfaceId: surfaceTwo, shutdownGeneration: 1, socketGeneration: { socketPath: "/tmp/a", socketDev: "1", socketIno: "1" } }),
+			resolveSharedCmuxSourcePreflight({ ...base, workspaceId: workspaceTwo, surfaceId: surfaceThree, shutdownGeneration: 1, socketGeneration: { socketPath: "/tmp/a", socketDev: "1", socketIno: "1" } }),
+		]);
+		assert.equal(calls, 5);
+	});
+
+	test("preserves cmux control exit/code/state and parser failure diagnostics", async () => {
+		const common = { singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1, socketGeneration: { socketPath: "/tmp/cmux", socketDev: "1", socketIno: "2" }, workspaceId: "123e4567-e89b-12d3-a456-426614174020", surfaceId: "123e4567-e89b-12d3-a456-426614174021", getTopologyGeneration: () => 0, isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true };
+		await assert.rejects(
+			() => resolveSharedCmuxSourcePreflight({ ...common, run: async () => ({ exitCode: 124, stdout: "", stderr: "timeout", aborted: false, diagnostic: { kind: "control" as const, code: "CMUX_TIMEOUT", state: "flushed" } }) }),
+			(error: unknown) => error instanceof CmuxSourcePreflightError && error.exitCode === 124 && error.controlErrorCode === "CMUX_TIMEOUT" && error.parserFailure === "not-run" && /state=flushed/.test(error.message),
+		);
+		await assert.rejects(
+			() => resolveSharedCmuxSourcePreflight({ ...common, singleFlight: new LaunchPreflightSingleFlight(), run: async () => ({ exitCode: 0, stdout: "not-json\n", stderr: "", aborted: false }) }),
+			(error: unknown) => error instanceof CmuxSourcePreflightError && error.exitCode === 0 && error.controlErrorCode === "none" && error.parserFailure === "invalid-json",
+		);
+	});
+
 	test("requires Pi 0.80.10 or newer for agent_settled", () => {
 		assert.equal(isPiVersionAtLeast("0.80.9"), false);
 		assert.equal(isPiVersionAtLeast("0.80.10"), true);
-		assert.equal(isPiVersionAtLeast("0.81.0-beta.1"), true);
+		assert.equal(isPiVersionAtLeast("0.80.11"), true);
+		assert.equal(isPiVersionAtLeast("0.81.0"), true);
+		assert.equal(isPiVersionAtLeast("0.81.0-beta.1"), false);
+		assert.equal(isPiVersionAtLeast("garbage"), false);
 		assert.equal(isPiVersionAtLeast("unknown"), false);
+	});
+
+	test("reuses the Pi version result per executable generation and invalidates on replacement", async () => {
+		resetInteractivePiVersionChecksForTest();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-version-cache-"));
+		try {
+			const executable = path.join(root, "pi"); await fs.promises.writeFile(executable, "v1", { mode: 0o700 });
+			let calls = 0;
+			const run = async () => { calls += 1; return { exitCode: 0, stdout: "0.81.0\n", stderr: "" }; };
+			const proof = await verifyInteractivePiVersionCached({ command: executable, run });
+			await verifyInteractivePiVersionCached({ command: executable, run });
+			assert.equal(calls, 1); assert.equal(isInteractivePiVersionProofCurrent(proof), true);
+			await new Promise((resolve) => setTimeout(resolve, 2)); await fs.promises.writeFile(executable, "v2", { mode: 0o700 });
+			assert.equal(isInteractivePiVersionProofCurrent(proof), false);
+			await verifyInteractivePiVersionCached({ command: executable, run });
+			assert.equal(calls, 2);
+			const entrypoint = path.join(root, "pi.js"); await fs.promises.writeFile(entrypoint, "aaaa", { mode: 0o700 });
+			const entryProof = await verifyInteractivePiVersionCached({ command: executable, prefixArgs: [entrypoint], run });
+			await new Promise((resolve) => setTimeout(resolve, 2)); await fs.promises.writeFile(entrypoint, "bbbb", { mode: 0o700 });
+			assert.equal(isInteractivePiVersionProofCurrent(entryProof), false);
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); resetInteractivePiVersionChecksForTest(); }
 	});
 
 	test("builds interactive Pi args without JSON, print, or no-session flags", () => {
@@ -95,6 +223,31 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(args.filter((value) => value === resolveCurrentPackageExtensionEntrypoint()).length, 1);
 		assert.equal(args.filter((value) => value === buildInteractiveExtensionArgs([]).at(-1)).length, 1);
 		assert.equal(args.at(-1), "@/tmp/run/task.md");
+	});
+
+	test("builds a minimal managed child profile while preserving bridge and nested delegation", () => {
+		assert.equal(resolveManagedChildPolicy({}), "inherit");
+		assert.equal(resolveManagedChildPolicy({ PI_SUBAGENT_CMUX_CHILD_POLICY: "managed" }), "managed");
+		assert.throws(() => resolveManagedChildPolicy({ PI_SUBAGENT_CMUX_CHILD_POLICY: "other" }));
+		assert.doesNotThrow(() => assertManagedChildToolCompatibility({ tools: ["read", "subagent"] }));
+		assert.throws(() => assertManagedChildToolCompatibility({ tools: ["cmux_open_terminal"] }), /cannot preserve/);
+		assert.throws(() => assertManagedChildToolCompatibility({ tools: ["read"] }, undefined, ["read"]), /extension overrides/);
+		assert.throws(() => assertManagedChildToolCompatibility({}, undefined, ["read"]), /extension overrides/);
+		assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, ["read"], true));
+		assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, ["grep"]));
+		const args = buildInteractivePiArgs({ name: "worker", description: "", systemPrompt: "", source: "user", filePath: "/tmp/worker.md", tools: ["read", "subagent"] }, null, "/tmp/task", "/tmp/session", undefined, "managed");
+		assert.ok(args.includes("--no-extensions"));
+		assert.equal(args.filter((value) => value === "--extension").length, 2);
+		assert.ok(args.some((value) => value.endsWith("index.ts")));
+		assert.ok(args.some((value) => value.endsWith("child-bridge.ts")));
+		const inlineArgs = buildPiArgs({ name: "worker", description: "", systemPrompt: "", source: "user", filePath: "/tmp/worker.md", tools: ["subagent"] }, null, "/tmp/task", "spawn", null, undefined, "managed");
+		assert.ok(inlineArgs.includes("--no-extensions"));
+		assert.equal(inlineArgs.filter((value) => value === "--extension").length, 1);
+		assert.ok(inlineArgs.some((value) => value.endsWith("index.ts")));
+		assert.ok(!inlineArgs.some((value) => value.endsWith("child-bridge.ts")));
+		const forkArgs = buildPiArgs({ name: "worker", description: "", systemPrompt: "", source: "user", filePath: "/tmp/worker.md", tools: ["subagent"] }, null, "/tmp/task", "fork", "/tmp/session", undefined, "managed");
+		assert.equal(forkArgs.filter((value) => value === "--extension").length, 2);
+		assert.ok(forkArgs.some((value) => value.endsWith("child-bridge.ts")));
 	});
 
 	test("adds the self extension when inheritance omits it", () => {
@@ -165,10 +318,7 @@ describe("interactive pane runner preparation", () => {
 	});
 
 	test("creates a new child session header and retains fork branch entries", () => {
-		const parent = [
-			JSON.stringify({ type: "session", version: 3, id: "parent", cwd: "/old" }),
-			JSON.stringify({ type: "message", id: "m1", parentId: null, message: { role: "user", content: "context" } }),
-		].join("\n");
+		const parent = JSON.stringify({ type: "message", id: "m1", parentId: null, message: { role: "user", content: "context" } });
 		const jsonl = buildInteractiveChildSessionJsonl({
 			cwd: "/new",
 			parentSessionFile: "/sessions/parent.jsonl",
@@ -182,9 +332,17 @@ describe("interactive pane runner preparation", () => {
 			id: "child",
 			timestamp: lines[0].timestamp,
 			cwd: "/new",
-			parentSession: "/sessions/parent.jsonl",
 		});
+		assert.equal("parentSession" in lines[0], false, "child headers must not disclose the parent session pathname");
 		assert.equal(lines[1].id, "m1");
+		assert.equal(lines.some((line) => line.id === "parent"), false);
+		assert.deepEqual(lines.slice(1).map((line) => JSON.stringify(line)), [parent]);
+	});
+
+	test("fails closed for malformed, header, and non-entry fork branch sources", () => {
+		for (const source of ["{", JSON.stringify({ type: "session", id: "parent" }), "null", JSON.stringify({ type: 1 })]) {
+			assert.throws(() => validateForkBranchSourceJsonl(source), /Fork branch source/);
+		}
 	});
 
 	test("keeps the child TUI attached directly to the terminal", () => {
@@ -193,6 +351,8 @@ describe("interactive pane runner preparation", () => {
 			childCommand: ["pi", "--session", "/tmp/run/child-session.jsonl", "@/tmp/run/task.md"],
 			exportedEnv: { [SUBAGENT_RUN_ID_ENV]: "run-id" },
 			wrapperStatusPath: "/tmp/run/wrapper-status",
+			cleanupDirs: ["/tmp/run/auth overlay"],
+			surfaceTitle: "subagent:worker:12345678",
 		});
 		assert.match(script, /pi.*--session/);
 		assert.equal(script.includes("pane-renderer"), false);
@@ -202,6 +362,39 @@ describe("interactive pane runner preparation", () => {
 		assert.match(script, /^#!\/bin\/bash/m);
 		assert.match(script, /unset NODE_OPTIONS NODE_PATH BUN_OPTIONS/);
 		assert.match(script, /trap finish_subagent_runtime EXIT/);
+		assert.match(script, /\/bin\/rm -rf '\/tmp\/run\/auth overlay'/);
+		assert.match(script, /printf '\\033\]2;%s\\007' 'subagent:worker:12345678'/);
+	});
+
+	test("stops the interactive wrapper before Pi startup until tree permit continuation", async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-permit-wrapper-"));
+		try {
+			const gatePath = path.join(root, "tree-permit-bootstrap.json");
+			const markerPath = path.join(root, "child-ran");
+			const wrapperPath = path.join(root, "wrapper.sh");
+			await fs.promises.writeFile(wrapperPath, buildInteractivePaneWrapperScript({
+				effectiveCwd: root,
+				childCommand: ["/usr/bin/touch", markerPath],
+				exportedEnv: {},
+				wrapperStatusPath: path.join(root, "status"),
+				treePermitBootstrapPath: gatePath,
+			}), { mode: 0o700 });
+			const child = spawn("/bin/bash", [wrapperPath], { stdio: "ignore" });
+			for (let attempt = 0; attempt < 200 && !fs.existsSync(gatePath); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.equal(fs.existsSync(markerPath), false, "child command cannot run before permit bind");
+			assert.equal((JSON.parse(await fs.promises.readFile(gatePath, "utf8")) as { pid: number }).pid, child.pid);
+			let stopped = false;
+			for (let attempt = 0; attempt < 200 && !stopped; attempt += 1) {
+				stopped = /^T/.test(spawnSync("/bin/ps", ["-o", "state=", "-p", String(child.pid)], { encoding: "utf8" }).stdout.trim());
+				if (!stopped) await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			assert.equal(stopped, true);
+			process.kill(child.pid!, "SIGCONT");
+			const exitCode = await new Promise<number>((resolve, reject) => { child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
+			assert.equal(exitCode, 0);
+			assert.equal(fs.existsSync(markerPath), true);
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("records wrapper failure and does not run the child when cwd is invalid", async () => {
@@ -252,7 +445,7 @@ describe("interactive pane runner preparation", () => {
 				child.once("error", reject); child.once("close", (code) => resolve(code ?? 1));
 			});
 			assert.equal(exitCode, 0);
-			assert.equal(await fs.promises.readFile(markerPath, "utf8"), "/private/socket|private-capability|/private/cmux|dynamic-workspace|dynamic-surface|openai-secret|anthropic-secret|http://proxy|localhost|unset");
+			assert.equal(await fs.promises.readFile(markerPath, "utf8"), "/private/socket||/private/cmux|dynamic-workspace|dynamic-surface|openai-secret|anthropic-secret|http://proxy|localhost|unset");
 			assert.equal(fs.existsSync(envPath), false);
 		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
 	});
@@ -308,7 +501,17 @@ describe("interactive pane runner preparation", () => {
 			AZURE_OPENAI_BASE_URL: "https://resource.openai.azure.com", CLOUDFLARE_ACCOUNT_ID: "account-id",
 			GOOGLE_APPLICATION_CREDENTIALS: "/private/vertex.json", HTTPS_PROXY: "proxy", BASH_ENV: "/hook", ENV: "/hook",
 		}, "cmux-pane");
-		assert.deepEqual(env, { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TERM: "xterm-256color", CMUX_SOCKET_PATH: "/safe/cmux.sock", CMUX_SOCKET_CAPABILITY: "capability", CMUX_BUNDLED_CLI_PATH: "/safe/cmux", CMUX_WORKSPACE_ID: "workspace", CMUX_SURFACE_ID: "surface" });
+		assert.deepEqual(env, { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TERM: "xterm-256color", CMUX_SOCKET_PATH: "/safe/cmux.sock", CMUX_BUNDLED_CLI_PATH: "/safe/cmux", CMUX_WORKSPACE_ID: "workspace", CMUX_SURFACE_ID: "surface" });
+	});
+
+	test("passes live telemetry only to the broker boundary, never child environments", () => {
+		const source = { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", PI_SUBAGENT_PHASE0_LIVE: "1", PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR: "/private/telemetry", PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY: "a".repeat(64) };
+		const broker = buildBrokerEnvironment(source, "tmux-pane");
+		assert.equal(broker.PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR, "/private/telemetry");
+		assert.equal(broker.PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY, "a".repeat(64));
+		const child = buildChildProcessEnv({ agentName: "worker", parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true, baseEnv: source });
+		assert.equal(child.PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR, undefined);
+		assert.equal(child.PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY, undefined);
 	});
 
 	test("rejects opposite-mode committed launch authority before gate publication", () => {
@@ -421,7 +624,7 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(script.includes("TMUX_PANE="), false);
 		assert.equal(script.includes("CMUX_SURFACE_ID="), false);
 		assert.match(script, /export CMUX_SOCKET_PATH='\/private\/cmux\.sock'/);
-		assert.match(script, /export CMUX_SOCKET_CAPABILITY='private-capability'/);
+		assert.equal(script.includes("CMUX_SOCKET_CAPABILITY="), false);
 		assert.match(script, /export CMUX_BUNDLED_CLI_PATH='\/Applications\/cmux\.app\/Contents\/Resources\/bin\/cmux'/);
 		assert.match(script, new RegExp(`export ${SUBAGENT_EXPECTED_PARENT_PID_ENV}='123'`));
 		assert.match(script, new RegExp(`export ${SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV}='456'`));
@@ -448,6 +651,122 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(await closeInteractiveTarget(backend, handle), true);
 	});
 
+	test("serializes tmux close-and-inspect behind the launch topology lock", async () => {
+		const releaseLaunch = await acquireTmuxTopologyMutationLockForTest();
+		const handle = { mode: "tmux-pane" as const, native: { paneId: "%2", socketPath: "/tmp/tmux.sock", serverPid: 1, panePid: 2 } };
+		let closeCalls = 0;
+		let inspectCalls = 0;
+		const backend: InteractivePaneBackend = {
+			mode: "tmux-pane", availabilityError: () => null, launch: async () => handle,
+			interrupt: async () => true,
+			close: async () => { closeCalls += 1; return true; },
+			inspect: async () => { inspectCalls += 1; return { exists: false }; },
+		};
+		try {
+			const closing = closeInteractiveTarget(backend, handle);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(closeCalls, 0);
+			assert.equal(inspectCalls, 0);
+			releaseLaunch();
+			assert.equal(await closing, true);
+			assert.equal(closeCalls, 1);
+			assert.equal(inspectCalls, 1);
+		} finally {
+			releaseLaunch();
+		}
+	});
+
+	test("cancelling a queued tmux launch lock cannot enter allocation", async () => {
+		const releaseLaunch = await acquireTmuxTopologyMutationLockForTest();
+		const controller = new AbortController();
+		let allocations = 0;
+		const queued = (async () => {
+			const release = await acquireTmuxTopologyMutationLockForTest(controller.signal);
+			try { allocations += 1; } finally { release(); }
+		})();
+		try {
+			controller.abort();
+			await assert.rejects(queued, /tmux topology lock acquisition aborted/);
+			assert.equal(allocations, 0);
+		} finally {
+			releaseLaunch();
+		}
+		const releaseNext = await acquireTmuxTopologyMutationLockForTest();
+		releaseNext();
+	});
+
+	test("serializes concurrent cmux launch and exact close-and-inspect", async () => {
+		const releaseLaunch = await acquireCmuxTopologyMutationLockForTest();
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "exact-surface" } };
+		let closeCalls = 0;
+		let inspectCalls = 0;
+		const backend: InteractivePaneBackend = {
+			mode: "cmux-pane", availabilityError: () => null, launch: async () => handle,
+			interrupt: async () => true,
+			close: async () => { closeCalls += 1; return true; },
+			inspect: async () => { inspectCalls += 1; return { exists: false }; },
+		};
+		try {
+			const closing = closeInteractiveTarget(backend, handle);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(closeCalls, 0);
+			assert.equal(inspectCalls, 0);
+			releaseLaunch();
+			assert.equal(await closing, true);
+			assert.equal(closeCalls, 1);
+			assert.equal(inspectCalls, 1);
+		} finally {
+			releaseLaunch();
+		}
+	});
+
+	test("serializes registered cmux exact cleanup behind the launch topology lock", async () => {
+		const releaseLaunch = await acquireCmuxTopologyMutationLockForTest();
+		const runId = "cmux-registered-close-lock";
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "registered-surface" } };
+		let closeCalls = 0;
+		const backend: InteractivePaneBackend = {
+			mode: "cmux-pane", availabilityError: () => null, launch: async () => handle,
+			interrupt: async () => true,
+			close: async () => { closeCalls += 1; return true; },
+			inspect: async () => ({ exists: false }),
+		};
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			const release = releaseRegisteredInteractiveRun(runId);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(closeCalls, 0);
+			releaseLaunch();
+			assert.equal(await release, true);
+			assert.equal(closeCalls, 1);
+		} finally {
+			releaseLaunch();
+			unregisterCommittedInteractiveRun(runId);
+		}
+	});
+
+	test("keeps cmux abort queue ordering while a later launch waits", async () => {
+		const releaseFirst = await acquireCmuxTopologyMutationLockForTest();
+		const controller = new AbortController();
+		let laterEntered = false;
+		const aborted = acquireCmuxTopologyMutationLockForTest(controller.signal);
+		const later = (async () => {
+			const release = await acquireCmuxTopologyMutationLockForTest();
+			try { laterEntered = true; } finally { release(); }
+		})();
+		try {
+			controller.abort();
+			await assert.rejects(aborted, /cmux topology lock acquisition aborted/);
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(laterEntered, false, "the aborted FIFO slot must not let a later launch pass its predecessor");
+			releaseFirst();
+			await later;
+			assert.equal(laterEntered, true);
+		} finally {
+			releaseFirst();
+		}
+	});
+
 	test("registers committed ownership before a post-commit gate failure and exact cleanup", async () => {
 		const runId = "commit-before-launch-failure";
 		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "s" } };
@@ -461,8 +780,326 @@ describe("interactive pane runner preparation", () => {
 			// gate failure must still leave the exact allocation actively owned.
 			await assert.rejects(async () => { throw new Error("injected gate publication failure"); });
 			assert.equal(listActiveInteractiveRunIds().includes(runId), true);
-			assert.equal(await recoverInteractiveTarget(backend, handle), true);
+			await backend.interrupt();
+			assert.equal(await closeInteractiveTarget(backend, handle), true);
 		} finally { unregisterCommittedInteractiveRun(runId); }
+	});
+
+	test("provides exact focus, preview, keep, and durable promote ownership actions", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-authority-"));
+		const runId = "ux-promote-run";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002" } };
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: handle.native.workspaceId, surfaceId: handle.native.surfaceId, paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+		let focused = 0; let released = 0; let pauseInspect = false; let inspectEntered!: () => void; let resumeInspect!: () => void;
+		const inspectStarted = new Promise<void>((resolve) => { inspectEntered = resolve; });
+		const inspectResume = new Promise<void>((resolve) => { resumeInspect = resolve; });
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { if (pauseInspect) { inspectEntered(); await inspectResume; } return { exists: true, title: "child" }; }, interrupt: async () => true, close: async () => true, focus: async () => { focused += 1; return true; } };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, agent: "worker", depth: 2, completionMode: "handoff", generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
+			assert.equal(await focusInteractiveRun(runId), true); assert.equal(focused, 1);
+			const inspected = await inspectInteractiveRunForUx(runId);
+			assert.match(inspected?.title ?? "", /^subagent:worker:/); assert.equal(inspected?.titleState, "changed");
+			assert.equal(listInteractiveRunUxSnapshots()[0]?.depth, 2);
+			assert.equal(await keepInteractiveRun(runId), true);
+			assert.equal(await releaseRegisteredInteractiveRun(runId), false); assert.equal(released, 0);
+			pauseInspect = true;
+			const childAcknowledgement = (async () => {
+				for (let attempt = 0; attempt < 500 && !fs.existsSync(paths.promotionRequestPath); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+				const request = JSON.parse(await fs.promises.readFile(paths.promotionRequestPath, "utf8"));
+				const { requestedAt: _requestedAt, ...shared } = request;
+				await fs.promises.writeFile(paths.promotionAckPath, `${JSON.stringify({ ...shared, kind: "ack", acknowledgedAt: Date.now() })}\n`, { mode: 0o600 });
+			})();
+			const promotion = promoteInteractiveRun(runId);
+			await inspectStarted;
+			const shutdown = beginInteractiveShutdownForSession();
+			resumeInspect();
+			assert.equal(await promotion, "promoted");
+			await childAcknowledgement;
+			await shutdown;
+			assert.equal(released, 0);
+			assert.equal(fs.existsSync(paths.detachedOwnershipPath), true);
+			assert.equal((JSON.parse(await fs.promises.readFile(paths.detachedOwnershipPath, "utf8")) as { completionMode?: string }).completionMode, "handoff");
+			assert.equal(fs.existsSync(paths.userOwnershipPath), false);
+			assert.equal(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.ownership, "detached");
+		} finally {
+			// The fake backend has no live target; this test-only teardown supplies
+			// the explicit absence proof required for a detached registry record.
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("requires an exact child handshake for a legacy marker and revokes shutdown authority once its request wins", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-legacy-"));
+		const runId = "matching-legacy";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		const digest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
+		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.userOwnershipPath, `${JSON.stringify({ version: 1, runId, promotedAt: 1, allocationDigest: digest })}\n`, { mode: 0o600 });
+		let interrupts = 0, releases = 0;
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: true }), interrupt: async () => { interrupts += 1; return true; }, close: async () => true };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest(), release: async () => { releases += 1; return true; } }), true);
+			const promotion = promoteInteractiveRun(runId);
+			for (let attempt = 0; attempt < 500 && !fs.existsSync(paths.promotionRequestPath); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+			assert.equal(fs.existsSync(paths.promotionRequestPath), true, "a legacy marker alone must not promote an active child");
+			assert.equal(await Promise.race([promotion.then(() => "settled"), new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 20))]), "pending");
+			assert.equal(listInteractiveRunUxSnapshots().find((entry) => entry.runId === runId)?.ownership, "transferring", "the winning request fences monitor settlement while revoking parent authority");
+			let permitDetaches = 0;
+			assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("transferring", { detachBoundChild: async () => { permitDetaches += 1; return true; } }), true);
+			assert.equal(permitDetaches, 0, "a delayed ACK must not detach the permit while the monitor waits");
+			// Shutdown fences behind the in-flight transfer; once the child acks it
+			// must observe detached authority and issue neither interrupt nor release.
+			const shutdown = shutdownActiveInteractiveRuns();
+			const request = JSON.parse(await fs.promises.readFile(paths.promotionRequestPath, "utf8"));
+			const { requestedAt: _requestedAt, ...shared } = request;
+			await fs.promises.writeFile(paths.promotionAckPath, `${JSON.stringify({ ...shared, kind: "ack", acknowledgedAt: Date.now() })}\n`, { mode: 0o600 });
+			assert.equal(await promotion, "already-promoted");
+			assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("detached", { detachBoundChild: async () => { permitDetaches += 1; return true; } }), true);
+			assert.equal(permitDetaches, 1, "eventual durable promotion detaches the permit exactly once");
+			await shutdown;
+			assert.equal(interrupts, 0, "shutdown must not interrupt after request/ack revokes authority");
+			assert.equal(releases, 0, "shutdown must not release after request/ack revokes authority");
+			assert.equal(fs.existsSync(paths.detachedOwnershipPath), true);
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("reconciles a late exact acknowledgement on a same-process promotion retry", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-late-ack-"));
+		const runId = "late-ack-retry";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
+		let targetLive = true;
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: targetLive }), interrupt: async () => true, close: async () => true };
+		try {
+			const request = {
+				contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId,
+				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+				parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: process.pid, startedAt: childStartedAt! }, requestedAt: Date.now(),
+			};
+			await fs.promises.writeFile(paths.promotionRequestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 });
+			const { requestedAt: _requestedAt, ...shared } = request;
+			// This acknowledgement arrived after an earlier same-process request
+			// attempt timed out; retry must reconcile it instead of staying unknown.
+			await fs.promises.writeFile(paths.promotionAckPath, `${JSON.stringify({ ...shared, kind: "ack", acknowledgedAt: Date.now() })}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(await promoteInteractiveRun(runId), "promoted");
+			targetLive = false;
+			assert.equal(await promoteInteractiveRun(runId), "already-promoted", "a detached retry relies on the durable transfer chain, not target liveness");
+			let detachAttempts = 0;
+			assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("detached", { detachBoundChild: async () => ++detachAttempts === 2 }), true);
+			assert.equal(detachAttempts, 2, "detached permit settlement retries a transient authority failure");
+			let failedDetachAttempts = 0;
+			assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("detached", { detachBoundChild: async () => { failedDetachAttempts += 1; return false; } }), false);
+			assert.equal(failedDetachAttempts, 3, "a detached monitor must fail closed after its bounded retry budget");
+			await fs.promises.unlink(paths.promotionAckPath);
+			assert.equal(await promoteInteractiveRun(runId), "ownership-unknown", "a detached retry fails closed when its transfer chain is incomplete");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("requires permit detachment before reporting a durable promotion and retries after monitor exit", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-permit-promotion-"));
+		const runId = "permit-promotion-retry";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+		const request = { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174005", runId,
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: process.pid, startedAt: childStartedAt! }, requestedAt: Date.now() };
+		const { requestedAt: _requestedAt, ...shared } = request;
+		await fs.promises.writeFile(paths.promotionRequestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.promotionAckPath, `${JSON.stringify({ ...shared, kind: "ack", acknowledgedAt: Date.now() })}\n`, { mode: 0o600 });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: true }), interrupt: async () => true, close: async () => true };
+		let detachAttempts = 0;
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest(), treePermitLease: { detachBoundChild: async () => ++detachAttempts >= 4 } }), true);
+			assert.equal(await promoteInteractiveRun(runId), "ownership-unknown");
+			assert.equal(detachAttempts, 3, "promotion cannot succeed while bounded permit detach fails");
+			assert.equal(await promoteInteractiveRun(runId), "promoted");
+			assert.equal(detachAttempts, 4, "the retained active run settles its exact permit before publishing its detached marker");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects promotion when a terminal completion won before the transfer fence", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-terminal-winner-"));
+		const runId = "terminal-winner";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
+		let inspected!: () => void, continuePromotion!: () => void;
+		const inspectStarted = new Promise<void>((resolve) => { inspected = resolve; });
+		const inspectContinue = new Promise<void>((resolve) => { continuePromotion = resolve; });
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { inspected(); await inspectContinue; return { exists: true }; }, interrupt: async () => true, close: async () => true };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			const promotion = promoteInteractiveRun(runId);
+			await inspectStarted;
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify({ version: 2, runId, status: "failed", completedAt: Date.now(), errorCode: "child-error" })}\n`, { mode: 0o600 });
+			continuePromotion();
+			assert.equal(await promotion, "rejected");
+			assert.equal(fs.existsSync(paths.promotionRequestPath), false);
+			assert.equal(listInteractiveRunUxSnapshots().find((entry) => entry.runId === runId)?.ownership, "managed");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("retains parent ownership when valid or malformed completion races an exact promotion ACK", async () => {
+		for (const [label, completion] of [
+			["valid", { version: 2, status: "failed", completedAt: Date.now(), errorCode: "child-error" }],
+			["malformed", "{malformed}\n"],
+		] as const) {
+			await resetInteractiveShutdownForSession();
+			const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), `pi-subagent-ux-completion-${label}-`));
+			const runId = `completion-after-ack-${label}`;
+			const paths = await prepareRunArtifactPaths({ rootDir, runId });
+			const allocation = { version: 2, runId, terminalMode: "cmux-pane" as const, target: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+			const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
+			await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+			await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
+			const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
+			const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: true }), interrupt: async () => true, close: async () => true };
+			let detachAttempts = 0;
+			try {
+				assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest(), treePermitLease: { detachBoundChild: async () => { detachAttempts += 1; return true; } } }), true);
+				const acknowledgement = (async () => {
+					for (let attempt = 0; attempt < 500 && !fs.existsSync(paths.promotionRequestPath); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+					const request = JSON.parse(await fs.promises.readFile(paths.promotionRequestPath, "utf8"));
+					const { requestedAt: _requestedAt, ...shared } = request;
+					await fs.promises.writeFile(paths.promotionAckPath, `${JSON.stringify({ ...shared, kind: "ack", acknowledgedAt: Date.now() })}\n`, { mode: 0o600 });
+					if (typeof completion === "string") await fs.promises.writeFile(paths.completionPath, completion, { mode: 0o600 });
+					else await fs.promises.writeFile(paths.completionPath, `${JSON.stringify({ ...completion, runId })}\n`, { mode: 0o600 });
+				})();
+				assert.equal(await promoteInteractiveRun(runId), "ownership-unknown");
+				await acknowledgement;
+				assert.equal(detachAttempts, 0, `${label} completion retains the parent tree permit`);
+				assert.equal(fs.existsSync(paths.detachedOwnershipPath), false, `${label} completion prevents detached marker publication`);
+			} finally {
+				unregisterCommittedInteractiveRun(runId, true);
+				await resetInteractiveShutdownForSession();
+				await removeRunArtifacts(paths).catch(() => undefined);
+				await fs.promises.rm(rootDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("reports unknown ownership as an error and retains its tree permit", async () => {
+		const result = { exitCode: -1, stderr: "", sawAgentEnd: undefined } as any;
+		applyInteractiveOwnershipUnknownResultForTest(result);
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.stopReason, "error");
+		assert.equal(result.sawAgentEnd, undefined);
+		assert.match(result.errorMessage, /ownership transfer is uncertain/);
+		let detachAttempts = 0;
+		assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("ownership-unknown", { detachBoundChild: async () => { detachAttempts += 1; return true; } }), true);
+		assert.equal(detachAttempts, 0);
+	});
+
+	test("keeps malformed promotion ownership visible and revokes local cleanup", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ux-unknown-"));
+		const runId = "ux-unknown-ownership";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "123e4567-e89b-12d3-a456-426614174000", surfaceId: "123e4567-e89b-12d3-a456-426614174002" } };
+		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: handle.native.workspaceId, surfaceId: handle.native.surfaceId, paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
+		await fs.promises.writeFile(paths.userOwnershipPath, "{malformed}\n", { mode: 0o600 });
+		let releases = 0;
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: true }), interrupt: async () => true, close: async () => true };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest(), release: async () => { releases += 1; return true; } }), true);
+			assert.equal(await promoteInteractiveRun(runId), "ownership-unknown");
+			assert.equal(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.ownership, "ownership-unknown");
+			let detachAttempts = 0;
+			assert.equal(await settleInteractiveTreePermitAfterOwnershipForTest("ownership-unknown", { detachBoundChild: async () => { detachAttempts += 1; return true; } }), true);
+			assert.equal(detachAttempts, 0, "unknown promotion must retain tree permit authority");
+			assert.equal(await releaseRegisteredInteractiveRun(runId, true), false);
+			await shutdownActiveInteractiveRuns();
+			assert.equal(releases, 0, "shutdown must not mutate a target after promotion authority becomes unknown");
+			assert.equal(listActiveInteractiveRunIds().includes(runId), true);
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
+	});
+
+	test("fences in-flight tmux pool connects at interactive shutdown and reopens only for the new session", async () => {
+		await resetInteractiveShutdownForSession();
+		let finishCreate!: () => void;
+		const connecting = acquireTmuxControlLease({
+			authority: {
+				controlContract: "tmux-control-v1", executableGeneration: { realpath: "/bin/tmux", dev: "1", ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" },
+				canonicalSocketPath: "/tmp/interactive-shutdown-race.sock", socketDev: 1, socketIno: 1, serverPid: 1, serverStartedAt: 1,
+				attachedSessionId: "$1", sourcePaneId: "%1", sourcePanePid: 1, sourceWindowId: "@1",
+			},
+			createClient: async () => await new Promise<void>((resolve) => { finishCreate = resolve; }).then(() => ({
+				close() {}, notificationSequence: () => 0, lastNotificationAt: () => null,
+				waitForNotification: async () => "disconnect" as const, execute: async () => [],
+			} as any)),
+			revalidate: async () => true,
+		});
+		const shutdown = beginInteractiveShutdownForSession();
+		finishCreate();
+		await shutdown;
+		assert.equal(await connecting, null);
+		assert.deepEqual(snapshotTmuxControlPoolForTest(), { entries: 0, leases: 0, clients: 0 });
+		await resetInteractiveShutdownForSession();
+		const fresh = await acquireTmuxControlLease({
+			authority: {
+				controlContract: "tmux-control-v1", executableGeneration: { realpath: "/bin/tmux", dev: "1", ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" },
+				canonicalSocketPath: "/tmp/interactive-shutdown-race.sock", socketDev: 1, socketIno: 1, serverPid: 1, serverStartedAt: 1,
+				attachedSessionId: "$1", sourcePaneId: "%1", sourcePanePid: 1, sourceWindowId: "@1",
+			},
+			createClient: async () => ({ close() {}, notificationSequence: () => 0, lastNotificationAt: () => null, waitForNotification: async () => "disconnect" as const, execute: async () => [] } as any),
+			revalidate: async () => true,
+		});
+		assert.ok(fresh);
+		fresh.release();
 	});
 
 	test("increments generations across resets and fences old captures", async () => {
@@ -477,6 +1114,77 @@ describe("interactive pane runner preparation", () => {
 		await resetInteractiveShutdownForSession();
 		assert.equal(canStartInteractiveRun(captured), false);
 		assert.equal(canStartInteractiveRun(getInteractiveShutdownGenerationForTest()), true);
+	});
+
+	test("serializes a paused live drain with completion replay and skips later drains", async () => {
+		const queue = createInteractiveResultMutationQueueForTest();
+		let entered!: () => void;
+		let resume!: () => void;
+		const drainEntered = new Promise<void>((resolve) => { entered = resolve; });
+		const drainResume = new Promise<void>((resolve) => { resume = resolve; });
+		let result = "initial";
+		let completionApplied = false;
+		let callbacks = 0;
+		const pausedDrain = queue.run(async () => {
+			entered();
+			await drainResume;
+			if (completionApplied) return;
+			result = "live";
+			callbacks += 1;
+		});
+		await drainEntered;
+		const replay = queue.run(async () => {
+			completionApplied = true;
+			result = "verified replay";
+		});
+		resume();
+		await Promise.all([pausedDrain, replay]);
+		assert.equal(result, "verified replay", "a paused drain cannot overwrite a later verified replay");
+		assert.equal(callbacks, 1, "the already-running drain retains its callback before the queued winner");
+		await queue.run(async () => {
+			if (completionApplied) return;
+			callbacks += 1;
+		});
+		assert.equal(callbacks, 1, "a drain that follows the applied winner must not callback");
+	});
+
+	test("replays and releases an existing child completion winner during shutdown", async () => {
+		await resetInteractiveShutdownForSession();
+		const rootDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-child-winner-shutdown-"));
+		const runId = "child-winner-shutdown";
+		const paths = await prepareRunArtifactPaths({ rootDir, runId });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "s" } };
+		const order: string[] = [];
+		let interrupts = 0;
+		const backend = {
+			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }), interrupt: async () => { interrupts += 1; return true; }, close: async () => true,
+		};
+		try {
+			const line = `${JSON.stringify({ type: "message", id: "child-final", message: { role: "assistant", content: [{ type: "text", text: "done" }] } })}\n`;
+			await fs.promises.writeFile(paths.childSessionPath, line, { mode: 0o600 });
+			const session = await computeSessionCompletionBoundary(paths.childSessionPath); assert.ok(session);
+			const identity = await getSessionFileIdentity(paths.childSessionPath); assert.ok(identity);
+			await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 0, phase: "starting", updatedAt: Date.now() })}\n`, { mode: 0o600 });
+			const childWinner = { version: 3, runId, producer: "child", status: "completed", completedAt: Date.now(), session } as const;
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(childWinner)}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({
+				runId, backend, handle, paths, sessionIdentity: identity, generation: getInteractiveShutdownGenerationForTest(),
+				stopLeaseWriterAndDrain: async () => { order.push("stop"); },
+				applyCompletionWinner: async (winner) => { assert.deepEqual(winner, childWinner); order.push("apply"); return true; },
+				release: async () => { order.push("release"); return true; },
+			}), true);
+			await shutdownActiveInteractiveRuns();
+			assert.equal(interrupts, 0, "an existing completion winner revokes shutdown interrupt authority");
+			assert.ok(order.indexOf("stop") < order.indexOf("apply"), "shutdown stops the lease before replaying the winner");
+			assert.ok(order.indexOf("apply") < order.indexOf("release"), "shutdown verifies the exact winner before release");
+			assert.equal(listActiveInteractiveRunIds().includes(runId), false);
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await removeRunArtifacts(paths).catch(() => undefined);
+			await fs.promises.rm(rootDir, { recursive: true, force: true });
+		}
 	});
 
 	test("retains a fenced late commit for shutdown retry when its first exact release fails", async () => {
@@ -504,6 +1212,83 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(listActiveInteractiveRunIds().includes(runId), false);
 		assert.deepEqual(calls, ["interrupt:exact-surface", "interrupt:exact-surface"]);
 		await resetInteractiveShutdownForSession();
+	});
+
+	test("does not let a hung shutdown interrupt retain the global fence or mutate a later registered target", async () => {
+		await resetInteractiveShutdownForSession();
+		const originalHandle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "reused", paneId: "original" } };
+		let interruptEntered!: () => void;
+		const interruptStarted = new Promise<void>((resolve) => { interruptEntered = resolve; });
+		let resolveInterrupt!: (value: boolean) => void;
+		const interrupted = new Promise<boolean>((resolve) => { resolveInterrupt = resolve; });
+		const originalBackend = {
+			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => originalHandle,
+			inspect: async () => ({ exists: true }),
+			interrupt: async (target: typeof originalHandle) => { assert.equal(target, originalHandle); interruptEntered(); return await interrupted; },
+			close: async () => true,
+		};
+		const originalRunId = "hung-interrupt-original";
+		const laterHandle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "reused", paneId: "replacement" } };
+		let laterInterrupted = 0;
+		let laterReleased = 0;
+		const laterBackend = {
+			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => laterHandle,
+			inspect: async () => ({ exists: true }),
+			interrupt: async (target: typeof laterHandle) => { assert.equal(target, laterHandle); laterInterrupted += 1; return true; },
+			close: async () => true,
+		};
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId: originalRunId, backend: originalBackend, handle: originalHandle, generation: getInteractiveShutdownGenerationForTest(), release: async () => true }), true);
+			const shutdown = shutdownActiveInteractiveRuns();
+			await interruptStarted;
+			// This commit is rejected by the shutdown generation, but its bounded
+			// cleanup must still acquire the global fence and touch only its exact handle.
+			assert.equal(registerCommittedInteractiveRun({ runId: "hung-interrupt-later", backend: laterBackend, handle: laterHandle, generation: getInteractiveShutdownGenerationForTest(), release: async () => { laterReleased += 1; return true; } }), false);
+			for (let attempt = 0; attempt < 100 && laterReleased === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.equal(laterInterrupted, 1, "the later run interrupt must not wait on unrelated backend I/O under the global fence");
+			assert.equal(laterReleased, 1, "late fenced cleanup must progress while the original interrupt is unresolved");
+			resolveInterrupt(true);
+			await shutdown;
+			assert.equal(laterInterrupted, 1, "a delayed original operation must not be replayed against the reused target");
+		} finally {
+			resolveInterrupt?.(false);
+			unregisterCommittedInteractiveRun(originalRunId, true);
+			unregisterCommittedInteractiveRun("hung-interrupt-later", true);
+			await resetInteractiveShutdownForSession();
+		}
+	});
+
+	test("does not let a hung registered close retain the global fence", async () => {
+		await resetInteractiveShutdownForSession();
+		const hungHandle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "hung-close", paneId: "original" } };
+		let closeEntered!: () => void;
+		const closeStarted = new Promise<void>((resolve) => { closeEntered = resolve; });
+		let resolveClose!: (value: boolean) => void;
+		const closeResult = new Promise<boolean>((resolve) => { resolveClose = resolve; });
+		const hungBackend = {
+			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => hungHandle,
+			interrupt: async () => true,
+			close: async (target: typeof hungHandle) => { assert.equal(target, hungHandle); closeEntered(); return await closeResult; },
+			inspect: async () => ({ exists: false }),
+		};
+		const otherHandle = { mode: "tmux-pane" as const, native: { paneId: "%99", serverPid: 1, panePid: 2 } };
+		let otherReleased = 0;
+		const otherBackend = { mode: "tmux-pane" as const, availabilityError: () => null, launch: async () => otherHandle, interrupt: async () => true, close: async () => true, inspect: async () => ({ exists: false }) };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId: "hung-close", backend: hungBackend, handle: hungHandle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			const closing = releaseRegisteredInteractiveRun("hung-close");
+			await closeStarted;
+			assert.equal(registerCommittedInteractiveRun({ runId: "other-close", backend: otherBackend, handle: otherHandle, generation: getInteractiveShutdownGenerationForTest(), release: async () => { otherReleased += 1; return true; } }), true);
+			assert.equal(await releaseRegisteredInteractiveRun("other-close"), true);
+			assert.equal(otherReleased, 1, "an unrelated registered release must not wait on the hung close's global fence");
+			resolveClose(true);
+			assert.equal(await closing, true);
+		} finally {
+			resolveClose?.(false);
+			unregisterCommittedInteractiveRun("hung-close", true);
+			unregisterCommittedInteractiveRun("other-close", true);
+			await resetInteractiveShutdownForSession();
+		}
 	});
 
 	test("serializes a paused gate publication with the shutdown fence", async () => {
@@ -563,10 +1348,11 @@ describe("interactive pane runner preparation", () => {
 		await resetInteractiveShutdownForSession();
 		const retryRunId = "retry-release";
 		const failedRunId = "failed-release";
+		const keptRunId = "kept-completion-release";
 		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "s" } };
 		const backend = {
 			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle,
-			interrupt: async () => true, close: async () => true, inspect: async () => ({ exists: false }),
+			interrupt: async () => true, close: async () => true, inspect: async () => ({ exists: true }),
 		};
 		let retries = 0;
 		registerCommittedInteractiveRun({
@@ -578,12 +1364,56 @@ describe("interactive pane runner preparation", () => {
 			runId: failedRunId, backend, handle,
 			generation: getInteractiveShutdownGenerationForTest(), release: async () => false,
 		});
+		let keptReleases = 0;
+		registerCommittedInteractiveRun({
+			runId: keptRunId, backend, handle,
+			generation: getInteractiveShutdownGenerationForTest(), release: async () => ++keptReleases >= 2,
+		});
+		assert.equal(await keepInteractiveRun(keptRunId), true);
+		assert.equal(await releaseRegisteredInteractiveRun(keptRunId), false, "completion must retain a kept run after its active lease is released");
 		await shutdownActiveInteractiveRuns();
 		assert.equal(retries, 2);
+		assert.equal(keptReleases, 2, "session shutdown retries the durable kept-run release without leaking it");
 		assert.equal(listActiveInteractiveRunIds().includes(retryRunId), false);
+		assert.equal(listActiveInteractiveRunIds().includes(keptRunId), false);
 		assert.equal(listActiveInteractiveRunIds().includes(failedRunId), true);
 		unregisterCommittedInteractiveRun(failedRunId);
 		await resetInteractiveShutdownForSession();
+	});
+
+	test("bounds stalled terminal preparation without releasing its target or delaying unrelated shutdown", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-terminal-stall-"));
+		const leasePaths = await prepareRunArtifactPaths({ rootDir: root, runId: "stalled-lease" });
+		const callbackPaths = await prepareRunArtifactPaths({ rootDir: root, runId: "stalled-callback" });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "s" } };
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, interrupt: async () => true, close: async () => true, inspect: async () => ({ exists: true }) };
+		let leasePublished = 0, leaseReleased = 0, callbackReleased = 0, unrelatedReleased = 0;
+		try {
+			assert.equal(registerCommittedInteractiveRun({
+				runId: "stalled-lease", backend, handle, paths: leasePaths, generation: getInteractiveShutdownGenerationForTest(),
+				stopLeaseWriterAndDrain: async () => await new Promise<never>(() => undefined),
+				publishParentCompletion: async () => { leasePublished += 1; return null; }, release: async () => { leaseReleased += 1; return true; },
+			}), true);
+			assert.equal(registerCommittedInteractiveRun({
+				runId: "stalled-callback", backend, handle, paths: callbackPaths, generation: getInteractiveShutdownGenerationForTest(),
+				publishParentCompletion: async () => await new Promise<never>(() => undefined), release: async () => { callbackReleased += 1; return true; },
+			}), true);
+			assert.equal(registerCommittedInteractiveRun({ runId: "unrelated-terminal", backend, handle, generation: getInteractiveShutdownGenerationForTest(), release: async () => { unrelatedReleased += 1; return true; } }), true);
+			const started = Date.now();
+			await shutdownActiveInteractiveRuns();
+			assert.ok(Date.now() - started < 2_000, "stalled terminal preparation must be bounded");
+			assert.equal(leasePublished, 0, "an unresolved lease drain must not publish parent completion");
+			assert.equal(leaseReleased, 0, "an unresolved lease drain must not release its target");
+			assert.equal(callbackReleased, 0, "an unresolved callback must not release its target");
+			assert.equal(unrelatedReleased, 1, "unrelated runs continue through shutdown");
+			assert.equal(listActiveInteractiveRunIds().includes("stalled-lease"), true);
+			assert.equal(listActiveInteractiveRunIds().includes("stalled-callback"), true);
+		} finally {
+			unregisterCommittedInteractiveRun("stalled-lease", true); unregisterCommittedInteractiveRun("stalled-callback", true); unregisterCommittedInteractiveRun("unrelated-terminal", true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("interrupts and confirms exact absence during inspect-exhaustion recovery", async () => {
@@ -595,8 +1425,245 @@ describe("interactive pane runner preparation", () => {
 			close: async () => { calls.push("close"); return true; },
 			inspect: async () => { calls.push("inspect"); return { exists: false }; },
 		};
-		assert.equal(await recoverInteractiveTarget(backend, handle), true);
+		await backend.interrupt();
+		assert.equal(await closeInteractiveTarget(backend, handle), true);
 		assert.deepEqual(calls, ["interrupt", "close", "inspect"]);
+	});
+
+	test("component-level fake backend exercises cancel, external close, shutdown, and reload without touching source/sentinel", async () => {
+		await shutdownActiveInteractiveRuns();
+		await resetInteractiveShutdownForSession();
+		const workspace = "123e4567-e89b-12d3-a456-426614174000";
+		const source = { workspaceId: workspace, sourceSurfaceId: "123e4567-e89b-12d3-a456-426614174001" };
+		const sentinel = "123e4567-e89b-12d3-a456-426614174002";
+		const live = new Set([source.sourceSurfaceId, sentinel]);
+		const interrupted: string[] = [];
+		const closed: string[] = [];
+		const backend: InteractivePaneBackend = {
+			mode: "cmux-pane",
+			availabilityError: () => null,
+			launch: async () => ({ mode: "cmux-pane", native: { workspaceId: workspace, surfaceId: "123e4567-e89b-12d3-a456-426614174099", paneId: "123e4567-e89b-12d3-a456-426614174090" } }),
+			interrupt: async (handle) => {
+				if (handle.mode !== "cmux-pane") return false;
+				interrupted.push(handle.native.surfaceId);
+				return true;
+			},
+			close: async (handle) => {
+				if (handle.mode !== "cmux-pane") return false;
+				closed.push(handle.native.surfaceId);
+				live.delete(handle.native.surfaceId);
+				return true;
+			},
+			inspect: async (handle) => handle.mode === "cmux-pane" ? { exists: live.has(handle.native.surfaceId) } : undefined,
+		};
+		const coordinator = new InteractiveLayoutCoordinator({ validateCmuxPane: async () => true });
+		const runNames = ["foreground", "background", "parallel-chain-0", "parallel-chain-1"];
+		const runs = await Promise.all(runNames.map(async (runId, index) => {
+			const lease = await coordinator.allocateCmux({
+				source, depth: 0, layout: "auto", runId,
+				allocate: async (request) => {
+					const surfaceId = `123e4567-e89b-12d3-a456-426614174${String(100 + index)}`;
+					live.add(surfaceId);
+					return {
+						committed: true as const, layout: request.layout, placement: request.placement,
+						container: { kind: "cmux-pane" as const, workspaceId: workspace, paneId: request.placement === "cmux-split" ? "123e4567-e89b-12d3-a456-426614174090" : request.container.paneId! },
+						target: { workspaceId: workspace, paneId: "123e4567-e89b-12d3-a456-426614174090", surfaceId },
+					};
+				},
+			});
+			const handle = { mode: "cmux-pane" as const, native: lease.allocation.target };
+			const release = async () => {
+				await coordinator.releaseCmux({ lease, close: async (allocation) => await closeInteractiveTarget(backend, {
+					mode: "cmux-pane", native: allocation.target,
+				}) });
+				return true;
+			};
+			registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest(), release });
+			return { runId, lease, handle, release };
+		}));
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), runNames.length);
+
+		// Model cancellation and an externally closed child without allowing either to name source/sentinel.
+		await backend.interrupt(runs[1]!.handle);
+		await runs[1]!.release();
+		unregisterCommittedInteractiveRun(runs[1]!.runId);
+		live.delete(runs[2]!.lease.allocation.target.surfaceId);
+		await runs[2]!.release();
+		unregisterCommittedInteractiveRun(runs[2]!.runId);
+		await shutdownActiveInteractiveRuns();
+		for (const { runId } of runs) assert.equal(listActiveInteractiveRunIds().includes(runId), false);
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), 0);
+		assert.equal(live.has(source.sourceSurfaceId), true);
+		assert.equal(live.has(sentinel), true);
+		assert.equal(closed.includes(source.sourceSurfaceId) || closed.includes(sentinel), false);
+		assert.equal(interrupted.includes(source.sourceSurfaceId) || interrupted.includes(sentinel), false);
+
+		// A reload starts a fresh generation and cannot reuse a retired shared pane.
+		await resetInteractiveShutdownForSession();
+		const replacement = await coordinator.allocateCmux({
+			source, depth: 0, layout: "auto", runId: "after-reload",
+			allocate: async (request) => ({
+				committed: true as const, layout: request.layout, placement: request.placement,
+				container: { kind: "cmux-pane" as const, workspaceId: workspace, paneId: "123e4567-e89b-12d3-a456-426614174091" },
+				target: { workspaceId: workspace, paneId: "123e4567-e89b-12d3-a456-426614174091", surfaceId: "123e4567-e89b-12d3-a456-426614174150" },
+			}),
+		});
+		assert.equal(replacement.request.placement, "cmux-split");
+		await coordinator.releaseCmux({ lease: replacement, close: async () => true });
+	});
+
+	test("inspects tmux through an accepted pool epoch without local generation probes", async () => {
+		await resetInteractiveShutdownForSession();
+		const lease = await acquireTmuxControlLease({
+			authority: {
+				controlContract: "tmux-control-v1", executableGeneration: { realpath: "/private/tmux", dev: "1", ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" },
+				canonicalSocketPath: "/private/socket", socketDev: 1, socketIno: 1, serverPid: 100, serverStartedAt: 1,
+				attachedSessionId: "$1", sourcePaneId: "%1", sourcePanePid: 101, sourceWindowId: "@1",
+			},
+			createClient: async () => ({
+				close() {}, notificationSequence: () => 0, lastNotificationAt: () => null, waitForNotification: async () => "timeout" as const,
+				execute: async (line: string) => line.startsWith("display-message") ? ["100"] : ["%2\t0\tchild\t102"],
+			} as any),
+			revalidate: async () => true,
+		});
+		assert.ok(lease);
+		try {
+			const snapshot = await inspectActiveTmuxSnapshotForTest({
+				handle: { mode: "tmux-pane", native: {
+					paneId: "%2", panePid: 102, serverPid: 100, socketPath: "/private/socket",
+					generation: { socketPath: "/intentionally-unavailable/socket", socketDev: "1", socketIno: "1", serverStartedAt: 1 },
+				} },
+				run: lease.run, backendKey: "ignored-by-pooled-tmux", generation: getInteractiveShutdownGenerationForTest(),
+				tmuxAcceptedTransport: () => lease.acceptedTransport(),
+			});
+			assert.deepEqual(snapshot, { exists: true, exited: false, title: "child" });
+		} finally {
+			lease.release();
+		}
+	});
+
+	test("does not spend inspection failures on 16 mutation-invalidated snapshots and applies a stable completion", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174100";
+		const paneId = "123e4567-e89b-12d3-a456-426614174101";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174102";
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId, surfaceId } };
+		const tree = JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }] }] }] }] });
+		const generation = getInteractiveShutdownGenerationForTest();
+		let queryFailures = 0;
+		for (let epoch = 0; epoch < 16; epoch += 1) {
+			let entered!: () => void;
+			let release!: () => void;
+			const inspectionEntered = new Promise<void>((resolve) => { entered = resolve; });
+			const inspectionRelease = new Promise<void>((resolve) => { release = resolve; });
+			const observationGeneration = getTopologyMutationGenerationForTest();
+			const inspection = inspectActiveCmuxSnapshotForTest({
+				handle, backendKey: "test-cmux", generation,
+				run: async () => { entered(); await inspectionRelease; return { exitCode: 0, stdout: tree, stderr: "", aborted: false }; },
+			});
+			await inspectionEntered;
+			advanceTopologyMutationGenerationForTest();
+			release();
+			const snapshot = await inspection;
+			assert.equal(snapshot, undefined);
+			if (!isTopologyMutationInvalidatedUndefinedInspectionForTest(snapshot, observationGeneration)) queryFailures += 1;
+		}
+		assert.equal(queryFailures, 0, "stale observations must not consume the transport-failure budget");
+
+		const stableSnapshotGeneration = getTopologyMutationGenerationForTest();
+		const stableSnapshot = await inspectActiveCmuxSnapshotForTest({
+			handle, backendKey: "test-cmux", generation,
+			run: async () => ({ exitCode: 0, stdout: tree, stderr: "", aborted: false }),
+		});
+		assert.equal(stableSnapshot?.exists, true);
+		assert.equal(isTopologyMutationInvalidatedUndefinedInspectionForTest(stableSnapshot, stableSnapshotGeneration), false);
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			const snapshot = await inspectActiveCmuxSnapshotForTest({
+				handle, backendKey: "test-cmux", generation,
+				run: async () => ({ exitCode: 1, stdout: "", stderr: "unavailable", aborted: false }),
+			});
+			assert.equal(snapshot, undefined);
+			if (!isTopologyMutationInvalidatedUndefinedInspectionForTest(snapshot, stableSnapshotGeneration)) queryFailures += 1;
+		}
+		assert.equal(queryFailures, 20, "20 stable undefined inspections still fail closed");
+
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-v3-winner-"));
+		try {
+			const sessionPath = path.join(root, "session.jsonl");
+			await fs.promises.writeFile(sessionPath, `${JSON.stringify({ type: "message", id: "final", message: { role: "assistant", content: [{ type: "text", text: "verified" }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } }, stopReason: "stop" } })}\n`);
+			const session = await computeSessionCompletionBoundary(sessionPath); assert.ok(session);
+			const completion = { version: 3 as const, runId: "winner", producer: "child" as const, status: "completed" as const, completedAt: 1, session };
+			const result = { agent: "reviewer", agentSource: "user" as const, task: "t", exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result, completion, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), true);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.messages.length, 1);
+			await fs.promises.writeFile(sessionPath, `${JSON.stringify({ type: "message", id: "forged", message: { role: "assistant", content: [{ type: "text", text: "forged" }] } })}\n`);
+			const forgedResult = { ...result, exitCode: -1, messages: [], usage: { ...result.usage } };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result: forgedResult, completion, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), false);
+			assert.equal(forgedResult.exitCode, -1, "failed boundary proof must retain the recoverable result");
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
+	});
+
+	test("replays a verified final assistant entry above the live-tail bound", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-large-final-"));
+		const sessionPath = path.join(root, "session.jsonl");
+		try {
+			const text = "x".repeat(64 * 1024 + 1);
+			await fs.promises.writeFile(sessionPath, `${JSON.stringify({ type: "message", id: "large-final", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } })}\n`, { mode: 0o600 });
+			const session = await computeSessionCompletionBoundary(sessionPath); assert.ok(session);
+			const completion = { version: 3 as const, runId: "large-final", producer: "child" as const, status: "completed" as const, completedAt: 1, session };
+			const result = { agent: "reviewer", agentSource: "user" as const, task: "t", exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result, completion, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), true);
+			assert.equal(getFinalOutput(result.messages as any), text);
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
+	});
+
+	test("releases the verified completion lease and retains recovery when final parsing fails", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-completion-lease-"));
+		const sessionPath = path.join(root, "session.jsonl");
+		try {
+			const line = `${JSON.stringify({ type: "message", id: "final", message: { role: "assistant", content: "done" } })}\n`;
+			await fs.promises.writeFile(sessionPath, line, { mode: 0o600 });
+			const session = await computeSessionCompletionBoundary(sessionPath); assert.ok(session);
+			const restore = setSessionVerificationBufferLimitForTesting(session.byteOffset);
+			try {
+				// Both primary and fallback index paths are files, forcing the final
+				// descriptor-bound drain to reject after it acquires the suffix lease.
+				await fs.promises.writeFile(`${sessionPath}.entry-index`, "blocked", { mode: 0o600 });
+				await fs.promises.writeFile(`${sessionPath}.entry-index.fallback`, "blocked", { mode: 0o600 });
+				const result = { agent: "reviewer", agentSource: "user" as const, task: "t", exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
+				const completion = { version: 3 as const, runId: "parse-throw", producer: "child" as const, status: "completed" as const, completedAt: 1, session };
+				assert.equal(await applyVerifiedInteractiveCompletion({ result, completion, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), false);
+				assert.equal(result.exitCode, -1, "failed replay must retain recoverable state");
+				const recovered = await computeSessionCompletionBoundary(sessionPath);
+				assert.ok(recovered, "the parse failure must release the full reservation for the next verifier");
+			} finally { restore(); }
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
+	});
+
+	test("replays generic failure boundaries, rejects replacement, and leaves boundary-less tails unpolled", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-v3-failure-"));
+		try {
+			const sessionPath = path.join(root, "session.jsonl");
+			const line = JSON.stringify({ type: "message", id: "failure-tail", message: { role: "assistant", content: [{ type: "text", text: "recovered failure usage" }], usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { total: 0 } } } });
+			await fs.promises.writeFile(sessionPath, `${line}\n`);
+			const identity = await getSessionFileIdentity(sessionPath); assert.ok(identity);
+			const session = await computeSessionFailureBoundary(sessionPath, { expectedSessionIdentity: identity }); assert.ok(session);
+			const failed = { version: 3 as const, runId: "failure", producer: "parent" as const, status: "failed" as const, completedAt: 1, errorCode: "transport-lost" as const, evidenceRefs: ["state"] as "state"[], session };
+			const recovered = { agent: "reviewer", agentSource: "user" as const, task: "t", exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result: recovered, completion: failed, childSessionPath: sessionPath, sessionResultStartOffset: 0, expectedSessionIdentity: identity, onUpdate: () => undefined }), true);
+			assert.equal(recovered.messages.length, 1);
+			assert.equal(recovered.exitCode, 1);
+			await fs.promises.writeFile(sessionPath, `${line.replace("failure-tail", "replacement")}\n`);
+			const retained = { ...recovered, exitCode: -1, messages: [], usage: { ...recovered.usage } };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result: retained, completion: failed, childSessionPath: sessionPath, sessionResultStartOffset: 0, expectedSessionIdentity: identity, onUpdate: () => undefined }), false);
+			assert.equal(retained.exitCode, -1);
+			const boundarylessV3 = { version: 3 as const, runId: "boundaryless", producer: "parent" as const, status: "failed" as const, completedAt: 1, errorCode: "transport-lost" as const, evidenceRefs: ["state"] as "state"[] };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result: retained, completion: boundarylessV3, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), false);
+			assert.equal(retained.messages.length, 0, "boundary-less V3 must retain recovery without final-draining live bytes");
+			const legacy = { version: 2 as const, runId: "legacy", status: "failed" as const, completedAt: 1 };
+			assert.equal(await applyVerifiedInteractiveCompletion({ result: retained, completion: legacy, childSessionPath: sessionPath, sessionResultStartOffset: 0, onUpdate: () => undefined }), true);
+			assert.equal(retained.messages.length, 0, "legacy V2 completion must not final-drain live session bytes");
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("clears inherited run protocol unless a new run explicitly replaces it", () => {
@@ -609,6 +1676,8 @@ describe("interactive pane runner preparation", () => {
 			[SUBAGENT_RUN_OWNERSHIP_ENV]: "parent-owned",
 			[SUBAGENT_EXPECTED_PARENT_PID_ENV]: "1",
 			[SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV]: "2",
+			[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: "/tmp/parent.sock",
+			[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: "/parent/lifecycle-token",
 		};
 		const cleared = buildChildProcessEnv({
 			agentName: "reviewer",
@@ -621,6 +1690,8 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(cleared[SUBAGENT_RUN_ID_ENV], undefined);
 		assert.equal(cleared[SUBAGENT_EXPECTED_PARENT_PID_ENV], undefined);
 		assert.equal(cleared[SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV], undefined);
+		assert.equal(cleared[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV], undefined);
+		assert.equal(cleared[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV], undefined);
 
 		const replaced = buildChildProcessEnv({
 			agentName: "reviewer",

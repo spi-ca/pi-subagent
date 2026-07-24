@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { MINIMUM_CMUX_VERSION, isStableSemverAtLeast } from "./version-policy.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,9 +12,32 @@ export const RUN_STATE_DIR_ENV = "PI_SUBAGENT_RUN_STATE_DIR";
 export const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 export const SUBAGENT_RUN_STATE_PATH_ENV = "PI_SUBAGENT_RUN_STATE_PATH";
 export const SUBAGENT_RUN_COMPLETION_PATH_ENV = "PI_SUBAGENT_RUN_COMPLETION_PATH";
+/** Private child/parent callback completion handshake. */
+export const SUBAGENT_COMPLETION_FENCE_PATH_ENV = "PI_SUBAGENT_COMPLETION_FENCE_PATH";
+export const SUBAGENT_COMPLETION_FENCE_ACK_PATH_ENV = "PI_SUBAGENT_COMPLETION_FENCE_ACK_PATH";
+export const SUBAGENT_COMPLETION_FENCE_NONCE_ENV = "PI_SUBAGENT_COMPLETION_FENCE_NONCE";
 export const SUBAGENT_PARENT_LEASE_PATH_ENV = "PI_SUBAGENT_PARENT_LEASE_PATH";
 export const SUBAGENT_CHILD_SESSION_PATH_ENV = "PI_SUBAGENT_CHILD_SESSION_PATH";
 export const SUBAGENT_RUN_OWNERSHIP_ENV = "PI_SUBAGENT_RUN_OWNERSHIP";
+/** Private immutable ownership-transfer artifacts, never inherited beyond the child. */
+export const SUBAGENT_PROMOTION_REQUEST_PATH_ENV = "PI_SUBAGENT_PROMOTION_REQUEST_PATH";
+export const SUBAGENT_PROMOTION_ACK_PATH_ENV = "PI_SUBAGENT_PROMOTION_ACK_PATH";
+/** Immutable fork descriptor consumed by child-bridge before agent input. */
+export const SUBAGENT_FORK_BOOTSTRAP_PATH_ENV = "PI_SUBAGENT_FORK_BOOTSTRAP_PATH";
+/** Explicit child lifecycle behavior; inherited values are cleared by the parent. */
+export const SUBAGENT_COMPLETION_MODE_ENV = "PI_SUBAGENT_COMPLETION_MODE";
+/** Opt-in only: newer parents permit child V3 failures to carry a session boundary. */
+export const SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV = "PI_SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY";
+export const V3_FAILURE_BOUNDARY_CAPABILITY = "v1";
+export function hasV3FailureBoundaryCapability(value: string | undefined): boolean {
+	return value === V3_FAILURE_BOUNDARY_CAPABILITY;
+}
+/** Opt-in only: newer parents accept success boundaries whose tail ends in linked Pi metadata. */
+export const SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV = "PI_SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY";
+export const V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY = "v1";
+export function hasV3MetadataTailSuccessBoundaryCapability(value: string | undefined): boolean {
+	return value === V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY;
+}
 export const SUBAGENT_LEASE_STALE_MS_ENV = "PI_SUBAGENT_LEASE_STALE_MS";
 export const SUBAGENT_LEASE_CHECK_MS_ENV = "PI_SUBAGENT_LEASE_CHECK_MS";
 /** Immutable parent identity copied from the committed launch intent into the child bootstrap. */
@@ -66,6 +90,7 @@ export interface RunStateV1 {
 	phase: RunPhase;
 	updatedAt: number;
 	childPid?: number;
+	childStartedAt?: number;
 	childProcessGroupId?: number;
 	lastEvent?: string;
 }
@@ -88,6 +113,109 @@ export interface ParentLeaseV1 {
 	renewedAt: number;
 }
 
+/** Immutable, exact, private completion callback fence records. */
+export interface CompletionFenceV1 {
+	version: 1;
+	kind: "completion-fence";
+	runId: string;
+	nonce: string;
+	publishedAt: number;
+}
+export interface CompletionFenceAckV1 {
+	version: 1;
+	kind: "completion-fence-ack";
+	runId: string;
+	nonce: string;
+	acknowledgedAt: number;
+}
+
+/**
+ * Legacy private ownership marker. Read-only compatibility for markers written
+ * before the public detached-ownership v1 contract; never publish this shape.
+ */
+export interface LegacyUserOwnershipRecordV1 {
+	version: 1;
+	runId: string;
+	promotedAt: number;
+	allocationDigest: string;
+}
+
+/** @deprecated Legacy read-only compatibility parser. */
+export function parseUserOwnershipRecord(value: unknown, runId: string): LegacyUserOwnershipRecordV1 | null {
+	if (!isRecord(value) || !hasExactKeys(value, ["version", "runId", "promotedAt", "allocationDigest"])) return null;
+	if (value.version !== 1 || value.runId !== runId || !isSafeRunId(value.runId)
+		|| !Number.isSafeInteger(value.promotedAt) || (value.promotedAt as number) <= 0
+		|| typeof value.allocationDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.allocationDigest)) return null;
+	return value as unknown as LegacyUserOwnershipRecordV1;
+}
+
+export interface OwnershipTransferRequestV1 {
+	contract: "pi-subagent.detached-transfer";
+	version: 1;
+	kind: "request";
+	transferId: string;
+	runId: string;
+	allocation: { algorithm: "sha256"; digest: string };
+	completionMode: "one-shot" | "handoff";
+	parent: { pid: number; startedAt: number };
+	child: { pid: number; startedAt: number };
+	requestedAt: number;
+}
+
+export interface OwnershipTransferAckV1 extends Omit<OwnershipTransferRequestV1, "kind" | "requestedAt"> {
+	kind: "ack";
+	acknowledgedAt: number;
+}
+
+function parseOwnershipTransferBase(value: unknown, runId: string, kind: "request" | "ack"): OwnershipTransferRequestV1 | OwnershipTransferAckV1 | null {
+	const timing = kind === "request" ? "requestedAt" : "acknowledgedAt";
+	const keys = ["contract", "version", "kind", "transferId", "runId", "allocation", "completionMode", "parent", "child", timing];
+	if (!isRecord(value) || !hasExactKeys(value, keys) || value.contract !== "pi-subagent.detached-transfer" || value.version !== 1
+		|| value.kind !== kind || value.runId !== runId || !isSafeRunId(value.runId)
+		|| typeof value.transferId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.transferId)
+		|| (value.completionMode !== "one-shot" && value.completionMode !== "handoff")
+		|| !isRecord(value.allocation) || !hasExactKeys(value.allocation, ["algorithm", "digest"]) || value.allocation.algorithm !== "sha256" || typeof value.allocation.digest !== "string" || !/^[0-9a-f]{64}$/.test(value.allocation.digest)
+		|| !isRecord(value.parent) || !hasExactKeys(value.parent, ["pid", "startedAt"]) || !pid(value.parent.pid) || !positive(value.parent.startedAt)
+		|| !isRecord(value.child) || !hasExactKeys(value.child, ["pid", "startedAt"]) || !pid(value.child.pid) || !positive(value.child.startedAt)
+		|| !Number.isSafeInteger(value[timing]) || (value[timing] as number) <= 0) return null;
+	return value as unknown as OwnershipTransferRequestV1 | OwnershipTransferAckV1;
+}
+
+export function parseOwnershipTransferRequest(value: unknown, runId: string): OwnershipTransferRequestV1 | null {
+	return parseOwnershipTransferBase(value, runId, "request") as OwnershipTransferRequestV1 | null;
+}
+
+export function parseOwnershipTransferAck(value: unknown, runId: string): OwnershipTransferAckV1 | null {
+	return parseOwnershipTransferBase(value, runId, "ack") as OwnershipTransferAckV1 | null;
+}
+
+export function sameOwnershipTransfer(request: OwnershipTransferRequestV1, ack: OwnershipTransferAckV1): boolean {
+	return request.transferId === ack.transferId && request.runId === ack.runId && request.completionMode === ack.completionMode
+		&& request.allocation.digest === ack.allocation.digest && request.parent.pid === ack.parent.pid && request.parent.startedAt === ack.parent.startedAt
+		&& request.child.pid === ack.child.pid && request.child.startedAt === ack.child.startedAt;
+}
+
+export interface DetachedOwnershipRecordV1 {
+	contract: "pi-subagent.detached-ownership";
+	version: 1;
+	runId: string;
+	owner: "user";
+	detachedAt: number;
+	allocation: { algorithm: "sha256"; digest: string };
+	completionMode: "one-shot" | "handoff";
+}
+
+/** Strict parser for the public detached ownership v1 marker. */
+export function parseDetachedOwnershipRecord(value: unknown, runId: string): DetachedOwnershipRecordV1 | null {
+	if (!isRecord(value) || !hasExactKeys(value, ["contract", "version", "runId", "owner", "detachedAt", "allocation", "completionMode"])) return null;
+	if (value.contract !== "pi-subagent.detached-ownership" || value.version !== 1 || value.runId !== runId || !isSafeRunId(value.runId)
+		|| value.owner !== "user" || !Number.isSafeInteger(value.detachedAt) || (value.detachedAt as number) <= 0
+		|| (value.completionMode !== "one-shot" && value.completionMode !== "handoff") || !isRecord(value.allocation)
+		|| !hasExactKeys(value.allocation, ["algorithm", "digest"]) || value.allocation.algorithm !== "sha256"
+		|| typeof value.allocation.digest !== "string" || !/^[0-9a-f]{64}$/.test(value.allocation.digest)) return null;
+	return value as unknown as DetachedOwnershipRecordV1;
+}
+
 export interface RunArtifactPaths {
 	rootDir: string;
 	runDir: string;
@@ -97,6 +225,10 @@ export interface RunArtifactPaths {
 	taskPath: string;
 	systemPromptPath: string;
 	childSessionPath: string;
+	/** Transient 0600 lifecycle capability bootstrap; consumed and unlinked by the child. */
+	lifecycleTokenPath: string;
+	/** Immutable tmux control-mode selection evidence, when the V3 branch is used. */
+	transportGatePath: string;
 	/** V2 committed launch record. */
 	launchPath: string;
 	launchIntentPath: string;
@@ -106,8 +238,18 @@ export interface RunArtifactPaths {
 	brokerClaimPath: string;
 	residualRiskPath: string;
 	brokerStatusPath: string;
+	/** Public immutable detached-ownership v1 authority; excludes the target from reaping. */
+	detachedOwnershipPath: string;
+	/** Private immutable request/ack pair for a live child ownership transfer. */
+	promotionRequestPath: string;
+	promotionAckPath: string;
+	/** Legacy private read-only ownership marker; retained only for compatibility. */
+	userOwnershipPath: string;
 	statePath: string;
 	completionPath: string;
+	/** Immutable child completion fence and parent acknowledgement. */
+	completionFencePath: string;
+	completionFenceAckPath: string;
 	parentLeasePath: string;
 	wrapperStatusPath: string;
 	stderrPath: string;
@@ -121,8 +263,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isSafeRunId(runId: unknown): runId is string {
+	return typeof runId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId);
+}
+
 function assertRunId(runId: string): void {
-	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId)) {
+	if (!isSafeRunId(runId)) {
 		throw new Error(`Invalid subagent run id: ${JSON.stringify(runId)}`);
 	}
 }
@@ -303,6 +449,13 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 	await assertSafeStateRoot(directory);
 }
 
+/** Initialize or validate the shared private state root without creating a run. */
+export async function ensureRunStateRoot(rootDir = getRunStateRoot()): Promise<string> {
+	const resolved = path.resolve(rootDir);
+	await ensurePrivateDirectory(resolved);
+	return await fs.promises.realpath(resolved);
+}
+
 export function resolveRunArtifactPaths(runId: string, rootDir = getRunStateRoot()): RunArtifactPaths {
 	assertRunId(runId);
 	rootDir = path.resolve(rootDir);
@@ -316,6 +469,8 @@ export function resolveRunArtifactPaths(runId: string, rootDir = getRunStateRoot
 		taskPath: path.join(runDir, "task.md"),
 		systemPromptPath: path.join(runDir, "system-prompt.md"),
 		childSessionPath: path.join(runDir, "child-session.jsonl"),
+		lifecycleTokenPath: path.join(runDir, "lifecycle-token"),
+		transportGatePath: path.join(runDir, "transport-gate.json"),
 		launchPath: path.join(runDir, "launch.json"),
 		launchIntentPath: path.join(runDir, "launch-intent.json"),
 		allocationPath: path.join(runDir, "allocation.json"),
@@ -324,8 +479,14 @@ export function resolveRunArtifactPaths(runId: string, rootDir = getRunStateRoot
 		brokerClaimPath: path.join(runDir, "broker-claim.json"),
 		residualRiskPath: path.join(runDir, "residual-risk.json"),
 		brokerStatusPath: path.join(runDir, "broker-status.json"),
+		detachedOwnershipPath: path.join(runDir, "detached-ownership.json"),
+		promotionRequestPath: path.join(runDir, "promotion-request.json"),
+		promotionAckPath: path.join(runDir, "promotion-ack.json"),
+		userOwnershipPath: path.join(runDir, "user-ownership.json"),
 		statePath: path.join(runDir, "state.json"),
 		completionPath: path.join(runDir, "complete.json"),
+		completionFencePath: path.join(runDir, "completion-fence.json"),
+		completionFenceAckPath: path.join(runDir, "completion-fence-ack.json"),
 		parentLeasePath: path.join(runDir, "parent-lease.json"),
 		wrapperStatusPath: path.join(runDir, "wrapper-status"),
 		stderrPath: path.join(runDir, "stderr.log"),
@@ -338,6 +499,8 @@ export function resolveRunArtifactPaths(runId: string, rootDir = getRunStateRoot
 export async function prepareRunArtifactPaths(options: {
 	runId?: string;
 	rootDir?: string;
+	/** Optional owner proof published before this function returns. */
+	initialParentLease?: { parentPid: number; parentStartedAt: number; renewedAt?: number };
 } = {}): Promise<RunArtifactPaths> {
 	const runId = options.runId ?? createRunId();
 	const paths = resolveRunArtifactPaths(runId, options.rootDir ?? getRunStateRoot());
@@ -349,6 +512,12 @@ export async function prepareRunArtifactPaths(options: {
 	if (path.dirname(canonicalRun) !== canonicalRoot) throw new Error(`Subagent run directory escaped its state root: ${paths.runDir}`);
 	await publishOwnershipMarker(paths.runDir, RUN_DIRECTORY_MARKER_NAME, { version: 1, kind: "pi-subagent-run-directory", runId });
 	await assertSafeRunArtifactPaths(paths);
+	if (options.initialParentLease) {
+		const lease: ParentLeaseV1 = { version: RUN_PROTOCOL_VERSION, runId, parentPid: options.initialParentLease.parentPid,
+			parentStartedAt: options.initialParentLease.parentStartedAt, renewedAt: options.initialParentLease.renewedAt ?? Date.now() };
+		if (!parseParentLease(lease, runId, lease.renewedAt)) throw new Error("Invalid initial parent lease identity.");
+		await atomicWriteJson(paths.parentLeasePath, lease);
+	}
 	// tmux must start its configured shell before it can exec the staged broker.
 	// Keep all shell startup files out of the project and persist the empty HOME.
 	await fs.promises.mkdir(paths.shellHomePath, { recursive: false, mode: 0o700 });
@@ -419,6 +588,66 @@ export async function readJsonFile(filePath: string): Promise<unknown | null> {
 	}
 }
 
+const DEFAULT_BOUNDED_PRIVATE_JSON_MAX_BYTES = 256 * 1024;
+
+export interface ReadBoundedPrivateJsonOptions {
+	maxBytes?: number;
+	/** Immutable broker records are exactly one LF-terminated JSON line. */
+	requireSingleLineTerminated?: boolean;
+}
+
+function isPrivateRunArtifact(stat: fs.Stats): boolean {
+	return stat.isFile() && !stat.isSymbolicLink()
+		&& (typeof process.getuid !== "function" || stat.uid === process.getuid())
+		&& (process.platform === "win32" || (stat.mode & 0o777) === 0o600);
+}
+
+function isSameArtifactIdentity(left: fs.Stats, right: fs.Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+/**
+ * Read one small run-private JSON artifact from a stable no-follow descriptor.
+ * Any unsafe, malformed, changed, or inaccessible artifact fails closed.
+ */
+export async function readBoundedPrivateJson(filePath: string, options: ReadBoundedPrivateJsonOptions = {}): Promise<unknown | null> {
+	const maxBytes = options.maxBytes ?? DEFAULT_BOUNDED_PRIVATE_JSON_MAX_BYTES;
+	const requiredOpenFlags = fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
+	if (!path.isAbsolute(filePath) || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || !fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK) return null;
+	const resolvedPath = path.resolve(filePath);
+	const directory = path.dirname(resolvedPath);
+	let handle: fs.promises.FileHandle | undefined;
+	try {
+		await assertSafeRunArtifactPaths({ rootDir: path.dirname(directory), runDir: directory });
+		handle = await fs.promises.open(resolvedPath, fs.constants.O_RDONLY | requiredOpenFlags);
+		const before = await handle.stat();
+		if (!isPrivateRunArtifact(before) || !Number.isSafeInteger(before.size) || before.size < 1 || before.size > maxBytes) return null;
+
+		const bytes = Buffer.alloc(before.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+			if (bytesRead <= 0) return null;
+			offset += bytesRead;
+		}
+
+		const [after, pathname] = await Promise.all([handle.stat(), fs.promises.lstat(resolvedPath)]);
+		if (!isPrivateRunArtifact(after) || !isPrivateRunArtifact(pathname)
+			|| !isSameArtifactIdentity(before, after) || !isSameArtifactIdentity(before, pathname)) return null;
+		await assertSafeRunArtifactPaths({ rootDir: path.dirname(directory), runDir: directory });
+		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		if (options.requireSingleLineTerminated) {
+			if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) return null;
+			return JSON.parse(text.slice(0, -1));
+		}
+		return JSON.parse(text);
+	} catch {
+		return null;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 /** Only wrapper-owned, canonical PID temporary status files are removable. */
 export function isWrapperStatusTemporaryArtifactName(name: string): boolean {
 	const match = /^wrapper-status\.tmp\.([1-9][0-9]*)$/.exec(name);
@@ -472,6 +701,9 @@ export function parseRunState(value: unknown, expectedRunId?: string): RunStateV
 	if (expectedRunId !== undefined && value.runId !== expectedRunId) return null;
 	if (!Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0) return null;
 	if (typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt)) return null;
+	if (value.childPid !== undefined && !pid(value.childPid)) return null;
+	if (value.childStartedAt !== undefined && !positive(value.childStartedAt)) return null;
+	if ((value.childPid === undefined) !== (value.childStartedAt === undefined)) return null;
 	const phases: RunPhase[] = ["starting", "idle", "running", "settled", "shutting-down", "shutdown", "failed", "orphaned"];
 	if (!phases.includes(value.phase as RunPhase)) return null;
 	return value as unknown as RunStateV1;
@@ -495,6 +727,26 @@ export function parseParentLease(value: unknown, expectedRunId?: string, now = D
 	if (typeof value.parentStartedAt !== "number" || !Number.isFinite(value.parentStartedAt)) return null;
 	if (typeof value.renewedAt !== "number" || !Number.isFinite(value.renewedAt) || value.renewedAt > now + MAX_PARENT_LEASE_FUTURE_MS) return null;
 	return value as unknown as ParentLeaseV1;
+}
+
+function isCompletionFenceNonce(value: unknown): value is string {
+	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+export function parseCompletionFence(value: unknown, runId: string, nonce: string): CompletionFenceV1 | null {
+	if (!isRecord(value) || !hasExactKeys(value, ["version", "kind", "runId", "nonce", "publishedAt"])
+		|| value.version !== 1 || value.kind !== "completion-fence" || value.runId !== runId || !isSafeRunId(value.runId)
+		|| value.nonce !== nonce || !isCompletionFenceNonce(value.nonce)
+		|| !Number.isSafeInteger(value.publishedAt) || (value.publishedAt as number) <= 0) return null;
+	return value as unknown as CompletionFenceV1;
+}
+
+export function parseCompletionFenceAck(value: unknown, runId: string, nonce: string): CompletionFenceAckV1 | null {
+	if (!isRecord(value) || !hasExactKeys(value, ["version", "kind", "runId", "nonce", "acknowledgedAt"])
+		|| value.version !== 1 || value.kind !== "completion-fence-ack" || value.runId !== runId || !isSafeRunId(value.runId)
+		|| value.nonce !== nonce || !isCompletionFenceNonce(value.nonce)
+		|| !Number.isSafeInteger(value.acknowledgedAt) || (value.acknowledgedAt as number) <= 0) return null;
+	return value as unknown as CompletionFenceAckV1;
 }
 
 export function isParentLeaseStale(
@@ -538,9 +790,32 @@ export function parseDarwinProcessIdentity(output: string): ProcessIdentity | nu
 	const state = stat?.[0];
 	const startedAtText = startedAtFields.join(" ");
 	if (!stat || !state || !DARWIN_LIVE_PROCESS_STATES.has(state) || !DARWIN_STAT_MODIFIERS.test(stat.slice(1)) || !DARWIN_LSTART.test(startedAtText)) return null;
-	const startedAt = Date.parse(startedAtText);
+	// ps lstart has no zone. Canonicalize it as UTC so a broker/controller
+	// pair with different TZ environments still binds the same process.
+	const startedAt = Date.parse(`${startedAtText} UTC`);
 	if (!Number.isFinite(startedAt) || startedAt <= 0) return null;
 	return { startedAt, isZombie: false };
+}
+
+const DEFAULT_DARWIN_PROCESS_IDENTITY_PROBE_TIMEOUT_MS = 1_000;
+const DARWIN_PROCESS_IDENTITY_PROBE_MAX_BUFFER = 8 * 1024;
+
+export interface ProcessIdentityProbeOptions {
+	/** Bound a Darwin /bin/ps probe; invalid or exhausted budgets fail closed. */
+	timeoutMs?: number;
+}
+
+function resolveDarwinProcessIdentityProbeTimeout(options: ProcessIdentityProbeOptions = {}): number | null {
+	const timeoutMs = options.timeoutMs ?? DEFAULT_DARWIN_PROCESS_IDENTITY_PROBE_TIMEOUT_MS;
+	return Number.isSafeInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : null;
+}
+
+function probeDarwinProcessIdentity(processId: number, options: ProcessIdentityProbeOptions = {}) {
+	const timeout = resolveDarwinProcessIdentityProbeTimeout(options);
+	if (timeout === null) return null;
+	return spawnSync("/bin/ps", ["-o", "stat=", "-o", "lstart=", "-p", String(processId)], {
+		encoding: "utf8", timeout, maxBuffer: DARWIN_PROCESS_IDENTITY_PROBE_MAX_BUFFER,
+	});
 }
 
 function getProcessIdentity(processId: number): ProcessIdentity | null {
@@ -548,8 +823,8 @@ function getProcessIdentity(processId: number): ProcessIdentity | null {
 	try {
 		if (process.platform === "linux") return parseLinuxProcessIdentity(fs.readFileSync(`/proc/${processId}/stat`, "utf8"));
 		if (process.platform === "darwin") {
-			const probe = spawnSync("/bin/ps", ["-o", "stat=", "-o", "lstart=", "-p", String(processId)], { encoding: "utf8" });
-			return probe.status === 0 ? parseDarwinProcessIdentity(String(probe.stdout)) : null;
+			const probe = probeDarwinProcessIdentity(processId);
+			return probe?.status === 0 && !probe.error ? parseDarwinProcessIdentity(String(probe.stdout)) : null;
 		}
 	} catch { /* dead or inaccessible process */ }
 	return null;
@@ -569,10 +844,45 @@ export function isMatchingLiveProcessIdentity(identity: ProcessIdentity | null, 
 }
 
 export type ParentProcessIdentityChecker = (parentPid: number, parentStartedAt: number) => boolean;
+export type ProcessIdentityStatus = "live" | "dead" | "unknown";
 
-/** A matching PID/start identity must also be runnable; zombies are not alive. */
+/** Tri-state identity proof: probe/parse/permission uncertainty is never death. */
+export function classifyParentProcessIdentity(
+	parentPid: number,
+	parentStartedAt: number,
+	options: ProcessIdentityProbeOptions = {},
+): ProcessIdentityStatus {
+	if (!pid(parentPid) || !Number.isFinite(parentStartedAt) || parentStartedAt <= 0) return "unknown";
+	try {
+		if (process.platform === "linux") {
+			let raw: string;
+			try { raw = fs.readFileSync(`/proc/${parentPid}/stat`, "utf8"); }
+			catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "dead" : "unknown"; }
+			const identity = parseLinuxProcessIdentity(raw);
+			if (identity) return identity.startedAt === parentStartedAt ? "live" : "dead";
+			const close = raw.lastIndexOf(")");
+			const state = close >= 0 ? raw.slice(close + 1).trim().split(/\s+/)[0] : undefined;
+			return state === "Z" || state === "X" || state === "x" ? "dead" : "unknown";
+		}
+		if (process.platform === "darwin") {
+			const probe = probeDarwinProcessIdentity(parentPid, options);
+			if (!probe || probe.error) return "unknown";
+			if (probe.status === 0) {
+				const output = String(probe.stdout);
+				const identity = parseDarwinProcessIdentity(output);
+				if (identity) return identity.startedAt === parentStartedAt ? "live" : "dead";
+				return /^\s*[ZXx]/.test(output) ? "dead" : "unknown";
+			}
+			try { process.kill(parentPid, 0); return "unknown"; }
+			catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "unknown"; }
+		}
+	} catch { return "unknown"; }
+	return "unknown";
+}
+
+/** A matching PID/start identity must also be runnable; unknown is not alive authority. */
 export const isParentProcessIdentityAlive: ParentProcessIdentityChecker = (parentPid, parentStartedAt) =>
-	isMatchingLiveProcessIdentity(getProcessIdentity(parentPid), parentStartedAt);
+	classifyParentProcessIdentity(parentPid, parentStartedAt) === "live";
 
 export function getCurrentProcessStartedAt(): number | null {
 	return getProcessStartedAt(process.pid);
@@ -598,40 +908,99 @@ export function startParentLeaseWriter(options: {
 	intervalMs?: number;
 	parentPid?: number;
 	parentStartedAt?: number;
+	/** Wall clock used only for the durable renewedAt value. */
 	now?: () => number;
-}): { renew: () => Promise<void>; stop: () => void } {
-	const intervalMs = Math.max(100, options.intervalMs ?? DEFAULT_PARENT_LEASE_RENEW_MS);
+	/** Test-only monotonic scheduling and I/O seams. */
+	monotonicNow?: () => number;
+	write?: (filePath: string, value: ParentLeaseV1) => Promise<void>;
+	setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
+	clearTimer?: (timer: NodeJS.Timeout) => void;
+}): { renew: () => Promise<void>; stop: () => void; stopAndDrain: () => Promise<void> } {
+	const intervalMs = Math.max(1, options.intervalMs ?? DEFAULT_PARENT_LEASE_RENEW_MS);
 	const now = options.now ?? Date.now;
+	const monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
+	const write = options.write ?? atomicWriteJson;
+	const setTimer = options.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+	const clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
 	const parentStartedAt = options.parentStartedAt ?? getCurrentProcessStartedAt();
 	if (parentStartedAt === null) throw new Error("Unable to establish parent process start identity.");
 	let stopped = false;
-	let writeChain = Promise.resolve();
-	const writeLease = async () => {
+	let pending = false;
+	let inFlight: Promise<void> | null = null;
+	let timer: NodeJS.Timeout | undefined;
+	const idleWaiters: Array<() => void> = [];
+	const epoch = monotonicNow();
+	let nextDue = epoch + intervalMs;
+
+	const resolveIdle = () => {
+		if (inFlight || pending) return;
+		while (idleWaiters.length) idleWaiters.pop()!();
+	};
+	const drain = () => !inFlight && !pending ? Promise.resolve() : new Promise<void>((resolve) => idleWaiters.push(resolve));
+	const schedule = () => {
 		if (stopped) return;
-		await atomicWriteJson(options.filePath, {
-			version: RUN_PROTOCOL_VERSION,
-			runId: options.runId,
-			parentPid: options.parentPid ?? process.pid,
-			parentStartedAt,
-			renewedAt: now(),
-		} satisfies ParentLeaseV1);
+		const current = monotonicNow();
+		// Skip missed slots rather than replaying them. Remaining slots stay
+		// anchored to the original monotonic epoch and therefore cannot drift.
+		if (nextDue <= current) nextDue = epoch + (Math.floor((current - epoch) / intervalMs) + 1) * intervalMs;
+		timer = setTimer(() => {
+			timer = undefined;
+			void requestRenew().catch(() => undefined);
+			schedule();
+		}, Math.max(0, nextDue - monotonicNow()));
+		timer.unref?.();
 	};
-	const renew = () => {
-		writeChain = writeChain.then(writeLease, writeLease);
-		return writeChain;
+	const startWrite = (): Promise<void> => {
+		const writeLease = async () => {
+			if (stopped) return;
+			await write(options.filePath, {
+				version: RUN_PROTOCOL_VERSION,
+				runId: options.runId,
+				parentPid: options.parentPid ?? process.pid,
+				parentStartedAt,
+				renewedAt: now(),
+			});
+		};
+		const current = writeLease();
+		inFlight = current;
+		void current.catch(() => undefined).finally(() => {
+			if (inFlight !== current) return;
+			inFlight = null;
+			if (!stopped && pending) {
+				pending = false;
+				startWrite();
+			} else {
+				pending = false;
+				resolveIdle();
+			}
+		});
+		return current;
 	};
-	const timer = setInterval(() => void renew().catch(() => undefined), intervalMs);
-	timer.unref?.();
-	return {
-		renew,
-		stop: () => {
-			stopped = true;
-			clearInterval(timer);
-		},
+	const requestRenew = (): Promise<void> => {
+		if (stopped) return Promise.resolve();
+		if (inFlight) {
+			pending = true; // latest-pending only; never queue every missed tick.
+			return drain();
+		}
+		return startWrite();
 	};
+	const stop = () => {
+		if (stopped) return;
+		stopped = true;
+		pending = false;
+		if (timer) { clearTimer(timer); timer = undefined; }
+		resolveIdle();
+	};
+	schedule();
+	return { renew: requestRenew, stop, stopAndDrain: async () => { stop(); await drain(); } };
 }
 
-export function scheduleRunArtifactCleanup(runDir: string, delaySeconds: number): void {
+export function scheduleRunArtifactCleanup(runDir: string, delaySeconds: number, deadline?: number): void {
+	// A persisted completion/launch timestamp supplies an absolute deadline so
+	// a process restart cannot grant an already-retained run a fresh TTL.
+	const delayMs = Number.isFinite(deadline)
+		? Math.max(0, deadline! - Date.now())
+		: Math.max(0, delaySeconds) * 1000;
 	const timer = setTimeout(() => {
 		const paths = { rootDir: path.dirname(runDir), runDir };
 		void assertSafeRunArtifactPaths(paths)
@@ -640,7 +1009,7 @@ export function scheduleRunArtifactCleanup(runDir: string, delaySeconds: number)
 				await fs.promises.rm(runDir, { recursive: true, force: true });
 			})
 			.catch(() => undefined);
-	}, Math.max(0, delaySeconds) * 1000);
+	}, delayMs);
 	timer.unref?.();
 }
 
@@ -664,7 +1033,15 @@ export const TMUX_SESSION_ID_RE = /^\$(?:0|[1-9][0-9]*)$/;
 export const TMUX_WINDOW_ID_RE = /^@(?:0|[1-9][0-9]*)$/;
 type V2Mode = "cmux-pane" | "tmux-pane";
 export type CmuxSourceV2 = { workspaceId: string; sourceSurfaceId: string };
-export type TmuxSourceV2 = { socketPath?: string; sourcePaneId: string; sourcePanePid: number; serverPid: number };
+/** Immutable control-v2 connection generation, never a credential. */
+export type CmuxControlTransportV2 = { transport: "cmux-control-v2"; socketPath: string; socketDev: string; socketIno: string; accessMode: string; apiVersion: 2; appVersion: string; identifyDigest: string; bootIdentity?: string };
+/**
+ * Socket device/inode values are decimal strings from bigint stat fields.
+ * Numbers would silently lose identity precision on filesystems with wide IDs.
+ */
+export type TmuxGenerationV2 = { socketPath: string; socketDev: string; socketIno: string; serverStartedAt: number };
+/** Missing generation denotes retained legacy V2 diagnostics, never mutation authority. */
+export type TmuxSourceV2 = { socketPath?: string; sourcePaneId: string; sourcePanePid: number; serverPid: number; generation?: TmuxGenerationV2 };
 
 /** The V2 layout policy selected by the parent coordinator. */
 export type LayoutModeV2 = "auto" | "split";
@@ -672,8 +1049,8 @@ export type PlacementV2 = "cmux-split" | "cmux-new-surface" | "tmux-split" | "tm
 export type CmuxSourceContainerV2 = { kind: "cmux-source"; workspaceId: string; sourceSurfaceId: string };
 export type CmuxPaneContainerV2 = { kind: "cmux-pane"; workspaceId: string; paneId: string };
 export type CmuxSourcePaneContainerV2 = { kind: "cmux-source-pane"; workspaceId: string; sourceSurfaceId: string; paneId: string };
-export type TmuxSourcePaneContainerV2 = { kind: "tmux-source-pane"; socketPath?: string; serverPid: number; sessionId: string; windowId: string; paneId: string; panePid: number };
-export type TmuxSessionContainerV2 = { kind: "tmux-session"; socketPath?: string; serverPid: number; sessionId: string; sourceWindowId: string };
+export type TmuxSourcePaneContainerV2 = { kind: "tmux-source-pane"; socketPath?: string; serverPid: number; sessionId: string; windowId: string; paneId: string; panePid: number; generation?: TmuxGenerationV2 };
+export type TmuxSessionContainerV2 = { kind: "tmux-session"; socketPath?: string; serverPid: number; sessionId: string; sourceWindowId: string; generation?: TmuxGenerationV2 };
 export type LayoutContainerV2 = CmuxSourceContainerV2 | CmuxPaneContainerV2 | CmuxSourcePaneContainerV2 | TmuxSourcePaneContainerV2 | TmuxSessionContainerV2;
 export type LayoutPlacementRequestV2 =
 	| { layout: LayoutModeV2; placement: "cmux-split"; container: CmuxSourceContainerV2 }
@@ -681,7 +1058,7 @@ export type LayoutPlacementRequestV2 =
 	| { layout: "split"; placement: "tmux-split"; container: TmuxSourcePaneContainerV2 }
 	| { layout: "auto"; placement: "tmux-new-window"; container: TmuxSessionContainerV2 };
 export type CmuxAllocatedContainerV2 = { kind: "cmux-pane"; workspaceId: string; paneId: string };
-export type TmuxAllocatedContainerV2 = { kind: "tmux-window"; socketPath?: string; serverPid: number; sessionId: string; windowId: string; paneId: string; panePid: number };
+export type TmuxAllocatedContainerV2 = { kind: "tmux-window"; socketPath?: string; serverPid: number; sessionId: string; windowId: string; paneId: string; panePid: number; generation?: TmuxGenerationV2 };
 export type AllocatedContainerV2 = CmuxAllocatedContainerV2 | TmuxAllocatedContainerV2;
 export type LayoutAllocationFieldsV2 =
 	| { layout: LayoutModeV2; placement: "cmux-split"; container: CmuxAllocatedContainerV2 }
@@ -692,15 +1069,15 @@ export type LayoutAllocationFieldsV2 =
 type LaunchIntentV2Base = { version: 2; runId: string; parentRunId?: string; parentSessionId: string; parentPid: number; parentStartedAt: number; childSessionFile: string; createdAt: number; brokerNonce: string; runtimePath: string; runtimeInterpreterPath: string; backendPath: string; brokerEntrypoint: string };
 type LegacyCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2 };
 type LegacyTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 };
-type LayoutCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2 } & Extract<LayoutPlacementRequestV2, { placement: "cmux-split" | "cmux-new-surface" }>;
+type LayoutCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2; control?: CmuxControlTransportV2 } & Extract<LayoutPlacementRequestV2, { placement: "cmux-split" | "cmux-new-surface" }>;
 type LayoutTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 } & Extract<LayoutPlacementRequestV2, { placement: "tmux-split" | "tmux-new-window" }>;
-/** Legacy records deliberately have no layout keys and always mean split placement. */
+/** Legacy cmux records without control are diagnostic-only and never production mutation authority. */
 export type LaunchIntentV2 = LegacyCmuxLaunchIntentV2 | LegacyTmuxLaunchIntentV2 | LayoutCmuxLaunchIntentV2 | LayoutTmuxLaunchIntentV2;
-export interface BrokerClaimV2 { version: 2; runId: string; brokerNonce: string; pid: number; claimedAt: number }
+export interface BrokerClaimV2 { version: 2; runId: string; brokerNonce: string; pid: number; brokerStartedAt?: number; claimedAt: number }
 export interface ResidualRiskV2 { version: 2; runId: string; reason: "possible-unrecorded-allocation"; recordedAt: number }
 type LegacyCmuxAllocationRecordV2 = { version: 2; runId: string; terminalMode: "cmux-pane"; target: { workspaceId: string; surfaceId: string; paneId: string }; allocatedAt: number };
-type LegacyTmuxAllocationRecordV2 = { version: 2; runId: string; terminalMode: "tmux-pane"; target: { socketPath?: string; serverPid: number; paneId: string; panePid: number }; allocatedAt: number };
-type LayoutCmuxAllocationRecordV2 = LegacyCmuxAllocationRecordV2 & Extract<LayoutAllocationFieldsV2, { placement: "cmux-split" | "cmux-new-surface" }>;
+type LegacyTmuxAllocationRecordV2 = { version: 2; runId: string; terminalMode: "tmux-pane"; target: { socketPath?: string; serverPid: number; paneId: string; panePid: number; generation?: TmuxGenerationV2 }; allocatedAt: number };
+type LayoutCmuxAllocationRecordV2 = LegacyCmuxAllocationRecordV2 & { control?: CmuxControlTransportV2 } & Extract<LayoutAllocationFieldsV2, { placement: "cmux-split" | "cmux-new-surface" }>;
 type LayoutTmuxAllocationRecordV2 = LegacyTmuxAllocationRecordV2 & Extract<LayoutAllocationFieldsV2, { placement: "tmux-split" | "tmux-new-window" }>;
 export type AllocationRecordV2 = LegacyCmuxAllocationRecordV2 | LegacyTmuxAllocationRecordV2 | LayoutCmuxAllocationRecordV2 | LayoutTmuxAllocationRecordV2;
 export interface CommittedLaunchRecordV2 { version: 2; runId: string; terminalMode: V2Mode; allocationPath: string; childSessionFile: string; committedAt: number; ownership: "parent-owned" }
@@ -714,6 +1091,22 @@ export type BrokerStatusV2 =
 export interface LaunchGateV2 { version: 2; runId: string; terminalMode: V2Mode; launchPath: string; publishedAt: number }
 export type CompletionErrorCodeV2 = "child-error" | "bridge-error" | "lease-expired" | "surface-closed" | "parent-aborted" | "wrapper-exited" | "pane-missing" | "inspect-exhausted" | "reaper-cleanup-failed";
 export interface CompletionRecordV2 { version: 2; runId: string; status: CompletionStatus; completedAt: number; errorCode?: CompletionErrorCodeV2 }
+/** A digest-bound, LF-complete JSONL prefix. This shape is intentionally exact. */
+export interface SessionBoundaryV3 { byteOffset: number; finalEntryId: string; digestAlgorithm: "sha256"; prefixDigest: string }
+export interface CompletionSuccessV3 { version: 3; runId: string; producer: "child"; status: "completed"; completedAt: number; session: SessionBoundaryV3 }
+export type ChildCompletionErrorCodeV3 = "child-error" | "bridge-error" | "lease-expired" | "surface-closed";
+/** Legacy boundary-less V3 child failure, retained for existing writers/readers and rolling parents. */
+export interface ChildFailureV3 { version: 3; runId: string; producer: "child"; status: "failed" | "aborted" | "orphaned"; completedAt: number; errorCode: ChildCompletionErrorCodeV3; stopReason: string | null }
+/** A child failure may bind a generic complete JSONL prefix, without asserting successful completion. */
+export interface ChildFailureWithSessionBoundaryV3 extends ChildFailureV3 { session: SessionBoundaryV3 }
+export type ObserverCompletionErrorCodeV3 = ChildCompletionErrorCodeV3 | "child-exited" | "completion-boundary-unproven" | "parent-aborted" | "transport-lost";
+export type CompletionEvidenceRefV3 = "launch" | "allocation" | "state" | "lease" | "wrapper-status" | "process-identity" | "target-snapshot";
+/** Legacy boundary-less V3 parent/reaper failure, retained for existing writers/readers. */
+export interface ObserverFailureV3 { version: 3; runId: string; producer: "parent" | "reaper"; status: "failed" | "aborted" | "orphaned"; completedAt: number; errorCode: ObserverCompletionErrorCodeV3; evidenceRefs: CompletionEvidenceRefV3[] }
+/** An observer failure may bind a parent-verified generic complete JSONL prefix. */
+export interface ObserverFailureWithSessionBoundaryV3 extends ObserverFailureV3 { session: SessionBoundaryV3 }
+export type CompletionRecordV3 = CompletionSuccessV3 | ChildFailureV3 | ChildFailureWithSessionBoundaryV3 | ObserverFailureV3 | ObserverFailureWithSessionBoundaryV3;
+export type CompletionRecord = CompletionRecordV2 | CompletionRecordV3;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
 	return Object.keys(value).every((key) => keys.includes(key)) && keys.every((key) => key in value);
@@ -730,16 +1123,39 @@ function validRun(value: Record<string, unknown>, expectedRunId?: string): boole
 function hasOnlyOptionalKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
 	return Object.keys(value).every((key) => required.includes(key) || optional.includes(key)) && required.every((key) => key in value);
 }
+function isCmuxControlTransport(value: unknown): value is CmuxControlTransportV2 {
+	return isRecord(value) && hasOnlyOptionalKeys(value, ["transport", "socketPath", "socketDev", "socketIno", "accessMode", "apiVersion", "appVersion", "identifyDigest"], ["bootIdentity"])
+		&& (value.bootIdentity === undefined || typeof value.bootIdentity === "string") && value.transport === "cmux-control-v2" && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath)
+		&& typeof value.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev)
+		&& typeof value.socketIno === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketIno)
+		&& typeof value.accessMode === "string" && value.accessMode.length > 0 && value.apiVersion === 2
+		&& typeof value.appVersion === "string" && isStableSemverAtLeast(value.appVersion, MINIMUM_CMUX_VERSION)
+		&& typeof value.identifyDigest === "string" && /^[a-f0-9]{64}$/.test(value.identifyDigest);
+}
 function isCmuxSource(value: unknown): value is CmuxSourceV2 {
 	return isRecord(value) && exactKeys(value, ["workspaceId", "sourceSurfaceId"])
 		&& typeof value.workspaceId === "string" && CMUX_UUID_RE.test(value.workspaceId)
 		&& typeof value.sourceSurfaceId === "string" && CMUX_UUID_RE.test(value.sourceSurfaceId);
 }
+function isTmuxGeneration(value: unknown): value is TmuxGenerationV2 {
+	return isRecord(value) && exactKeys(value, ["socketPath", "socketDev", "socketIno", "serverStartedAt"])
+		&& typeof value.socketPath === "string" && path.isAbsolute(value.socketPath)
+		&& typeof value.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev)
+		&& typeof value.socketIno === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketIno) && positive(value.serverStartedAt);
+}
+export function hasTmuxGeneration(value: { generation?: TmuxGenerationV2 } | null | undefined): value is { generation: TmuxGenerationV2 } {
+	return Boolean(value?.generation && isTmuxGeneration(value.generation));
+}
+function sameTmuxGeneration(left: TmuxGenerationV2 | undefined, right: TmuxGenerationV2 | undefined): boolean {
+	return Boolean(left && right && left.socketPath === right.socketPath && left.socketDev === right.socketDev
+		&& left.socketIno === right.socketIno && left.serverStartedAt === right.serverStartedAt);
+}
 function isTmuxSource(value: unknown): value is TmuxSourceV2 {
-	return isRecord(value) && hasOnlyOptionalKeys(value, ["sourcePaneId", "sourcePanePid", "serverPid"], ["socketPath"])
+	return isRecord(value) && hasOnlyOptionalKeys(value, ["sourcePaneId", "sourcePanePid", "serverPid"], ["socketPath", "generation"])
 		&& typeof value.sourcePaneId === "string" && TMUX_PANE_ID_RE.test(value.sourcePaneId)
 		&& pid(value.sourcePanePid) && pid(value.serverPid)
-		&& (value.socketPath === undefined || typeof value.socketPath === "string");
+		&& (value.socketPath === undefined || typeof value.socketPath === "string")
+		&& (value.generation === undefined || isTmuxGeneration(value.generation));
 }
 function parseLayoutContainerV2(value: unknown): LayoutContainerV2 | null {
 	if (!isRecord(value) || typeof value.kind !== "string") return null;
@@ -753,15 +1169,15 @@ function parseLayoutContainerV2(value: unknown): LayoutContainerV2 | null {
 		&& typeof value.workspaceId === "string" && CMUX_UUID_RE.test(value.workspaceId)
 		&& typeof value.sourceSurfaceId === "string" && CMUX_UUID_RE.test(value.sourceSurfaceId)
 		&& typeof value.paneId === "string" && CMUX_UUID_RE.test(value.paneId)) return value as CmuxSourcePaneContainerV2;
-	if (value.kind === "tmux-source-pane" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"], ["socketPath"])
+	if (value.kind === "tmux-source-pane" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"], ["socketPath", "generation"])
 		&& pid(value.serverPid) && typeof value.sessionId === "string" && TMUX_SESSION_ID_RE.test(value.sessionId)
 		&& typeof value.windowId === "string" && TMUX_WINDOW_ID_RE.test(value.windowId)
 		&& typeof value.paneId === "string" && TMUX_PANE_ID_RE.test(value.paneId) && pid(value.panePid)
-		&& (value.socketPath === undefined || typeof value.socketPath === "string")) return value as TmuxSourcePaneContainerV2;
-	if (value.kind === "tmux-session" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "sourceWindowId"], ["socketPath"])
+		&& (value.socketPath === undefined || typeof value.socketPath === "string") && (value.generation === undefined || isTmuxGeneration(value.generation))) return value as TmuxSourcePaneContainerV2;
+	if (value.kind === "tmux-session" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "sourceWindowId"], ["socketPath", "generation"])
 		&& pid(value.serverPid) && typeof value.sessionId === "string" && TMUX_SESSION_ID_RE.test(value.sessionId)
 		&& typeof value.sourceWindowId === "string" && TMUX_WINDOW_ID_RE.test(value.sourceWindowId)
-		&& (value.socketPath === undefined || typeof value.socketPath === "string")) return value as TmuxSessionContainerV2;
+		&& (value.socketPath === undefined || typeof value.socketPath === "string") && (value.generation === undefined || isTmuxGeneration(value.generation))) return value as TmuxSessionContainerV2;
 	return null;
 }
 function parseAllocatedContainerV2(value: unknown): AllocatedContainerV2 | null {
@@ -769,11 +1185,11 @@ function parseAllocatedContainerV2(value: unknown): AllocatedContainerV2 | null 
 	if (value.kind === "cmux-pane" && exactKeys(value, ["kind", "workspaceId", "paneId"])
 		&& typeof value.workspaceId === "string" && CMUX_UUID_RE.test(value.workspaceId)
 		&& typeof value.paneId === "string" && CMUX_UUID_RE.test(value.paneId)) return value as CmuxAllocatedContainerV2;
-	if (value.kind === "tmux-window" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"], ["socketPath"])
+	if (value.kind === "tmux-window" && hasOnlyOptionalKeys(value, ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"], ["socketPath", "generation"])
 		&& pid(value.serverPid) && typeof value.sessionId === "string" && TMUX_SESSION_ID_RE.test(value.sessionId)
 		&& typeof value.windowId === "string" && TMUX_WINDOW_ID_RE.test(value.windowId)
 		&& typeof value.paneId === "string" && TMUX_PANE_ID_RE.test(value.paneId) && pid(value.panePid)
-		&& (value.socketPath === undefined || typeof value.socketPath === "string")) return value as TmuxAllocatedContainerV2;
+		&& (value.socketPath === undefined || typeof value.socketPath === "string") && (value.generation === undefined || isTmuxGeneration(value.generation))) return value as TmuxAllocatedContainerV2;
 	return null;
 }
 function hasValidLayoutIntentPlacement(terminalMode: unknown, layout: unknown, placement: unknown, container: LayoutContainerV2): boolean {
@@ -800,7 +1216,7 @@ export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runD
 	if (value.parentRunId !== undefined && (typeof value.parentRunId !== "string" || !value.parentRunId)) return null;
 	if (runDir && !containedPath(value.childSessionFile, runDir, "child-session.jsonl")) return null;
 	const legacyIntentKeys = ["version", "runId", "parentRunId", "parentSessionId", "parentPid", "parentStartedAt", "terminalMode", "source", "childSessionFile", "createdAt", "brokerNonce", "runtimePath", "runtimeInterpreterPath", "backendPath", "brokerEntrypoint"];
-	const layoutIntentKeys = [...legacyIntentKeys, "layout", "placement", "container"];
+	const layoutIntentKeys = [...legacyIntentKeys, "layout", "placement", "container", "control"];
 	const executionPaths = [value.runtimePath, value.runtimeInterpreterPath, value.backendPath, value.brokerEntrypoint];
 	if (typeof value.brokerNonce !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(value.brokerNonce) || !executionPaths.every((field) => typeof field === "string" && field.length > 0 && path.isAbsolute(field))) return null;
 	const sourceIsValid = value.terminalMode === "cmux-pane" ? isCmuxSource(value.source) : value.terminalMode === "tmux-pane" && isTmuxSource(value.source);
@@ -808,26 +1224,42 @@ export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runD
 	const layoutFieldNames = ["layout", "placement", "container"];
 	const hasAnyLayoutField = layoutFieldNames.some((key) => Object.hasOwn(value, key));
 	if (!hasAnyLayoutField && Object.keys(value).every((key) => legacyIntentKeys.includes(key))) return value as LaunchIntentV2;
-	if (!hasOnlyOptionalKeys(value, layoutIntentKeys.filter((key) => key !== "parentRunId"), ["parentRunId"])
+	if (!hasOnlyOptionalKeys(value, layoutIntentKeys.filter((key) => key !== "parentRunId" && key !== "control"), ["parentRunId", "control"])
 		|| !layoutFieldNames.every((key) => Object.hasOwn(value, key))) return null;
+	if (value.control !== undefined && (value.terminalMode !== "cmux-pane" || !isCmuxControlTransport(value.control))) return null;
 	const container = parseLayoutContainerV2(value.container);
-	return container && hasValidLayoutIntentPlacement(value.terminalMode, value.layout, value.placement, container) ? value as LaunchIntentV2 : null;
+	if (!container || !hasValidLayoutIntentPlacement(value.terminalMode, value.layout, value.placement, container)) return null;
+	if (value.terminalMode === "tmux-pane") {
+		const source = value.source as TmuxSourceV2;
+		const generated = hasTmuxGeneration(source) || ("generation" in container && hasTmuxGeneration(container));
+		if (generated && (!("generation" in container) || !hasTmuxGeneration(source) || !hasTmuxGeneration(container)
+			|| !sameTmuxGeneration(source.generation, container.generation))) return null;
+	}
+	return value as LaunchIntentV2;
 }
 export function parseAllocationRecordV2(value: unknown, expectedRunId?: string): AllocationRecordV2 | null {
 	if (!isRecord(value) || !validRun(value, expectedRunId) || !positive(value.allocatedAt) || !isRecord(value.target)) return null;
 	const legacyAllocationKeys = ["version", "runId", "terminalMode", "target", "allocatedAt"];
-	const layoutAllocationKeys = [...legacyAllocationKeys, "layout", "placement", "container"];
+	const layoutAllocationKeys = [...legacyAllocationKeys, "layout", "placement", "container", "control"];
 	const targetIsValid = value.terminalMode === "cmux-pane"
 		? exactKeys(value.target, ["workspaceId", "surfaceId", "paneId"]) && [value.target.workspaceId, value.target.surfaceId, value.target.paneId].every((id) => typeof id === "string" && CMUX_UUID_RE.test(id))
-		: value.terminalMode === "tmux-pane" && hasOnlyOptionalKeys(value.target, ["serverPid", "paneId", "panePid"], ["socketPath"])
-			&& typeof value.target.paneId === "string" && TMUX_PANE_ID_RE.test(value.target.paneId) && pid(value.target.serverPid) && pid(value.target.panePid) && (value.target.socketPath === undefined || typeof value.target.socketPath === "string");
+		: value.terminalMode === "tmux-pane" && hasOnlyOptionalKeys(value.target, ["serverPid", "paneId", "panePid"], ["socketPath", "generation"])
+			&& typeof value.target.paneId === "string" && TMUX_PANE_ID_RE.test(value.target.paneId) && pid(value.target.serverPid) && pid(value.target.panePid) && (value.target.socketPath === undefined || typeof value.target.socketPath === "string") && (value.target.generation === undefined || isTmuxGeneration(value.target.generation));
 	if (!targetIsValid) return null;
 	const layoutFieldNames = ["layout", "placement", "container"];
 	const hasAnyLayoutField = layoutFieldNames.some((key) => Object.hasOwn(value, key));
 	if (!hasAnyLayoutField && exactKeys(value, legacyAllocationKeys)) return value as AllocationRecordV2;
-	if (!exactKeys(value, layoutAllocationKeys) || !layoutFieldNames.every((key) => Object.hasOwn(value, key))) return null;
+	if (!hasOnlyOptionalKeys(value, layoutAllocationKeys.filter((key) => key !== "control"), ["control"]) || !layoutFieldNames.every((key) => Object.hasOwn(value, key))) return null;
+	if (value.control !== undefined && (value.terminalMode !== "cmux-pane" || !isCmuxControlTransport(value.control))) return null;
 	const container = parseAllocatedContainerV2(value.container);
-	return container && hasValidLayoutAllocation(value.terminalMode, value.layout, value.placement, container, value.target) ? value as AllocationRecordV2 : null;
+	if (!container || !hasValidLayoutAllocation(value.terminalMode, value.layout, value.placement, container, value.target)) return null;
+	if (value.terminalMode === "tmux-pane") {
+		const target = value.target as { generation?: TmuxGenerationV2 };
+		const generated = hasTmuxGeneration(target) || ("generation" in container && hasTmuxGeneration(container));
+		if (generated && (!("generation" in container) || !hasTmuxGeneration(target) || !hasTmuxGeneration(container)
+			|| !sameTmuxGeneration(target.generation, container.generation))) return null;
+	}
+	return value as AllocationRecordV2;
 }
 export function parseDecisionV2(value: unknown, expectedRunId?: string, runDir?: string): DecisionV2 | null {
 	if (!isRecord(value) || !validRun(value, expectedRunId) || !positive(value.decidedAt)) return null;
@@ -841,7 +1273,11 @@ export function parseCommittedLaunchRecordV2(value: unknown, expectedRunId?: str
 	return value as unknown as CommittedLaunchRecordV2;
 }
 export function parseBrokerClaimV2(value: unknown, expectedRunId?: string): BrokerClaimV2 | null {
-	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "brokerNonce", "pid", "claimedAt"]) || typeof value.brokerNonce !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(value.brokerNonce) || !pid(value.pid) || !positive(value.claimedAt)) return null;
+	if (!isRecord(value) || !validRun(value, expectedRunId)
+		|| !(exactKeys(value, ["version", "runId", "brokerNonce", "pid", "claimedAt"])
+			|| exactKeys(value, ["version", "runId", "brokerNonce", "pid", "brokerStartedAt", "claimedAt"]))
+		|| typeof value.brokerNonce !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(value.brokerNonce) || !pid(value.pid)
+		|| (value.brokerStartedAt !== undefined && !positive(value.brokerStartedAt)) || !positive(value.claimedAt)) return null;
 	return value as unknown as BrokerClaimV2;
 }
 export function parseResidualRiskV2(value: unknown, expectedRunId?: string): ResidualRiskV2 | null {
@@ -862,6 +1298,48 @@ export function parseCompletionRecordV2(value: unknown, expectedRunId?: string):
 	if (!isRecord(value) || !validRun(value, expectedRunId) || !["completed", "failed", "aborted", "orphaned"].includes(String(value.status)) || !positive(value.completedAt) || !Object.keys(value).every((key) => ["version", "runId", "status", "completedAt", "errorCode"].includes(key))) return null;
 	if (value.errorCode !== undefined && !["child-error", "bridge-error", "lease-expired", "surface-closed", "parent-aborted", "wrapper-exited", "pane-missing", "inspect-exhausted", "reaper-cleanup-failed"].includes(String(value.errorCode))) return null;
 	return value as unknown as CompletionRecordV2;
+}
+
+const CHILD_COMPLETION_ERRORS_V3 = ["child-error", "bridge-error", "lease-expired", "surface-closed"] as const;
+const OBSERVER_COMPLETION_ERRORS_V3 = [...CHILD_COMPLETION_ERRORS_V3, "child-exited", "completion-boundary-unproven", "parent-aborted", "transport-lost"] as const;
+const COMPLETION_EVIDENCE_REFS_V3 = ["allocation", "launch", "lease", "process-identity", "state", "target-snapshot", "wrapper-status"] as const;
+function isSessionBoundaryV3(value: unknown): value is SessionBoundaryV3 {
+	return isRecord(value) && exactKeys(value, ["byteOffset", "finalEntryId", "digestAlgorithm", "prefixDigest"])
+		&& Number.isSafeInteger(value.byteOffset) && (value.byteOffset as number) > 0
+		&& typeof value.finalEntryId === "string" && /^[^\u0000-\u001f\u007f]{1,512}$/.test(value.finalEntryId)
+		&& value.digestAlgorithm === "sha256" && typeof value.prefixDigest === "string" && /^[a-f0-9]{64}$/.test(value.prefixDigest);
+}
+export function parseCompletionRecordV3(value: unknown, expectedRunId?: string): CompletionRecordV3 | null {
+	if (!isRecord(value) || value.version !== 3 || typeof value.runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.runId)
+		|| (expectedRunId !== undefined && value.runId !== expectedRunId) || !positive(value.completedAt)) return null;
+	if (value.producer === "child" && value.status === "completed") {
+		if (!exactKeys(value, ["version", "runId", "producer", "status", "completedAt", "session"]) || !isSessionBoundaryV3(value.session)) return null;
+		return value as unknown as CompletionSuccessV3;
+	}
+	if (value.producer === "child") {
+		const hasSession = Object.hasOwn(value, "session");
+		if (!(hasSession ? exactKeys(value, ["version", "runId", "producer", "status", "completedAt", "errorCode", "stopReason", "session"])
+			: exactKeys(value, ["version", "runId", "producer", "status", "completedAt", "errorCode", "stopReason"]))
+			|| !["failed", "aborted", "orphaned"].includes(String(value.status)) || !CHILD_COMPLETION_ERRORS_V3.includes(value.errorCode as ChildCompletionErrorCodeV3)
+			|| !(value.stopReason === null || typeof value.stopReason === "string" && value.stopReason.length <= 256)
+			|| (hasSession && !isSessionBoundaryV3(value.session))) return null;
+		return value as unknown as ChildFailureV3 | ChildFailureWithSessionBoundaryV3;
+	}
+	if (value.producer === "parent" || value.producer === "reaper") {
+		const hasSession = Object.hasOwn(value, "session");
+		const evidenceRefs = Array.isArray(value.evidenceRefs) ? value.evidenceRefs : null;
+		if (!(hasSession ? exactKeys(value, ["version", "runId", "producer", "status", "completedAt", "errorCode", "evidenceRefs", "session"])
+			: exactKeys(value, ["version", "runId", "producer", "status", "completedAt", "errorCode", "evidenceRefs"]))
+			|| !["failed", "aborted", "orphaned"].includes(String(value.status)) || !OBSERVER_COMPLETION_ERRORS_V3.includes(value.errorCode as ObserverCompletionErrorCodeV3)
+			|| !evidenceRefs || evidenceRefs.length === 0 || !evidenceRefs.every((entry) => COMPLETION_EVIDENCE_REFS_V3.includes(entry as CompletionEvidenceRefV3))
+			|| new Set(evidenceRefs).size !== evidenceRefs.length || evidenceRefs.some((entry, index) => index > 0 && String(evidenceRefs[index - 1]).localeCompare(String(entry)) >= 0)
+			|| (hasSession && !isSessionBoundaryV3(value.session))) return null;
+		return value as unknown as ObserverFailureV3 | ObserverFailureWithSessionBoundaryV3;
+	}
+	return null;
+}
+export function parseCompletionAuthority(value: unknown, expectedRunId?: string): CompletionRecord | null {
+	return parseCompletionRecordV3(value, expectedRunId) ?? parseCompletionRecordV2(value, expectedRunId);
 }
 
 /** V2 artifacts are a dependency graph, not independently-valid hints. */
@@ -888,7 +1366,9 @@ export function hasAllocationIntentSourceBinding(
 				&& !cmuxIdsEqual(allocation.target.surfaceId, intent.source.sourceSurfaceId);
 		}
 		if (intent.terminalMode === "tmux-pane" && allocation.terminalMode === "tmux-pane") {
-			return allocation.target.socketPath === intent.source.socketPath
+			return hasTmuxGeneration(intent.source) && hasTmuxGeneration(allocation.target)
+				&& sameTmuxGeneration(intent.source.generation, allocation.target.generation)
+				&& allocation.target.socketPath === intent.source.socketPath
 				&& allocation.target.serverPid === intent.source.serverPid
 				// Pane identity alone is source authority; a changed PID is not a
 				// new allocation and must be quarantined without lifecycle mutation.
@@ -899,6 +1379,11 @@ export function hasAllocationIntentSourceBinding(
 	if (!layoutIntent || !layoutAllocation) return false;
 	if (intent.layout !== allocation.layout || intent.placement !== allocation.placement) return false;
 	if (intent.terminalMode === "cmux-pane" && allocation.terminalMode === "cmux-pane" && allocation.container.kind === "cmux-pane") {
+		// New production cmux records must bind the exact socket generation and
+		// non-secret identify fingerprint. Legacy no-control records remain
+		// parseable diagnostics but cannot bind to this branch.
+		if ((intent.control !== undefined || allocation.control !== undefined)
+			&& (!intent.control || !allocation.control || JSON.stringify(intent.control) !== JSON.stringify(allocation.control))) return false;
 		const request = intent.container;
 		const sourceMatches = cmuxIdsEqual(allocation.target.workspaceId, intent.source.workspaceId)
 			&& !cmuxIdsEqual(allocation.target.surfaceId, intent.source.sourceSurfaceId);
@@ -917,20 +1402,26 @@ export function hasAllocationIntentSourceBinding(
 	}
 	if (intent.terminalMode === "tmux-pane" && allocation.terminalMode === "tmux-pane" && allocation.container.kind === "tmux-window") {
 		const request = intent.container;
-		const sourceMatches = allocation.target.socketPath === intent.source.socketPath
+		const sourceMatches = hasTmuxGeneration(intent.source) && hasTmuxGeneration(allocation.target)
+			&& hasTmuxGeneration(allocation.container) && sameTmuxGeneration(intent.source.generation, allocation.target.generation)
+			&& sameTmuxGeneration(intent.source.generation, allocation.container.generation)
+			&& allocation.target.socketPath === intent.source.socketPath
 			&& allocation.target.serverPid === intent.source.serverPid
 			&& allocation.target.paneId !== intent.source.sourcePaneId;
 		if (!sourceMatches || allocation.container.socketPath !== allocation.target.socketPath
 			|| allocation.container.serverPid !== allocation.target.serverPid
 			|| allocation.container.paneId !== allocation.target.paneId
 			|| allocation.container.panePid !== allocation.target.panePid) return false;
-		if (request.kind === "tmux-source-pane") return request.socketPath === intent.source.socketPath
+		if (request.kind === "tmux-source-pane") return hasTmuxGeneration(request)
+			&& sameTmuxGeneration(intent.source.generation, request.generation)
+			&& request.socketPath === intent.source.socketPath
 			&& request.serverPid === intent.source.serverPid
 			&& request.paneId === intent.source.sourcePaneId
 			&& request.panePid === intent.source.sourcePanePid
 			&& allocation.container.sessionId === request.sessionId
 			&& allocation.container.windowId === request.windowId;
-		return request.kind === "tmux-session"
+		return request.kind === "tmux-session" && hasTmuxGeneration(request)
+			&& sameTmuxGeneration(intent.source.generation, request.generation)
 			&& request.socketPath === intent.source.socketPath
 			&& request.serverPid === intent.source.serverPid
 			&& request.sessionId === allocation.container.sessionId
@@ -989,6 +1480,13 @@ export async function publishCompletionRecordV2(filePath: string, record: Comple
 	if (!winner) throw new Error(`Completion authority is malformed or does not match run ${record.runId}.`);
 	return winner;
 }
+export async function publishCompletionRecordV3(filePath: string, record: CompletionRecordV3): Promise<CompletionRecord> {
+	if (!parseCompletionRecordV3(record, record.runId)) throw new Error(`Completion V3 record is malformed for run ${record.runId}.`);
+	await publishImmutableJson(filePath, record);
+	const winner = parseCompletionAuthority(await readBrokerJson(filePath), record.runId);
+	if (!winner) throw new Error(`Completion authority is malformed or does not match run ${record.runId}.`);
+	return winner;
+}
 
 export type BrokerArtifactRead =
 	| { outcome: "missing" }
@@ -998,14 +1496,12 @@ export type BrokerArtifactRead =
 /** Tri-state immutable-authority read. Invalid is deliberately distinct from missing. */
 export async function readBrokerArtifact(filePath: string): Promise<BrokerArtifactRead> {
 	try {
-		const bytes = await fs.promises.readFile(filePath);
-		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-		if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) return { outcome: "invalid" };
-		const value = JSON.parse(text.slice(0, -1));
-		return isRecord(value) ? { outcome: "valid", value } : { outcome: "invalid" };
+		await fs.promises.lstat(filePath);
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT" ? { outcome: "missing" } : { outcome: "invalid" };
 	}
+	const value = await readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true });
+	return isRecord(value) ? { outcome: "valid", value } : { outcome: "invalid" };
 }
 
 export async function readBrokerJson(filePath: string): Promise<unknown | null> {

@@ -1,0 +1,98 @@
+name: Opt-in live acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_cmux:
+        description: "Run cmux live acceptance on a preconfigured self-hosted macOS/cmux runner"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-subagent-live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tmux-live:
+    name: tmux live title and lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.3.14
+      - name: Build pinned tmux 3.7b
+        env:
+          TMUX_VERSION: 3.7b
+          TMUX_SHA256: 87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential ca-certificates curl libevent-dev libncurses-dev pkg-config
+          archive="tmux-${TMUX_VERSION}.tar.gz"
+          curl --fail --location --retry 3 --silent --show-error "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/${archive}" --output "$RUNNER_TEMP/$archive"
+          printf '%s  %s\n' "$TMUX_SHA256" "$RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/tmux-${TMUX_VERSION}"
+          ./configure --prefix="$RUNNER_TEMP/tmux-${TMUX_VERSION}-install"
+          make --jobs="$(nproc)"
+          make install
+          printf '%s/bin\n' "$RUNNER_TEMP/tmux-${TMUX_VERSION}-install" >> "$GITHUB_PATH"
+      - name: Assert pinned tmux stable minimum
+        run: |
+          set -euo pipefail
+          test "$(tmux -V)" = "tmux 3.7b"
+          tmux -V
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Full non-live verification
+        run: bun run ci
+      - name: Verify source-bound Phase 0 live evidence
+        run: bun run benchmark:phase0:live:verify
+      - name: Live tmux title smoke
+        env:
+          PI_SUBAGENT_LIVE_TITLE_SMOKE: "1"
+        run: bun run title:live:tmux
+      - name: Live tmux lifecycle acceptance
+        env:
+          PI_SUBAGENT_LIVE_TMUX: "1"
+        run: bun run acceptance:tmux
+
+  cmux-live:
+    name: cmux live title and lifecycle
+    if: ${{ inputs.run_cmux }}
+    runs-on: [self-hosted, macOS, cmux]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.3.14
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Verify preconfigured cmux identity
+        run: |
+          test -n "$CMUX_WORKSPACE_ID"
+          test -n "$CMUX_SURFACE_ID"
+          cmux --version
+      - name: Full non-live verification
+        run: bun run ci
+      - name: Verify source-bound Phase 0 live evidence
+        run: bun run benchmark:phase0:live:verify
+      - name: Live cmux title smoke
+        env:
+          PI_SUBAGENT_LIVE_TITLE_SMOKE: "1"
+        run: bun run title:live:cmux
+      - name: Live cmux lifecycle acceptance
+        env:
+          PI_SUBAGENT_LIVE_CMUX: "1"
+        run: bun run acceptance:cmux

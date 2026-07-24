@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { createCmuxControlCommandRunner } from "./cmux-control-adapter.mjs";
+import { MINIMUM_CMUX_VERSION, isStableSemverAtLeast, parseCmuxVersionOutput } from "./version-policy.mjs";
 
 /** cmux 0.64.20 returns UUIDs and human refs together; refs are never authority. */
 export const CMUX_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -57,45 +58,24 @@ export const CMUX_REQUIRED_SURFACE_CAPABILITIES = [
 
 export type CmuxRequiredSurfaceCapability = (typeof CMUX_REQUIRED_SURFACE_CAPABILITIES)[number];
 export type CmuxSurfaceCapabilities = Record<CmuxRequiredSurfaceCapability, true>;
-export const MIN_CMUX_LAYOUT_VERSION = [0, 64, 20] as const;
+export const CMUX_LAYOUT_CONTRACT_ID = "cmux-layout-v1" as const;
+export const MIN_CMUX_LAYOUT_VERSION = MINIMUM_CMUX_VERSION;
 
 export interface CmuxLayoutPhase0Fixture {
-	cmuxVersion: "0.64.20";
+	contractId: typeof CMUX_LAYOUT_CONTRACT_ID;
+	cmuxVersion: string;
 	newSplit: CmuxSurfaceIdentity;
 	newSurface: CmuxSurfaceIdentity;
 	lastSurfacePane: "removed" | "empty";
 	capabilities: CmuxSurfaceCapabilities;
 }
 
-export const runCmuxCommand: CmuxCommandRunner = async (args, options = {}) => await new Promise((resolve) => {
-	const proc = spawn("cmux", args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
-	let stdout = "";
-	let stderr = "";
-	let settled = false;
-	let aborted = false;
-	let abortHandler: (() => void) | undefined;
-	const finish = (exitCode: number) => {
-		if (settled) return;
-		settled = true;
-		if (options.signal && abortHandler) options.signal.removeEventListener("abort", abortHandler);
-		resolve({ exitCode, stdout, stderr, aborted });
-	};
-	proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-	proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-	proc.on("error", (error) => {
-		if (!stderr.trim()) stderr = error.message;
-		finish(1);
-	});
-	proc.on("close", (code) => finish(code ?? 0));
-	if (options.signal) {
-		abortHandler = () => {
-			aborted = true;
-			proc.kill("SIGTERM");
-		};
-		if (options.signal.aborted) abortHandler();
-		else options.signal.addEventListener("abort", abortHandler, { once: true });
-	}
-});
+const runCmuxControlCommand = createCmuxControlCommandRunner();
+/** Production default: direct persistent control-v2 only; there is no CLI fallback. */
+export const runCmuxCommand: CmuxCommandRunner = async (args, options = {}) => {
+	if (options.signal?.aborted) return { exitCode: 130, stdout: "", stderr: "cmux control request aborted before dispatch", aborted: true };
+	return await runCmuxControlCommand(args, options);
+};
 
 function parseJsonObject(text: string): Record<string, unknown> | null {
 	try {
@@ -191,8 +171,9 @@ export function sanitizeCreatedCmuxSurfaceResponse(stdout: string): CmuxFixtureC
 export function parseCmuxLayoutPhase0Fixture(value: unknown): CmuxLayoutPhase0Fixture | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const record = value as Record<string, unknown>;
-	const fixtureKeys = ["schema_version", "cmux_version", "new_split_response", "new_surface_response", "last_surface_pane", "capabilities"];
-	if (!hasExactKeys(record, fixtureKeys) || record.schema_version !== 1 || record.cmux_version !== "0.64.20") return null;
+	const fixtureKeys = ["schema_version", "contract_id", "cmux_version", "new_split_response", "new_surface_response", "last_surface_pane", "capabilities"];
+	if (!hasExactKeys(record, fixtureKeys) || record.schema_version !== 1 || record.contract_id !== CMUX_LAYOUT_CONTRACT_ID
+		|| typeof record.cmux_version !== "string" || !isStableSemverAtLeast(record.cmux_version, MINIMUM_CMUX_VERSION)) return null;
 	const newSplit = parseFixtureCreatedResponse(record.new_split_response);
 	const newSurface = parseFixtureCreatedResponse(record.new_surface_response);
 	if (!newSplit || !newSurface || !cmuxIdsEqual(newSplit.workspaceId, newSurface.workspaceId)
@@ -204,7 +185,8 @@ export function parseCmuxLayoutPhase0Fixture(value: unknown): CmuxLayoutPhase0Fi
 	if (!hasExactKeys(capabilityRecord, CMUX_REQUIRED_SURFACE_CAPABILITIES)
 		|| CMUX_REQUIRED_SURFACE_CAPABILITIES.some((name) => capabilityRecord[name] !== true)) return null;
 	return {
-		cmuxVersion: "0.64.20",
+		contractId: CMUX_LAYOUT_CONTRACT_ID,
+		cmuxVersion: record.cmux_version,
 		newSplit,
 		newSurface,
 		lastSurfacePane: record.last_surface_pane,
@@ -216,22 +198,17 @@ export function parseCmuxLayoutPhase0Fixture(value: unknown): CmuxLayoutPhase0Fi
  * Parses cmux's JSON capabilities response without accepting aliases, blank
  * method names, or duplicate entries. Extra advertised methods are allowed.
  */
-export function isCmuxVersionAtLeast(rawVersion: string, minimum = MIN_CMUX_LAYOUT_VERSION): boolean {
-	const match = rawVersion.trim().match(/(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\D|$)/);
-	if (!match) return false;
-	const actual = [Number(match[1]), Number(match[2]), Number(match[3])];
-	for (let index = 0; index < minimum.length; index += 1) {
-		if (actual[index]! > minimum[index]!) return true;
-		if (actual[index]! < minimum[index]!) return false;
-	}
-	return true;
+export function isCmuxVersionAtLeast(rawVersion: string, minimum: string | readonly [number, number, number] = MIN_CMUX_LAYOUT_VERSION): boolean {
+	const detected = parseCmuxVersionOutput(rawVersion);
+	const minimumVersion = typeof minimum === "string" ? minimum : minimum.join(".");
+	return Boolean(detected && isStableSemverAtLeast(detected, minimumVersion));
 }
 
 /** Fail closed unless the exact backend supports layout allocation commands. */
 export async function assertCmuxLayoutSupport(run: CmuxCommandRunner): Promise<void> {
 	const version = await run(["--version"]);
 	if (version.exitCode !== 0 || !isCmuxVersionAtLeast(version.stdout || version.stderr)) {
-		throw new Error(`cmux auto pane layout requires cmux >= ${MIN_CMUX_LAYOUT_VERSION.join(".")}; use --subagent-pane-layout=split or upgrade cmux.`);
+		throw new Error(`cmux auto pane layout requires cmux >= ${MIN_CMUX_LAYOUT_VERSION}; use --subagent-pane-layout=split or upgrade cmux.`);
 	}
 	const capabilities = await run(["--json", "capabilities"]);
 	if (capabilities.exitCode !== 0 || !parseCmuxCapabilities(capabilities.stdout)) {
@@ -525,53 +502,58 @@ export function canonicalCmuxPaneExists(
 	return found;
 }
 
-export function resolveCanonicalCmuxSurfacePane(
-	stdout: string,
-	workspaceId: string,
-	surfaceId: string,
-): CmuxSurfaceIdentity | undefined {
+export type CmuxSourceTopologyFailure = "invalid-json" | "invalid-request-identity" | "invalid-topology" | "duplicate-identity" | "cross-type-identity" | "source-absent" | "source-duplicate";
+export type CmuxSourceTopologyResolution = { ok: true; identity: CmuxSurfaceIdentity } | { ok: false; reason: CmuxSourceTopologyFailure };
+
+export function diagnoseCanonicalCmuxSurfacePane(stdout: string, workspaceId: string, surfaceId: string): CmuxSourceTopologyResolution {
 	const tree = parseJsonObject(stdout);
-	if (!tree || !isCanonicalCmuxId(workspaceId) || !isCanonicalCmuxId(surfaceId)
-		|| cmuxIdsEqual(workspaceId, surfaceId) || !Array.isArray(tree.windows)) return undefined;
-	const identities = new Set<string>();
+	if (!tree) return { ok: false, reason: "invalid-json" };
+	if (!isCanonicalCmuxId(workspaceId) || !isCanonicalCmuxId(surfaceId)) return { ok: false, reason: "invalid-request-identity" };
+	if (cmuxIdsEqual(workspaceId, surfaceId)) return { ok: false, reason: "cross-type-identity" };
+	if (!Array.isArray(tree.windows)) return { ok: false, reason: "invalid-topology" };
+	const identities = new Map<string, "workspace" | "pane" | "surface">();
 	let resolved: CmuxSurfaceIdentity | undefined;
+	const addIdentity = (id: string, kind: "workspace" | "pane" | "surface"): CmuxSourceTopologyFailure | null => {
+		const key = id.toLowerCase(), prior = identities.get(key);
+		if (!prior) { identities.set(key, kind); return null; }
+		return prior === kind ? "duplicate-identity" : "cross-type-identity";
+	};
 	for (const window of tree.windows) {
-		if (!window || typeof window !== "object" || Array.isArray(window)) return undefined;
+		if (!window || typeof window !== "object" || Array.isArray(window)) return { ok: false, reason: "invalid-topology" };
 		const workspaces = (window as Record<string, unknown>).workspaces;
-		if (!Array.isArray(workspaces)) return undefined;
+		if (!Array.isArray(workspaces)) return { ok: false, reason: "invalid-topology" };
 		for (const workspace of workspaces) {
-			if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return undefined;
-			const workspaceRecord = workspace as Record<string, unknown>;
-			const canonicalWorkspaceId = workspaceRecord.id;
-			if (!isCanonicalCmuxId(canonicalWorkspaceId) || !Array.isArray(workspaceRecord.panes)) return undefined;
-			const workspaceKey = canonicalWorkspaceId.toLowerCase();
-			if (identities.has(workspaceKey)) return undefined;
-			identities.add(workspaceKey);
+			if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return { ok: false, reason: "invalid-topology" };
+			const workspaceRecord = workspace as Record<string, unknown>, canonicalWorkspaceId = workspaceRecord.id;
+			if (!isCanonicalCmuxId(canonicalWorkspaceId) || !Array.isArray(workspaceRecord.panes)) return { ok: false, reason: "invalid-topology" };
+			const workspaceConflict = addIdentity(canonicalWorkspaceId, "workspace");
+			if (workspaceConflict) return { ok: false, reason: workspaceConflict };
 			for (const pane of workspaceRecord.panes) {
-				if (!pane || typeof pane !== "object" || Array.isArray(pane)) return undefined;
-				const paneRecord = pane as Record<string, unknown>;
-				const canonicalPaneId = paneRecord.id;
-				if (!isCanonicalCmuxId(canonicalPaneId) || !Array.isArray(paneRecord.surfaces)) return undefined;
-				const paneKey = canonicalPaneId.toLowerCase();
-				if (identities.has(paneKey)) return undefined;
-				identities.add(paneKey);
+				if (!pane || typeof pane !== "object" || Array.isArray(pane)) return { ok: false, reason: "invalid-topology" };
+				const paneRecord = pane as Record<string, unknown>, canonicalPaneId = paneRecord.id;
+				if (!isCanonicalCmuxId(canonicalPaneId) || !Array.isArray(paneRecord.surfaces)) return { ok: false, reason: "invalid-topology" };
+				const paneConflict = addIdentity(canonicalPaneId, "pane");
+				if (paneConflict) return { ok: false, reason: paneConflict };
 				for (const surface of paneRecord.surfaces) {
-					if (!surface || typeof surface !== "object" || Array.isArray(surface)) return undefined;
-					const surfaceRecord = surface as Record<string, unknown>;
-					const canonicalSurfaceId = surfaceRecord.id;
-					if (!isCanonicalCmuxId(canonicalSurfaceId) || !cmuxIdsEqual(surfaceRecord.pane_id, canonicalPaneId)) return undefined;
-					const surfaceKey = canonicalSurfaceId.toLowerCase();
-					if (identities.has(surfaceKey)) return undefined;
-					identities.add(surfaceKey);
+					if (!surface || typeof surface !== "object" || Array.isArray(surface)) return { ok: false, reason: "invalid-topology" };
+					const surfaceRecord = surface as Record<string, unknown>, canonicalSurfaceId = surfaceRecord.id;
+					if (!isCanonicalCmuxId(canonicalSurfaceId) || !cmuxIdsEqual(surfaceRecord.pane_id, canonicalPaneId)) return { ok: false, reason: "invalid-topology" };
+					const surfaceConflict = addIdentity(canonicalSurfaceId, "surface");
+					if (surfaceConflict) return { ok: false, reason: surfaceConflict };
 					if (cmuxIdsEqual(canonicalWorkspaceId, workspaceId) && cmuxIdsEqual(canonicalSurfaceId, surfaceId)) {
-						if (resolved) return undefined;
+						if (resolved) return { ok: false, reason: "source-duplicate" };
 						resolved = { workspaceId: canonicalWorkspaceId, paneId: canonicalPaneId, surfaceId: canonicalSurfaceId };
 					}
 				}
 			}
 		}
 	}
-	return resolved;
+	return resolved ? { ok: true, identity: resolved } : { ok: false, reason: "source-absent" };
+}
+
+export function resolveCanonicalCmuxSurfacePane(stdout: string, workspaceId: string, surfaceId: string): CmuxSurfaceIdentity | undefined {
+	const resolved = diagnoseCanonicalCmuxSurfacePane(stdout, workspaceId, surfaceId);
+	return resolved.ok ? resolved.identity : undefined;
 }
 
 function canonicalTopologySurface(
@@ -683,6 +665,16 @@ export async function interruptCmuxSurface(
 	const resolved = await resolveCmuxSurfaceForMutation(handle, run);
 	if (!resolved) return false;
 	const response = await run(["send-key", "--workspace", resolved.workspaceId!, "--surface", resolved.surfaceId!, "escape"]);
+	return response.exitCode === 0;
+}
+
+export async function focusCmuxSurface(
+	handle: CmuxSurfaceHandle,
+	run: CmuxCommandRunner = runCmuxCommand,
+): Promise<boolean> {
+	const resolved = await resolveCmuxSurfaceForMutation(handle, run);
+	if (!resolved) return false;
+	const response = await run(["focus-panel", "--workspace", resolved.workspaceId!, "--panel", resolved.surfaceId!]);
 	return response.exitCode === 0;
 }
 

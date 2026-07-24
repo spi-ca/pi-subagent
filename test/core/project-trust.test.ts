@@ -5,9 +5,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   applySessionProjectTrustOverride,
+  getSessionProjectTrustOverride,
   isTrustedProjectAgentsDir,
   isTrustedProjectAgentsDirWithSessionOverrides,
+  resolveSessionProjectTrust,
 } from "../../src/core/project-trust";
+import { loadSubagentLimitConfigSources } from "../../src/core/subagent-limits";
 
 describe("project trust boundaries", () => {
   test("requires an exact trusted project root for the nearest .pi/agents directory", async () => {
@@ -81,6 +84,98 @@ describe("project trust boundaries", () => {
         }),
         true,
       );
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses true, false, or unavailable session trust without replacing prior exact-root state", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-trust-"));
+    try {
+      const projectRoot = path.join(tempDir, "project");
+      const agentsDir = path.join(projectRoot, ".pi", "agents");
+      const agentDir = path.join(tempDir, "agent");
+      const existingTrustedRoot = path.join(tempDir, "already-trusted");
+      const existingDeniedRoot = path.join(tempDir, "already-denied");
+      await Promise.all([
+        fs.mkdir(agentsDir, { recursive: true }),
+        fs.mkdir(agentDir, { recursive: true }),
+        fs.mkdir(existingTrustedRoot, { recursive: true }),
+        fs.mkdir(existingDeniedRoot, { recursive: true }),
+      ]);
+      await fs.writeFile(
+        path.join(projectRoot, ".pi", "pi-subagent.json"),
+        JSON.stringify({ maxActive: 3 }),
+        "utf-8",
+      );
+      const canonicalProjectRoot = await fs.realpath(projectRoot);
+      const canonicalTrustedRoot = await fs.realpath(existingTrustedRoot);
+      const canonicalDeniedRoot = await fs.realpath(existingDeniedRoot);
+      const projectConfig = async (projectTrusted: boolean) =>
+        (await loadSubagentLimitConfigSources({
+          agentDir,
+          cwd: projectRoot,
+          configDirName: ".pi",
+          projectTrusted,
+          warn: () => {},
+        })).projectConfig;
+
+      const approvedTrustedRoots = new Set([existingTrustedRoot]);
+      const approvedDeniedRoots = new Set([projectRoot, existingDeniedRoot]);
+      const approvedProjectTrusted = resolveSessionProjectTrust(
+        agentsDir,
+        getSessionProjectTrustOverride({ isProjectTrusted: () => true }),
+        approvedTrustedRoots,
+        approvedDeniedRoots,
+        { trust: {} },
+      );
+      assert.equal(approvedProjectTrusted, true);
+      assert.deepEqual(Array.from(approvedTrustedRoots), [canonicalTrustedRoot, canonicalProjectRoot]);
+      assert.deepEqual(Array.from(approvedDeniedRoots), [canonicalDeniedRoot]);
+      assert.deepEqual(await projectConfig(approvedProjectTrusted), { maxActive: 3 });
+
+      const deniedTrustedRoots = new Set([existingTrustedRoot, projectRoot]);
+      const deniedRoots = new Set([existingDeniedRoot]);
+      const deniedProjectTrusted = resolveSessionProjectTrust(
+        agentsDir,
+        getSessionProjectTrustOverride({ isProjectTrusted: () => false }),
+        deniedTrustedRoots,
+        deniedRoots,
+        { trust: { [projectRoot]: true } },
+      );
+      assert.equal(deniedProjectTrusted, false);
+      assert.deepEqual(Array.from(deniedTrustedRoots), [canonicalTrustedRoot]);
+      assert.deepEqual(Array.from(deniedRoots), [canonicalDeniedRoot, canonicalProjectRoot]);
+      assert.deepEqual(await projectConfig(deniedProjectTrusted), {});
+
+      const unavailableTrustedRoots = new Set([existingTrustedRoot]);
+      const unavailableDeniedRoots = new Set([existingDeniedRoot]);
+      const unavailableProjectTrusted = resolveSessionProjectTrust(
+        agentsDir,
+        getSessionProjectTrustOverride({}),
+        unavailableTrustedRoots,
+        unavailableDeniedRoots,
+        { trust: { [projectRoot]: true } },
+      );
+      assert.equal(unavailableProjectTrusted, true);
+      assert.deepEqual(Array.from(unavailableTrustedRoots), [existingTrustedRoot]);
+      assert.deepEqual(Array.from(unavailableDeniedRoots), [existingDeniedRoot]);
+      assert.deepEqual(await projectConfig(unavailableProjectTrusted), { maxActive: 3 });
+
+      const unavailableDeniedTrustedRoots = new Set([existingTrustedRoot]);
+      const unavailableCurrentDeniedRoots = new Set([projectRoot, existingDeniedRoot]);
+      const unavailableDeniedProjectTrusted = resolveSessionProjectTrust(
+        agentsDir,
+        getSessionProjectTrustOverride({}),
+        unavailableDeniedTrustedRoots,
+        unavailableCurrentDeniedRoots,
+        { trust: { [projectRoot]: true } },
+      );
+      assert.equal(unavailableDeniedProjectTrusted, false);
+      assert.deepEqual(Array.from(unavailableDeniedTrustedRoots), [existingTrustedRoot]);
+      assert.deepEqual(Array.from(unavailableCurrentDeniedRoots), [projectRoot, existingDeniedRoot]);
+      assert.deepEqual(await projectConfig(unavailableDeniedProjectTrusted), {});
+      assert.equal(getSessionProjectTrustOverride({ isProjectTrusted: () => { throw new Error("unavailable"); } }), null);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }

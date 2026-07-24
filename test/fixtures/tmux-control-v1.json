@@ -1,0 +1,19 @@
+{
+  "contract": "tmux-control-v1",
+  "minimumVersion": "3.7b",
+  "capturedVersion": "3.7b",
+  "sourceCommit": "e802909de06012a4df6209d55e86487c56223163",
+  "response": [
+    "%begin 1710000000 1 0",
+    "%1|$1|@1|0|1234",
+    "%end 1710000000 1 0"
+  ],
+  "notifications": [
+    "%layout-change @1 b25f,80x24,0,0,1 b25f,80x24,0,0,1 *",
+    "%window-add @2",
+    "%window-close @2",
+    "%sessions-changed",
+    "%output %1 ignored-output",
+    "%extended-output %1 3 : ignored-output"
+  ]
+}

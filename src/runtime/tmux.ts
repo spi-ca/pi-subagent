@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { getProcessStartedAt, type TmuxGenerationV2 } from "./run-protocol.js";
+import { readFileGeneration } from "./launch-preflight.js";
 
 export const TMUX_PANE_ID_RE = /^%(?:0|[1-9][0-9]*)$/;
 /** Layout topology requires non-zero stable container IDs. */
@@ -17,7 +19,7 @@ function withoutFinalLineEnding(value: string): string {
 	return value.endsWith("\r\n") ? value.slice(0, -2) : value.endsWith("\n") ? value.slice(0, -1) : value;
 }
 
-function parseTmuxPidOutput(value: string): number | null {
+export function parseTmuxServerPidOutput(value: string): number | null {
 	return parsePositivePid(withoutFinalLineEnding(value));
 }
 
@@ -41,6 +43,8 @@ export interface TmuxPaneHandle {
 	/** Optional allocation diagnostics; legacy split handles do not require them. */
 	sessionId?: string;
 	windowId?: string;
+	/** V2 lifecycle authority; absent only for legacy/low-level compatibility. */
+	generation?: TmuxGenerationV2;
 }
 
 export interface TmuxSourceTopology {
@@ -89,6 +93,17 @@ export function isInsideTmux(env: NodeJS.ProcessEnv = process.env): boolean {
 
 function withSocket(socketPath: string | undefined, args: string[]): string[] {
 	return socketPath ? ["-S", socketPath, ...args] : args;
+}
+
+export function buildTmuxServerPidArgs(socketPath?: string): string[] {
+	return withSocket(socketPath, ["display-message", "-p", "#{pid}"]);
+}
+
+export function buildTmuxPaneSnapshotArgs(socketPath?: string): string[] {
+	return withSocket(socketPath, [
+		"list-panes", "-a", "-F",
+		"#{pane_id}\t#{pane_dead}\t#{pane_title}\t#{pane_pid}",
+	]);
 }
 
 /** Uses a printable separator because locale/client handling can sanitize tabs. */
@@ -270,8 +285,8 @@ async function readTmuxServerPid(
 	run: TmuxCommandRunner,
 	signal?: AbortSignal,
 ): Promise<number | null> {
-	const result = await run(withSocket(socketPath, ["display-message", "-p", "#{pid}"]), { signal });
-	const serverPid = parseTmuxPidOutput(result.stdout);
+	const result = await run(buildTmuxServerPidArgs(socketPath), { signal });
+	const serverPid = parseTmuxServerPidOutput(result.stdout);
 	return result.exitCode === 0 ? serverPid : null;
 }
 
@@ -381,7 +396,7 @@ export async function createTmuxPane(options: {
 	return handle;
 }
 
-function parseTmuxPaneSnapshots(stdout: string): Map<string, TmuxPaneSnapshot> | null {
+export function parseTmuxPaneSnapshots(stdout: string): ReadonlyMap<string, TmuxPaneSnapshot> | null {
 	const output = withoutFinalLineEnding(stdout);
 	if (output.endsWith("\r")) return null;
 	const panes = new Map<string, TmuxPaneSnapshot>();
@@ -402,22 +417,26 @@ export async function inspectTmuxPane(
 	signal?: AbortSignal,
 ): Promise<TmuxPaneSnapshot | undefined> {
 	if (!TMUX_PANE_ID_RE.test(handle.paneId)) return undefined;
-	const result = await run(withSocket(handle.socketPath, [
-		"list-panes",
-		"-a",
-		"-F",
-		"#{pane_id}\t#{pane_dead}\t#{pane_title}\t#{pane_pid}",
-	]), { signal });
+	const result = await run(buildTmuxPaneSnapshotArgs(handle.socketPath), { signal });
 	if (result.exitCode !== 0) return undefined;
 	const panes = parseTmuxPaneSnapshots(result.stdout);
 	if (!panes) return undefined;
 	return panes.get(handle.paneId) ?? { exists: false };
 }
 
+export function isTmuxPaneGenerationCurrent(handle: TmuxPaneHandle): boolean {
+	if (!handle.generation) return true;
+	const socket = readFileGeneration(handle.generation.socketPath, true);
+	return socket !== null && socket.realpath === handle.generation.socketPath
+		&& socket.dev === handle.generation.socketDev && socket.ino === handle.generation.socketIno
+		&& getProcessStartedAt(handle.serverPid) === handle.generation.serverStartedAt;
+}
+
 export async function inspectTmuxPaneFingerprint(
 	handle: TmuxPaneHandle,
 	run: TmuxCommandRunner = runTmuxCommand,
 ): Promise<TmuxPaneSnapshot | undefined> {
+	if (!isTmuxPaneGenerationCurrent(handle)) return { exists: false };
 	const serverPid = await readTmuxServerPid(handle.socketPath, run);
 	if (serverPid === null) return undefined;
 	if (serverPid !== handle.serverPid) return { exists: false };
@@ -448,7 +467,7 @@ export function buildGuardedTmuxPaneCommandArgs(
 		handle.paneId,
 		condition,
 		guardedCommand,
-		"",
+		"display-message -p -l pi-subagent-guard-noop",
 	]);
 }
 

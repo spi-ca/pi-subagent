@@ -21,21 +21,73 @@ import {
 } from "../../src/runtime/run-protocol.js";
 import { reapStaleInteractiveRuns, resolveBrokerRuntime, resolveBackendExecutable, resolveRuntimeInterpreter } from "../../src/runtime/runner.js";
 import { buildCmuxNewSplitArgs, buildCmuxRespawnPaneArgs, cmuxIdsEqual, inspectCanonicalCmuxSurfaceTree, isCanonicalCmuxId, parseCreatedCmuxSurface } from "../../src/runtime/cmux.js";
+import { hasValidTmuxControlChain, parseAllocationRecordV3, parseBrokerStatusV3, parseCommittedLaunchRecordV3, parseLaunchIntentV3, parseResidualRiskV3 } from "../../src/runtime/tmux-control-protocol.js";
+import { isTmuxControlTransportGateCurrent, parseTmuxControlTransportGate } from "../../src/runtime/tmux-control-gate.js";
+import { TmuxControlClient, createTmuxControlCommandRunner, resetTmuxControlMetrics, snapshotTmuxControlMetrics } from "../../src/runtime/tmux-control.mjs";
+import { MINIMUM_CMUX_VERSION, isStableSemverAtLeast, parseCmuxVersionOutput } from "../../src/runtime/version-policy.mjs";
+import { acceptanceAllocationCheckpointPath } from "./acceptance-allocation-checkpoint";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const FIXTURE = path.join(ROOT, "test/fixtures/acceptance-parent.ts");
 const BROKER_RELATIVE = "src/runtime/pane-launch-broker.mjs";
 const LIVE_CMUX_ENV = "PI_SUBAGENT_LIVE_CMUX";
+function shellQuote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
 const LIVE_TMUX_ENV = "PI_SUBAGENT_LIVE_TMUX";
 const PACKAGE_ENV = "PI_SUBAGENT_PACKAGE_ACCEPTANCE";
 /** Registration contract checked against the separately packed/installable extension. */
 export const PACKAGE_REGISTRATION_EXPECTED_FLAGS = [
   "subagent-max-depth",
+  "subagent-max-active",
+  "subagent-max-parallel-tasks",
+  "subagent-max-chain-steps",
+  "subagent-max-concurrency",
+  "subagent-max-chain-parallel-tasks",
+  "subagent-max-background-jobs",
+  "subagent-background-history-limit",
+  "subagent-background-history-ttl-ms",
+  "subagent-background-output-max-bytes",
+  "subagent-background-shutdown-settle-ms",
+  "subagent-parallel-heartbeat-ms",
   "subagent-prevent-cycles",
   "subagent-pane-layout",
 ] as const;
 const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "session_shutdown", "before_agent_start"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_TOOLS = ["subagent"] as const;
+const PACKAGE_REGISTRATION_EXPECTED_COMMANDS = ["subagents"] as const;
+export const PACKAGE_PROBE_EVENT_CHANNELS = ["pi-subagent:dashboard:v1", "pi-subagent:aggregate-completed:v1"] as const;
+
+type PackageProbeEvents = {
+  on(channel: unknown, handler: unknown): void;
+  emit(channel: unknown, payload: unknown): void;
+};
+
+/**
+ * The installed-extension probe needs only the two synchronous dashboard
+ * channels. Keep their listener sets bounded and separate from `pi.on`, which
+ * verifies lifecycle registration rather than application event delivery.
+ */
+export function createBoundedPackageProbeEvents(): PackageProbeEvents {
+  const channels = new Set<string>(PACKAGE_PROBE_EVENT_CHANNELS);
+  const listeners = new Map<string, Set<(payload: unknown) => void>>();
+  const assertChannel = (channel: unknown): string => {
+    if (typeof channel !== "string" || !channels.has(channel)) throw new Error(`unexpected pi.events channel: ${String(channel)}`);
+    return channel;
+  };
+  return {
+    on(channel, handler) {
+      const name = assertChannel(channel);
+      if (typeof handler !== "function") throw new Error("non-function pi.events handler");
+      const channelListeners = listeners.get(name) ?? new Set<(payload: unknown) => void>();
+      if (channelListeners.size !== 0) throw new Error(`duplicate pi.events listener: ${name}`);
+      channelListeners.add(handler as (payload: unknown) => void);
+      listeners.set(name, channelListeners);
+    },
+    emit(channel, payload) {
+      const name = assertChannel(channel);
+      for (const handler of listeners.get(name) ?? []) handler(payload);
+    },
+  };
+}
 
 /** Reject unexpected, duplicate, and missing registrations without depending on registration order. */
 export const assertExactPackageRegistrationNames = (
@@ -173,10 +225,9 @@ export function safeResumeBroker(identity: ProcessIdentity, stateProbe: ProcessS
 }
 
 /** The exact parser is deliberately pinned to the live harness's supported cmux release. */
-export function parseRequiredCmuxVersion(stdout: string): "0.64.20" | null {
-  // cmux 0.64.20 reports its release build as `cmux 0.64.20 (100) [hash]`.
-  // Keep the semantic version exact: a prefix such as 0.64.200 is not valid.
-  return /^cmux (0\.64\.20)(?: \([0-9]+\) \[[0-9a-f]+\])?$/i.test(stdout.trim()) ? "0.64.20" : null;
+export function parseRequiredCmuxVersion(stdout: string): string | null {
+  const detected = parseCmuxVersionOutput(stdout.trim());
+  return detected && isStableSemverAtLeast(detected, MINIMUM_CMUX_VERSION) ? detected : null;
 }
 
 function run(bin: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -259,11 +310,37 @@ function minimalBrokerEnv(mode: "tmux-pane" | "cmux-pane", base = process.env): 
     TMPDIR: base.TMPDIR || os.tmpdir(),
     TERM: base.TERM || "xterm-256color",
   };
+  for (const key of ["LANG", "LC_ALL"] as const) {
+    const value = base[key];
+    if (typeof value === "string" && /^[A-Za-z0-9_.@-]+$/.test(value)) env[key] = value;
+  }
   const keys = mode === "cmux-pane"
     ? ["CMUX_SOCKET_PATH", "CMUX_SOCKET_CAPABILITY", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH"]
     : ["TMUX", "TMUX_PANE"];
   for (const key of keys) if (typeof base[key] === "string") env[key] = base[key];
   return env;
+}
+
+function directTmuxChildPids(): Set<number> {
+  const probe = spawnSync("/bin/ps", ["-axo", "pid=,ppid=,comm="], { encoding: "utf8" });
+  const pids = new Set<number>();
+  if (probe.status !== 0) return pids;
+  for (const line of String(probe.stdout).split("\n")) {
+    const match = line.trim().match(/^([1-9][0-9]*)\s+([1-9][0-9]*)\s+(.+)$/);
+    if (!match || Number(match[2]) !== process.pid || path.basename(match[3]!.trim()) !== "tmux") continue;
+    pids.add(Number(match[1]));
+  }
+  return pids;
+}
+
+async function sampleUnexpectedTmuxChildren(expectedPid: number, durationMs: number): Promise<{ unexpected: Set<number>; samples: number }> {
+  const unexpected = new Set<number>(), deadline = performance.now() + durationMs; let samples = 0;
+  while (performance.now() < deadline) {
+    samples += 1;
+    for (const pid of directTmuxChildPids()) if (pid !== expectedPid) unexpected.add(pid);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return { unexpected, samples };
 }
 
 function parseFixtureHandoff(value: unknown): FixtureHandoff | null {
@@ -288,7 +365,10 @@ export async function spawnFixture(spec: Record<string, unknown>, tracker: Fixtu
   const specPath = path.join(root, "fixture-spec.json");
   await fs.promises.writeFile(specPath, `${JSON.stringify(spec)}\n`, { mode: 0o600 });
   const mode = spec.mode as "tmux-pane" | "cmux-pane";
-  const child = spawn(process.execPath, [FIXTURE, "--spec", specPath], { cwd: root, env: minimalBrokerEnv(mode), stdio: "ignore" });
+  const fixtureStderrPath = path.join(root, "fixture-stderr.log");
+  const fixtureStderr = fs.openSync(fixtureStderrPath, "wx", 0o600);
+  const child = spawn(process.execPath, [FIXTURE, "--spec", specPath], { cwd: root, env: minimalBrokerEnv(mode), stdio: ["ignore", "ignore", fixtureStderr] });
+  fs.closeSync(fixtureStderr);
   tracker.child = child;
   const startedAt = await waitFor(async () => child.pid ? getProcessStartedAt(child.pid) : null, "fixture process identity");
   tracker.parent = { pid: child.pid!, startedAt, expectedCommand: "acceptance-parent.ts", runId: "unpublished" };
@@ -379,9 +459,62 @@ export async function terminateStoppedPreallocationBroker(broker: ProcessIdentit
   }, "stopped pre-allocation broker termination", 5_000).catch(() => false);
 }
 
+type PostallocationCheckpoint = { allocation: unknown; exactCandidate: boolean; protocolVersion: 2 | 3 };
+
+/**
+ * The response-to-record checkpoint is test-only, but its controller proof is
+ * intentionally strict: an outer PID/start/run/nonce binding may authorize
+ * terminating the stopped broker; only a separately source-bound allocation
+ * may authorize backend cleanup. A malformed candidate is retained as risk.
+ */
+async function readStoppedPostallocationCheckpoint(broker: ProcessIdentity, paths: RunArtifactPaths): Promise<PostallocationCheckpoint | null> {
+  const [intentValue, checkpoint] = await Promise.all([
+    readBrokerJson(paths.launchIntentPath), readBrokerJson(acceptanceAllocationCheckpointPath(paths)),
+  ]);
+  const intentV3 = parseLaunchIntentV3(intentValue, broker.runId, paths.runDir);
+  const intent = intentV3 ?? parseLaunchIntentV2(intentValue, broker.runId);
+  if (!intent || !checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)) return null;
+  const value = checkpoint as Record<string, unknown>;
+  if (Object.keys(value).length !== 5 || value.version !== 1 || value.runId !== broker.runId || value.brokerNonce !== intent.brokerNonce
+    || !value.broker || typeof value.broker !== "object" || Array.isArray(value.broker)) return null;
+  const identity = value.broker as Record<string, unknown>;
+  if (Object.keys(identity).length !== 4 || identity.pid !== broker.pid || identity.startedAt !== broker.startedAt
+    || identity.expectedCommand !== broker.expectedCommand || identity.runId !== broker.runId) return null;
+  const allocation = intentV3 ? parseAllocationRecordV3(value.allocation, broker.runId) : parseAllocationRecordV2(value.allocation, broker.runId);
+  return { allocation: value.allocation, exactCandidate: Boolean(allocation && hasAllocationIntentSourceBinding(intent as any, allocation as any)), protocolVersion: intent.version };
+}
+
+export type StoppedPostallocationBrokerResult = "not-checkpoint" | "identity-lost" | "exact-candidate-killed" | "residual-risk-retained";
+
+/** Kill only the identity-bound stopped broker; never guess a cleanup target. */
+export async function terminateStoppedPostallocationBroker(
+  broker: ProcessIdentity,
+  paths: RunArtifactPaths,
+  stateProbe: ProcessStateProbe = probeProcessState,
+): Promise<{ result: StoppedPostallocationBrokerResult; allocation: unknown | null }> {
+  const checkpoint = await readStoppedPostallocationCheckpoint(broker, paths);
+  if (!checkpoint) return { result: "not-checkpoint", allocation: null };
+  const initial = stateProbe(broker.pid);
+  if (initial.state === "unknown" || !isIdentityStopped(broker, stateProbe)) return { result: "identity-lost", allocation: null };
+  process.kill(broker.pid, "SIGKILL");
+  const terminated = await waitFor(async () => {
+    const state = stateProbe(broker.pid);
+    return state.state === "unknown" ? false : isTerminalOwnedIdentity(broker, state) ? true : null;
+  }, "stopped post-allocation broker termination", 5_000).catch(() => false);
+  if (!terminated) return { result: "identity-lost", allocation: null };
+  if (checkpoint.exactCandidate) return { result: "exact-candidate-killed", allocation: checkpoint.allocation };
+  // The allocation response existed but the controller cannot establish that
+  // this candidate is safe to mutate. Persist the conservative outcome before
+  // returning so later cleanup retains the private root rather than guessing.
+  await publishImmutableJson(paths.residualRiskPath, { version: checkpoint.protocolVersion, runId: broker.runId, reason: "possible-unrecorded-allocation", recordedAt: Date.now() }).catch(() => undefined);
+  return { result: "residual-risk-retained", allocation: null };
+}
+
 type BrokerReconciliation = {
-  state: "not-started" | "stopped-preallocation-killed" | "exited-with-allocation" | "exited-terminal" | "exited-unrecorded" | "residual-risk" | "handoff-unresolved" | "alive-with-allocation" | "alive-terminal" | "alive-timeout" | "identity-lost";
+  state: "not-started" | "stopped-preallocation-killed" | "stopped-postallocation-killed" | "exited-with-allocation" | "exited-terminal" | "exited-unrecorded" | "residual-risk" | "handoff-unresolved" | "alive-with-allocation" | "alive-terminal" | "alive-timeout" | "identity-lost";
   allocationPublished: boolean;
+  /** Exact test-only candidate returned only after PID/start/run-bound termination. */
+  checkpointAllocation?: unknown;
   canFinishCleanup: boolean;
 };
 
@@ -393,12 +526,12 @@ async function readBrokerAuthority(paths: RunArtifactPaths, runId: string): Prom
   const [allocationValue, statusValue, riskValue] = await Promise.all([
     readBrokerJson(paths.allocationPath), readBrokerJson(paths.brokerStatusPath), readBrokerJson(paths.residualRiskPath),
   ]);
-  const allocation = parseAllocationRecordV2(allocationValue, runId);
-  const status = parseBrokerStatusV2(statusValue, runId);
+  const allocation = parseAllocationRecordV3(allocationValue, runId) ?? parseAllocationRecordV2(allocationValue, runId);
+  const status = parseBrokerStatusV3(statusValue, runId) ?? parseBrokerStatusV2(statusValue, runId);
   return {
     allocation: allocation !== null,
-    residualRisk: parseResidualRiskV2(riskValue, runId) !== null || status?.phase === "failed" && status.errorCode === "possible-unrecorded-allocation",
-    handoffUnresolved: status?.phase === "failed" && status.errorCode === "acceptance-handoff-unresolved",
+    residualRisk: parseResidualRiskV3(riskValue, runId) !== null || parseResidualRiskV2(riskValue, runId) !== null || status?.phase === "failed" && "errorCode" in status && status.errorCode === "possible-unrecorded-allocation",
+    handoffUnresolved: status?.phase === "failed" && "errorCode" in status && status.errorCode === "acceptance-handoff-unresolved",
     terminal: status?.writer === "broker" && (status.phase === "committed" || status.phase === "failed"),
   };
 }
@@ -422,6 +555,14 @@ export async function reconcileFixtureBroker(fixture: Pick<FixtureTracker, "brok
   if (!fixture.broker || !fixture.paths) return { state: "not-started", allocationPublished: false, canFinishCleanup: true };
   const { broker, paths } = fixture;
   if (isIdentityStopped(broker, stateProbe)) {
+    const postallocation = await terminateStoppedPostallocationBroker(broker, paths, stateProbe);
+    if (postallocation.result === "exact-candidate-killed") {
+      return { state: "stopped-postallocation-killed", allocationPublished: false, checkpointAllocation: postallocation.allocation, canFinishCleanup: true };
+    }
+    if (postallocation.result === "residual-risk-retained") {
+      return { state: "residual-risk", allocationPublished: false, canFinishCleanup: false };
+    }
+    if (postallocation.result === "identity-lost") return { state: "identity-lost", allocationPublished: false, canFinishCleanup: false };
     if (!await terminateStoppedPreallocationBroker(broker, paths, stateProbe)) return { state: "identity-lost", allocationPublished: false, canFinishCleanup: false };
     const authority = await readBrokerAuthority(paths, broker.runId);
     if (authority.residualRisk || authority.allocation) return classifyBrokerAuthority(authority, false);
@@ -453,11 +594,12 @@ async function cleanupFixtureProcesses(fixture: FixtureTracker): Promise<Fixture
   return { broker, parent };
 }
 
-export function bindAcceptanceTmuxAllocation(intentValue: unknown, allocationValue: unknown, runId: string): TmuxTarget | null {
-  const intent = parseLaunchIntentV2(intentValue, runId);
-  const allocation = parseAllocationRecordV2(allocationValue, runId);
+export function bindAcceptanceTmuxAllocation(intentValue: unknown, allocationValue: unknown, runId: string, runDir?: string): TmuxTarget | null {
+  const v3 = runDir ? parseLaunchIntentV3(intentValue, runId, runDir) : null;
+  const intent = v3 ?? parseLaunchIntentV2(intentValue, runId);
+  const allocation = v3 ? parseAllocationRecordV3(allocationValue, runId) : parseAllocationRecordV2(allocationValue, runId);
   if (!intent || !allocation || intent.terminalMode !== "tmux-pane" || allocation.terminalMode !== "tmux-pane"
-    || !hasAllocationIntentSourceBinding(intent, allocation)) return null;
+    || !hasAllocationIntentSourceBinding(intent as any, allocation as any)) return null;
   return { paneId: allocation.target.paneId, panePid: allocation.target.panePid, serverPid: allocation.target.serverPid, socketPath: allocation.target.socketPath };
 }
 
@@ -466,7 +608,7 @@ async function durableTmuxTarget(paths: RunArtifactPaths | null): Promise<TmuxTa
   const [intent, allocation] = await Promise.all([
     readBrokerJson(paths.launchIntentPath), readBrokerJson(paths.allocationPath),
   ]);
-  return bindAcceptanceTmuxAllocation(intent, allocation, path.basename(paths.runDir));
+  return bindAcceptanceTmuxAllocation(intent, allocation, path.basename(paths.runDir), paths.runDir);
 }
 
 export type CmuxAllocationAuthority =
@@ -554,7 +696,7 @@ async function signalFixtureAtCheckpoint(identity: ProcessIdentity, broker: Proc
 }
 
 async function publishGate(paths: RunArtifactPaths, runId: string, mode: "tmux-pane" | "cmux-pane"): Promise<void> {
-  const published = await publishImmutableJson(paths.launchGatePath, { version: 2, runId, terminalMode: mode, launchPath: paths.launchPath, publishedAt: Date.now() });
+  const published = await publishImmutableJson(paths.launchGatePath, { version: mode === "tmux-pane" ? 3 : 2, runId, terminalMode: mode, launchPath: paths.launchPath, publishedAt: Date.now() });
   if (published !== "published") throw new Error("launch gate was not published exactly once");
 }
 
@@ -593,7 +735,7 @@ async function cleanupTmuxTarget(tmux: string, socket: string, target: TmuxTarge
   if (current === "absent") return true;
   if (current !== "present") return false;
   const condition = `#{&&:#{==:#{pid},${target.serverPid}},#{==:#{pane_pid},${target.panePid}}}`;
-  if ((await run(tmux, ["-S", socket, "if-shell", "-F", "-t", target.paneId, condition, `kill-pane -t ${target.paneId}`, ""])).code !== 0) return false;
+  if ((await run(tmux, ["-S", socket, "if-shell", "-F", "-t", target.paneId, condition, `kill-pane -t ${target.paneId}`, "display-message -p -l pi-subagent-guard-noop"])).code !== 0) return false;
   return (await probeTmuxPanePair(tmux, socket, { id: target.paneId, pid: target.panePid })) === "absent";
 }
 
@@ -652,6 +794,7 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
   let target: TmuxTarget | null = null;
   let retainRoot = options.keep;
   let cleanupFailed = false;
+  let targetProvenAbsent = false;
   const evidence: Record<string, unknown> = { mode: "tmux", outcome: "failed" };
   try {
     tmux = backend("tmux-pane");
@@ -672,22 +815,85 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
     }, "broker ready checkpoint");
     await signalFixtureAtCheckpoint(launchedFixture.identity, launchedFixture.broker, launchedFixture.paths);
     await waitFor(async () => (await readBrokerJson(launchedFixture.paths.launchPath)) ? {} : null, "detached broker commit");
-    const allocation = await readBrokerJson(launchedFixture.paths.allocationPath) as { target?: Partial<TmuxTarget> };
+    const [rawIntent, rawAllocation, rawLaunch, rawTransportGate] = await Promise.all([
+      readBrokerJson(launchedFixture.paths.launchIntentPath), readBrokerJson(launchedFixture.paths.allocationPath),
+      readBrokerJson(launchedFixture.paths.launchPath), readBrokerJson(launchedFixture.paths.transportGatePath),
+    ]);
+    const controlIntent = parseLaunchIntentV3(rawIntent, launchedFixture.identity.runId, launchedFixture.paths.runDir);
+    const allocation = parseAllocationRecordV3(rawAllocation, launchedFixture.identity.runId);
+    const committedLaunch = parseCommittedLaunchRecordV3(rawLaunch, launchedFixture.identity.runId, launchedFixture.paths.runDir);
+    const transportGate = parseTmuxControlTransportGate(rawTransportGate, launchedFixture.identity.runId);
+    if (!controlIntent || !allocation || !committedLaunch || !transportGate
+      || !await hasValidTmuxControlChain({ runDir: launchedFixture.paths.runDir, intent: controlIntent, allocation, launch: committedLaunch })) {
+      throw new Error("tmux acceptance did not produce a strict V3 control authority chain");
+    }
     if (!allocation.target?.paneId || !allocation.target.panePid || !allocation.target.serverPid) throw new Error("missing exact tmux allocation");
     target = { paneId: allocation.target.paneId, panePid: allocation.target.panePid, serverPid: allocation.target.serverPid, socketPath: allocation.target.socketPath };
     evidence.allocation = target;
+    evidence.transport = { selected: transportGate.selectedTransport, version: transportGate.probeResult.detectedTmuxVersion, fixtureContractId: transportGate.fixtureContractId, authorityChain: "v3-exact-digests" };
+    resetTmuxControlMetrics();
+    const steadyClient = new TmuxControlClient({ executable: tmux, socketPath: transportGate.canonicalSocketPath, sessionId: transportGate.probeResult.attachedSessionId });
+    await steadyClient.start();
+    const steadyRun = createTmuxControlCommandRunner(steadyClient, transportGate.canonicalSocketPath);
+    const initialSnapshot = await steadyRun(["-S", transportGate.canonicalSocketPath, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]);
+    if (initialSnapshot.exitCode !== 0) throw new Error("tmux control steady-state snapshot failed");
+    const beforeSteadyWait = snapshotTmuxControlMetrics(), steadyPid = steadyClient.processId();
+    if (!steadyPid) throw new Error("tmux control steady-state client PID is unavailable");
+    const [, unexpectedTmuxChildren] = await Promise.all([
+      steadyClient.waitForNotification(350),
+      sampleUnexpectedTmuxChildren(steadyPid, 350),
+    ]);
+    const afterSteadyWait = snapshotTmuxControlMetrics();
+    if (afterSteadyWait.commandsDispatched !== beforeSteadyWait.commandsDispatched) throw new Error("tmux control client issued a periodic steady-state status command");
+    if (unexpectedTmuxChildren.unexpected.size !== 0) throw new Error("tmux control steady state spawned a recurring short-lived tmux process");
+    evidence.transportMetrics = { persistentClients: afterSteadyWait.clientsSpawned, startupAndSnapshotCommands: beforeSteadyWait.commandsDispatched, healthyPeriodicStatusCommands: afterSteadyWait.commandsDispatched - beforeSteadyWait.commandsDispatched, observedRecurringShortLivedTmuxProcesses: unexpectedTmuxChildren.unexpected.size, processSamples: unexpectedTmuxChildren.samples };
+    const injectionMarker = path.join(root, `tmux-injection-${crypto.randomUUID()}`), canaryProof = path.join(root, "tmux-canary-proof");
+    const canary = `x; run-shell 'touch ${injectionMarker}' $HOME`;
+    const canaryScript = path.join(root, "tmux-canary.sh");
+    await fs.promises.writeFile(canaryScript, `#!/bin/sh\nif [ "$PI_SUBAGENT_CANARY" = ${shellQuote(canary)} ]; then printf 'preserved\\n' > ${shellQuote(canaryProof)}; fi\nexec /bin/sleep 30\n`, { mode: 0o700 });
+    const notification = steadyClient.waitForNotification(2_000);
+    const disposableResult = await steadyRun(["-S", transportGate.canonicalSocketPath, "split-window", "-h", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", source.id, "/usr/bin/env", `PI_SUBAGENT_CANARY=${canary}`, canaryScript]);
+    if (disposableResult.exitCode !== 0) throw new Error("tmux control multi-argv canary allocation failed");
+    const disposable = parseTabPair(disposableResult.stdout, "tmux control disposable pane");
+    if (await notification !== "notification") throw new Error("tmux control mutation did not emit a reconciliation notification");
+    const eventSnapshotBefore = snapshotTmuxControlMetrics().commandsDispatched;
+    const eventSnapshot = await steadyRun(["-S", transportGate.canonicalSocketPath, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]);
+    if (eventSnapshot.exitCode !== 0 || !eventSnapshot.stdout.includes(`${disposable.id}|${disposable.pid}`)) throw new Error("tmux notification-triggered reconciliation snapshot failed");
+    const eventTriggeredSnapshotCommands = snapshotTmuxControlMetrics().commandsDispatched - eventSnapshotBefore;
+    await waitFor(async () => fs.existsSync(canaryProof) ? {} : null, "tmux control multi-argv canary proof", 2_000);
+    if ((await fs.promises.readFile(canaryProof, "utf8")) !== "preserved\n" || fs.existsSync(injectionMarker)) throw new Error("tmux multi-argv canary was not preserved as one non-executed environment token");
+    const condition = `#{&&:#{==:#{pid},${transportGate.probeResult.serverPid}},#{==:#{pane_pid},${disposable.pid}}}`;
+    const disposableClose = await steadyRun(["-S", transportGate.canonicalSocketPath, "if-shell", "-F", "-t", disposable.id, condition, `kill-pane -t ${disposable.id}`, "display-message -p -l pi-subagent-guard-noop"]);
+    if (disposableClose.exitCode !== 0) throw new Error("tmux control disposable pane cleanup failed");
+    evidence.transportEvents = { notification: "observed", eventTriggeredSnapshotCommands, multiArgvCanary: "preserved-not-executed", disposablePane: "closed" };
+    steadyClient.close();
     await publishGate(launchedFixture.paths, launchedFixture.identity.runId, "tmux-pane");
     await waitFor(async () => fs.existsSync(path.join(launchedFixture.paths.runDir, "fixture-child-started")) ? {} : null, "gated fixture child");
     await assertFreshFixtureParentLease(launchedFixture.paths, launchedFixture.identity);
     const fixtureTerminationState = verifyFixtureTerminationState(launchedFixture.identity);
     if (!fixtureTerminationState) throw new Error("fixture parent is not verified absent or zombie immediately before reaper");
     evidence.fixtureTerminationState = fixtureTerminationState;
+    resetTmuxControlMetrics();
     const reaped = await reapStaleInteractiveRuns({ rootDir: launchedFixture.paths.rootDir, staleAfterMs: LIVE_REAPER_LEASE_FRESHNESS_MS, diagnosticRetentionSeconds: 1, scheduleCleanup: () => undefined });
+    evidence.reaper = reaped;
+    evidence.reaperTransportMetrics = snapshotTmuxControlMetrics();
     assertFixtureRunReaped(launchedFixture.identity.runId, reaped);
     const targetAbsent = (await probeTmuxPanePair(tmux, socket, { id: target.paneId, pid: target.panePid })) === "absent";
     const sourceAndSentinelPreserved = (await probeTmuxPanePair(tmux, socket, source)) === "present" && (await probeTmuxPanePair(tmux, socket, sentinel)) === "present";
     if (!targetAbsent) throw new Error("recorded child pane is still present after reaper");
+    targetProvenAbsent = true;
     if (!sourceAndSentinelPreserved) throw new Error("source or sentinel pane changed during isolated acceptance");
+    if (!isTmuxControlTransportGateCurrent(transportGate)) throw new Error("tmux transport gate became stale before restart fence acceptance");
+    if ((await run(tmux, ["-S", socket, "kill-server"])).code !== 0) throw new Error("could not stop the isolated tmux server for restart fencing");
+    await waitFor(async () => getProcessStartedAt(serverPid!) === null ? {} : null, "old tmux server termination");
+    if ((await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", `${session}-replacement`, "-c", root, "exec sleep 30"])).code !== 0) throw new Error("could not create replacement tmux generation");
+    const replacementServerPid = Number((await run(tmux, ["-S", socket, "display-message", "-p", "#{pid}"])).stdout.trim());
+    if (!Number.isSafeInteger(replacementServerPid) || replacementServerPid <= 0 || isTmuxControlTransportGateCurrent(transportGate)) throw new Error("stale tmux transport gate authorized a replacement server generation");
+    if ((await run(tmux, ["-S", socket, "kill-server"])).code !== 0) throw new Error("could not stop replacement tmux generation");
+    await waitFor(async () => getProcessStartedAt(replacementServerPid) === null ? {} : null, "replacement tmux server termination");
+    await removePrivateStaleTmuxSocket(root, socket);
+    serverStarted = false; serverPid = null;
+    evidence.restartFence = { oldGenerationRejected: true, replacementServerStopped: true };
     Object.assign(evidence, { reaped, targetAbsent, sourceAndSentinelPreserved, outcome: "passed" });
   } finally {
     // Read before and after process reconciliation: a resumed broker can
@@ -696,13 +902,16 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
     const durableBeforeCleanup = await durableTmuxTarget(trackedPaths).catch(() => null);
     const fixtureProcesses = await cleanupFixtureProcesses(fixture).catch(() => ({ broker: { state: "identity-lost", allocationPublished: false, canFinishCleanup: false } as BrokerReconciliation, parent: false }));
     const durableTarget = await durableTmuxTarget(trackedPaths).catch(() => null);
-    target = durableTarget ?? durableBeforeCleanup ?? target;
+    const checkpointTarget = trackedPaths && fixtureProcesses.broker.checkpointAllocation !== undefined
+      ? bindAcceptanceTmuxAllocation(await readBrokerJson(trackedPaths.launchIntentPath), fixtureProcesses.broker.checkpointAllocation, path.basename(trackedPaths.runDir), trackedPaths.runDir)
+      : null;
+    target = durableTarget ?? durableBeforeCleanup ?? checkpointTarget ?? target;
     const residualRisk = trackedPaths ? await readBrokerJson(trackedPaths.residualRiskPath).catch(() => null) : null;
-    const canExactCleanTarget = fixtureProcesses.broker.allocationPublished && fixtureProcesses.broker.state !== "residual-risk";
+    const canExactCleanTarget = (fixtureProcesses.broker.allocationPublished || checkpointTarget !== null) && fixtureProcesses.broker.state !== "residual-risk";
     const canFinishBackendTeardown = fixtureProcesses.parent === true && fixtureProcesses.broker.canFinishCleanup;
     const cleanup = {
       fixtureProcesses,
-      target: target && tmux && canExactCleanTarget ? await cleanupTmuxTarget(tmux, socket, target, source ?? undefined).catch(() => false) : target ? "broker-unreconciled" : canFinishBackendTeardown ? "not-required" : "unrecorded-risk",
+      target: targetProvenAbsent ? "not-required" : target && tmux && canExactCleanTarget ? await cleanupTmuxTarget(tmux, socket, target, source ?? undefined).catch(() => false) : target ? "broker-unreconciled" : canFinishBackendTeardown ? "not-required" : "unrecorded-risk",
       server: serverStarted && tmux && serverPid !== null && canFinishBackendTeardown ? await tmuxServerAbsent(tmux, root, socket, serverPid).catch(() => false) : serverStarted ? "broker-unreconciled" : "not-started",
     };
     evidence.targetAbsent = cleanup.target === true || cleanup.target === "not-required";
@@ -1103,7 +1312,7 @@ async function runCmuxLive(options: HarnessOptions): Promise<void> {
   const cmux = backend("cmux-pane");
   const runtime = brokerRuntime(), runtimeInterpreter = brokerRuntimeInterpreter(runtime);
   const parsedVersion = parseRequiredCmuxVersion((await run(cmux, ["--version"])).stdout);
-  if (parsedVersion === null) throw new Error("cmux acceptance requires exact version 0.64.20");
+  if (parsedVersion === null) throw new Error(`cmux acceptance requires stable cmux >= ${MINIMUM_CMUX_VERSION}`);
   const root = await privateTempRoot("pi-subagent-accept-cmux");
   const workspaceName = `pi-subagent-accept-${crypto.randomUUID()}`;
   let caller: CmuxIdentity | null = null;
@@ -1216,12 +1425,15 @@ async function runCmuxLive(options: HarnessOptions): Promise<void> {
     const durableBeforeCleanup = await durableCmuxTarget(trackedPaths, acceptance, caller ?? { workspaceId: callerWorkspaceId, surfaceId: callerSurfaceId, paneId: "" }).catch(() => ({ state: "unresolved", reason: "invalid-allocation" } as CmuxAllocationAuthority));
     const fixtureProcesses = await cleanupFixtureProcesses(fixture).catch(() => ({ broker: { state: "identity-lost", allocationPublished: false, canFinishCleanup: false } as BrokerReconciliation, parent: false }));
     const durableAfterCleanup = await durableCmuxTarget(trackedPaths, acceptance, caller ?? { workspaceId: callerWorkspaceId, surfaceId: callerSurfaceId, paneId: "" }).catch(() => ({ state: "unresolved", reason: "invalid-allocation" } as CmuxAllocationAuthority));
-    const observedAuthorities = [allocationAuthority, durableBeforeCleanup, durableAfterCleanup];
+    const checkpointAuthority = trackedPaths && acceptance && caller && fixtureProcesses.broker.checkpointAllocation !== undefined
+      ? bindAcceptanceCmuxAllocation(await readBrokerJson(trackedPaths.launchIntentPath), fixtureProcesses.broker.checkpointAllocation, path.basename(trackedPaths.runDir), acceptance, caller)
+      : ({ state: "no-allocation" } as CmuxAllocationAuthority);
+    const observedAuthorities = [allocationAuthority, durableBeforeCleanup, durableAfterCleanup, checkpointAuthority];
     const unresolvedAuthority = observedAuthorities.find((authority): authority is Extract<CmuxAllocationAuthority, { state: "unresolved" }> => authority.state === "unresolved");
     const authorizedAuthority = observedAuthorities.find((authority): authority is Extract<CmuxAllocationAuthority, { state: "authorized" }> => authority.state === "authorized");
     target = authorizedAuthority?.target ?? target;
     const residualRisk = trackedPaths ? await readBrokerJson(trackedPaths.residualRiskPath).catch(() => null) : null;
-    const canExactCleanTarget = fixtureProcesses.broker.allocationPublished && fixtureProcesses.broker.state !== "residual-risk" && !unresolvedAuthority;
+    const canExactCleanTarget = (fixtureProcesses.broker.allocationPublished || checkpointAuthority.state === "authorized") && fixtureProcesses.broker.state !== "residual-risk" && !unresolvedAuthority;
     const canFinishBackendTeardown = fixtureProcesses.parent === true && fixtureProcesses.broker.canFinishCleanup;
     const targetCleanup = identityOverlapHardStop ? "identity-overlap-hard-stop" : unresolvedAuthority ? "non-authority" : target && acceptance && caller && canExactCleanTarget ? await cleanupAcceptanceCmuxTarget(cmux, target, acceptance, caller, cmuxCommandGate.run).catch(() => false) : target ? "broker-unreconciled" : canFinishBackendTeardown ? "not-required" : "unrecorded-risk";
     const sentinelCleanup = identityOverlapHardStop ? "identity-overlap-hard-stop" : sentinel && acceptance && caller && canFinishBackendTeardown ? await cleanupAcceptanceCmuxTarget(cmux, sentinel, acceptance, caller, cmuxCommandGate.run).catch(() => false) : sentinel ? "broker-unreconciled" : sentinelResponseUnresolved ? "unresolved-response" : "not-created";
@@ -1294,34 +1506,44 @@ async function runPackageHarness(options: HarnessOptions): Promise<void> {
     ];
     if (probePeers.some((peer) => !fs.existsSync(peer)) || (await run("bun", ["add", ...probePeers], { cwd: installRoot })).code !== 0) throw new Error("isolated registration probe peer install failed");
     const installed = path.join(installRoot, "node_modules/@mjakl/pi-subagent");
-    const installedIndex = path.join(installed, "index.ts"), installedBroker = path.join(installed, BROKER_RELATIVE);
-    if (!fs.existsSync(installedIndex) || !fs.existsSync(installedBroker) || path.resolve(installed) === ROOT) throw new Error("installed package paths are incomplete or point at the checkout");
+    const installedIndex = path.join(installed, "index.ts"), installedBroker = path.join(installed, BROKER_RELATIVE), installedScheduler = path.join(installed, "src/runtime/process-local-scheduler.ts");
+    const installedSchema = path.join(installed, "pi-subagent.schema.json"), installedDetachedOwnershipSchema = path.join(installed, "pi-subagent.detached-ownership.schema.json"), installedReadme = path.join(installed, "README.md");
+    const installedConfigurationDoc = path.join(installed, "docs/configuration.md"), installedDiagram = path.join(installed, "docs/diagram/performance-phase-map.svg");
+    if (![installedIndex, installedBroker, installedScheduler, installedSchema, installedDetachedOwnershipSchema, installedReadme, installedConfigurationDoc, installedDiagram].every(fs.existsSync) || path.resolve(installed) === ROOT) throw new Error("installed package paths are incomplete or point at the checkout");
     const probe = path.join(installRoot, "registration-probe.ts");
     await fs.promises.writeFile(probe, `import extension from ${JSON.stringify(installedIndex)};
 const expectedFlags = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_FLAGS)};
 const expectedEvents = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_EVENTS)};
 const expectedTools = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_TOOLS)};
+const expectedCommands = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_COMMANDS)};
 const assertExactRegistrationNames = ${assertExactPackageRegistrationNames.toString()};
 const registeredFlags: unknown[] = [];
 const registeredEvents: unknown[] = [];
 const registeredTools: unknown[] = [];
+const registeredCommands: unknown[] = [];
+const PACKAGE_PROBE_EVENT_CHANNELS = ${JSON.stringify(PACKAGE_PROBE_EVENT_CHANNELS)};
+const createBoundedPackageProbeEvents = ${createBoundedPackageProbeEvents.toString()};
 const api = new Proxy({
   getFlag: (_name: string) => undefined,
+  // Application events are intentionally distinct from pi.on lifecycle registrations.
+  events: createBoundedPackageProbeEvents(),
   registerFlag: (name: unknown) => { registeredFlags.push(name); },
   on: (event: unknown, handler: unknown) => { if (typeof handler !== "function") throw new Error("non-function event handler"); registeredEvents.push(event); },
   registerTool: (tool: { name?: unknown }) => { registeredTools.push(tool?.name); },
+  registerCommand: (name: unknown, command: { handler?: unknown }) => { if (typeof command?.handler !== "function") throw new Error("command has no handler"); registeredCommands.push(name); },
 }, { get(target, key, receiver) { if (typeof key !== "string" || !(key in target)) throw new Error("unexpected ExtensionAPI access: " + String(key)); return Reflect.get(target, key, receiver); } });
 extension(api as never);
 assertExactRegistrationNames(registeredFlags, expectedFlags, "flag");
 assertExactRegistrationNames(registeredEvents, expectedEvents, "event");
 assertExactRegistrationNames(registeredTools, expectedTools, "tool");
+assertExactRegistrationNames(registeredCommands, expectedCommands, "command");
 console.log("registered:subagent");
 `, { mode: 0o600 });
     const registration = await run("bun", [probe], { cwd: installRoot, env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR } });
     if (registration.code !== 0 || registration.stdout.trim() !== "registered:subagent") throw new Error("installed extension import/registration probe failed");
     const syntax = await run(brokerRuntime(), [installedBroker], { cwd: installRoot, env: minimalBrokerEnv("tmux-pane") });
     if (syntax.code !== 2) throw new Error("installed broker bootstrap did not fail closed as expected");
-    Object.assign(evidence, { tarball: path.basename(tarball), tarballSha256, bunVersion: bunVersion.stdout.trim(), source, installedExtension: "node_modules/@mjakl/pi-subagent/index.ts", installedBroker: "node_modules/@mjakl/pi-subagent/src/runtime/pane-launch-broker.mjs", pack: "passed", install: "passed", import: "passed", register: "subagent", brokerBootstrap: "failed-closed-exit-2", outcome: "passed" });
+    Object.assign(evidence, { tarball: path.basename(tarball), tarballSha256, bunVersion: bunVersion.stdout.trim(), source, installedExtension: "node_modules/@mjakl/pi-subagent/index.ts", installedBroker: "node_modules/@mjakl/pi-subagent/src/runtime/pane-launch-broker.mjs", installedScheduler: "node_modules/@mjakl/pi-subagent/src/runtime/process-local-scheduler.ts", installedSchema: "node_modules/@mjakl/pi-subagent/pi-subagent.schema.json", installedDetachedOwnershipSchema: "node_modules/@mjakl/pi-subagent/pi-subagent.detached-ownership.schema.json", installedDocs: ["README.md", "docs/configuration.md", "docs/diagram/performance-phase-map.svg"], pack: "passed", install: "passed", import: "passed", register: "subagent", brokerBootstrap: "failed-closed-exit-2", outcome: "passed" });
   } finally {
     evidence.cleanup = options.keep ? "private temporary install retained" : "private temporary install removed";
     await writeEvidence(root, evidence).catch(() => undefined);

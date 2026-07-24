@@ -229,6 +229,14 @@ describe("tmux adapter", () => {
 		assert.equal(calls.some((args) => args.some((arg) => arg === "kill-pane -t %13")), false);
 	});
 
+	test("uses a fixed nonempty false branch for guarded pane mutations", () => {
+		const handle = { paneId: "%12", socketPath: "/tmp/tmux/default", serverPid: 123, panePid: 212 };
+		for (const command of ["interrupt", "close"] as const) {
+			const args = buildGuardedTmuxPaneCommandArgs(handle, command);
+			assert.equal(args.at(-1), "display-message -p -l pi-subagent-guard-noop");
+		}
+	});
+
 	test("creates, inspects, interrupts, and closes the exact pane", async () => {
 		const calls: string[][] = [];
 		const run = async (args: string[]) => {

@@ -291,6 +291,11 @@ export function selectTmuxInteractivePlacement(options: TmuxLayoutPlacementOptio
 		|| !TMUX_SESSION_ID_RE.test(sourceTopology.sessionId) || !TMUX_WINDOW_ID_RE.test(sourceTopology.windowId)
 		|| !Number.isSafeInteger(sourceTopology.serverPid) || sourceTopology.serverPid <= 0
 		|| !Number.isSafeInteger(sourceTopology.panePid) || sourceTopology.panePid <= 0
+		|| !source.generation || !sourceTopology.generation
+		|| source.generation.socketPath !== sourceTopology.generation.socketPath
+		|| source.generation.socketDev !== sourceTopology.generation.socketDev
+		|| source.generation.socketIno !== sourceTopology.generation.socketIno
+		|| source.generation.serverStartedAt !== sourceTopology.generation.serverStartedAt
 		|| source.socketPath !== sourceTopology.socketPath || source.serverPid !== sourceTopology.serverPid
 		|| source.sourcePaneId !== sourceTopology.paneId || source.sourcePanePid !== sourceTopology.panePid) {
 		throw new Error("tmux layout requires exact source pane topology matching the inherited tmux identity.");
@@ -301,7 +306,7 @@ export function selectTmuxInteractivePlacement(options: TmuxLayoutPlacementOptio
 		placement: "tmux-new-window",
 		container: {
 			kind: "tmux-session", socketPath: sourceTopology.socketPath, serverPid: sourceTopology.serverPid,
-			sessionId: sourceTopology.sessionId, sourceWindowId: sourceTopology.windowId,
+			sessionId: sourceTopology.sessionId, sourceWindowId: sourceTopology.windowId, generation: sourceTopology.generation,
 		},
 	};
 }

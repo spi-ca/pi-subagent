@@ -3,6 +3,7 @@
  */
 
 import type { Message } from "@earendil-works/pi-ai";
+import type { AccountingUsage } from "./accounting-usage.js";
 import { getFinalAssistantText } from "./runner-events.js";
 
 /** Context mode for delegated runs. */
@@ -65,7 +66,10 @@ export interface SingleResult {
 	exitCode: number;
 	messages: Message[];
 	stderr: string;
+	/** Legacy UI-only summary. Its semantics intentionally remain unchanged. */
 	usage: UsageStats;
+	/** Complete Pi usage accounting, including tool results and optional 0.81 fields. */
+	accountingUsage?: AccountingUsage;
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;

@@ -1,10 +1,15 @@
 import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { prepareRunArtifactPaths, readBrokerJson, writePrivateExecutableFile, writePrivateFile } from "../../src/runtime/run-protocol";
+import { getProcessStartedAt, prepareRunArtifactPaths, readBrokerJson, writePrivateExecutableFile, writePrivateFile } from "../../src/runtime/run-protocol";
+import { getCmuxControlRequestManager } from "../../src/runtime/cmux-control-adapter.mjs";
+import { fakeCmuxControlServer } from "../helpers/fake-cmux-control-server";
+import { acceptanceAllocationCheckpointPath } from "../acceptance/acceptance-allocation-checkpoint";
+import { cleanupAcceptanceCmuxTarget, terminateStoppedPostallocationBroker } from "../acceptance/live-harness";
 
 const tempDirs: string[] = [];
 afterEach(async () => { while (tempDirs.length) await fs.promises.rm(tempDirs.pop()!, { recursive: true, force: true }); });
@@ -57,9 +62,13 @@ async function writeIntent(paths: Awaited<ReturnType<typeof prepareRunArtifactPa
 
 async function writeTmuxIntent(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, backend: string): Promise<string[]> {
 	const nonce = "b".repeat(43), broker = path.resolve("src/runtime/pane-launch-broker.mjs");
+	const socketPath = path.join(paths.runDir, "tmux.sock");
+	await fs.promises.writeFile(socketPath, "fixture", { mode: 0o600 });
+	const socket = fs.realpathSync.native(socketPath), stat = fs.statSync(socket, { bigint: true });
+	const generation = { socketPath: socket, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), serverStartedAt: getProcessStartedAt(process.pid)! };
 	await writePrivateFile(paths.launchIntentPath, `${JSON.stringify({
 		version: 2, runId, parentSessionId: "p", parentPid: process.pid, parentStartedAt: 1, terminalMode: "tmux-pane",
-		source: { socketPath: "/tmp/tmux.sock", sourcePaneId: "%1", sourcePanePid: 456, serverPid: 123 }, childSessionFile: paths.childSessionPath,
+		source: { socketPath: socket, sourcePaneId: "%1", sourcePanePid: 456, serverPid: process.pid, generation }, childSessionFile: paths.childSessionPath,
 		createdAt: 1, brokerNonce: nonce, runtimePath: fs.realpathSync(process.execPath), runtimeInterpreterPath: fs.realpathSync(process.execPath), backendPath: fs.realpathSync(backend), brokerEntrypoint: fs.realpathSync(broker),
 	})}\n`);
 	return [broker, "--run-dir", paths.runDir, "--nonce", nonce, "--runtime", fs.realpathSync(process.execPath), "--runtime-interpreter", fs.realpathSync(process.execPath), "--backend", fs.realpathSync(backend)];
@@ -69,7 +78,8 @@ async function nativeTmuxMock(root: string, defaultShell: string, log: string, s
 	const source = path.join(root, "mock-tmux.c"), binary = path.join(root, `tmux-${path.basename(defaultShell).replace(/[^a-z]/gi, "") || "unsafe"}`);
 	await fs.promises.writeFile(source, `#include <stdio.h>
 #include <string.h>
-int main(int n,char**v){int show=0,display=0,list=0,split=0,topology=0;for(int i=1;i<n;i++){show|=!strcmp(v[i],"show-options");display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");split|=!strcmp(v[i],"split-window")||!strcmp(v[i],"new-window");topology|=strstr(v[i],"session_id")!=0;}FILE*f=fopen(${JSON.stringify(log)},"a");if(f){for(int i=1;i<n;i++)fprintf(f,"%s ",v[i]);fputc('\\n',f);fclose(f);}if(split){puts(${JSON.stringify(splitResponse)});return ${splitExitCode};}else if(show)puts(${JSON.stringify(defaultShell)});else if(display)puts("123");else if(list){puts(topology?${JSON.stringify(topologyResponse)}:${JSON.stringify(paneListResponse)});return topology?${topologyExitCode}:0;}return 0;}`);
+#include <stdlib.h>
+int main(int n,char**v){int show=0,display=0,list=0,split=0,topology=0;for(int i=1;i<n;i++){show|=!strcmp(v[i],"show-options");display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");split|=!strcmp(v[i],"split-window")||!strcmp(v[i],"new-window");topology|=strstr(v[i],"session_id")!=0;}FILE*f=fopen(${JSON.stringify(log)},"a");if(f){for(int i=1;i<n;i++)fprintf(f,"%s ",v[i]);fputc('\\n',f);fclose(f);}if(split){puts(${JSON.stringify(splitResponse)});return ${splitExitCode};}else if(show)puts(${JSON.stringify(defaultShell)});else if(display){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_SERVER_PID");puts(pid?pid:"123");}else if(list){puts(topology?${JSON.stringify(topologyResponse)}:${JSON.stringify(paneListResponse)});return topology?${topologyExitCode}:0;}return 0;}`);
 	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
@@ -81,17 +91,37 @@ async function nativeTmuxGateMock(root: string): Promise<string> {
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
-int main(int n,char**v){int display=0,list=0;for(int i=1;i<n;i++){display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");}if(display){puts("123");return 0;}if(list){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_PANE_PID");if(pid)printf("%%2|%s\\n",pid);else printf("%%2|%ld\\n",(long)getppid());return 0;}return 1;}`);
+int main(int n,char**v){int display=0,list=0;for(int i=1;i<n;i++){display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");}if(display){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_SERVER_PID");puts(pid?pid:"123");return 0;}if(list){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_PANE_PID");if(pid)printf("%%2|%s\\n",pid);else printf("%%2|%ld\\n",(long)getppid());return 0;}return 1;}`);
 	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
 }
 
 async function publishCommittedTmuxGate(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, panePid: number, paneId = "%2") {
-	await writePrivateFile(paths.allocationPath, `${JSON.stringify({ version: 2, runId, terminalMode: "tmux-pane", target: { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId, panePid }, allocatedAt: 1 })}\n`);
+	const intent = await readBrokerJson(paths.launchIntentPath) as { source: { socketPath: string; serverPid: number; generation: unknown } };
+	await writePrivateFile(paths.allocationPath, `${JSON.stringify({ version: 2, runId, terminalMode: "tmux-pane", target: { socketPath: intent.source.socketPath, serverPid: intent.source.serverPid, paneId, panePid, generation: intent.source.generation }, allocatedAt: 1 })}\n`);
 	await writePrivateFile(paths.decisionPath, `${JSON.stringify({ version: 2, runId, kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath })}\n`);
 	await writePrivateFile(paths.launchPath, `${JSON.stringify({ version: 2, runId, terminalMode: "tmux-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: 1, ownership: "parent-owned" })}\n`);
 	await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "tmux-pane", launchPath: paths.launchPath, publishedAt: 1 })}\n`);
+}
+
+function tmuxSourceAuthority(record: Record<string, unknown>) {
+	return record.source as { socketPath: string; serverPid: number; generation: unknown };
+}
+function tmuxSourceContainer(record: Record<string, unknown>) {
+	const source = tmuxSourceAuthority(record);
+	return { kind: "tmux-source-pane", socketPath: source.socketPath, serverPid: source.serverPid, sessionId: "$1", windowId: "@2", paneId: "%1", panePid: 456, generation: source.generation };
+}
+function tmuxSessionContainer(record: Record<string, unknown>) {
+	const source = tmuxSourceAuthority(record);
+	return { kind: "tmux-session", socketPath: source.socketPath, serverPid: source.serverPid, sessionId: "$1", sourceWindowId: "@2", generation: source.generation };
+}
+function tmuxTarget(record: Record<string, unknown>, paneId = "%2", panePid = 789) {
+	const source = tmuxSourceAuthority(record);
+	return { socketPath: source.socketPath, serverPid: source.serverPid, paneId, panePid, generation: source.generation };
+}
+function tmuxWindow(record: Record<string, unknown>, windowId: string) {
+	return { kind: "tmux-window", sessionId: "$1", windowId, ...tmuxTarget(record) };
 }
 
 function waitForExit(child: ReturnType<typeof spawn>): Promise<number> {
@@ -99,7 +129,8 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<number> {
 }
 
 function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = process.execPath): Promise<number> {
-	return new Promise((resolve, reject) => { const child = spawn(command, args, { cwd, env, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
+	const fixtureEnv = { ...env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) };
+	return new Promise((resolve, reject) => { const child = spawn(command, args, { cwd, env: fixtureEnv, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
 }
 
 async function writeCommittedGate(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, backend: string, options: { allocationRunId?: string; allocationMode?: "cmux-pane" | "tmux-pane"; gateMode?: "cmux-pane" | "tmux-pane" } = {}): Promise<string[]> {
@@ -116,6 +147,40 @@ async function writeCommittedGate(paths: Awaited<ReturnType<typeof prepareRunArt
 }
 
 describe("pane launch broker", () => {
+	test("uses production control-v2 in a detached broker without invoking a cmux CLI", async () => {
+		if (process.platform !== "darwin") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-control-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const socket = path.join(root, "cmux.sock");
+		const identify = { app_bundle_path: "/Applications/cmux.app", app_version: "0.64.20", boot_id: "broker-fixture" };
+		const methods = ["system.tree", "surface.split", "surface.create", "surface.respawn", "surface.send_key", "surface.close", "tab.action"];
+		const fake = await fakeCmuxControlServer(socket, (request, server) => {
+			const result = request.method === "system.capabilities"
+				? { version: 2, protocol: "cmux-socket", access_mode: "automation", methods }
+				: request.method === "system.identify" ? identify
+					: request.method === "system.tree"
+						? { windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: sourcePaneId, surfaces: [{ id: sourceSurfaceId, pane_id: sourcePaneId }] }] }] }] }
+						: request.method === "surface.split" ? { workspace_id: workspaceId, pane_id: allocatedPaneId, surface_id: surfaceId } : {};
+			server.send(request.socket, { id: request.id, ok: true, result });
+		});
+		try {
+			const stateRoot = path.join(root, "state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "control-v2-broker" });
+			const canonicalSocket = path.join(await fs.promises.realpath(path.dirname(socket)), path.basename(socket)), socketStat = await fs.promises.lstat(canonicalSocket, { bigint: true });
+			const control = { transport: "cmux-control-v2", socketPath: canonicalSocket, socketDev: socketStat.dev.toString(), socketIno: socketStat.ino.toString(), accessMode: "automation", apiVersion: 2, appVersion: "0.64.20", identifyDigest: crypto.createHash("sha256").update(JSON.stringify(identify, Object.keys(identify).sort())).digest("hex"), bootIdentity: identify.boot_id };
+			const probe = getCmuxControlRequestManager({ broker: true, env: { CMUX_SOCKET_PATH: socket } });
+			const probeHandshake = await probe.ensureReady();
+			assert.deepEqual({ transport: "cmux-control-v2", socketPath: probe.identity()?.socketPath, socketDev: probe.identity()?.socketDev, socketIno: probe.identity()?.socketIno, accessMode: probeHandshake.access_mode, apiVersion: probeHandshake.version, appVersion: probeHandshake.detectedAppVersion, identifyDigest: crypto.createHash("sha256").update(JSON.stringify(probeHandshake.identify, Object.keys(probeHandshake.identify).sort())).digest("hex"), bootIdentity: probeHandshake.identify.boot_id }, control);
+			probe.close();
+			const nonce = "c".repeat(43), broker = path.resolve("src/runtime/pane-launch-broker.mjs"), runtime = fs.realpathSync(process.execPath);
+			await writePrivateFile(paths.launchIntentPath, `${JSON.stringify({ version: 2, runId: "control-v2-broker", parentSessionId: "p", parentPid: process.pid, parentStartedAt: 1, terminalMode: "cmux-pane", source: { workspaceId, sourceSurfaceId }, layout: "split", placement: "cmux-split", container: { kind: "cmux-source", workspaceId, sourceSurfaceId }, control, childSessionFile: paths.childSessionPath, createdAt: 1, brokerNonce: nonce, runtimePath: runtime, runtimeInterpreterPath: runtime, backendPath: runtime, brokerEntrypoint: fs.realpathSync(broker) })}\n`);
+			const args = [broker, "--run-dir", paths.runDir, "--nonce", nonce, "--runtime", runtime, "--runtime-interpreter", runtime, "--backend", runtime];
+			assert.equal(await new Promise<number>((resolve, reject) => { const child = spawn(runtime, args, { cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: socket }, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); }), 0);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { phase?: string })?.phase, "committed");
+			assert.deepEqual(fake.requests.map((request) => request.method), ["system.capabilities", "system.identify", "system.capabilities", "system.identify", "system.tree", "surface.split"]);
+			assert.equal((await readBrokerJson(paths.allocationPath) as { control?: unknown })?.control && JSON.stringify((await readBrokerJson(paths.allocationPath) as { control?: unknown }).control), JSON.stringify(control));
+		} finally { await fake.close(); }
+	});
+
 	test("rejects an unsafe run directory before reading or mutating authority", async () => {
 		if (process.platform === "win32") return;
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-")); tempDirs.push(root);
@@ -156,7 +221,7 @@ describe("pane launch broker", () => {
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
 		const backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "preallocation-checkpoint" });
 		const nonce = "a".repeat(43);
-		const child = spawn(process.execPath, [...await writeIntent(paths, "preallocation-checkpoint", backend), "--acceptance-preallocation-checkpoint"], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore" });
+		const child = spawn(process.execPath, [...await writeIntent(paths, "preallocation-checkpoint", backend), "--acceptance-preallocation-checkpoint"], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore" });
 		await writePrivateFile(path.join(paths.runDir, "acceptance-handoff.json"), `${JSON.stringify({ version: 1, runId: "preallocation-checkpoint", brokerNonce: nonce, broker: { pid: child.pid, startedAt: 1, expectedCommand: "pane-launch-broker.mjs", runId: "preallocation-checkpoint" } })}\n`);
 		try {
 			for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -173,6 +238,81 @@ describe("pane launch broker", () => {
 		} finally {
 			// SIGKILL is reserved for the dedicated acceptance fixture parent.
 			if (child.exitCode === null) { child.kill("SIGCONT"); child.kill("SIGTERM"); }
+		}
+	});
+
+	test("kills the exact response-to-record checkpoint and cleans only its bound candidate", { timeout: 15_000 }, async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-")); tempDirs.push(root);
+		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
+		const log = path.join(root, "commands.log"), backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "postallocation-checkpoint" });
+		const checkpointPath = acceptanceAllocationCheckpointPath(paths);
+		const child = spawn(process.execPath, [...await writeIntent(paths, "postallocation-checkpoint", backend), "--acceptance-postallocation-checkpoint"], {
+			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
+		});
+		try {
+			let checkpoint: Record<string, unknown> | null = null;
+			for (let attempt = 0; attempt < 200; attempt += 1) {
+				checkpoint = await readBrokerJson(checkpointPath) as Record<string, unknown> | null;
+				if (checkpoint) break;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			assert.ok(checkpoint);
+			assert.deepEqual(checkpoint!.allocation, { version: 2, runId: "postallocation-checkpoint", terminalMode: "cmux-pane", target: { workspaceId, surfaceId, paneId }, allocatedAt: (checkpoint!.allocation as { allocatedAt: unknown }).allocatedAt });
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal(await readBrokerJson(paths.decisionPath), null);
+			assert.equal(await readBrokerJson(paths.launchPath), null);
+			const broker = { pid: child.pid!, startedAt: getProcessStartedAt(child.pid!)!, expectedCommand: "pane-launch-broker.mjs", runId: "postallocation-checkpoint" };
+			const killed = await terminateStoppedPostallocationBroker(broker, paths);
+			assert.equal(killed.result, "exact-candidate-killed");
+			const target = (killed.allocation as { target: { workspaceId: string; surfaceId: string; paneId: string } }).target;
+			const cmuxRun = async (args: string[]) => await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+				const command = spawn(backend, args, { env: { ...process.env, CMUX_SOCKET_PATH: log }, stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = "";
+				command.stdout.on("data", (data) => { stdout += String(data); }); command.stderr.on("data", (data) => { stderr += String(data); });
+				command.once("error", reject); command.once("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+			});
+			const acceptance = { workspaceId, surfaceId: sourceSurfaceId, paneId: sourcePaneId, name: "fixture" };
+			const caller = { workspaceId: "123e4567-e89b-12d3-a456-426614174090", surfaceId: "123e4567-e89b-12d3-a456-426614174091", paneId: "123e4567-e89b-12d3-a456-426614174092" };
+			assert.equal(await cleanupAcceptanceCmuxTarget(backend, target, acceptance, caller, cmuxRun), true);
+			const commands = await fs.promises.readFile(log, "utf8");
+			assert.match(commands, new RegExp(`close-surface --workspace ${workspaceId} --surface ${surfaceId}`));
+			assert.doesNotMatch(commands, new RegExp(`close-surface --workspace ${workspaceId} --surface ${sourceSurfaceId}`));
+			assert.equal(await readBrokerJson(paths.launchPath), null);
+		} finally {
+			if (child.exitCode === null) { child.kill("SIGCONT"); child.kill("SIGKILL"); }
+		}
+	});
+
+	test("retains residual risk for a killed response checkpoint without exact candidate authority", { timeout: 15_000 }, async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-")); tempDirs.push(root);
+		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
+		const log = path.join(root, "commands.log"), backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "postallocation-residual" });
+		const checkpointPath = acceptanceAllocationCheckpointPath(paths);
+		const child = spawn(process.execPath, [...await writeIntent(paths, "postallocation-residual", backend), "--acceptance-postallocation-checkpoint"], {
+			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
+		});
+		try {
+			let checkpoint: Record<string, unknown> | null = null;
+			for (let attempt = 0; attempt < 200; attempt += 1) {
+				checkpoint = await readBrokerJson(checkpointPath) as Record<string, unknown> | null;
+				if (checkpoint) break;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			assert.ok(checkpoint);
+			await fs.promises.unlink(checkpointPath);
+			await fs.promises.writeFile(checkpointPath, `${JSON.stringify({ ...checkpoint, allocation: { ...(checkpoint!.allocation as Record<string, unknown>), target: { workspaceId, surfaceId: sourceSurfaceId, paneId: sourcePaneId } } })}\n`, { mode: 0o600 });
+			const broker = { pid: child.pid!, startedAt: getProcessStartedAt(child.pid!)!, expectedCommand: "pane-launch-broker.mjs", runId: "postallocation-residual" };
+			assert.deepEqual(await terminateStoppedPostallocationBroker(broker, paths), { result: "residual-risk-retained", allocation: null });
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal(await readBrokerJson(paths.launchPath), null);
+			const risk = await readBrokerJson(paths.residualRiskPath) as { recordedAt: unknown } | null;
+			assert.deepEqual(risk, { version: 2, runId: "postallocation-residual", reason: "possible-unrecorded-allocation", recordedAt: risk?.recordedAt });
+			const commands = await fs.promises.readFile(log, "utf8");
+			assert.doesNotMatch(commands, /close-surface/);
+			assert.doesNotMatch(commands, new RegExp(`close-surface --workspace ${workspaceId} --surface ${sourceSurfaceId}`));
+		} finally {
+			if (child.exitCode === null) { child.kill("SIGCONT"); child.kill("SIGKILL"); }
 		}
 	});
 
@@ -563,7 +703,7 @@ describe("pane launch broker", () => {
 		const backend = await nativeTmuxGateMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-gate-direct" });
 		const args = await writeTmuxIntent(paths, "tmux-gate-direct", backend), marker = path.join(root, "launched");
 		await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
-		const child = spawn(process.execPath, [...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, stdio: "ignore" });
+		const child = spawn(process.execPath, [...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) }, stdio: "ignore" });
 		assert.ok(child.pid);
 		await publishCommittedTmuxGate(paths, "tmux-gate-direct", child.pid!);
 		assert.equal(await waitForExit(child), 0);
@@ -578,7 +718,7 @@ describe("pane launch broker", () => {
 		await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
 		const launcher = path.join(root, "non-exec-launcher.mjs");
 		await fs.promises.writeFile(launcher, `import { spawn } from "node:child_process";\nconst [runtime, ...args] = process.argv.slice(2);\nconst child = spawn(runtime, args, { stdio: "inherit", env: { ...process.env, PI_SUBAGENT_TEST_TMUX_PANE_PID: String(process.pid) } });\nchild.once("exit", (code) => process.exit(code ?? 1));\n`);
-		const child = spawn(process.execPath, [launcher, process.execPath, ...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1" }, stdio: "ignore" });
+		const child = spawn(process.execPath, [launcher, process.execPath, ...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) }, stdio: "ignore" });
 		assert.ok(child.pid);
 		await publishCommittedTmuxGate(paths, "tmux-gate-child", child.pid!);
 		assert.equal(await waitForExit(child), 0);
@@ -668,12 +808,12 @@ describe("pane launch broker", () => {
 		const args = await writeTmuxIntent(paths, "tmux-layout-split", backend);
 		const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
 		record.layout = "split"; record.placement = "tmux-split";
-		record.container = { kind: "tmux-source-pane", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", windowId: "@2", paneId: "%1", panePid: 456 };
+		record.container = tmuxSourceContainer(record);
 		await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 		assert.equal(await run(args, process.env, paths.runDir), 0);
 		const allocation = await readBrokerJson(paths.allocationPath) as { container?: unknown; target?: unknown };
-		assert.deepEqual(allocation.container, { kind: "tmux-window", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", windowId: "@2", paneId: "%2", panePid: 789 });
-		assert.deepEqual(allocation.target, { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789 });
+		assert.deepEqual(allocation.container, tmuxWindow(record, "@2"));
+		assert.deepEqual(allocation.target, tmuxTarget(record));
 		assert.equal((await readBrokerJson(paths.brokerStatusPath) as { phase?: string })?.phase, "committed");
 		assert.match(await fs.promises.readFile(log, "utf8"), /#{pane_id}\|#{session_id}\|#{window_id}\|#{pane_pid}/);
 	});
@@ -686,11 +826,11 @@ describe("pane launch broker", () => {
 		const args = await writeTmuxIntent(paths, "tmux-layout-window", backend);
 		const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
 		record.layout = "auto"; record.placement = "tmux-new-window";
-		record.container = { kind: "tmux-session", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", sourceWindowId: "@2" };
+		record.container = tmuxSessionContainer(record);
 		await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 		assert.equal(await run(args, process.env, paths.runDir), 0);
 		const allocation = await readBrokerJson(paths.allocationPath) as { container?: unknown };
-		assert.deepEqual(allocation.container, { kind: "tmux-window", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", windowId: "@3", paneId: "%2", panePid: 789 });
+		assert.deepEqual(allocation.container, tmuxWindow(record, "@3"));
 		const commands = await fs.promises.readFile(log, "utf8");
 		assert.match(commands, /#{session_id}\|#{window_id}\|#{pane_id}\|#{pane_pid}/);
 		assert.match(commands, /new-window/);
@@ -707,7 +847,7 @@ describe("pane launch broker", () => {
 		const args = await writeTmuxIntent(paths, "tmux-same-window", backend);
 		const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
 		record.layout = "auto"; record.placement = "tmux-new-window";
-		record.container = { kind: "tmux-session", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", sourceWindowId: "@2" };
+		record.container = tmuxSessionContainer(record);
 		await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 		assert.equal(await run(args, process.env, paths.runDir), 0);
 		assert.equal(await readBrokerJson(paths.allocationPath), null);
@@ -736,7 +876,7 @@ describe("pane launch broker", () => {
 			const args = await writeTmuxIntent(paths, runId, backend);
 			const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
 			record.layout = "auto"; record.placement = "tmux-new-window";
-			record.container = { kind: "tmux-session", socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", sourceWindowId: "@2" };
+			record.container = tmuxSessionContainer(record);
 			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 			assert.equal(await run(args, process.env, paths.runDir), 0);
 			assert.equal(await readBrokerJson(paths.allocationPath), null);
@@ -754,7 +894,7 @@ describe("pane launch broker", () => {
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-exact-nonzero" });
 		assert.equal(await run(await writeTmuxIntent(paths, "tmux-exact-nonzero", backend), process.env, paths.runDir), 0);
 		const allocation = await readBrokerJson(paths.allocationPath) as { target?: unknown } | null;
-		assert.deepEqual(allocation?.target, { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789 }, JSON.stringify(await readBrokerJson(paths.brokerStatusPath)));
+		assert.deepEqual(allocation?.target, tmuxTarget(await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>), JSON.stringify(await readBrokerJson(paths.brokerStatusPath)));
 		assert.equal(await readBrokerJson(paths.decisionPath), null);
 		assert.equal(await readBrokerJson(paths.launchPath), null);
 		assert.ok(await readBrokerJson(paths.residualRiskPath));
@@ -827,7 +967,7 @@ describe("pane launch broker", () => {
 		const backend = await nativeTmuxMock(root, "/bin/sh", log, "%2\t789", 1, "%1|$1|@2|456", 0, "%1\t456\nnot-a-row");
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-malformed-rollback-row" });
 		assert.equal(await run(await writeTmuxIntent(paths, "tmux-malformed-rollback-row", backend), process.env, paths.runDir), 0);
-		assert.deepEqual((await readBrokerJson(paths.allocationPath) as { target?: unknown })?.target, { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789 });
+		assert.deepEqual((await readBrokerJson(paths.allocationPath) as { target?: unknown })?.target, tmuxTarget(await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>));
 		assert.ok(await readBrokerJson(paths.residualRiskPath));
 		const commands = await fs.promises.readFile(log, "utf8");
 		assert.match(commands, /list-panes/);
@@ -954,7 +1094,8 @@ describe("pane launch broker", () => {
 			record.layout = placement === "cmux-split" ? "split" : "auto";
 			record.placement = placement; record.container = container;
 			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
-			assert.equal(await run(args, process.env, paths.runDir), 0);
+			const brokerExit = await run(args, process.env, paths.runDir);
+			assert.equal(brokerExit, 0, JSON.stringify(await readBrokerJson(paths.brokerStatusPath)));
 			assert.equal(await readBrokerJson(paths.allocationPath), null);
 			const commands = await fs.promises.readFile(log, "utf8");
 			assert.equal((commands.match(/tree --all/g) ?? []).length, 1);

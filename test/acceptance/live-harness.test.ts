@@ -5,7 +5,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getProcessStartedAt, prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
-import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_FLAGS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
+import { acceptanceAllocationCheckpointPath } from "./acceptance-allocation-checkpoint";
+import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, createBoundedPackageProbeEvents, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_FLAGS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
 
 async function waitForStartedAt(pid: number): Promise<number> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -41,6 +42,13 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string, 
 }
 
 describe("live acceptance harness safety guards", () => {
+  test("derives the acceptance checkpoint path outside production run artifacts", () => {
+    const runDir = path.join(os.tmpdir(), "pi-subagent-acceptance-checkpoint");
+    const expected = path.join(runDir, "acceptance-allocation-checkpoint.json");
+    assert.equal(acceptanceAllocationCheckpointPath(runDir), expected);
+    assert.equal(acceptanceAllocationCheckpointPath({ runDir }), expected);
+  });
+
   test("parses only explicit modes and non-mutating dry-run flags", () => {
     assert.deepEqual(parseHarnessArgs(["tmux", "--dry-run"]), { mode: "tmux", dryRun: true, keep: false });
     assert.deepEqual(parseHarnessArgs(["package", "--keep"]), { mode: "package", dryRun: false, keep: true });
@@ -56,11 +64,22 @@ describe("live acceptance harness safety guards", () => {
   });
 
   test("pins package registration flags and rejects unknown, duplicate, or missing names", () => {
-    assert.deepEqual(PACKAGE_REGISTRATION_EXPECTED_FLAGS, ["subagent-max-depth", "subagent-prevent-cycles", "subagent-pane-layout"]);
+    assert.deepEqual(PACKAGE_REGISTRATION_EXPECTED_FLAGS, ["subagent-max-depth", "subagent-max-active", "subagent-max-parallel-tasks", "subagent-max-chain-steps", "subagent-max-concurrency", "subagent-max-chain-parallel-tasks", "subagent-max-background-jobs", "subagent-background-history-limit", "subagent-background-history-ttl-ms", "subagent-background-output-max-bytes", "subagent-background-shutdown-settle-ms", "subagent-parallel-heartbeat-ms", "subagent-prevent-cycles", "subagent-pane-layout"]);
     assert.doesNotThrow(() => assertExactPackageRegistrationNames(PACKAGE_REGISTRATION_EXPECTED_FLAGS, PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"));
     assert.throws(() => assertExactPackageRegistrationNames([...PACKAGE_REGISTRATION_EXPECTED_FLAGS, "other"], PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /unexpected flag registration: other/);
     assert.throws(() => assertExactPackageRegistrationNames([...PACKAGE_REGISTRATION_EXPECTED_FLAGS, "subagent-pane-layout"], PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /duplicate flag registration: subagent-pane-layout/);
     assert.throws(() => assertExactPackageRegistrationNames(PACKAGE_REGISTRATION_EXPECTED_FLAGS.slice(0, -1), PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /missing flag registration: subagent-pane-layout/);
+  });
+
+  test("keeps bounded dashboard events separate from lifecycle registrations", () => {
+    const events = createBoundedPackageProbeEvents();
+    const received: unknown[] = [];
+    events.on("pi-subagent:dashboard:v1", (payload: unknown) => { received.push(payload); });
+    events.emit("pi-subagent:dashboard:v1", { active: 1 });
+    assert.deepEqual(received, [{ active: 1 }]);
+    assert.throws(() => events.on("session_start", () => undefined), /unexpected pi\.events channel/);
+    assert.throws(() => events.on("pi-subagent:dashboard:v1", () => undefined), /duplicate pi\.events listener/);
+    assert.throws(() => events.emit("unexpected", undefined), /unexpected pi\.events channel/);
   });
 
   test("requires an injectable OS-stopped state before resuming a broker", () => {
@@ -175,11 +194,14 @@ describe("live acceptance harness safety guards", () => {
     }
   });
 
-  test("parses the exact cmux release format without accepting semantic prefixes", () => {
+  test("accepts stable cmux minimum and higher releases only", () => {
     assert.equal(parseRequiredCmuxVersion("cmux 0.64.20\n"), "0.64.20");
     assert.equal(parseRequiredCmuxVersion("cmux 0.64.20 (100) [a1b2c3d4]"), "0.64.20");
-    assert.equal(parseRequiredCmuxVersion("cmux 0.64.200 (100) [a1b2c3d4]"), null);
-    assert.equal(parseRequiredCmuxVersion("cmux 0.64.21"), null);
+    assert.equal(parseRequiredCmuxVersion("cmux 0.64.200 (100) [a1b2c3d4]"), "0.64.200");
+    assert.equal(parseRequiredCmuxVersion("cmux 0.64.21"), "0.64.21");
+    assert.equal(parseRequiredCmuxVersion("cmux 1.0.0"), "1.0.0");
+    assert.equal(parseRequiredCmuxVersion("cmux 0.64.19"), null);
+    assert.equal(parseRequiredCmuxVersion("cmux 0.65.0-rc1"), null);
     assert.equal(parseRequiredCmuxVersion("cmux 0.64.20 (dev)"), null);
   });
 

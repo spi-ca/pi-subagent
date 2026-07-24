@@ -22,6 +22,7 @@ import {
 	resolveProjectAgentFilePathWithinRoot,
 } from "./project-agent-paths.js";
 import { getProjectRootFromAgentsDir } from "./subagent-config.js";
+import { isPathWithinRoot } from "./trust-path.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -41,8 +42,27 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
+export interface TrustedProjectCandidateIdentity {
+	resolvedPath: string;
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
 export interface DiscoverAgentOptions {
 	metadataOnly?: boolean;
+	/** Internal callers that already performed path validation can pin the directory. */
+	projectAgentsDir?: string | null;
+	/** Exact canonical root authorizing a full project body read. */
+	trustedProjectRoot?: string | null;
+	/** Pre-body-read target proof captured by the discovery manifest. */
+	trustedProjectCandidates?: ReadonlyMap<string, TrustedProjectCandidateIdentity>;
+	/** Deterministic test seam between manifest capture and trusted FD open. */
+	beforeTrustedProjectRead?: (resolvedPath: string) => void;
+	/** Internal cache hook: warnings/failures must not become negative entries. */
+	onParseIssue?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -60,16 +80,84 @@ export function findNearestProjectAgentsDir(cwd: string): string | null {
 }
 
 /** Parse a single agent markdown file into an AgentConfig. Returns null on skip. */
-function parseAgentFile(filePath: string, source: "user" | "project"): AgentConfig | null {
-	let content: string;
-	try { content = fs.readFileSync(filePath, "utf-8"); } catch { return null; }
+function sameFileStat(left: fs.Stats, right: fs.Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+		&& left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+/**
+ * Read a trusted project body from a verified resolved target, never by
+ * reopening its logical pathname. O_NOFOLLOW and the before/after fd identity
+ * checks make a replacement or symlink race fail closed.
+ */
+function readTrustedProjectBody(
+	resolvedPath: string,
+	projectRoot: string,
+	expected: TrustedProjectCandidateIdentity | undefined,
+	beforeRead?: (resolvedPath: string) => void,
+): string | null {
+	// Full-body authority is the pre-manifest target, the opened FD before/after
+	// read, and the current resolved pathname target all being exactly equal.
+	if (!expected || expected.resolvedPath !== resolvedPath || !isPathWithinRoot(resolvedPath, projectRoot)) return null;
+	let fd: number | undefined;
+	try {
+		beforeRead?.(resolvedPath);
+		fd = fs.openSync(resolvedPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const before = fs.fstatSync(fd);
+		if (!before.isFile() || before.dev !== expected.dev || before.ino !== expected.ino || before.size !== expected.size
+			|| before.mtimeMs !== expected.mtimeMs || before.ctimeMs !== expected.ctimeMs) return null;
+		const bytes = fs.readFileSync(fd);
+		const after = fs.fstatSync(fd);
+		const currentResolved = fs.realpathSync.native(resolvedPath);
+		const current = fs.statSync(currentResolved);
+		if (currentResolved !== expected.resolvedPath || !isPathWithinRoot(currentResolved, projectRoot)
+			|| !sameFileStat(before, after) || !sameFileStat(before, current)) return null;
+		return bytes.toString("utf8");
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) try { fs.closeSync(fd); } catch { /* fail closed above */ }
+	}
+}
+
+const MAX_DIAGNOSTIC_PATH_CHARS = 160;
+
+/**
+ * Repository configuration can control agent filenames and paths. Keep warnings
+ * useful without allowing terminal controls or unbounded path text into logs.
+ */
+export function safeDiagnosticPath(value: string): string {
+	const basename = path.basename(value) || "unknown";
+	const escaped = basename.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, (character) => {
+		const code = character.codePointAt(0)!;
+		return code <= 0xff ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
+	});
+	return escaped.length <= MAX_DIAGNOSTIC_PATH_CHARS
+		? escaped
+		: `${escaped.slice(0, MAX_DIAGNOSTIC_PATH_CHARS - 1)}…`;
+}
+
+export function formatInvalidAgentWarning(filePath: string, metadataOnly = false): string {
+	return `[pi-subagent] Skipping invalid agent${metadataOnly ? " metadata" : " file"} "${safeDiagnosticPath(filePath)}": invalid frontmatter.`;
+}
+
+function parseAgentFile(filePath: string, source: "user" | "project", options: DiscoverAgentOptions = {}): AgentConfig | null {
+	let content: string | null;
+	if (source === "project") {
+		content = options.trustedProjectRoot ? readTrustedProjectBody(
+			filePath, options.trustedProjectRoot, options.trustedProjectCandidates?.get(filePath), options.beforeTrustedProjectRead,
+		) : null;
+	} else {
+		try { content = fs.readFileSync(filePath, "utf-8"); } catch { content = null; }
+	}
+	if (content === null) { options.onParseIssue?.(); return null; }
 
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
 		parsed = parseFrontmatter<Record<string, unknown>>(content);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		console.warn(`[pi-subagent] Skipping invalid agent file "${filePath}": ${message}`);
+	} catch {
+		console.warn(formatInvalidAgentWarning(filePath));
+		options.onParseIssue?.();
 		return null;
 	}
 
@@ -78,7 +166,10 @@ function parseAgentFile(filePath: string, source: "user" | "project"): AgentConf
 
 	const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
 	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
-	if (!name || !description) return null;
+	if (!name || !description) {
+		options.onParseIssue?.();
+		return null;
+	}
 
 	let tools: string[] | undefined;
 	if (typeof frontmatter.tools === "string") {
@@ -95,8 +186,9 @@ function parseAgentFile(filePath: string, source: "user" | "project"): AgentConf
 		if (parsedTools.length > 0) tools = parsedTools;
 	} else if (frontmatter.tools !== undefined) {
 		console.warn(
-			`[pi-subagent] Ignoring invalid tools field in "${filePath}". Expected a comma-separated string or string array.`,
+			`[pi-subagent] Ignoring invalid tools field in "${safeDiagnosticPath(filePath)}". Expected a comma-separated string or string array.`,
 		);
+		options.onParseIssue?.();
 	}
 
 	return {
@@ -111,23 +203,29 @@ function parseAgentFile(filePath: string, source: "user" | "project"): AgentConf
 	};
 }
 
-function parseAgentMetadataOnly(filePath: string, source: "user" | "project"): AgentConfig | null {
+function parseAgentMetadataOnly(filePath: string, source: "user" | "project", onParseIssue?: () => void): AgentConfig | null {
 	const frontmatterOnly = readFrontmatterOnly(filePath);
-	if (!frontmatterOnly) return null;
+	if (!frontmatterOnly) {
+		onParseIssue?.();
+		return null;
+	}
 
 	let parsed: { frontmatter: Record<string, unknown>; body: string };
 	try {
 		parsed = parseFrontmatter<Record<string, unknown>>(frontmatterOnly);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		console.warn(`[pi-subagent] Skipping invalid agent metadata in "${filePath}": ${message}`);
+	} catch {
+		console.warn(formatInvalidAgentWarning(filePath, true));
+		onParseIssue?.();
 		return null;
 	}
 
 	const frontmatter = parsed.frontmatter ?? {};
 	const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
 	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
-	if (!name || !description) return null;
+	if (!name || !description) {
+		onParseIssue?.();
+		return null;
+	}
 
 	return {
 		name,
@@ -154,7 +252,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", options: Dis
 		if (!projectRoot) return [];
 		if (!isProjectAgentsDirWithinRoot(dir, projectRoot)) {
 			console.warn(
-				`[pi-subagent] Ignoring project agents directory "${dir}" because it resolves outside project root "${projectRoot}".`,
+				`[pi-subagent] Ignoring project agents directory "${safeDiagnosticPath(dir)}" because it resolves outside project root "${safeDiagnosticPath(projectRoot)}".`,
 			);
 			return [];
 		}
@@ -172,14 +270,14 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", options: Dis
 		if (!parsePath) {
 			if (source === "project" && projectRoot) {
 				console.warn(
-					`[pi-subagent] Ignoring project agent file "${filePath}" because it resolves outside project root "${projectRoot}".`,
+					`[pi-subagent] Ignoring project agent file "${safeDiagnosticPath(filePath)}" because it resolves outside project root "${safeDiagnosticPath(projectRoot)}".`,
 				);
 			}
 			continue;
 		}
 		const agent = options.metadataOnly
-			? parseAgentMetadataOnly(parsePath, source)
-			: parseAgentFile(parsePath, source);
+			? parseAgentMetadataOnly(parsePath, source, options.onParseIssue)
+			: parseAgentFile(parsePath, source, options);
 		if (agent) {
 			// Preserve the logical project-agent path for trust checks. `parsePath` may be a
 			// realpath inside the project when `.pi/agents` or an agent file is a symlink;
@@ -210,10 +308,16 @@ export function mergeAgents(...groups: AgentConfig[][]): AgentConfig[] {
  */
 export function discoverAgents(cwd: string, scope: AgentScope, options: DiscoverAgentOptions = {}): AgentDiscoveryResult {
 	const userAgentsDir = getUserAgentsDir();
-	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+	const projectAgentsDir = options.projectAgentsDir === undefined
+		? findNearestProjectAgentsDir(cwd)
+		: options.projectAgentsDir;
 
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userAgentsDir, "user", options);
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", options);
+	const projectAgents = scope === "user" || !projectAgentsDir
+		? []
+		: options.metadataOnly || (options.trustedProjectRoot && getProjectRootFromAgentsDir(projectAgentsDir) === options.trustedProjectRoot)
+			? loadAgentsFromDir(projectAgentsDir, "project", options)
+			: [];
 
 	if (scope === "user") {
 		return { agents: userAgents, projectAgentsDir };

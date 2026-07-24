@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi.dev/schemas/pi-subagent.detached-ownership.schema.json",
+  "title": "Pi Subagent Detached Ownership v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "version",
+    "runId",
+    "owner",
+    "detachedAt",
+    "allocation",
+    "completionMode"
+  ],
+  "properties": {
+    "contract": { "const": "pi-subagent.detached-ownership" },
+    "version": { "const": 1 },
+    "runId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "owner": { "const": "user" },
+    "detachedAt": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "completionMode": { "enum": ["one-shot", "handoff"] }
+  }
+}

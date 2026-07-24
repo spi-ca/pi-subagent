@@ -72,6 +72,14 @@ describe("inherited CLI args", () => {
     });
   });
 
+  test("strips inherited subagent policy flags because resolved values use child environment", () => {
+    const parsed = parseInheritedCliArgs([
+      "node", "pi", "--subagent-max-active=2", "--subagent-max-concurrency", "3",
+      "--subagent-background-output-max-bytes", "0", "--subagent-parallel-heartbeat-ms=4",
+    ]);
+    assert.deepEqual(parsed.alwaysProxy, []);
+  });
+
   test("does not forward unknown flags while preserving explicit allowlisted non-secret flags", () => {
     const parsed = parseInheritedCliArgs([
       "node",

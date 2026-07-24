@@ -19,6 +19,8 @@
  *   - cmux-pane / tmux-pane: child pi runs as an interactive TUI in a managed pane.
  */
 
+import * as crypto from "node:crypto";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   buildChainTaskFromStages,
@@ -35,19 +37,38 @@ import {
   type ChainTaskStage,
   validateChainStages,
 } from "./src/core/chain-helpers.js";
-import { type AgentConfig, discoverAgents, findNearestProjectAgentsDir } from "./src/core/agents.js";
+import { type AgentConfig, findNearestProjectAgentsDir, type AgentDiscoveryResult, type AgentScope, type DiscoverAgentOptions } from "./src/core/agents.js";
+import { AgentDiscoveryCache } from "./src/core/agent-discovery-cache.js";
+import { settleWithUnrefTimeout } from "./src/core/async-settle.js";
+import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
+import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
+import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
+import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, parseSubagentsCommand } from "./src/core/subagent-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
-import { applySessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides } from "./src/core/project-trust.js";
-import { beginInteractiveShutdownForSession, getInteractiveShutdownGenerationForTest, mapConcurrent, reapStaleInteractiveRuns, resetInteractiveShutdownForSession, runAgent, shutdownActiveInteractiveRuns } from "./src/runtime/runner.js";
+import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
+import { applySessionProjectTrustOverride, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
+import { beginInteractiveShutdownForSession, focusInteractiveRun, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
+import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
+import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
+import {
+  createSharedForegroundPermitScopeManager,
+  createTreePermitAuthorityLifecycle,
+  type ForegroundDelegationScope,
+  type TreePermitAuthority,
+  type TreePermitLease,
+} from "./src/runtime/tree-permit-authority.js";
+import { createPiSubagentDashboardPublisher, type PiSubagentUxSnapshotLike } from "./src/integration/pi-cmux-contract.js";
+import { createPiSubagentPresenceProducer } from "./src/integration/pi-presence-producer.js";
 import { resolveInteractivePaneLayout, type InteractivePaneLayout } from "./src/runtime/interactive-layout.js";
 import {
   BACKGROUND_BEHAVIOR_GUIDANCE,
+  BackgroundJobSessionFence,
   cancelBackgroundJobs,
-  compactBackgroundJobResult,
   createBackgroundJobRecord,
   extractToolText,
-  formatUntrustedToolText,
+  finalizeBackgroundJobForSession,
+  formatStoredBackgroundToolText,
   formatBackgroundJobListEntry,
   formatBackgroundJobStatusText,
   formatInvalidInvocationShapeMessage,
@@ -58,9 +79,10 @@ import {
   listBackgroundJobSnapshots,
   parseBackgroundAction,
   parseBackgroundFlag,
+  parseCompletionMode,
+  validateCompletionInvocation,
   pruneBackgroundJobs,
   type BackgroundJobRecord,
-  type BackgroundJobStatus,
   type BackgroundJobToolResult,
   SubagentParams,
   getProjectRootFromAgentsDir,
@@ -76,18 +98,15 @@ import {
   SUBAGENT_TOOL_LABEL,
   emptyUsage,
   getDefaultTerminalModeFromEnv,
+  isInsideCmux,
+  isInsideTmux,
   isResultError,
-  isResultSuccess,
 } from "./src/core/types.js";
 
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
 
-const MAX_PARALLEL_TASKS = 50;
-const MAX_CHAIN_STEPS = 12;
-const MAX_CONCURRENCY = 16;
-const PARALLEL_HEARTBEAT_MS = 1000;
 const DEFAULT_MAX_DELEGATION_DEPTH = 5;
 const DEFAULT_PREVENT_CYCLE_DELEGATION = true;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -96,6 +115,11 @@ const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
+// CONFIG_DIR_NAME is public in current Pi hosts. Retain the documented default
+// for older compatible hosts whose package root does not export it yet.
+const CONFIG_DIR_NAME = typeof (piCodingAgent as unknown as { CONFIG_DIR_NAME?: unknown }).CONFIG_DIR_NAME === "string"
+  ? (piCodingAgent as unknown as { CONFIG_DIR_NAME: string }).CONFIG_DIR_NAME
+  : ".pi";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,14 +133,7 @@ interface DelegationDepthConfig {
   preventCycles: boolean;
 }
 
-interface SessionSnapshotSource {
-  getHeader: () => unknown;
-  getBranch: () => unknown[];
-}
-
 const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
-const MAX_RUNNING_BACKGROUND_JOBS = 4;
-const BACKGROUND_SHUTDOWN_SETTLE_MS = 3_000;
 const backgroundJobs = new Map<string, BackgroundJobRecord>();
 const backgroundJobSettlements = new Map<string, Promise<void>>();
 
@@ -135,9 +152,9 @@ function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): 
   };
   const detailText = job.status === "cancelled" ? "" : extractToolText(job.result);
   const untrustedOutput = detailText
-    ? `\n\n${formatUntrustedToolText(detailText)}`
+    ? `\n\n${formatStoredBackgroundToolText(detailText)}`
     : "";
-  const errorText = job.error ? `\n\n${formatUntrustedToolText(job.error)}` : "";
+  const errorText = job.error ? `\n\n${formatStoredBackgroundToolText(job.error)}` : "";
   const content = `Background subagent job ${job.id} ${job.status}.${untrustedOutput || errorText}`;
 
   try {
@@ -157,65 +174,59 @@ function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): 
   }
 }
 
-function finalizeBackgroundJob(
-  pi: ExtensionAPI,
-  job: BackgroundJobRecord,
-  result: BackgroundJobToolResult | undefined,
-  fallbackError: string | undefined,
-): void {
-  const cancellationRequested = job.status === "cancelling";
-  const status: BackgroundJobStatus = cancellationRequested && (fallbackError || result?.isError)
-    ? "cancelled"
-    : result?.isError
-      ? "failed"
-      : fallbackError
-        ? "failed"
-        : "completed";
-  const error = fallbackError;
-
-  job.status = status;
-  job.completedAt = Date.now();
-  job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result);
-  job.error = status === "cancelled" ? undefined : error;
-  backgroundJobs.set(job.id, job);
-  pruneBackgroundJobs(backgroundJobs);
-  notifyBackgroundJobResult(pi, job);
-}
-
 function startBackgroundJob(
   pi: ExtensionAPI,
   job: BackgroundJobRecord,
   run: (signal: AbortSignal) => Promise<BackgroundJobToolResult>,
+  limits: SubagentLimits,
+  sessionToken: number,
+  sessionFence: BackgroundJobSessionFence,
+  onSettled?: (job: BackgroundJobRecord) => void,
 ): void {
-  pruneBackgroundJobs(backgroundJobs);
+  if (!sessionFence.isCurrent(sessionToken)) return;
+  pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
   backgroundJobs.set(job.id, job);
 
-  const settlement = run(job.controller.signal)
+  let settlement: Promise<void>;
+  settlement = run(job.controller.signal)
     .then((result) => {
-      finalizeBackgroundJob(pi, job, result, undefined);
+      finalizeBackgroundJobForSession({
+        job,
+        result,
+        sessionToken,
+        isSessionCurrent: (token) => sessionFence.isCurrent(token),
+        registry: backgroundJobs,
+        outputMaxBytes: limits.backgroundOutputMaxBytes,
+        maxCompletedJobs: limits.backgroundHistoryLimit,
+        completedTtlMs: limits.backgroundHistoryTtlMs,
+        onFinalized: (finalizedJob) => {
+          onSettled?.(finalizedJob);
+          notifyBackgroundJobResult(pi, finalizedJob);
+        },
+      });
     })
     .catch((error) => {
-      finalizeBackgroundJob(
-        pi,
+      finalizeBackgroundJobForSession({
         job,
-        undefined,
-        error instanceof Error ? error.message : String(error),
-      );
+        fallbackError: error instanceof Error ? error.message : String(error),
+        sessionToken,
+        isSessionCurrent: (token) => sessionFence.isCurrent(token),
+        registry: backgroundJobs,
+        outputMaxBytes: limits.backgroundOutputMaxBytes,
+        maxCompletedJobs: limits.backgroundHistoryLimit,
+        completedTtlMs: limits.backgroundHistoryTtlMs,
+        onFinalized: (finalizedJob) => {
+          onSettled?.(finalizedJob);
+          notifyBackgroundJobResult(pi, finalizedJob);
+        },
+      });
     })
     .finally(() => {
-      backgroundJobSettlements.delete(job.id);
+      if (backgroundJobSettlements.get(job.id) === settlement) {
+        backgroundJobSettlements.delete(job.id);
+      }
     });
   backgroundJobSettlements.set(job.id, settlement);
-}
-
-/** Await post-abort background settlement without allowing session shutdown to hang. */
-async function settleBackgroundJobsForShutdown(): Promise<void> {
-  const settlements = Array.from(backgroundJobSettlements.values());
-  if (settlements.length === 0) return;
-  await Promise.race([
-    Promise.allSettled(settlements).then(() => undefined),
-    new Promise<void>((resolve) => setTimeout(resolve, BACKGROUND_SHUTDOWN_SETTLE_MS)),
-  ]);
 }
 
 function parseDelegationMode(raw: unknown): DelegationMode | null {
@@ -226,18 +237,6 @@ function parseDelegationMode(raw: unknown): DelegationMode | null {
     return normalized;
   }
   return null;
-}
-
-function buildForkSessionSnapshotJsonl(
-  sessionManager: SessionSnapshotSource,
-): string | null {
-  const header = sessionManager.getHeader();
-  if (!header || typeof header !== "object") return null;
-
-  const branchEntries = sessionManager.getBranch();
-  const lines = [JSON.stringify(header)];
-  for (const entry of branchEntries) lines.push(JSON.stringify(entry));
-  return `${lines.join("\n")}\n`;
 }
 
 function parseNonNegativeInt(raw: unknown): number | null {
@@ -276,39 +275,6 @@ function parseAgentStack(raw: unknown): string[] | null {
     .filter((value) => value.length > 0);
 }
 
-function getMaxDepthFlagFromArgv(argv: string[]): string | null {
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--subagent-max-depth") {
-      return argv[i + 1] ?? "";
-    }
-    if (arg.startsWith("--subagent-max-depth=")) {
-      return arg.slice("--subagent-max-depth=".length);
-    }
-  }
-  return null;
-}
-
-function getPreventCyclesFlagFromArgv(
-  argv: string[],
-): string | boolean | null {
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--subagent-prevent-cycles") {
-      const maybeValue = argv[i + 1];
-      if (maybeValue !== undefined && !maybeValue.startsWith("--")) {
-        return maybeValue;
-      }
-      return true;
-    }
-    if (arg === "--no-subagent-prevent-cycles") return false;
-    if (arg.startsWith("--subagent-prevent-cycles=")) {
-      return arg.slice("--subagent-prevent-cycles=".length);
-    }
-  }
-  return null;
-}
-
 function resolveDelegationDepthConfig(pi: ExtensionAPI): DelegationDepthConfig {
   const depthRaw = process.env[SUBAGENT_DEPTH_ENV];
   const parsedDepth = parseNonNegativeInt(depthRaw);
@@ -335,22 +301,12 @@ function resolveDelegationDepthConfig(pi: ExtensionAPI): DelegationDepthConfig {
     );
   }
 
-  const argvFlagRaw = getMaxDepthFlagFromArgv(process.argv);
-  const argvFlagMaxDepth =
-    argvFlagRaw !== null ? parseNonNegativeInt(argvFlagRaw) : null;
-  if (argvFlagRaw !== null && argvFlagMaxDepth === null) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid --subagent-max-depth value "${argvFlagRaw}". Expected a non-negative integer.`,
-    );
-  }
-
   const runtimeFlagValue = pi.getFlag("subagent-max-depth");
   const runtimeFlagMaxDepth =
     typeof runtimeFlagValue === "string"
       ? parseNonNegativeInt(runtimeFlagValue)
       : null;
   if (
-    argvFlagRaw === null &&
     typeof runtimeFlagValue === "string" &&
     runtimeFlagMaxDepth === null
   ) {
@@ -367,24 +323,9 @@ function resolveDelegationDepthConfig(pi: ExtensionAPI): DelegationDepthConfig {
     );
   }
 
-  const argvPreventCyclesRaw = getPreventCyclesFlagFromArgv(process.argv);
-  const argvPreventCycles =
-    typeof argvPreventCyclesRaw === "boolean"
-      ? argvPreventCyclesRaw
-      : parseBoolean(argvPreventCyclesRaw);
-  if (
-    typeof argvPreventCyclesRaw === "string" &&
-    argvPreventCycles === null
-  ) {
-    console.warn(
-      `[pi-subagent] Ignoring invalid --subagent-prevent-cycles value "${argvPreventCyclesRaw}". Expected true/false.`,
-    );
-  }
-
   const runtimePreventCyclesRaw = pi.getFlag("subagent-prevent-cycles");
   const runtimePreventCycles = parseBoolean(runtimePreventCyclesRaw);
   if (
-    argvPreventCyclesRaw === null &&
     runtimePreventCyclesRaw !== undefined &&
     runtimePreventCycles === null
   ) {
@@ -393,10 +334,8 @@ function resolveDelegationDepthConfig(pi: ExtensionAPI): DelegationDepthConfig {
     );
   }
 
-  const flagMaxDepth = argvFlagMaxDepth ?? runtimeFlagMaxDepth;
-  const maxDepth = flagMaxDepth ?? envMaxDepth ?? DEFAULT_MAX_DELEGATION_DEPTH;
+  const maxDepth = runtimeFlagMaxDepth ?? envMaxDepth ?? DEFAULT_MAX_DELEGATION_DEPTH;
   const preventCycles =
-    argvPreventCycles ??
     runtimePreventCycles ??
     envPreventCycles ??
     DEFAULT_PREVENT_CYCLE_DELEGATION;
@@ -434,22 +373,6 @@ function formatAgentNames(agents: AgentConfig[]): string {
   return agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 }
 
-function countCompletedChainStages(stages: ChainStageRecord[]): number {
-  return stages.filter((stage) => stage.status === "completed").length;
-}
-
-function countDoneChainStages(stages: ChainStageRecord[]): number {
-  return stages.filter((stage) => stage.status !== "skipped").length;
-}
-
-function countFailedChainStages(stages: ChainStageRecord[]): number {
-  return stages.filter((stage) => stage.status === "failed").length;
-}
-
-function countCompletedWithErrorChainStages(stages: ChainStageRecord[]): number {
-  return stages.filter((stage) => stage.status === "completed_with_errors").length;
-}
-
 function makeUnstartedAbortResult(
   agent: string,
   task: string,
@@ -465,6 +388,7 @@ function makeUnstartedAbortResult(
     messages: [],
     stderr: "Subagent task was not started because the parent invocation was aborted before it reached the concurrency queue.",
     usage: emptyUsage(),
+    accountingUsage: emptyAccountingUsage(),
     model,
     stopReason: "aborted",
     errorMessage: "Not started: parent invocation was aborted.",
@@ -499,22 +423,58 @@ function inferInvocationMode(params: { agent?: unknown; task?: unknown; tasks?: 
   return "single";
 }
 
+function validateConfiguredChainLimits(chain: ChainStage[], limits: SubagentLimits): string | null {
+  if (chain.length > limits.maxChainSteps) return `Too many chain stages (${chain.length}). Max is ${limits.maxChainSteps}.`;
+  for (const stage of chain) {
+    if (getChainStageType(stage) === "parallel" && (stage as ChainParallelStage).tasks.length > limits.maxChainParallelTasks) {
+      return `Too many tasks in a chain parallel stage (${(stage as ChainParallelStage).tasks.length}). Max is ${limits.maxChainParallelTasks}.`;
+    }
+  }
+  return null;
+}
+
+function formatApprovalAgentNames(agents: AgentConfig[]): string {
+  return Array.from(new Set(agents.map((agent) => agent.name))).sort().map((name) => JSON.stringify(name)).join(", ") || "none";
+}
+
+function getProjectUserNameCollisions(projectAgents: AgentConfig[], userAgents: AgentConfig[]): string[] {
+  const userNames = new Set(userAgents.filter((agent) => agent.source === "user").map((agent) => agent.name));
+  return Array.from(new Set(projectAgents.map((agent) => agent.name).filter((name) => userNames.has(name)))).sort();
+}
+
+function formatProjectAgentApprovalScope(
+  projectRoot: string | null,
+  projectAgents: AgentConfig[],
+  requestedProjectAgents: AgentConfig[],
+  userAgents: AgentConfig[],
+): string {
+  const collisions = getProjectUserNameCollisions(projectAgents, userAgents);
+  return [
+    `Project root: ${projectRoot ?? "(unknown)"}`,
+    `Project agents in this root: ${formatApprovalAgentNames(projectAgents)}`,
+    `Requested project agents: ${formatApprovalAgentNames(requestedProjectAgents)}`,
+    `Project/user name collisions: ${collisions.map((name) => JSON.stringify(name)).join(", ") || "none"}`,
+    "",
+    "Approving trusts the entire listed project root for this session. Project agents may shadow same-named user agents.",
+  ].join("\n");
+}
+
 /**
- * Prompt the user to confirm project-local agents if needed.
+ * Prompt the user to trust the exact root containing a requested project agent.
  * Returns false if the user declines.
  */
 async function requestProjectAgentApprovalIfNeeded(
+  projectRoot: string | null,
   projectAgents: AgentConfig[],
-  projectAgentsDir: string | null,
+  requestedProjectAgents: AgentConfig[],
+  userAgents: AgentConfig[],
   ctx: { ui: { confirm: (title: string, body: string) => Promise<boolean> } },
 ): Promise<boolean> {
-  if (projectAgents.length === 0) return true;
+  if (requestedProjectAgents.length === 0) return true;
 
-  const names = projectAgents.map((a) => a.name).join(", ");
-  const dir = projectAgentsDir ?? "(unknown)";
   return ctx.ui.confirm(
-    "Approve project-local agent prompts?",
-    `Agents: ${names}\nSource: ${dir}\n\nThis approves only these repo-controlled agent prompts. Child Pi runs remain project-unapproved and do not load .pi settings, extensions, packages, or themes.`,
+    "Trust project-local agent root for this session?",
+    `${formatProjectAgentApprovalScope(projectRoot, projectAgents, requestedProjectAgents, userAgents)}\n\nChild Pi runs remain project-unapproved and do not load .pi settings, extensions, packages, or themes.`,
   );
 }
 
@@ -527,6 +487,24 @@ export default function (pi: ExtensionAPI) {
     description: "Maximum allowed subagent delegation depth (default: 5).",
     type: "string",
   });
+  pi.registerFlag("subagent-max-active", {
+    description: "Maximum active/reserved delegation-tree leases including the root on Linux/macOS; process-local child launches on Windows (default: 16).",
+    type: "string",
+  });
+  for (const [name, description] of [
+    ["subagent-max-parallel-tasks", "Maximum top-level parallel tasks (default: 50)."],
+    ["subagent-max-chain-steps", "Maximum chain stages (default: 12)."],
+    ["subagent-max-concurrency", "Maximum concurrent child mappings per invocation (default: 16)."],
+    ["subagent-max-chain-parallel-tasks", "Maximum tasks in a chain parallel stage (default: 8)."],
+    ["subagent-max-background-jobs", "Maximum running or cancelling background jobs (default: 16)."],
+    ["subagent-background-history-limit", "Completed background job history count (default: 20)."],
+    ["subagent-background-history-ttl-ms", "Completed background job history TTL in milliseconds (default: 3600000)."],
+    ["subagent-background-output-max-bytes", "Background result/error output byte limit (default: 16384)."],
+    ["subagent-background-shutdown-settle-ms", "Background shutdown settle time in milliseconds (default: 3000)."],
+    ["subagent-parallel-heartbeat-ms", "Parallel progress heartbeat interval in milliseconds (default: 1000)."],
+  ] as const) {
+    pi.registerFlag(name, { description, type: "string" });
+  }
   pi.registerFlag("subagent-prevent-cycles", {
     description:
       "Block delegating to agents already in the current delegation stack (default: true).",
@@ -540,28 +518,283 @@ export default function (pi: ExtensionAPI) {
   // cannot wait until a later tool invocation to fail.
   const interactivePaneLayout = resolveInteractivePaneLayout(pi.getFlag("subagent-pane-layout"));
   const depthConfig = resolveDelegationDepthConfig(pi);
+  // A safe pre-session snapshot keeps tool calls deterministic if a host invokes
+  // one before session_start. Session starts replace it after loading JSON files.
+  let limits = resolveSubagentLimits({ getFlag: (name) => pi.getFlag(name) });
   const { currentDepth, maxDepth, canDelegate, ancestorAgentStack, preventCycles } =
     depthConfig;
+  const scheduler = new ProcessLocalScheduler(limits.maxActive);
+  // A scheduler handle is invocation authority. Fork managers never cross this
+  // generation:id boundary, including concurrent/background invocations.
+  const forkManagers = new Map<string, ForkSourceOwnershipManager>();
+  const forkHandoffs = new WeakMap<ForkSourceOwnershipManager, ReturnType<ForkSourceOwnershipManager["reconcile"]>>();
+  const handoffForkManager = (manager: ForkSourceOwnershipManager) => {
+    const existing = forkHandoffs.get(manager);
+    if (existing) return existing;
+    const handoff = (async () => {
+      await manager.quiesce();
+      const recovery = await ForkSourceOwnershipManager.open(manager.paths.invocationDir);
+      return await recovery.reconcile({ allowDeadOwnerSeal: true });
+    })();
+    forkHandoffs.set(manager, handoff);
+    return handoff;
+  };
+  const treePermitAuthorityLifecycle = createTreePermitAuthorityLifecycle();
+  const foregroundPermitScopes = createSharedForegroundPermitScopeManager();
+  const getTreePermitAuthority = async (): Promise<TreePermitAuthority | null> =>
+    await treePermitAuthorityLifecycle.get(limits.maxActive);
+  const acquireForegroundPermitScope = async (authority: TreePermitAuthority): Promise<ForegroundDelegationScope> =>
+    await foregroundPermitScopes.acquire(authority) as ForegroundDelegationScope;
+  const releaseForegroundPermitScope = async (scope: ForegroundDelegationScope): Promise<boolean> =>
+    await foregroundPermitScopes.release(scope);
+  const backgroundSessionFence = new BackgroundJobSessionFence();
+  const uxRegistry = new SubagentUxRegistry({ recentLimit: 20 });
+  const dashboardPublisher = currentDepth === 0
+    ? createPiSubagentDashboardPublisher({
+      emit: (channel, payload) => pi.events.emit(channel, payload),
+      getSchedulerCounts: () => ({ active: scheduler.activeCount, queued: scheduler.queuedCount }),
+      getInteractiveActiveCount: () => listActiveInteractiveRunIds().length,
+    })
+    : null;
+  const presenceProducer = currentDepth === 0
+    ? createPiSubagentPresenceProducer({
+      emit: (channel, payload) => pi.events.emit(channel, payload),
+      on: typeof pi.events.on === "function" ? (channel, handler) => pi.events.on(channel, handler) : undefined,
+      getSchedulerCounts: () => ({ active: scheduler.activeCount, queued: scheduler.queuedCount }),
+      getInteractiveActiveCount: () => listActiveInteractiveRunIds().length,
+    })
+    : null;
+  // This is the single UX update boundary for invocation progress. It reads
+  // structured details only; child task/output text cannot reach presence.
+  const updateUxFromPartial = (id: string, generation: number, value: { content?: Array<{ type?: string; text?: string }>; details?: any } | undefined) => {
+    const text = value?.content?.filter((entry) => entry.type === "text" && typeof entry.text === "string").at(-1)?.text;
+    if (text) uxRegistry.updatePreview(id, text, generation);
+    const details = value?.details;
+    if (details?.mode === "parallel" && Array.isArray(details.results) && details.results.length > 0) {
+      const completed = details.results.filter((result: unknown) => typeof result === "object" && result !== null && (result as { exitCode?: unknown }).exitCode !== -1).length;
+      uxRegistry.updateProgress(id, Math.min(details.results.length, completed), details.results.length, generation);
+    } else if (details?.mode === "chain" && Number.isSafeInteger(details.chainStageCount) && details.chainStageCount > 0) {
+      const keys = ["chainCompletedCount", "chainSkippedCount", "chainFailedCount", "chainCompletedWithErrorsCount"] as const;
+      const completed = keys.reduce((sum, key) => {
+        const count = details[key];
+        return sum + (Number.isSafeInteger(count) && count >= 0 ? count : 0);
+      }, 0);
+      uxRegistry.updateProgress(id, Math.min(details.chainStageCount, completed), details.chainStageCount, generation);
+    }
+  };
+  let unsubscribeUxStatus: (() => void) | null = null;
+  let unsubscribeSchedulerStatus: (() => void) | null = null;
+
+  if (currentDepth === 0) {
+    pi.registerCommand("subagents", {
+      description: "List, inspect, diagnose, or cancel process-local subagent runs",
+      getArgumentCompletions: (prefix) => {
+        const fixed = ["list", "doctor", "cancel ", "details ", "focus ", "keep ", "promote "];
+        const jobs = uxRegistry.snapshot().active;
+        const interactive = listInteractiveRunUxSnapshots();
+        const ids = [
+          ...jobs.flatMap((job) => [`cancel ${job.id}`, `details ${job.id}`]),
+          ...interactive.flatMap((run) => [`details ${run.runId}`, `focus ${run.runId}`, `keep ${run.runId}`, `promote ${run.runId}`]),
+        ];
+        const values = [...fixed, ...ids].filter((value) => value.startsWith(prefix));
+        return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
+      },
+      handler: async (rawArgs, ctx) => {
+        const command = parseSubagentsCommand(rawArgs);
+        if (!command) {
+          ctx.ui.notify("Usage: /subagents [list|doctor|cancel|details|focus|keep|promote <full-id>]", "error");
+          return;
+        }
+        if (command.kind === "doctor") {
+          const terminal = getDefaultTerminalModeFromEnv();
+          const hasCmuxFields = process.env.CMUX_WORKSPACE_ID !== undefined || process.env.CMUX_SURFACE_ID !== undefined;
+          const hasTmuxFields = process.env.TMUX !== undefined || process.env.TMUX_PANE !== undefined;
+          const piCmuxTool = pi.getAllTools().some((tool) => tool.name === "cmux_open_terminal" && tool.sourceInfo.source !== "builtin");
+          const piCmuxCommand = pi.getCommands().some((entry) => entry.source === "extension" && /^(?:cmv|cmh|cmo|cmt)(?::\d+)?$/.test(entry.name));
+          const lines = [
+            `terminal: ${terminal}`,
+            `cmux identity: ${hasCmuxFields ? isInsideCmux() ? "valid" : "invalid" : "not present"}`,
+            `tmux identity: ${hasTmuxFields ? isInsideTmux() ? "valid" : "invalid" : "not present"}`,
+            `layout: ${interactivePaneLayout}`,
+            `child policy: ${resolveManagedChildPolicy()}`,
+            `scheduler: ${scheduler.activeCount} active, ${scheduler.queuedCount} queued, max ${scheduler.maxActive}`,
+            `interactive authority: ${listActiveInteractiveRunIds().length} active`,
+            `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
+            "control readiness: validated per interactive launch (no doctor probe)",
+          ];
+          ctx.ui.notify(lines.join("\n"), "info");
+          return;
+        }
+        if (command.kind === "cancel") {
+          const snapshot = uxRegistry.get(command.id);
+          if (!snapshot) {
+            ctx.ui.notify(`Unknown subagent invocation id: ${command.id}`, "error");
+            return;
+          }
+          if (snapshot.status !== "running") {
+            ctx.ui.notify(`Subagent ${command.id} is ${snapshot.status}.`, "warning");
+            return;
+          }
+          if (ctx.hasUI && !await ctx.ui.confirm("Cancel subagent?", `${snapshot.agent} (${snapshot.id})`)) return;
+          const cancelled = uxRegistry.cancel(command.id, snapshot.generation);
+          ctx.ui.notify(cancelled.changed ? `Cancelling subagent ${command.id}.` : `Subagent ${command.id} was not cancelled.`, cancelled.changed ? "info" : "warning");
+          return;
+        }
+        if (command.kind === "details") {
+          const invocation = uxRegistry.get(command.id);
+          if (invocation) { ctx.ui.notify(formatSubagentUxDetail(invocation), "info"); return; }
+          const run = await inspectInteractiveRunForUx(command.id);
+          if (!run) { ctx.ui.notify(`Unknown interactive run id: ${command.id}`, "error"); return; }
+          const elapsed = Math.max(0, Date.now() - run.startedAt);
+          ctx.ui.notify([
+            `Interactive subagent ${run.runId}`,
+            `- agent: ${run.agent}`,
+            `- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}`,
+            `- ownership: ${run.ownership}`,
+            `- depth: ${run.depth}`,
+            `- elapsedMs: ${elapsed}`,
+            `- target: ${run.exists === undefined ? "unknown" : run.exists ? run.exited ? "exited" : "present" : "absent"}`,
+            `- focus: ${run.focusSupported ? "supported" : "unsupported"}`,
+            `- promote: ${run.promoteSupported ? "supported" : "unsupported"}`,
+            ...(run.title ? [`- managedTitle: ${run.title}`, `- titleState: ${run.titleState ?? "unavailable"}`] : []),
+            ...(run.preview ? [`- preview: ${run.preview}`] : []),
+          ].join("\n"), "info");
+          return;
+        }
+        if (command.kind === "focus") {
+          const focused = await focusInteractiveRun(command.id);
+          ctx.ui.notify(focused ? `Focused interactive subagent ${command.id}.` : `Could not safely focus interactive subagent ${command.id}.`, focused ? "info" : "warning");
+          return;
+        }
+        if (command.kind === "keep") {
+          const kept = await keepInteractiveRun(command.id);
+          ctx.ui.notify(kept ? `Keeping interactive subagent ${command.id} until session shutdown or promotion.` : `Could not keep interactive subagent ${command.id}.`, kept ? "info" : "warning");
+          return;
+        }
+        if (command.kind === "promote") {
+          if (ctx.hasUI && !await ctx.ui.confirm("Promote subagent surface?", `Transfer ${command.id} to user ownership and exclude it from automatic cleanup.`)) return;
+          // Capture the exact active-run metadata before the promotion removes
+          // it from the registry; only a fresh durable promotion may publish.
+          const activeSnapshot = await inspectInteractiveRunForUx(command.id);
+          const detachedAt = Date.now();
+          const promoted = activeSnapshot ? await promoteInteractiveRun(command.id, detachedAt) : "rejected";
+          if (promoted === "promoted" && activeSnapshot) dashboardPublisher?.publishDetached({
+            runId: activeSnapshot.runId,
+            agent: activeSnapshot.agent,
+            backend: activeSnapshot.backend,
+            detachedAt,
+          });
+          const notification = promoted === "promoted"
+            ? `Promoted interactive subagent ${command.id} to user ownership.`
+            : promoted === "already-promoted"
+              ? `Interactive subagent ${command.id} was already promoted to user ownership.`
+              : promoted === "ownership-unknown"
+                ? `Interactive subagent ${command.id} remains visible: cleanup authority is unknown/revoked, so automatic cleanup is disabled.`
+                : `Could not safely promote interactive subagent ${command.id}.`;
+          ctx.ui.notify(notification, promoted === "rejected" ? "warning" : "info");
+          return;
+        }
+        const jobs = uxRegistry.list();
+        const interactive = listInteractiveRunUxSnapshots();
+        const commandMode = (ctx as typeof ctx & { mode?: string }).mode;
+        if (rawArgs.trim() === "" && commandMode === "tui" && jobs.length + interactive.length > 0) {
+          const entries = [
+            ...jobs.map((job) => ({ label: `${job.id} · ${job.agent} · ${job.status} · ${Math.max(0, (job.completedAt ?? Date.now()) - job.startedAt)}ms${job.preview ? ` · ${job.preview}` : ""}`, detail: formatSubagentUxDetail(job) })),
+            ...interactive.map((run) => ({ label: `${run.runId} · ${run.agent} · interactive/${run.ownership} · ${Math.max(0, Date.now() - run.startedAt)}ms${run.preview ? ` · ${run.preview}` : ""}`, detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.` })),
+          ];
+          const selected = await ctx.ui.select("Subagents", entries.map((entry) => entry.label));
+          const entry = entries.find((candidate) => candidate.label === selected);
+          if (entry) ctx.ui.notify(entry.detail, "info");
+          return;
+        }
+        const invocationText = formatSubagentUxList(jobs);
+        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${run.ownership}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
+        ctx.ui.notify(`${invocationText}\n${interactiveText}`, "info");
+      },
+    });
+  }
 
   let discoveredAgents: AgentConfig[] = [];
   let sessionShuttingDown = false;
+  let startupReaper: StaleInteractiveReaperHandle | null = null;
+  const cancelStartupReaperBounded = async (): Promise<void> => {
+    const reaper = startupReaper;
+    if (!reaper) return;
+    await settleWithUnrefTimeout([reaper.cancelAndDrain().catch(() => undefined)], limits.backgroundShutdownSettleMs);
+    if (startupReaper === reaper) startupReaper = null;
+  };
+  const discoveryCache = new AgentDiscoveryCache();
+
+  const treePermitSources = new Map<string, { source: TreePermitAuthority | ForegroundDelegationScope; scope?: ForegroundDelegationScope }>();
+  const runScheduledAgent = async (
+    handle: SchedulerHandle,
+    options: RunAgentOptions,
+  ): Promise<SingleResult> => {
+    let forkChildId: string | undefined;
+    const schedulerKey = `${handle.generation}:${handle.id}`;
+    const forkManager = options.delegationMode === "fork" ? forkManagers.get(schedulerKey) : undefined;
+    const permitContext = treePermitSources.get(schedulerKey);
+    try {
+      if (options.delegationMode === "fork" && !forkManager) throw new Error("Fork source ownership manager is unavailable for this invocation.");
+      if (forkManager) {
+        forkChildId = crypto.randomUUID();
+        await forkManager.registerChild({
+          childId: forkChildId,
+          surface: options.terminalMode === "inline" ? "inline" : "interactive",
+          runId: options.terminalMode === "inline" ? null : forkChildId,
+        });
+      }
+      const managedOverriddenBuiltinTools = pi.getAllTools()
+        .filter((tool) => ["read", "bash", "edit", "write", "grep", "find", "ls"].includes(tool.name) && tool.sourceInfo.source !== "builtin")
+        .map((tool) => tool.name);
+      const scheduled = await scheduler.schedule(handle, async () => {
+        const treePermitLease = permitContext
+          ? (await permitContext.source.waitForReservation({ signal: options.signal }) ?? undefined)
+          : undefined;
+        if (permitContext && !treePermitLease) return makeUnstartedAbortResult(options.agentName, options.task, options.stageLabel, options.model);
+        try {
+          return await runAgent({ ...options, forkSourceOwnership: forkManager, forkChildId, treePermitLease, maxActive: limits.maxActive, limits, managedOverriddenBuiltinTools });
+        } finally {
+          if (treePermitLease) {
+            const releasedBeforeBind = await treePermitLease.release().catch(() => false);
+            if (permitContext?.scope && !releasedBeforeBind) {
+              const settled = await permitContext.scope.completeChild(treePermitLease).catch(() => false);
+              // A result can arrive just before its exact child is observable
+              // as dead. Keep the parked parent recoverable without revoking a
+              // live child; the scope owns one unref'd retry loop per lease.
+              if (!settled) permitContext.scope.watchChildSettlement(treePermitLease);
+            } else if (!permitContext?.scope && !releasedBeforeBind) {
+              await treePermitLease.finalizeBoundChildIfDead().catch(() => false);
+            }
+          }
+        }
+      }, options.signal);
+      if (scheduled.started) return scheduled.value;
+      if (forkManager && forkChildId) await forkManager.markTerminal(forkChildId, "no-launch");
+      return makeUnstartedAbortResult(options.agentName, options.task, options.stageLabel, options.model);
+    } catch (error) {
+      if (forkManager && forkChildId) await forkManager.markTerminal(forkChildId, "launch-failed").catch(() => undefined);
+      const agent = options.agents.find((candidate) => candidate.name === options.agentName);
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        agent: options.agentName,
+        agentSource: agent?.source ?? "unknown",
+        task: options.task,
+        stageLabel: options.stageLabel,
+        exitCode: 1,
+        messages: [],
+        stderr: message,
+        usage: emptyUsage(),
+        accountingUsage: emptyAccountingUsage(),
+        model: options.model ?? agent?.model,
+        stopReason: "error",
+        errorMessage: message,
+      };
+    }
+  };
 
   const sessionTrustedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_TRUSTED_PROJECTS_ENV]));
   const sessionDeniedProjectDirs = new Set<string>(parseProjectRootEnvValue(process.env[SUBAGENT_DENIED_PROJECTS_ENV]));
-
-  const getTrustOverrideFromArgv = (): boolean | null => {
-    if (process.argv.includes("--approve") || process.argv.includes("-a")) return true;
-    if (process.argv.includes("--no-approve") || process.argv.includes("-na")) return false;
-    return null;
-  };
-
-  const applyArgvTrustOverride = (projectAgentsDir: string | null): string | null =>
-    applySessionProjectTrustOverride(
-      projectAgentsDir,
-      getTrustOverrideFromArgv(),
-      sessionTrustedProjectDirs,
-      sessionDeniedProjectDirs,
-    );
 
   const isProjectTrustedForSession = (projectAgentsDir: string | null): boolean =>
     isTrustedProjectAgentsDirWithSessionOverrides(projectAgentsDir, {
@@ -569,34 +802,144 @@ export default function (pi: ExtensionAPI) {
       sessionDeniedProjectRoots: sessionDeniedProjectDirs,
     });
 
+  const discoverForSession = (
+    cwd: string,
+    scope: AgentScope,
+    options: DiscoverAgentOptions = {},
+  ): AgentDiscoveryResult => {
+    const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+    const trustedProjectRoot = isProjectTrustedForSession(projectAgentsDir)
+      ? getProjectRootFromAgentsDir(projectAgentsDir)
+      : null;
+    return discoveryCache.discover(cwd, scope, {
+      metadataOnly: options.metadataOnly,
+      trustedProjectRoot,
+      sessionTrustedProjectRoots: sessionTrustedProjectDirs,
+      sessionDeniedProjectRoots: sessionDeniedProjectDirs,
+    });
+  };
+
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
+    const projectTrustOverride = getSessionProjectTrustOverride(ctx);
+    const trustedProject = resolveSessionProjectTrust(
+      projectAgentsDir,
+      projectTrustOverride,
+      sessionTrustedProjectDirs,
+      sessionDeniedProjectDirs,
+    );
+    limits = await resolveSubagentLimitsForSession({
+      agentDir: piCodingAgent.getAgentDir(),
+      cwd: ctx.cwd,
+      configDirName: CONFIG_DIR_NAME,
+      projectTrusted: trustedProject,
+      getFlag: (name) => pi.getFlag(name),
+    });
+
+    // A new session never inherits old-session background records. Invalidate
+    // first so a late finalizer cannot republish one after this clear.
+    backgroundSessionFence.startSession();
+    cancelBackgroundJobs(backgroundJobs);
+    backgroundJobs.clear();
+    unsubscribeUxStatus?.();
+    unsubscribeUxStatus = null;
+    unsubscribeSchedulerStatus?.();
+    unsubscribeSchedulerStatus = null;
+    const uxGeneration = uxRegistry.reset();
+    if (currentDepth === 0 && dashboardPublisher) {
+      dashboardPublisher.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
+      presenceProducer?.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
+      const notifiedTerminalIds = new Set<string>();
+      const updateObservers = (snapshot: PiSubagentUxSnapshotLike) => {
+        dashboardPublisher.publish(snapshot);
+        presenceProducer?.publish(snapshot);
+        if (ctx.hasUI) {
+          ctx.ui.setStatus("pi-subagent-runs", formatSubagentUxFooter(snapshot));
+          for (const item of snapshot.recent) {
+            if (item.status !== "completed" && item.status !== "failed" && item.status !== "cancelled"
+              || notifiedTerminalIds.has(item.id)) continue;
+            notifiedTerminalIds.add(item.id);
+            while (notifiedTerminalIds.size > 256) {
+              const oldest = notifiedTerminalIds.values().next().value;
+              if (oldest === undefined) break;
+              notifiedTerminalIds.delete(oldest);
+            }
+            try {
+              ctx.ui.notify(
+                `Subagent ${item.agent} (${item.id}) ${item.status}.`,
+                item.status === "completed" ? "info" : "warning",
+              );
+            } catch { /* Pi TUI notifications are non-authoritative. */ }
+          }
+        }
+      };
+      unsubscribeUxStatus = uxRegistry.subscribe(updateObservers);
+      unsubscribeSchedulerStatus = scheduler.subscribe(() => updateObservers(uxRegistry.snapshot()));
+      updateObservers(uxRegistry.snapshot());
+    }
+    backgroundJobSettlements.clear();
     sessionShuttingDown = false;
+    discoveryCache.startSession();
+    scheduler.startSession(limits.maxActive);
+    await treePermitAuthorityLifecycle.startup(limits.maxActive);
     await resetInteractiveShutdownForSession();
     if (currentDepth === 0) {
-      await reapStaleInteractiveRuns().catch((error) => {
-        console.warn(`[pi-subagent] Failed to reap stale interactive runs: ${error instanceof Error ? error.message : String(error)}`);
-      });
+      await cancelStartupReaperBounded();
+      try {
+        const reaper = await startStaleInteractiveReaper();
+        startupReaper = reaper;
+        await reaper.startup;
+        void reaper.completion.catch((error) => {
+          console.warn(`[pi-subagent] Failed to reap stale interactive runs: ${error instanceof Error ? error.message : String(error)}`);
+        }).finally(() => { if (startupReaper === reaper) startupReaper = null; });
+      } catch (error) {
+        console.warn(`[pi-subagent] Failed to start stale interactive reaper: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     if (!canDelegate) return;
 
-    const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
-    applyArgvTrustOverride(projectAgentsDir);
-    const trustedProject = isProjectTrustedForSession(projectAgentsDir);
     const discovery = trustedProject
-      ? discoverAgents(ctx.cwd, "both")
-      : discoverAgents(ctx.cwd, "user");
+      ? discoverForSession(ctx.cwd, "both")
+      : discoverForSession(ctx.cwd, "user");
     discoveredAgents = discovery.agents;
   });
 
-  pi.on("session_shutdown", async () => {
-    // Fence before cancellation/settlement so a delayed background callback
-    // cannot start while shutdown is waiting for it.
+  pi.on("session_shutdown", async (_event, ctx) => {
+    // Invalidate and quarantine before any await/cancellation so a late
+    // old-session finalizer cannot repopulate the registry or send a steer.
     sessionShuttingDown = true;
-    await beginInteractiveShutdownForSession();
+    backgroundSessionFence.invalidate();
+    const priorSessionSettlements = Array.from(backgroundJobSettlements.values());
     cancelBackgroundJobs(backgroundJobs);
-    await settleBackgroundJobsForShutdown();
+    backgroundJobs.clear();
+    backgroundJobSettlements.clear();
+    unsubscribeUxStatus?.();
+    unsubscribeUxStatus = null;
+    unsubscribeSchedulerStatus?.();
+    unsubscribeSchedulerStatus = null;
+    if (currentDepth === 0) {
+      dashboardPublisher?.stop();
+      presenceProducer?.stop();
+    }
+    uxRegistry.reset();
+    if (currentDepth === 0 && ctx.hasUI) ctx.ui.setStatus("pi-subagent-runs", undefined);
+
+    discoveryCache.clear();
+    scheduler.shutdown();
+    // An active exact child must retain its permit across this Pi session
+    // boundary. Idle watcher cancellation only drains already-settled local
+    // bookkeeping and never releases a live child.
+    await settleWithUnrefTimeout([foregroundPermitScopes.cancelSettlementWatchersIfIdle()], limits.backgroundShutdownSettleMs);
+    await cancelStartupReaperBounded();
+    await beginInteractiveShutdownForSession();
+    await settleWithUnrefTimeout(priorSessionSettlements, limits.backgroundShutdownSettleMs);
     await shutdownActiveInteractiveRuns();
+    const strandedForkManagers = Array.from(forkManagers.entries());
+    const handoffs = strandedForkManagers.map(([key, manager]) => handoffForkManager(manager)
+      .catch((error) => console.warn(`[pi-subagent] Fork source shutdown handoff retained artifacts: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { if (forkManagers.get(key) === manager) forkManagers.delete(key); }));
+    await settleWithUnrefTimeout(handoffs, limits.backgroundShutdownSettleMs);
   });
 
   // Inject available agents into the system prompt
@@ -605,7 +948,7 @@ export default function (pi: ExtensionAPI) {
     if (discoveredAgents.length === 0) return;
 
     const agentList = discoveredAgents
-      .map((a) => JSON.stringify({ name: a.name, description: truncateAgentDescription(a.description) }))
+      .map((a) => JSON.stringify([a.name, truncateAgentDescription(a.description)]))
       .join("\n");
     return {
       systemPrompt:
@@ -630,7 +973,6 @@ export default function (pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
-        applyArgvTrustOverride(projectAgentsDir);
         const earlyToolDetails = makeDetailsFactory(
           projectAgentsDir,
           DEFAULT_DELEGATION_MODE,
@@ -656,6 +998,8 @@ export default function (pi: ExtensionAPI) {
         const hasSingle = Boolean(params.agent && params.task);
         const action = parseBackgroundAction(params.action);
         const background = parseBackgroundFlag(params.background);
+        const completionMode = parseCompletionMode(params.completion);
+        const terminalMode = getDefaultTerminalModeFromEnv();
 
         if (params.action !== undefined && !action) {
           return {
@@ -683,8 +1027,32 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
+        if (!completionMode) {
+          return {
+            content: [{ type: "text", text: `Invalid completion \"${String(params.completion)}\". Expected \"one-shot\" or \"handoff\".` }],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+        const completionValidationError = validateCompletionInvocation({
+          completionMode,
+          hasSingle,
+          hasTasksField: params.tasks !== undefined,
+          hasChainField: params.chain !== undefined,
+          hasActionField: params.action !== undefined,
+          background,
+          terminalMode,
+        });
+        if (completionValidationError) {
+          return {
+            content: [{ type: "text", text: completionValidationError }],
+            details: earlyToolDetails,
+            isError: true,
+          };
+        }
+
         if (action) {
-          const hasExecutionField = params.agent !== undefined || params.task !== undefined || params.model !== undefined || params.tasks !== undefined || params.chain !== undefined || params.cwd !== undefined || params.mode !== undefined;
+          const hasExecutionField = params.agent !== undefined || params.task !== undefined || params.model !== undefined || params.tasks !== undefined || params.chain !== undefined || params.cwd !== undefined || params.mode !== undefined || params.completion !== undefined;
           if (hasExecutionField) {
             return {
               content: [
@@ -721,7 +1089,7 @@ export default function (pi: ExtensionAPI) {
               isError: true,
             };
           }
-          pruneBackgroundJobs(backgroundJobs);
+          pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
           if (action === "status") {
             if (typeof params.id === "string") {
               const job = getBackgroundJobSnapshot(params.id, backgroundJobs);
@@ -751,6 +1119,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           const cancellation = cancelBackgroundJobs(backgroundJobs, typeof params.id === "string" ? params.id : undefined);
+          for (const cancelledJob of cancellation.cancelled) uxRegistry.cancel(cancelledJob.id);
           if (!cancellation.found) {
             return {
               content: [{ type: "text", text: `Background subagent job ${String(params.id)} was not found.` }],
@@ -802,18 +1171,17 @@ export default function (pi: ExtensionAPI) {
         }
 
         const trustedProjectAtStart = isProjectTrustedForSession(projectAgentsDir);
-        const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverAgents(ctx.cwd, "project", { metadataOnly: true }).agents;
+        const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverForSession(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
-          ? discoverAgents(ctx.cwd, "both")
+          ? discoverForSession(ctx.cwd, "both")
           : {
-            agents: discoverAgents(ctx.cwd, "user").agents,
+            agents: discoverForSession(ctx.cwd, "user").agents,
             projectAgentsDir,
           };
         const { agents } = discovery;
-        const visibleAgents = trustedProjectAtStart ? agents : discoverAgents(ctx.cwd, "user").agents;
+        const visibleAgents = trustedProjectAtStart ? agents : discoverForSession(ctx.cwd, "user").agents;
 
         const delegationMode = parseDelegationMode(params.mode);
-        const terminalMode = getDefaultTerminalModeFromEnv();
         const parentSessionId = ctx.sessionManager.getSessionId();
         const parentSessionFile = ctx.sessionManager.getSessionFile();
         const intendedMode = inferInvocationMode(params);
@@ -860,9 +1228,9 @@ export default function (pi: ExtensionAPI) {
 
         let forkSessionSnapshotJsonl: string | undefined;
         if (delegationMode === "fork") {
-          forkSessionSnapshotJsonl =
-            buildForkSessionSnapshotJsonl(ctx.sessionManager) ?? undefined;
-          if (!forkSessionSnapshotJsonl) {
+          const forkBranchSource = buildForkBranchSourceJsonl(ctx.sessionManager);
+          forkSessionSnapshotJsonl = forkBranchSource ?? undefined;
+          if (forkBranchSource === null) {
             return {
               content: [
                 {
@@ -890,6 +1258,14 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
+        if (params.tasks && params.tasks.length > limits.maxParallelTasks) {
+          return {
+            content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${limits.maxParallelTasks}.` }],
+            details: makeDetails("parallel")([]),
+            isError: true,
+          };
+        }
+
         if (params.model !== undefined && !hasSingle) {
           return {
             content: [
@@ -907,7 +1283,18 @@ export default function (pi: ExtensionAPI) {
         const requested = new Set<string>();
         if (params.tasks) for (const t of params.tasks) requested.add(t.agent);
         if (params.chain) {
-          const chainValidationError = validateChainStages(params.chain as ChainStage[]);
+          const chainLimitError = validateConfiguredChainLimits(params.chain as ChainStage[], limits);
+          if (chainLimitError) {
+            return {
+              content: [{ type: "text", text: chainLimitError }],
+              details: makeDetails("chain", { chainStageCount: params.chain.length })([]),
+              isError: true,
+            };
+          }
+          const chainValidationError = validateChainStages(
+            params.chain as ChainStage[],
+            limits.maxChainParallelTasks,
+          );
           if (chainValidationError) {
             return {
               content: [{ type: "text", text: chainValidationError }],
@@ -982,8 +1369,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           const shouldPrompt = !trustedProject;
           if (ctx.hasUI && shouldPrompt) {
             const approved = await requestProjectAgentApprovalIfNeeded(
+              currentProjectRoot,
+              untrustedProjectAgents,
               requestedProjectAgents,
-              discovery.projectAgentsDir,
+              visibleAgents,
               ctx,
             );
             if (!approved) {
@@ -1016,13 +1405,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               if (deniedIndex !== -1) deniedProjectRoots.splice(deniedIndex, 1);
             }
           } else if (!ctx.hasUI && shouldPrompt) {
-            const names = requestedProjectAgents.map((a) => a.name).join(", ");
-            const dir = discovery.projectAgentsDir ?? "(unknown)";
             return {
               content: [
                 {
                   type: "text",
-                  text: `Blocked: project-local agent prompt confirmation is required in non-UI mode.\nAgents: ${names}\nSource: ${dir}\n\nRun from an interactive session and approve this exact project-agent root, or pass --approve to approve only its project-agent prompts for this session. Child Pi runs still use --no-approve and do not load other .pi project code.`,
+                  text: `Blocked: project-local agent prompt confirmation is required in non-UI mode.\n${formatProjectAgentApprovalScope(currentProjectRoot, untrustedProjectAgents, requestedProjectAgents, visibleAgents)}\n\nRun from an interactive session and approve the entire listed project root for this session, or pass --approve to trust the entire listed project root for this session. Child Pi runs still use --no-approve and do not load other .pi project code.`,
                 },
               ],
               details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
@@ -1030,7 +1417,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             };
           }
 
-          const fullDiscovery = discoverAgents(ctx.cwd, "both");
+          const fullDiscovery = discoverForSession(ctx.cwd, "both");
           runnableAgents = fullDiscovery.agents;
           discoveredAgents = fullDiscovery.agents;
         }
@@ -1045,21 +1432,52 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           };
         }
 
-        const runInvocation = (
+        const schedulerHandle = scheduler.createHandle();
+
+        const runInvocation = async (
           executionSignal: AbortSignal | undefined,
           executionOnUpdate: ((partial: any) => void) | undefined,
+          backgroundExecution: boolean,
         ) => {
+          const schedulerKey = `${schedulerHandle.generation}:${schedulerHandle.id}`;
           // Recheck immediately before every foreground call and every
           // background callback. This is intentionally exact, not best effort.
           if (!canStartInvocation()) {
-            return Promise.resolve({
+            const pendingForkManager = forkManagers.get(schedulerKey);
+            if (pendingForkManager) {
+              await handoffForkManager(pendingForkManager).catch(() => undefined);
+              forkManagers.delete(schedulerKey);
+            }
+            return {
               content: [{ type: "text" as const, text: "Cannot start subagents while the parent session is shutting down." }],
               details: makeDetails(intendedMode, detailsExtras)([]),
               isError: true,
-            });
+            };
           }
-          if (params.tasks && params.tasks.length > 0) {
-            return executeParallel(
+          let forkManager: ForkSourceOwnershipManager | undefined;
+          if (delegationMode === "fork") {
+            try {
+              forkManager = forkManagers.get(schedulerKey) ?? await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!);
+              forkManagers.set(schedulerKey, forkManager);
+            } catch (error) {
+              const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
+              return { content: [{ type: "text" as const, text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+            }
+          }
+          let foregroundPermitScope: ForegroundDelegationScope | undefined;
+          try {
+            try {
+              const authority = await getTreePermitAuthority();
+              if (authority) {
+                foregroundPermitScope = backgroundExecution ? undefined : await acquireForegroundPermitScope(authority);
+                treePermitSources.set(schedulerKey, { source: foregroundPermitScope ?? authority, scope: foregroundPermitScope });
+              }
+            } catch (error) {
+              const message = `Cannot acquire tree-wide permit authority: ${error instanceof Error ? error.message : String(error)}`;
+              return { content: [{ type: "text" as const, text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+            }
+            if (params.tasks && params.tasks.length > 0) {
+            return await executeParallel(
               params.tasks,
               delegationMode,
               terminalMode,
@@ -1075,11 +1493,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               executionSignal,
               executionOnUpdate,
               makeDetails,
+              schedulerHandle,
+              forkManager,
             );
           }
 
           if (params.chain && params.chain.length > 0) {
-            return executeChain(
+            return await executeChain(
               params.chain as ChainStage[],
               delegationMode,
               terminalMode,
@@ -1095,17 +1515,20 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               executionSignal,
               executionOnUpdate,
               makeDetails,
+              schedulerHandle,
+              forkManager,
             );
           }
 
           if (params.agent && params.task) {
-            return executeSingle(
+            return await executeSingle(
               params.agent,
               params.task,
               params.cwd,
               params.model,
               delegationMode,
               terminalMode,
+              completionMode,
               interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
@@ -1118,10 +1541,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               executionSignal,
               executionOnUpdate,
               makeDetails,
+              schedulerHandle,
+              forkManager,
             );
           }
 
-          return Promise.resolve({
+          return {
             content: [
               {
                 type: "text" as const,
@@ -1129,7 +1554,25 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               },
             ],
             details: makeDetails("single")([]),
-          });
+          };
+          } finally {
+            treePermitSources.delete(schedulerKey);
+            if (foregroundPermitScope) {
+              const resumed = await releaseForegroundPermitScope(foregroundPermitScope).catch(() => false);
+              if (!resumed) console.warn("[pi-subagent] Tree permit parent remained parked because descendant ownership is unresolved.");
+            }
+            if (forkManager) {
+              try {
+                const outcome = await handoffForkManager(forkManager);
+                if (!outcome.removed) console.warn(`[pi-subagent] Retained fork source artifacts: ${outcome.retained.join(", ")}`);
+              } catch (error) {
+                // Cleanup cannot replace an already successful child result.
+                console.warn(`[pi-subagent] Fork source cleanup failed; artifacts retained: ${error instanceof Error ? error.message : String(error)}`);
+              } finally {
+                forkManagers.delete(schedulerKey);
+              }
+            }
+          }
         };
 
         if (background) {
@@ -1142,18 +1585,26 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               isError: true,
             };
           }
-          pruneBackgroundJobs(backgroundJobs);
-          if (countRunningBackgroundJobs() >= MAX_RUNNING_BACKGROUND_JOBS) {
+          pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
+          if (countRunningBackgroundJobs() >= limits.maxBackgroundJobs) {
             return {
               content: [{
                 type: "text",
-                text: `Cannot start background subagent job: ${MAX_RUNNING_BACKGROUND_JOBS} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
+                text: `Cannot start background subagent job: ${limits.maxBackgroundJobs} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
               }],
               details: makeDetails(intendedMode, detailsExtras)([]),
               isError: true,
             };
           }
 
+          if (delegationMode === "fork") {
+            try {
+              forkManagers.set(`${schedulerHandle.generation}:${schedulerHandle.id}`, await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!));
+            } catch (error) {
+              const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
+              return { content: [{ type: "text", text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+            }
+          }
           const job = createBackgroundJobRecord({
             mode: intendedMode,
             agent: params.agent,
@@ -1161,7 +1612,32 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             taskCount: params.tasks?.length,
             chainStageCount: params.chain?.length,
           });
-          startBackgroundJob(pi, job, (jobSignal) => runInvocation(jobSignal, undefined));
+          const uxGeneration = uxRegistry.captureGeneration();
+          const progressTotal = params.tasks?.length ?? params.chain?.length ?? 1;
+          uxRegistry.start({
+            id: job.id,
+            agent: params.agent ?? (params.tasks ? `${params.tasks.length} parallel agents` : `${params.chain?.length ?? 0} chain stages`),
+            kind: "background",
+            progressTotal,
+            cancel: () => {
+              const cancellation = cancelBackgroundJobs(backgroundJobs, job.id);
+              if (!cancellation.found) job.controller.abort();
+            },
+          });
+          startBackgroundJob(
+            pi,
+            job,
+            (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true),
+            limits,
+            backgroundSessionFence.capture(),
+            backgroundSessionFence,
+            (finalizedJob) => {
+              updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
+              if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
+              else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
+              else uxRegistry.fail(finalizedJob.id, uxGeneration);
+            },
+          );
           return {
             content: [{
               type: "text",
@@ -1175,7 +1651,32 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           };
         }
 
-        return runInvocation(signal, onUpdate);
+        const foregroundController = new AbortController();
+        const forwardAbort = () => foregroundController.abort();
+        if (signal?.aborted) forwardAbort();
+        else signal?.addEventListener("abort", forwardAbort, { once: true });
+        const uxGeneration = uxRegistry.captureGeneration();
+        const progressTotal = params.tasks?.length ?? params.chain?.length ?? 1;
+        const uxRun = uxRegistry.start({
+          agent: params.agent ?? (params.tasks ? `${params.tasks.length} parallel agents` : `${params.chain?.length ?? 0} chain stages`),
+          kind: "foreground",
+          progressTotal,
+          cancel: () => foregroundController.abort(),
+        });
+        try {
+          const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false));
+          updateUxFromPartial(uxRun.id, uxGeneration, result);
+          if (foregroundController.signal.aborted) uxRegistry.cancelled(uxRun.id, uxGeneration);
+          else if ("isError" in result && result.isError) uxRegistry.fail(uxRun.id, uxGeneration);
+          else uxRegistry.complete(uxRun.id, uxGeneration);
+          return result;
+        } catch (error) {
+          if (foregroundController.signal.aborted) uxRegistry.cancelled(uxRun.id, uxGeneration);
+          else uxRegistry.fail(uxRun.id, uxGeneration);
+          throw error;
+        } finally {
+          signal?.removeEventListener("abort", forwardAbort);
+        }
       },
 
       renderCall: (args, theme) => renderCall(args, theme),
@@ -1195,6 +1696,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     model: string | undefined,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
+    completionMode: "one-shot" | "handoff",
     interactivePaneLayout: InteractivePaneLayout,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
@@ -1207,8 +1709,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     signal: AbortSignal | undefined,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
+    schedulerHandle: SchedulerHandle,
+    forkSourceOwnership?: ForkSourceOwnershipManager,
   ) {
-    const result = await runAgent({
+    const result = await runScheduledAgent(schedulerHandle, {
       cwd: defaultCwd,
       agents,
       agentName,
@@ -1217,10 +1721,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       model,
       delegationMode,
       terminalMode,
+      completionMode,
       interactivePaneLayout,
       trustedProjectRoots,
       deniedProjectRoots,
       forkSessionSnapshotJsonl,
+      forkSourceOwnership,
       parentSessionId,
       parentSessionFile,
       interactiveShutdownGeneration,
@@ -1273,21 +1779,19 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     signal: AbortSignal | undefined,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
+    schedulerHandle: SchedulerHandle,
+    forkSourceOwnership?: ForkSourceOwnershipManager,
   ) {
-    if (chain.length > MAX_CHAIN_STEPS) {
+    const chainLimitError = validateConfiguredChainLimits(chain, limits);
+    if (chainLimitError) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Too many chain stages (${chain.length}). Max is ${MAX_CHAIN_STEPS}.`,
-          },
-        ],
+        content: [{ type: "text" as const, text: chainLimitError }],
         details: makeDetails("chain", { chainStageCount: chain.length })([]),
         isError: true,
       };
     }
 
-    const validationError = validateChainStages(chain);
+    const validationError = validateChainStages(chain, limits.maxChainParallelTasks);
     if (validationError) {
       return {
         content: [{ type: "text" as const, text: validationError }],
@@ -1299,12 +1803,40 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     const stages: ChainStageRecord[] = [];
     const flattenedResults: SingleResult[] = [];
     const state: ChainExecutionState = { hadError: false, hadCompletedWithErrors: false, hadBlockingError: false };
+    const stageCounts = { completed: 0, skipped: 0, failed: 0, completedWithErrors: 0 };
 
-    const emitProgress = (running?: SingleResult[]) => {
+    const recordStage = (stage: ChainStageRecord) => {
+      stages.push(stage);
+      switch (stage.status) {
+        case "completed":
+          stageCounts.completed++;
+          break;
+        case "skipped":
+          stageCounts.skipped++;
+          break;
+        case "failed":
+          stageCounts.failed++;
+          break;
+        case "completed_with_errors":
+          stageCounts.completedWithErrors++;
+          break;
+      }
+    };
+
+    const chainDetails = () => ({
+      chainStageCount: chain.length,
+      chainCompletedCount: stageCounts.completed,
+      chainSkippedCount: stageCounts.skipped,
+      chainFailedCount: stageCounts.failed,
+      chainCompletedWithErrorsCount: stageCounts.completedWithErrors,
+    });
+
+    const emitProgress = (running?: IncrementalResultSlots) => {
       if (!onUpdate) return;
-      const displayedResults = running ? [...flattenedResults, ...running] : [...flattenedResults];
-      const runningText = running && running.length > 0
-        ? `, running ${running.map((r) => r.agent).join(", ")}...`
+      const runningSnapshot = running?.snapshot();
+      const displayedResults = runningSnapshot ? [...flattenedResults, ...runningSnapshot.results] : [...flattenedResults];
+      const runningText = runningSnapshot && runningSnapshot.results.length > 0
+        ? `, running ${runningSnapshot.results.map((result) => result.agent).join(", ")}...`
         : "";
       onUpdate({
         content: [
@@ -1313,13 +1845,16 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             text: `Chain: ${stages.length}/${chain.length} stages done${runningText}`,
           },
         ],
-        details: makeDetails("chain", {
-          chainStageCount: chain.length,
-          chainCompletedCount: countCompletedChainStages(stages),
-          chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-          chainFailedCount: countFailedChainStages(stages),
-          chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-        })(displayedResults),
+        details: makeDetails("chain", chainDetails())(displayedResults),
+      });
+    };
+
+    const emitChildProgress = (content: unknown, running: IncrementalResultSlots) => {
+      if (!onUpdate) return;
+      const runningSnapshot = running.snapshot();
+      onUpdate({
+        content,
+        details: makeDetails("chain", chainDetails())([...flattenedResults, ...runningSnapshot.results]),
       });
     };
 
@@ -1332,7 +1867,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       const continueOnError = stage.continueOnError ?? false;
 
       if (signal?.aborted) {
-        stages.push({
+        recordStage({
           label,
           type: stageType,
           status: "failed",
@@ -1346,19 +1881,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               text: `Chain aborted before stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
             },
           ],
-          details: makeDetails("chain", {
-            chainStageCount: chain.length,
-            chainCompletedCount: countCompletedChainStages(stages),
-            chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-            chainFailedCount: countFailedChainStages(stages),
-            chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-          })(flattenedResults),
+          details: makeDetails("chain", chainDetails())(flattenedResults),
           isError: true,
         };
       }
 
       if (!shouldRunStage(stage.condition, state)) {
-        stages.push({
+        recordStage({
           label,
           type: stageType,
           status: "skipped",
@@ -1371,7 +1900,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
 
       if (stageType === "parallel") {
         const parallel = stage as ChainParallelStage;
-        const runningResults: SingleResult[] = parallel.tasks.map((task) => ({
+        const runningSlots = new IncrementalResultSlots(parallel.tasks.map((task) => ({
           agent: task.agent,
           agentSource: "unknown" as const,
           task: buildChainTaskFromStages(task.task, stages),
@@ -1380,15 +1909,16 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           messages: [],
           stderr: "",
           usage: emptyUsage(),
+          accountingUsage: emptyAccountingUsage(),
           model: task.model,
-        }));
-        emitProgress(runningResults);
+        })));
+        emitProgress(runningSlots);
 
         const maybeStageResults = await mapConcurrent(
           parallel.tasks,
-          MAX_CONCURRENCY,
+          limits.maxConcurrency,
           async (task, taskIndex) => {
-            const result = await runAgent({
+            const result = await runScheduledAgent(schedulerHandle, {
               cwd: defaultCwd,
               agents,
               agentName: task.agent,
@@ -1402,6 +1932,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               trustedProjectRoots,
               deniedProjectRoots,
               forkSessionSnapshotJsonl,
+              forkSourceOwnership,
               parentSessionId,
               parentSessionFile,
               interactiveShutdownGeneration,
@@ -1412,35 +1943,28 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               signal,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
-                  runningResults[taskIndex] = partial.details.results[0];
-                  onUpdate?.({
-                    content: partial.content,
-                    details: makeDetails("chain", {
-                      chainStageCount: chain.length,
-                      chainCompletedCount: countCompletedChainStages(stages),
-                      chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-                      chainFailedCount: countFailedChainStages(stages),
-                      chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-                    })([...flattenedResults, ...runningResults]),
-                  });
+                  runningSlots.replace(taskIndex, partial.details.results[0]);
+                  emitChildProgress(partial.content, runningSlots);
                 }
               },
               makeDetails: makeDetails("chain"),
             });
-            runningResults[taskIndex] = result;
-            emitProgress(runningResults);
+            runningSlots.replace(taskIndex, result);
+            emitProgress(runningSlots);
             return result;
           },
           { signal },
         );
-        const stageResults = maybeStageResults.map((result, taskIndex) =>
-          result ?? makeUnstartedAbortResult(
+        const stageResults = maybeStageResults.map((result, taskIndex) => {
+          const stageResult = result ?? makeUnstartedAbortResult(
             parallel.tasks[taskIndex].agent,
             buildChainTaskFromStages(parallel.tasks[taskIndex].task, stages),
             label,
             parallel.tasks[taskIndex].model,
-          ),
-        );
+          );
+          runningSlots.replace(taskIndex, stageResult);
+          return stageResult;
+        });
 
         flattenedResults.push(...stageResults);
         const stageHasError = stageResults.some((result) => isResultError(result));
@@ -1449,7 +1973,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             ? "completed_with_errors"
             : "failed"
           : "completed";
-        stages.push({ label, type: "parallel", status, results: stageResults });
+        recordStage({ label, type: "parallel", status, results: stageResults });
         if (stageHasError) {
           state.hadError = true;
           if (continueOnError) state.hadCompletedWithErrors = true;
@@ -1465,13 +1989,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
               },
             ],
-            details: makeDetails("chain", {
-              chainStageCount: chain.length,
-              chainCompletedCount: countCompletedChainStages(stages),
-              chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-              chainFailedCount: countFailedChainStages(stages),
-              chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-            })(flattenedResults),
+            details: makeDetails("chain", chainDetails())(flattenedResults),
             isError: true,
           };
         }
@@ -1488,11 +2006,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         messages: [],
         stderr: "",
         usage: emptyUsage(),
+        accountingUsage: emptyAccountingUsage(),
         model: taskStage.model,
       };
-      emitProgress([runningResult]);
+      const runningSlots = new IncrementalResultSlots([runningResult]);
+      emitProgress(runningSlots);
 
-      const result = await runAgent({
+      const result = await runScheduledAgent(schedulerHandle, {
         cwd: defaultCwd,
         agents,
         agentName: taskStage.agent,
@@ -1506,6 +2026,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         trustedProjectRoots,
         deniedProjectRoots,
         forkSessionSnapshotJsonl,
+        forkSourceOwnership,
         parentSessionId,
         parentSessionFile,
         interactiveShutdownGeneration,
@@ -1516,21 +2037,14 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         signal,
         onUpdate: (partial) => {
           if (partial.details?.results[0]) {
-            onUpdate?.({
-              content: partial.content,
-              details: makeDetails("chain", {
-                chainStageCount: chain.length,
-                chainCompletedCount: countCompletedChainStages(stages),
-                chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-                chainFailedCount: countFailedChainStages(stages),
-                chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-              })([...flattenedResults, partial.details.results[0]]),
-            });
+            runningSlots.replace(0, partial.details.results[0]);
+            emitChildProgress(partial.content, runningSlots);
           }
         },
         makeDetails: makeDetails("chain"),
       });
 
+      runningSlots.replace(0, result);
       flattenedResults.push(result);
       const stageHasError = isResultError(result);
       const status: ChainStageStatus = stageHasError
@@ -1538,7 +2052,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           ? "completed_with_errors"
           : "failed"
         : "completed";
-      stages.push({ label, type: "chain", status, results: [result] });
+      recordStage({ label, type: "chain", status, results: [result] });
       if (stageHasError) {
         state.hadError = true;
         if (continueOnError) state.hadCompletedWithErrors = true;
@@ -1554,22 +2068,16 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
             },
           ],
-          details: makeDetails("chain", {
-            chainStageCount: chain.length,
-            chainCompletedCount: countCompletedChainStages(stages),
-            chainSkippedCount: stages.filter((stage) => stage.status === "skipped").length,
-            chainFailedCount: countFailedChainStages(stages),
-            chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-          })(flattenedResults),
+          details: makeDetails("chain", chainDetails())(flattenedResults),
           isError: true,
         };
       }
     }
 
-    const completed = countCompletedChainStages(stages);
-    const completedWithErrors = countCompletedWithErrorChainStages(stages);
-    const skipped = stages.filter((stage) => stage.status === "skipped").length;
-    const failed = countFailedChainStages(stages);
+    const completed = stageCounts.completed;
+    const completedWithErrors = stageCounts.completedWithErrors;
+    const skipped = stageCounts.skipped;
+    const failed = stageCounts.failed;
     return {
       content: [
         {
@@ -1577,13 +2085,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           text: `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}\n\n${formatChainStageSummaries(stages)}`,
         },
       ],
-      details: makeDetails("chain", {
-        chainStageCount: chain.length,
-        chainCompletedCount: completed,
-        chainSkippedCount: skipped,
-        chainFailedCount: countFailedChainStages(stages),
-        chainCompletedWithErrorsCount: countCompletedWithErrorChainStages(stages),
-      })(flattenedResults),
+      details: makeDetails("chain", chainDetails())(flattenedResults),
       isError: state.hadError || state.hadCompletedWithErrors ? true : undefined,
     };
   }
@@ -1604,44 +2106,41 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     signal: AbortSignal | undefined,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
+    schedulerHandle: SchedulerHandle,
+    forkSourceOwnership?: ForkSourceOwnershipManager,
   ) {
-    if (tasks.length > MAX_PARALLEL_TASKS) {
+    if (tasks.length > limits.maxParallelTasks) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Too many parallel tasks (${tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.` }],
         details: makeDetails("parallel")([]),
         isError: true,
       };
     }
 
-    // Initialize placeholder results for streaming
-    let allResults: SingleResult[] = tasks.map((t) => ({
-      agent: t.agent,
+    // Preserve one placeholder per task while scheduler-queued work has not started.
+    const resultSlots = new IncrementalResultSlots(tasks.map((task) => ({
+      agent: task.agent,
       agentSource: "unknown" as const,
-      task: t.task,
+      task: task.task,
       exitCode: -1,
       messages: [],
       stderr: "",
       usage: emptyUsage(),
-      model: t.model,
-    }));
+      accountingUsage: emptyAccountingUsage(),
+      model: task.model,
+    })));
 
     const emitProgress = () => {
       if (!onUpdate) return;
-      const running = allResults.filter((r) => r.exitCode === -1).length;
-      const done = allResults.filter((r) => r.exitCode !== -1).length;
+      const snapshot = resultSlots.snapshot();
       onUpdate({
         content: [
           {
             type: "text",
-            text: `Parallel: ${done}/${allResults.length} done, ${running} running...`,
+            text: `Parallel: ${snapshot.doneCount}/${snapshot.results.length} done, ${snapshot.runningCount} running...`,
           },
         ],
-        details: makeDetails("parallel")([...allResults]),
+        details: makeDetails("parallel")(snapshot.results),
       });
     };
 
@@ -1649,17 +2148,17 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     if (onUpdate) {
       emitProgress();
       heartbeat = setInterval(() => {
-        if (allResults.some((r) => r.exitCode === -1)) emitProgress();
-      }, PARALLEL_HEARTBEAT_MS);
+        if (resultSlots.hasRunning) emitProgress();
+      }, limits.parallelHeartbeatMs);
     }
 
     let results: SingleResult[];
     try {
       const maybeResults = await mapConcurrent(
         tasks,
-        MAX_CONCURRENCY,
+        limits.maxConcurrency,
         async (t, index) => {
-          const result = await runAgent({
+          const result = await runScheduledAgent(schedulerHandle, {
             cwd: defaultCwd,
             agents,
             agentName: t.agent,
@@ -1672,6 +2171,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             trustedProjectRoots,
             deniedProjectRoots,
             forkSessionSnapshotJsonl,
+            forkSourceOwnership,
             parentSessionId,
             parentSessionFile,
             interactiveShutdownGeneration,
@@ -1682,27 +2182,28 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             signal,
             onUpdate: (partial) => {
               if (partial.details?.results[0]) {
-                allResults[index] = partial.details.results[0];
+                resultSlots.replace(index, partial.details.results[0]);
                 emitProgress();
               }
             },
             makeDetails: makeDetails("parallel"),
           });
-          allResults[index] = result;
+          resultSlots.replace(index, result);
           emitProgress();
           return result;
         },
         { signal },
       );
-      results = maybeResults.map((result, index) =>
-        result ?? makeUnstartedAbortResult(tasks[index].agent, tasks[index].task, undefined, tasks[index].model),
-      );
-      allResults = results;
+      results = maybeResults.map((result, index) => {
+        const terminalResult = result ?? makeUnstartedAbortResult(tasks[index].agent, tasks[index].task, undefined, tasks[index].model);
+        resultSlots.replace(index, terminalResult);
+        return terminalResult;
+      });
     } finally {
       if (heartbeat) clearInterval(heartbeat);
     }
 
-    const successCount = results.filter((r) => isResultSuccess(r)).length;
+    const successCount = resultSlots.snapshot().successCount;
     const summaries = results.map((r) =>
       `[${r.agent}] ${isResultError(r) ? "failed" : "completed"}: ${getResultSummaryText(r)}`,
     );

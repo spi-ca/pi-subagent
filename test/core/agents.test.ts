@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { discoverAgents, formatInvalidAgentWarning, safeDiagnosticPath } from "../../src/core/agents";
 import {
   findNearestProjectAgentsDirWithinRoot,
   getProjectAgentConfigFilePath,
@@ -10,6 +11,23 @@ import {
 } from "../../src/core/project-agent-paths";
 
 describe("agent discovery", () => {
+  test("sanitizes agent warning paths and never accepts parser exception text", () => {
+    const filename = `bad-${String.fromCharCode(0x1b)}]8;;osc-target${String.fromCharCode(0x07)}-${String.fromCharCode(0x1b)}[31mansi-${String.fromCharCode(0x202e)}-${String.fromCharCode(1)}.md`;
+    const warning = formatInvalidAgentWarning(`/untrusted/${filename}`, true);
+    assert.match(warning, /invalid frontmatter/);
+    assert.equal(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(warning), false);
+    assert.equal(warning.includes("\\x1b]8;;osc-target\\x07"), true);
+    assert.equal(warning.includes("\\x1b[31mansi"), true);
+    assert.equal(formatInvalidAgentWarning.length, 1, "formatter accepts no parser exception argument");
+  });
+
+  test("escapes Unicode line separators in repository-controlled diagnostic paths", () => {
+    const sanitized = safeDiagnosticPath(`bad-${String.fromCharCode(0x2028)}-${String.fromCharCode(0x2029)}.md`);
+    assert.equal(/[\u2028\u2029]/.test(sanitized), false);
+    assert.equal(sanitized.includes("\\u2028"), true);
+    assert.equal(sanitized.includes("\\u2029"), true);
+  });
+
   test("does not include starter agent creation code", async () => {
     const agentsSource = await fs.readFile(
       path.join(process.cwd(), "src", "core", "agents.ts"),

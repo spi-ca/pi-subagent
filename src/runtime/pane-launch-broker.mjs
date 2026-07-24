@@ -9,7 +9,12 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createCmuxControlCommandRunner, getCmuxControlRequestManager } from "./cmux-control-adapter.mjs";
+import { TmuxControlClient, createTmuxControlCommandRunner } from "./tmux-control.mjs";
+import { MINIMUM_CMUX_VERSION, MINIMUM_TMUX_VERSION, isStableSemverAtLeast, isStableTmuxVersionAtLeast } from "./version-policy.mjs";
+import { recordPhase0LiveTelemetry } from "./phase0-live-telemetry.mjs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // UUID authority is string-only: RegExp.test() coerces arrays, objects, and
@@ -28,19 +33,64 @@ const parsePid = (value) => {
 };
 const stripFinalLineEnding = (value) => value.endsWith("\r\n") ? value.slice(0, -2) : value.endsWith("\n") ? value.slice(0, -1) : value;
 const parsePidOutput = (value) => parsePid(stripFinalLineEnding(value));
+function processStartedAt(pid) {
+  try {
+    if (process.platform === "linux") { const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8"); const close = stat.lastIndexOf(")"); const fields = stat.slice(close + 1).trim().split(/\s+/); const started = Number(fields[19]); return Number.isSafeInteger(started) && started > 0 ? started : null; }
+    if (process.platform === "darwin") {
+      const probe = spawnSync("/bin/ps", ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+      if (probe.status !== 0) return null;
+      const [stat, ...startedAtFields] = String(probe.stdout).trim().split(/\s+/); const state = stat?.[0]; const startedAtText = startedAtFields.join(" ");
+      if (!stat || !state || !new Set(["R", "S", "D", "I", "T", "U"]).has(state) || !/^[<NLs+]*$/.test(stat.slice(1))
+        || !/^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[1-9]|0[1-9]|[12][0-9]|3[01]) [0-2][0-9]:[0-5][0-9]:[0-5][0-9] [0-9]{4}$/.test(startedAtText)) return null;
+      // ps lstart omits a zone; use the same UTC canonicalization as the
+      // controller's run protocol so test checkpoint identity survives TZ.
+      const started = Date.parse(`${startedAtText} UTC`);
+      return Number.isFinite(started) && started > 0 ? started : null;
+    }
+  } catch {}
+  return null;
+}
+function tmuxGeneration(value) {
+  return value && exact(value, ["socketPath", "socketDev", "socketIno", "serverStartedAt"])
+    && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath)
+    && typeof value.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev)
+    && typeof value.socketIno === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketIno)
+    && Number.isFinite(value.serverStartedAt) && value.serverStartedAt > 0 ? value : null;
+}
+function sameTmuxGeneration(left, right) {
+  return Boolean(left && right && left.socketPath === right.socketPath && left.socketDev === right.socketDev && left.socketIno === right.socketIno && left.serverStartedAt === right.serverStartedAt);
+}
+function currentTmuxGeneration(generation, serverPid) {
+  // Deterministic broker fixtures may inject the live-generation proof. This
+  // seam is unavailable unless the explicit test harness marker is present.
+  if (process.env.PI_SUBAGENT_TEST_HARNESS === "1" && process.env.PI_SUBAGENT_TEST_TMUX_GENERATION === "1") return Boolean(tmuxGeneration(generation));
+  if (!tmuxGeneration(generation) || serverPid <= 0) return false;
+  try {
+    const resolved = path.join(fsSync.realpathSync.native(path.dirname(generation.socketPath)), path.basename(generation.socketPath));
+    const stat = fsSync.lstatSync(resolved, { bigint: true }), startedAt = processStartedAt(serverPid);
+    if (!stat.isSocket()) return false;
+    const current = resolved === generation.socketPath && stat.dev.toString() === generation.socketDev && stat.ino.toString() === generation.socketIno && startedAt === generation.serverStartedAt;
+    if (!current && process.env.PI_SUBAGENT_ACCEPTANCE_HARNESS === "1") console.error(`[pi-subagent acceptance broker] tmux generation mismatch: path=${resolved === generation.socketPath} dev=${stat.dev.toString() === generation.socketDev} ino=${stat.ino.toString() === generation.socketIno} started=${startedAt === generation.serverStartedAt}`);
+    return current;
+  } catch (error) {
+    if (process.env.PI_SUBAGENT_ACCEPTANCE_HARNESS === "1") console.error(`[pi-subagent acceptance broker] tmux generation probe error: ${error instanceof Error ? error.message : "unknown"}`);
+    return false;
+  }
+}
 function hasConsistentArgv() {
   // --project-root is accepted as an ignored compatibility argument from
   // parent processes loaded before executable path-policy removal.
   const valueFlags = new Set(["--run-dir", "--nonce", "--runtime", "--runtime-interpreter", "--backend", "--wrapper", "--project-root"]);
-  let verifyGateCount = 0, acceptanceCheckpointCount = 0;
+  let verifyGateCount = 0, acceptanceCheckpointCount = 0, acceptancePostallocationCheckpointCount = 0;
   for (let index = 2; index < process.argv.length; index += 1) {
     const value = process.argv[index];
     if (value === "--verify-gate") { verifyGateCount += 1; continue; }
     if (value === "--acceptance-preallocation-checkpoint") { acceptanceCheckpointCount += 1; continue; }
+    if (value === "--acceptance-postallocation-checkpoint") { acceptancePostallocationCheckpointCount += 1; continue; }
     if (!valueFlags.has(value) || index + 1 >= process.argv.length || process.argv[index + 1].startsWith("--")) return false;
     index += 1;
   }
-  return verifyGateCount <= 1 && acceptanceCheckpointCount <= 1;
+  return verifyGateCount <= 1 && acceptanceCheckpointCount <= 1 && acceptancePostallocationCheckpointCount <= 1;
 }
 function singleArg(name) {
   const positions = process.argv.flatMap((value, index) => value === name ? [index] : []);
@@ -69,6 +119,16 @@ const brokerRuntime = regularFile(expectedRuntime, true);
 const brokerInterpreter = regularFile(expectedRuntimeInterpreter, true);
 const backendPath = regularFile(expectedBackend, true);
 let backendMode = null;
+let protocolVersion = 2;
+const legacyCmuxHarness = process.env.PI_SUBAGENT_TEST_HARNESS === "1";
+// A detached broker has a separate process-owned UDS client. No cmux binary
+// is spawned for allocation, rollback, inspection, or gate checks.
+let cmuxCommand = null;
+let cmuxManager = null;
+let tmuxCommand = null;
+let tmuxManager = null;
+const cmuxBrokerOptions = { broker: true,
+  ...(process.env.PI_SUBAGENT_TEST_HARNESS === "1" ? { appVersionValidator: (identify) => isStableSemverAtLeast(identify?.app_version, MINIMUM_CMUX_VERSION) || identify?.app_bundle_path === "/Applications/cmux.app" } : {}) };
 const brokerEntrypoint = regularFile(path.resolve(process.argv[1] || ""), false);
 if (!brokerRuntime || !brokerInterpreter || !backendPath || !brokerEntrypoint || !regularFile(process.execPath, true)) process.exit(2);
 const rootDir = path.dirname(runDir);
@@ -82,10 +142,11 @@ const commandEnv = Object.fromEntries([
   ["HOME", process.env.HOME || os.homedir()],
   ["TMPDIR", process.env.TMPDIR || os.tmpdir()],
   ["TERM", process.env.TERM || "xterm-256color"],
-  ...["CMUX_SOCKET_PATH", "CMUX_SOCKET_CAPABILITY", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH", "TMUX", "TMUX_PANE"].flatMap((key) => typeof process.env[key] === "string" ? [[key, process.env[key]]] : []),
+  ...["CMUX_SOCKET_PATH", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH", "TMUX", "TMUX_PANE"].flatMap((key) => typeof process.env[key] === "string" ? [[key, process.env[key]]] : []),
   // The isolated test harness may pass a synthetic pane PID to its backend
   // fixture. It is never available to production verifier processes.
   ...(process.env.PI_SUBAGENT_TEST_HARNESS === "1" && typeof process.env.PI_SUBAGENT_TEST_TMUX_PANE_PID === "string" ? [["PI_SUBAGENT_TEST_TMUX_PANE_PID", process.env.PI_SUBAGENT_TEST_TMUX_PANE_PID]] : []),
+  ...(process.env.PI_SUBAGENT_TEST_HARNESS === "1" && typeof process.env.PI_SUBAGENT_TEST_TMUX_SERVER_PID === "string" ? [["PI_SUBAGENT_TEST_TMUX_SERVER_PID", process.env.PI_SUBAGENT_TEST_TMUX_SERVER_PID]] : []),
 ]);
 async function validateRunAuthority() {
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
@@ -110,14 +171,24 @@ async function validateRunAuthority() {
 }
 async function requireSafeRunAuthority() { await validateRunAuthority(); }
 
-async function readExact(file) {
+async function readBoundExact(file) {
+  let handle;
   try {
-    const text = await fs.readFile(file, "utf8");
-    if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) return null;
-    const value = JSON.parse(text.slice(0, -1));
-    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    handle = await fs.open(file, fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0));
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size <= 0n || before.size > 1024n * 1024n) return null;
+    const bytes = await handle.readFile(); const after = await handle.stat({ bigint: true }); const pathname = await fs.lstat(file, { bigint: true });
+    if (bytes.length !== Number(before.size) || bytes.at(-1) !== 0x0a || bytes.subarray(0, -1).includes(0x0a)
+      || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs
+      || pathname.isSymbolicLink() || pathname.dev !== after.dev || pathname.ino !== after.ino || pathname.size !== after.size || pathname.mtimeNs !== after.mtimeNs) return null;
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, -1)); const value = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? { value, digest: crypto.createHash("sha256").update(bytes).digest("hex") } : null;
   } catch { return null; }
+  finally { await handle?.close().catch(() => {}); }
 }
+async function readExact(file) { return (await readBoundExact(file))?.value ?? null; }
+async function exactDigest(file) { return (await readBoundExact(file))?.digest ?? null; }
 async function immutable(file, value) {
   await requireSafeRunAuthority();
   const tmp = path.join(runDir, `.${path.basename(file)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`);
@@ -170,84 +241,112 @@ function cmuxSourcePaneContainer(value) {
 function cmuxAllocatedContainer(value) { return cmuxPaneContainer(value); }
 function tmuxSource(value) {
   return value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).every((key) => ["socketPath", "sourcePaneId", "sourcePanePid", "serverPid"].includes(key))
+    && Object.keys(value).every((key) => ["socketPath", "sourcePaneId", "sourcePanePid", "serverPid", "generation"].includes(key))
     && typeof value.sourcePaneId === "string" && PANE.test(value.sourcePaneId)
     && Number.isSafeInteger(value.sourcePanePid) && value.sourcePanePid > 0
     && Number.isSafeInteger(value.serverPid) && value.serverPid > 0
-    && (value.socketPath === undefined || typeof value.socketPath === "string");
+    && (value.socketPath === undefined || typeof value.socketPath === "string")
+    && (value.generation === undefined || tmuxGeneration(value.generation));
 }
 function tmuxSourceContainer(value) {
   return value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "windowId", "paneId", "panePid"].includes(key))
+    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "windowId", "paneId", "panePid", "generation"].includes(key))
     && ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"].every((key) => Object.hasOwn(value, key))
     && value.kind === "tmux-source-pane" && (value.socketPath === undefined || typeof value.socketPath === "string")
     && Number.isSafeInteger(value.serverPid) && value.serverPid > 0
     && typeof value.sessionId === "string" && SESSION.test(value.sessionId)
     && typeof value.windowId === "string" && WINDOW.test(value.windowId)
     && typeof value.paneId === "string" && PANE.test(value.paneId)
-    && Number.isSafeInteger(value.panePid) && value.panePid > 0;
+    && Number.isSafeInteger(value.panePid) && value.panePid > 0
+    && (value.generation === undefined || tmuxGeneration(value.generation));
 }
 function tmuxSessionContainer(value) {
   return value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "sourceWindowId"].includes(key))
+    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "sourceWindowId", "generation"].includes(key))
     && ["kind", "serverPid", "sessionId", "sourceWindowId"].every((key) => Object.hasOwn(value, key))
     && value.kind === "tmux-session" && (value.socketPath === undefined || typeof value.socketPath === "string")
     && Number.isSafeInteger(value.serverPid) && value.serverPid > 0
     && typeof value.sessionId === "string" && SESSION.test(value.sessionId)
-    && typeof value.sourceWindowId === "string" && WINDOW.test(value.sourceWindowId);
+    && typeof value.sourceWindowId === "string" && WINDOW.test(value.sourceWindowId)
+    && (value.generation === undefined || tmuxGeneration(value.generation));
 }
 function intent(value) {
-  const base = value && value.version === 2 && typeof value.runId === "string" && value.runId === path.basename(runDir) && typeof value.parentSessionId === "string" && value.parentSessionId && Number.isSafeInteger(value.parentPid) && value.parentPid > 0 && Number.isFinite(value.parentStartedAt) && value.parentStartedAt > 0 && Number.isFinite(value.createdAt) && value.createdAt > 0 && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.brokerNonce === expectedNonce && value.runtimePath === brokerRuntime && value.runtimeInterpreterPath === brokerInterpreter && value.backendPath === backendPath && value.brokerEntrypoint === brokerEntrypoint;
+  const tmuxControlV3 = value?.version === 3 && value?.terminalMode === "tmux-pane";
+  const base = value && (value.version === 2 || tmuxControlV3) && typeof value.runId === "string" && value.runId === path.basename(runDir) && typeof value.parentSessionId === "string" && value.parentSessionId && Number.isSafeInteger(value.parentPid) && value.parentPid > 0 && Number.isFinite(value.parentStartedAt) && value.parentStartedAt > 0 && Number.isFinite(value.createdAt) && value.createdAt > 0 && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.brokerNonce === expectedNonce && value.runtimePath === brokerRuntime && value.runtimeInterpreterPath === brokerInterpreter && value.backendPath === backendPath && value.brokerEntrypoint === brokerEntrypoint;
   if (!base) return null;
   const baseKeys = ["version", "runId", ...(Object.hasOwn(value, "parentRunId") ? ["parentRunId"] : []), "parentSessionId", "parentPid", "parentStartedAt", "terminalMode", "source", "childSessionFile", "createdAt", "brokerNonce", "runtimePath", "runtimeInterpreterPath", "backendPath", "brokerEntrypoint"];
   if (Object.hasOwn(value, "parentRunId") && (typeof value.parentRunId !== "string" || !value.parentRunId)) return null;
   const layoutKeys = ["layout", "placement", "container"];
   const hasLayout = layoutKeys.some((key) => Object.hasOwn(value, key));
-  if (!exact(value, hasLayout ? [...baseKeys, ...layoutKeys] : baseKeys) || hasLayout && !layoutKeys.every((key) => Object.hasOwn(value, key))) return null;
+  const control = (candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    && Object.keys(candidate).every((key) => ["transport", "socketPath", "socketDev", "socketIno", "accessMode", "apiVersion", "appVersion", "identifyDigest", "bootIdentity"].includes(key))
+    && ["transport", "socketPath", "socketDev", "socketIno", "accessMode", "apiVersion", "appVersion", "identifyDigest"].every((key) => Object.hasOwn(candidate, key))
+    && candidate.transport === "cmux-control-v2" && typeof candidate.socketPath === "string" && path.isAbsolute(candidate.socketPath)
+    && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketDev) && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketIno)
+    && typeof candidate.accessMode === "string" && candidate.accessMode.length > 0 && candidate.apiVersion === 2 && typeof candidate.appVersion === "string" && isStableSemverAtLeast(candidate.appVersion, MINIMUM_CMUX_VERSION) && /^[a-f0-9]{64}$/.test(candidate.identifyDigest)
+    && (candidate.bootIdentity === undefined || typeof candidate.bootIdentity === "string");
+  const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
+  const transportKeys = tmuxControlV3 ? ["transport", "transportGatePath", "transportGateDigest"] : [];
+  const expected = hasLayout ? [...baseKeys, ...layoutKeys, ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys];
+  if (!exact(value, expected) || hasLayout && !layoutKeys.every((key) => Object.hasOwn(value, key))
+    || value.terminalMode === "cmux-pane" && ((!hasLayout && !legacyCmuxHarness) || requiresControl && !control(value.control))
+    || tmuxControlV3 && (value.transport !== "tmux-control-v1" || !artifactPathEquals(value.transportGatePath, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.transportGateDigest))) return null;
   const sourceValid = value.terminalMode === "cmux-pane"
     ? exact(value.source, ["workspaceId", "sourceSurfaceId"]) && isUuidString(value.source.workspaceId) && isUuidString(value.source.sourceSurfaceId)
     : value.terminalMode === "tmux-pane" && tmuxSource(value.source);
   if (!sourceValid) return null;
+  // New tmux authority is always generation-bound. Generation-less V2
+  // records remain parseable diagnostics in the parent, but this broker must
+  // never allocate or mutate from them.
+  if (value.terminalMode === "tmux-pane" && (!tmuxGeneration(value.source.generation) || value.source.socketPath !== value.source.generation.socketPath || (value.version === 3 && !hasLayout))) return null;
   if (!hasLayout) return value;
   if (value.terminalMode === "cmux-pane") {
     if (value.placement === "cmux-split" && ["auto", "split"].includes(value.layout) && cmuxSourceContainer(value.container)) return value;
     if (value.placement === "cmux-new-surface" && value.layout === "auto" && (cmuxPaneContainer(value.container) || cmuxSourcePaneContainer(value.container))) return value;
     return null;
   }
-  if (value.placement === "tmux-split" && value.layout === "split" && tmuxSourceContainer(value.container)) return value;
-  if (value.placement === "tmux-new-window" && value.layout === "auto" && tmuxSessionContainer(value.container)) return value;
+  if (value.placement === "tmux-split" && value.layout === "split" && tmuxSourceContainer(value.container)
+    && tmuxGeneration(value.container.generation) && sameTmuxGeneration(value.source.generation, value.container.generation)
+    && value.container.socketPath === value.source.socketPath && value.container.serverPid === value.source.serverPid) return value;
+  if (value.placement === "tmux-new-window" && value.layout === "auto" && tmuxSessionContainer(value.container)
+    && tmuxGeneration(value.container.generation) && sameTmuxGeneration(value.source.generation, value.container.generation)
+    && value.container.socketPath === value.source.socketPath && value.container.serverPid === value.source.serverPid) return value;
   return null;
 }
 function decision(value, runId) {
-  if (!value || value.version !== 2 || value.runId !== runId || !Number.isFinite(value.decidedAt) || value.decidedAt <= 0) return null;
+  if (!value || value.version !== protocolVersion || value.runId !== runId || !Number.isFinite(value.decidedAt) || value.decidedAt <= 0) return null;
   if (value.kind === "cancel" && exact(value, ["version", "runId", "kind", "decidedAt", "reason"]) && ["parent-abort", "ready-timeout", "commit-timeout"].includes(value.reason)) return value;
   if (value.kind === "commit" && exact(value, ["version", "runId", "kind", "decidedAt", "allocationPath", "launchPath"]) && artifactPathEquals(value.allocationPath, "allocation.json") && artifactPathEquals(value.launchPath, "launch.json")) return value;
   return null;
 }
 function tmuxTarget(value) {
   return value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).every((key) => ["socketPath", "serverPid", "paneId", "panePid"].includes(key))
+    && Object.keys(value).every((key) => ["socketPath", "serverPid", "paneId", "panePid", "generation"].includes(key))
     && typeof value.paneId === "string" && PANE.test(value.paneId)
     && Number.isSafeInteger(value.serverPid) && value.serverPid > 0
     && Number.isSafeInteger(value.panePid) && value.panePid > 0
-    && (value.socketPath === undefined || typeof value.socketPath === "string");
+    && (value.socketPath === undefined || typeof value.socketPath === "string") && (value.generation === undefined || tmuxGeneration(value.generation));
 }
 function tmuxWindowContainer(value) {
   return value && typeof value === "object" && !Array.isArray(value)
-    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "windowId", "paneId", "panePid"].includes(key))
+    && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "windowId", "paneId", "panePid", "generation"].includes(key))
     && ["kind", "serverPid", "sessionId", "windowId", "paneId", "panePid"].every((key) => Object.hasOwn(value, key))
     && value.kind === "tmux-window" && Number.isSafeInteger(value.serverPid) && value.serverPid > 0
     && typeof value.sessionId === "string" && SESSION.test(value.sessionId)
     && typeof value.windowId === "string" && WINDOW.test(value.windowId)
     && typeof value.paneId === "string" && PANE.test(value.paneId)
     && Number.isSafeInteger(value.panePid) && value.panePid > 0
-    && (value.socketPath === undefined || typeof value.socketPath === "string");
+    && (value.socketPath === undefined || typeof value.socketPath === "string") && (value.generation === undefined || tmuxGeneration(value.generation));
 }
 function allocation(value, runId) {
-  if (!value || value.version !== 2 || value.runId !== runId || !Number.isFinite(value.allocatedAt) || value.allocatedAt <= 0 || !value.target || typeof value.target !== "object") return null;
+  if (!value || value.version !== protocolVersion || value.runId !== runId || !Number.isFinite(value.allocatedAt) || value.allocatedAt <= 0 || !value.target || typeof value.target !== "object") return null;
   const hasLayout = ["layout", "placement", "container"].some((key) => Object.hasOwn(value, key));
   const baseKeys = ["version", "runId", "terminalMode", "target", "allocatedAt"];
-  if (!exact(value, hasLayout ? [...baseKeys, "layout", "placement", "container"] : baseKeys)) return null;
+  const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
+  const transportKeys = value.version === 3 ? ["transport", "intentDigest"] : [];
+  if (!exact(value, hasLayout ? [...baseKeys, "layout", "placement", "container", ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys])) return null;
+  if (value.version === 3 && (value.terminalMode !== "tmux-pane" || value.transport !== "tmux-control-v1" || typeof value.intentDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.intentDigest))) return null;
+  if (requiresControl && (!value.control || value.control.transport !== "cmux-control-v2" || !isStableSemverAtLeast(value.control.appVersion, MINIMUM_CMUX_VERSION))) return null;
   if (value.terminalMode === "cmux-pane" && exact(value.target, ["workspaceId", "surfaceId", "paneId"]) && isUuidString(value.target.workspaceId) && isUuidString(value.target.surfaceId) && isUuidString(value.target.paneId)) {
     if (!hasLayout) return value;
     return cmuxAllocatedContainer(value.container)
@@ -262,20 +361,23 @@ function allocation(value, runId) {
   return (value.placement === "tmux-split" && value.layout === "split" || value.placement === "tmux-new-window" && value.layout === "auto") ? value : null;
 }
 function launch(value, runId, terminalMode) {
-  return value && exact(value, ["version", "runId", "terminalMode", "allocationPath", "childSessionFile", "committedAt", "ownership"]) && value.version === 2 && value.runId === runId && value.terminalMode === terminalMode && artifactPathEquals(value.allocationPath, "allocation.json") && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.ownership === "parent-owned" && Number.isFinite(value.committedAt) && value.committedAt > 0 ? value : null;
+  const keys = ["version", "runId", "terminalMode", ...(protocolVersion === 3 ? ["transport"] : []), "allocationPath", ...(protocolVersion === 3 ? ["allocationDigest"] : []), "childSessionFile", "committedAt", "ownership"];
+  return value && exact(value, keys) && value.version === protocolVersion && value.runId === runId && value.terminalMode === terminalMode
+    && (protocolVersion !== 3 || value.transport === "tmux-control-v1" && typeof value.allocationDigest === "string" && /^[a-f0-9]{64}$/.test(value.allocationDigest))
+    && artifactPathEquals(value.allocationPath, "allocation.json") && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.ownership === "parent-owned" && Number.isFinite(value.committedAt) && value.committedAt > 0 ? value : null;
 }
 function gate(value, runId, terminalMode) {
-  return value && exact(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"]) && value.version === 2 && value.runId === runId && value.terminalMode === terminalMode && artifactPathEquals(value.launchPath, "launch.json") && Number.isFinite(value.publishedAt) && value.publishedAt > 0 ? value : null;
+  return value && exact(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"]) && value.version === protocolVersion && value.runId === runId && value.terminalMode === terminalMode && artifactPathEquals(value.launchPath, "launch.json") && Number.isFinite(value.publishedAt) && value.publishedAt > 0 ? value : null;
 }
 function targetFromAllocation(value) {
   return value.terminalMode === "cmux-pane"
     ? { mode: "cmux-pane", workspaceId: value.target.workspaceId, surfaceId: value.target.surfaceId, paneId: value.target.paneId }
-    : { mode: "tmux-pane", socketPath: value.target.socketPath, serverPid: value.target.serverPid, paneId: value.target.paneId, panePid: value.target.panePid };
+    : { mode: "tmux-pane", socketPath: value.target.socketPath, serverPid: value.target.serverPid, paneId: value.target.paneId, panePid: value.target.panePid, generation: value.target.generation };
 }
 function sameTarget(left, right) {
   return left.mode === right.mode && (left.mode === "cmux-pane"
     ? cmuxIdsEqual(left.workspaceId, right.workspaceId) && cmuxIdsEqual(left.surfaceId, right.surfaceId) && cmuxIdsEqual(left.paneId, right.paneId)
-    : left.socketPath === right.socketPath && left.serverPid === right.serverPid && left.paneId === right.paneId && left.panePid === right.panePid);
+    : left.socketPath === right.socketPath && left.serverPid === right.serverPid && left.paneId === right.paneId && left.panePid === right.panePid && sameTmuxGeneration(left.generation, right.generation));
 }
 function isTmuxSourceTarget(intentRecord, target) {
   // Pane IDs are the backend's allocation identity. A recycled or changed PID
@@ -293,6 +395,7 @@ function allocationMatchesIntentSource(intentRecord, allocationRecord) {
   const layoutIntent = Object.hasOwn(intentRecord, "layout"), layoutAllocation = Object.hasOwn(allocationRecord, "layout");
   if (layoutIntent !== layoutAllocation) return false;
   if (intentRecord.terminalMode === "cmux-pane") {
+    if (!legacyCmuxHarness && (!intentRecord.control || !allocationRecord.control || JSON.stringify(intentRecord.control) !== JSON.stringify(allocationRecord.control))) return false;
     const sourceMatches = cmuxIdsEqual(allocationRecord.target.workspaceId, intentRecord.source.workspaceId)
       && !cmuxIdsEqual(allocationRecord.target.surfaceId, intentRecord.source.sourceSurfaceId);
     if (!sourceMatches) return false;
@@ -312,27 +415,45 @@ function allocationMatchesIntentSource(intentRecord, allocationRecord) {
       && cmuxIdsEqual(request.workspaceId, allocationRecord.container.workspaceId)
       && cmuxIdsEqual(request.paneId, allocationRecord.container.paneId);
   }
-  const sourceMatches = allocationRecord.target.socketPath === intentRecord.source.socketPath
+  const sourceMatches = tmuxGeneration(intentRecord.source.generation) && tmuxGeneration(allocationRecord.target.generation)
+    && sameTmuxGeneration(intentRecord.source.generation, allocationRecord.target.generation)
+    && allocationRecord.target.socketPath === intentRecord.source.socketPath
     && allocationRecord.target.serverPid === intentRecord.source.serverPid
     && allocationRecord.target.paneId !== intentRecord.source.sourcePaneId;
   if (!sourceMatches) return false;
   if (!layoutIntent) return true;
-  if (intentRecord.layout !== allocationRecord.layout || intentRecord.placement !== allocationRecord.placement
+  if (!tmuxGeneration(allocationRecord.container.generation)
+    || !sameTmuxGeneration(intentRecord.source.generation, allocationRecord.container.generation)
+    || intentRecord.layout !== allocationRecord.layout || intentRecord.placement !== allocationRecord.placement
     || allocationRecord.container.socketPath !== allocationRecord.target.socketPath
     || allocationRecord.container.serverPid !== allocationRecord.target.serverPid
     || allocationRecord.container.paneId !== allocationRecord.target.paneId
     || allocationRecord.container.panePid !== allocationRecord.target.panePid) return false;
   if (intentRecord.placement === "tmux-split") {
     const request = intentRecord.container;
-    return request.kind === "tmux-source-pane" && request.socketPath === intentRecord.source.socketPath
+    return request.kind === "tmux-source-pane" && tmuxGeneration(request.generation)
+      && sameTmuxGeneration(intentRecord.source.generation, request.generation)
+      && request.socketPath === intentRecord.source.socketPath
       && request.serverPid === intentRecord.source.serverPid && request.paneId === intentRecord.source.sourcePaneId
       && request.panePid === intentRecord.source.sourcePanePid
       && allocationRecord.container.sessionId === request.sessionId && allocationRecord.container.windowId === request.windowId;
   }
   const request = intentRecord.container;
-  return request.kind === "tmux-session" && request.socketPath === intentRecord.source.socketPath
+  return request.kind === "tmux-session" && tmuxGeneration(request.generation)
+    && sameTmuxGeneration(intentRecord.source.generation, request.generation)
+    && request.socketPath === intentRecord.source.socketPath
     && request.serverPid === intentRecord.source.serverPid && allocationRecord.container.sessionId === request.sessionId
     && allocationRecord.container.windowId !== request.sourceWindowId;
+}
+async function validV3Chain(i, a, l) {
+  if (i.version !== 3) return true;
+  const [gateArtifact, intentArtifact, allocationArtifact, launchArtifact] = await Promise.all([
+    readBoundExact(i.transportGatePath), readBoundExact(p("launch-intent.json")), readBoundExact(p("allocation.json")), readBoundExact(p("launch.json")),
+  ]);
+  return gateArtifact?.digest === i.transportGateDigest
+    && intentArtifact?.digest === a?.intentDigest && JSON.stringify(intentArtifact?.value) === JSON.stringify(i)
+    && a?.transport === "tmux-control-v1" && allocationArtifact?.digest === l?.allocationDigest && JSON.stringify(allocationArtifact?.value) === JSON.stringify(a)
+    && l?.transport === "tmux-control-v1" && JSON.stringify(launchArtifact?.value) === JSON.stringify(l);
 }
 function validStateDependencies(allocationRecord, decisionRecord, launchRecord, gateRecord) {
   if (decisionRecord?.kind === "commit" && !allocationRecord) return false;
@@ -342,13 +463,14 @@ function validStateDependencies(allocationRecord, decisionRecord, launchRecord, 
   return true;
 }
 async function residualRisk(runId) {
-  await immutable(p("residual-risk.json"), { version: 2, runId, reason: "possible-unrecorded-allocation", recordedAt: now() }).catch(() => {});
+  recordPhase0LiveTelemetry(backendMode === "tmux-pane" ? "tmux" : "cmux", "residualRecovery", 1, "broker");
+  await immutable(p("residual-risk.json"), { version: protocolVersion, runId, reason: "possible-unrecorded-allocation", recordedAt: now() }).catch(() => {});
 }
 async function status(runId, phase, errorCode) {
   // Residual risk is immutable and authoritative: no later broker status can
   // make an uncertain allocation look committed or safe to delete.
   if (phase !== "failed" && await readExact(p("residual-risk.json"))) return;
-  const value = { version: 2, runId, writer: "broker", pid: process.pid, phase, updatedAt: now(), ...(errorCode ? { errorCode } : {}) };
+  const value = { version: protocolVersion, runId, writer: "broker", pid: process.pid, phase, updatedAt: now(), ...(errorCode ? { errorCode } : {}) };
   await replace(p("broker-status.json"), value).catch(() => {});
 }
 async function riskAndFail(runId) { await residualRisk(runId); await status(runId, "failed", "possible-unrecorded-allocation"); }
@@ -359,25 +481,27 @@ async function rollback(target, intentRecord) {
   if (target.mode === "cmux-pane") {
     // A surface can move workspaces. Establish both presence and its current
     // canonical workspace from one strict global topology before mutating.
-    const before = await command(backendPath, ["--json", "--id-format", "both", "tree", "--all"]);
+    const before = await cmuxCommand(["--json", "--id-format", "both", "tree", "--all"]);
     const current = before.code === 0 ? canonicalCmuxSurface(parseCanonicalCmuxTopology(before.stdout), target.surfaceId) : null;
     if (current === false) return true;
     if (!current) return false;
-    await command(backendPath, ["close-surface", "--workspace", current.workspaceId, "--surface", current.surfaceId]);
-    const after = await command(backendPath, ["--json", "--id-format", "both", "tree", "--all"]);
+    await cmuxCommand(["close-surface", "--workspace", current.workspaceId, "--surface", current.surfaceId]);
+    const after = await cmuxCommand(["--json", "--id-format", "both", "tree", "--all"]);
     return after.code === 0 && canonicalCmuxSurface(parseCanonicalCmuxTopology(after.stdout), target.surfaceId) === false;
   }
   // A pane id can be recycled after server restart. Prove the complete target
   // fingerprint before issuing even a guarded mutation; malformed or duplicate
   // unrelated rows are ambiguous and therefore suppress the command.
+  if (!tmuxGeneration(target.generation) || !currentTmuxGeneration(target.generation, target.serverPid)) return false;
   const socket = target.socketPath ? ["-S", target.socketPath] : [];
-  const before = await command(backendPath, [...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
+  const runTmux = tmuxCommand ?? (async (args) => await command(backendPath, args));
+  const before = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
   const fingerprint = before.code === 0 ? parseTmuxPanePidList(before.stdout, target.paneId) : null;
   if (fingerprint === false) return true;
   if (fingerprint !== target.panePid) return false;
   const condition = `#{&&:#{==:#{pid},${target.serverPid}},#{==:#{pane_pid},${target.panePid}}}`;
-  await command(backendPath, [...socket, "if-shell", "-F", "-t", target.paneId, condition, `kill-pane -t ${target.paneId}`, ""]);
-  const after = await command(backendPath, [...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
+  await runTmux([...socket, "if-shell", "-F", "-t", target.paneId, condition, `kill-pane -t ${target.paneId}`, "display-message -p -l pi-subagent-guard-noop"]);
+  const after = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
   return after.code === 0 && parseTmuxPanePidList(after.stdout, target.paneId) === false;
 }
 function parseCanonicalCmuxTopology(stdout) {
@@ -443,7 +567,7 @@ async function allocateCmux(i) {
   const layout = Object.hasOwn(i, "layout");
   // Every allocation captures one strict, global pre-mutation topology. It is
   // both source authority and the novelty baseline for returned identities.
-  const treeResult = await command(backendPath, ["--json", "--id-format", "both", "tree", "--all"]);
+  const treeResult = await cmuxCommand(["--json", "--id-format", "both", "tree", "--all"]);
   const topology = treeResult.code === 0 ? parseCanonicalCmuxTopology(treeResult.stdout) : null;
   const sourcePane = topology && canonicalCmuxSourcePane(topology, i.source.workspaceId, i.source.sourceSurfaceId);
   if (!topology || !sourcePane) throw new Error("cmux source topology changed before allocation");
@@ -462,7 +586,7 @@ async function allocateCmux(i) {
   }
   if (split) args = ["--json", "--id-format", "both", "new-split", "right", "--workspace", i.source.workspaceId, "--surface", i.source.sourceSurfaceId, "--focus", "false"];
   else args = ["--json", "--id-format", "both", "new-surface", "--type", "terminal", "--workspace", i.container.workspaceId, "--pane", requestedPaneId, "--working-directory", path.dirname(i.childSessionFile), "--focus", "false"];
-  const result = await command(backendPath, args);
+  const result = await cmuxCommand(args);
   const value = cmuxResponseValue(result.stdout);
   const exact = value && isUuidString(value.workspace_id) && isUuidString(value.surface_id) && isUuidString(value.pane_id)
     && cmuxIdsEqual(value.workspace_id, i.source.workspaceId)
@@ -530,15 +654,17 @@ function parseTmuxCreatedPane(stdout, layout, sessionId) {
 }
 async function allocateTmux(i) {
   const source = i.source, socket = socketArgs(source.socketPath), layout = Object.hasOwn(i, "layout");
+  const runTmux = tmuxCommand ?? (async (args) => await command(backendPath, args));
+  if (!tmuxGeneration(source.generation) || source.socketPath !== source.generation.socketPath || !currentTmuxGeneration(source.generation, source.serverPid)) throw new Error("tmux generation changed before allocation");
   const shellHome = await safeTmuxShellHome();
   if (!shellHome) throw new Error("tmux private shell home is unsafe");
-  const server = await command(backendPath, [...socket, "display-message", "-p", "#{pid}"]);
+  const server = await runTmux([...socket, "display-message", "-p", "#{pid}"]);
   if (server.code || parsePidOutput(server.stdout) !== source.serverPid) throw new Error("tmux server identity changed before allocation");
   let request = null;
   const sessionFirst = layout && i.placement === "tmux-new-window";
   // One strict, complete pre-allocation snapshot preserves every pane ID and
   // fingerprint; a returned pane must be absent from this map.
-  const panes = await command(backendPath, [...socket, "list-panes", "-a", "-F", sessionFirst ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{session_id}|#{window_id}|#{pane_pid}"]);
+  const panes = await runTmux([...socket, "list-panes", "-a", "-F", sessionFirst ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{session_id}|#{window_id}|#{pane_pid}"]);
   const topology = panes.code ? null : parseTmuxTopologyFingerprint(panes.stdout, source.sourcePaneId, sessionFirst);
   const fingerprint = topology?.source;
   if (!fingerprint || fingerprint.panePid !== source.sourcePanePid) throw new Error("tmux source pane fingerprint changed before allocation");
@@ -567,7 +693,7 @@ async function allocateTmux(i) {
   const allocationArgs = layout && i.placement === "tmux-new-window"
     ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", "subagent:broker", "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
     : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}\t#{pane_pid}", "-t", source.sourcePaneId, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
-  const result = await command(backendPath, allocationArgs);
+  const result = await runTmux(allocationArgs);
   // A complete response stays rollback authority even on nonzero. Parse it
   // before status handling; malformed nonzero output never authorizes mutation.
   const created = parseTmuxCreatedPane(result.stdout, layout, layout && i.placement === "tmux-new-window" ? request.sessionId : request?.sessionId);
@@ -582,7 +708,7 @@ async function allocateTmux(i) {
   // IDs are similarly unowned and must never reach rollback.
   if (created.paneId === source.sourcePaneId || topology.panes.has(created.paneId)) throw new Error("tmux possible-unrecorded-allocation");
   return {
-    mode: "tmux-pane", socketPath: source.socketPath, serverPid: source.serverPid, paneId: created.paneId, panePid: created.panePid,
+    mode: "tmux-pane", socketPath: source.socketPath, serverPid: source.serverPid, paneId: created.paneId, panePid: created.panePid, generation: source.generation,
     ...(layout ? { sessionId: created.sessionId, windowId: created.windowId } : {}),
     ...(result.code ? { allocationFailed: true, allocationError: result.stderr || result.stdout || "tmux allocation failed" } : {}),
   };
@@ -605,18 +731,106 @@ async function awaitAcceptanceHandoff(intentRecord) {
   }
   return false;
 }
+function acceptancePostallocationCheckpointEnabled() {
+  return process.argv.includes("--acceptance-postallocation-checkpoint") && process.env.PI_SUBAGENT_ACCEPTANCE_HARNESS === "1";
+}
+function startAcceptanceCheckpointWatchdog(identity) {
+  // A stopped test broker cannot run its own timer. A separate, identity-bound
+  // watchdog eventually resumes it, so an interrupted acceptance controller
+  // retains the normal durable-publication recovery path. It verifies the
+  // broker start identity again before SIGCONT, preventing PID-reuse signals.
+  const script = `const fs=require("node:fs"),{spawnSync}=require("node:child_process");const [pidText,startedText,file]=process.argv.slice(1);const pid=Number(pidText),started=Number(startedText);const current=()=>{try{if(process.platform==="linux"){const s=fs.readFileSync("/proc/"+pid+"/stat","utf8"),i=s.lastIndexOf(")"),f=s.slice(i+1).trim().split(/\\s+/);return Number(f[19])}const r=spawnSync("/bin/ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8"});return r.status===0?Date.parse(String(r.stdout).trim()+" UTC"):null}catch{return null}};setTimeout(()=>{try{const v=JSON.parse(fs.readFileSync(file,"utf8"));if(v&&v.broker&&v.broker.pid===pid&&v.broker.startedAt===started&&current()===started)process.kill(pid,"SIGCONT")}catch{}},5000);`;
+  const watchdog = spawn(process.execPath, ["-e", script, String(identity.pid), String(identity.startedAt), p("acceptance-allocation-checkpoint.json")], { detached: true, stdio: "ignore" });
+  watchdog.unref();
+}
+async function stopAtAcceptancePostallocationCheckpoint(intentRecord, candidate, brokerStartedAt) {
+  if (!acceptancePostallocationCheckpointEnabled()) return "disabled";
+  const checkpoint = {
+    version: 1, runId: intentRecord.runId, brokerNonce: expectedNonce,
+    broker: { pid: process.pid, startedAt: brokerStartedAt, expectedCommand: "pane-launch-broker.mjs", runId: intentRecord.runId },
+    allocation: candidate,
+  };
+  const publication = await immutable(p("acceptance-allocation-checkpoint.json"), checkpoint);
+  if (publication !== "published") throw new Error("acceptance postallocation checkpoint unavailable");
+  startAcceptanceCheckpointWatchdog(checkpoint.broker);
+  process.kill(process.pid, "SIGSTOP");
+  return "stopped";
+}
+async function validateTmuxControlGate(intentRecord, allowAdditionalPanes = false) {
+  const gateArtifact = await readBoundExact(intentRecord.transportGatePath);
+  const gateRecord = gateArtifact?.value;
+  const gateKeys = ["version", "runId", "selectedTransport", "fixtureContractId", "pinnedSourceCommit", "executableGeneration", "probeRecipeId", "probeResult", "probeDigestAlgorithm", "probeDigest", "canonicalSocketPath", "socketDev", "socketIno", "serverStartedAt", "createdAt"];
+  if (!gateRecord || !exact(gateRecord, gateKeys) || gateRecord.version !== 1 || gateRecord.runId !== intentRecord.runId
+    || gateRecord.selectedTransport !== "tmux-control-v1" || gateRecord.fixtureContractId !== "tmux-control-v1"
+    || gateRecord.pinnedSourceCommit !== "e802909de06012a4df6209d55e86487c56223163" || gateRecord.probeRecipeId !== "tmux-control-readonly-v1"
+    || gateRecord.probeDigestAlgorithm !== "sha256" || typeof gateRecord.probeDigest !== "string" || !/^[a-f0-9]{64}$/.test(gateRecord.probeDigest)
+    || gateRecord.canonicalSocketPath !== intentRecord.source.socketPath || gateRecord.serverStartedAt !== intentRecord.source.generation.serverStartedAt) return false;
+  const generation = gateRecord.executableGeneration;
+  if (!generation || !exact(generation, ["realpath", "dev", "ino", "size", "mtimeNs", "ctimeNs"]) || generation.realpath !== backendPath) return false;
+  try {
+    const executableStat = fsSync.statSync(backendPath, { bigint: true });
+    const canonicalSocketPath = path.join(fsSync.realpathSync.native(path.dirname(gateRecord.canonicalSocketPath)), path.basename(gateRecord.canonicalSocketPath));
+    const socketStat = fsSync.lstatSync(canonicalSocketPath, { bigint: true });
+    if (!executableStat.isFile() || !socketStat.isSocket() || canonicalSocketPath !== gateRecord.canonicalSocketPath
+      || String(executableStat.dev) !== generation.dev || String(executableStat.ino) !== generation.ino || String(executableStat.size) !== generation.size || String(executableStat.mtimeNs) !== generation.mtimeNs || String(executableStat.ctimeNs) !== generation.ctimeNs
+      || Number(socketStat.dev) !== gateRecord.socketDev || Number(socketStat.ino) !== gateRecord.socketIno
+      || processStartedAt(intentRecord.source.serverPid) !== gateRecord.serverStartedAt) return false;
+  } catch { return false; }
+  const probe = gateRecord.probeResult;
+  if (!probe || !exact(probe, ["detectedTmuxVersion", "serverPid", "attachedSessionId", "sourcePaneId", "sourcePanePid", "paneRows"])
+    || typeof probe.detectedTmuxVersion !== "string" || !isStableTmuxVersionAtLeast(probe.detectedTmuxVersion, MINIMUM_TMUX_VERSION)
+    || probe.serverPid !== intentRecord.source.serverPid || probe.sourcePaneId !== intentRecord.source.sourcePaneId || probe.sourcePanePid !== intentRecord.source.sourcePanePid
+    || probe.attachedSessionId !== intentRecord.container.sessionId || !Array.isArray(probe.paneRows)) return false;
+  const canonicalProbe = `${JSON.stringify({ detectedTmuxVersion: probe.detectedTmuxVersion, serverPid: probe.serverPid, attachedSessionId: probe.attachedSessionId, sourcePaneId: probe.sourcePaneId, sourcePanePid: probe.sourcePanePid, paneRows: probe.paneRows })}\n`;
+  if (crypto.createHash("sha256").update(canonicalProbe).digest("hex") !== gateRecord.probeDigest) return false;
+  const [identity, panes] = await Promise.all([
+    command(backendPath, ["-S", gateRecord.canonicalSocketPath, "display-message", "-p", "-t", probe.sourcePaneId, "#{pid}|#{session_id}|#{pane_id}|#{pane_pid}"]),
+    command(backendPath, ["-S", gateRecord.canonicalSocketPath, "list-panes", "-a", "-F", "#{session_id}|#{pane_id}|#{pane_pid}"]),
+  ]);
+  if (identity.code !== 0 || panes.code !== 0 || !identity.stdout.endsWith("\n") || identity.stdout.includes("\r") || identity.stdout.slice(0, -1).includes("\n")
+    || !panes.stdout.endsWith("\n") || panes.stdout.includes("\r") || panes.stdout.slice(0, -1).endsWith("\n")) return false;
+  const identityFields = identity.stdout.slice(0, -1).split("|");
+  if (identityFields.length !== 4 || !/^[1-9][0-9]*$/.test(identityFields[0]) || !/^\$[0-9]+$/.test(identityFields[1]) || !/^%[0-9]+$/.test(identityFields[2]) || !/^[1-9][0-9]*$/.test(identityFields[3])
+    || !Number.isSafeInteger(Number(identityFields[0])) || !Number.isSafeInteger(Number(identityFields[3]))) return false;
+  const rowFields = panes.stdout.slice(0, -1).split("\n").map((line) => line.split("|"));
+  if (rowFields.length === 0 || rowFields.some((fields) => fields.length !== 3 || !/^\$[0-9]+$/.test(fields[0]) || !/^%[0-9]+$/.test(fields[1]) || !/^[1-9][0-9]*$/.test(fields[2]))) return false;
+  const currentRows = rowFields.map(([sessionId, paneId, panePid]) => ({ sessionId, paneId, panePid: Number(panePid) }));
+  if (currentRows.some((row) => !Number.isSafeInteger(row.panePid)) || new Set(currentRows.map((row) => `${row.sessionId}\0${row.paneId}`)).size !== currentRows.length) return false;
+  currentRows.sort((left, right) => Number(left.sessionId.slice(1)) - Number(right.sessionId.slice(1)) || Number(left.paneId.slice(1)) - Number(right.paneId.slice(1)) || left.panePid - right.panePid);
+  const rowsMatch = allowAdditionalPanes
+    ? probe.paneRows.every((expected) => currentRows.some((current) => current.sessionId === expected.sessionId && current.paneId === expected.paneId && current.panePid === expected.panePid))
+    : JSON.stringify(currentRows) === JSON.stringify(probe.paneRows);
+  return identityFields.length === 4 && Number(identityFields[0]) === probe.serverPid && identityFields[1] === probe.attachedSessionId && identityFields[2] === probe.sourcePaneId && Number(identityFields[3]) === probe.sourcePanePid
+    && rowsMatch && gateArtifact.digest === intentRecord.transportGateDigest;
+}
+
 async function main() {
   try { await validateRunAuthority(); } catch { process.exitCode = 2; return; }
-  const i = intent(await readExact(p("launch-intent.json")));
+  const intentArtifact = await readBoundExact(p("launch-intent.json"));
+  const i = intent(intentArtifact?.value);
   if (!i) { await status("unknown", "failed", "intent-invalid"); return; }
   backendMode = i.terminalMode;
+  protocolVersion = i.version;
+  if (i.version === 3) {
+    if (!await validateTmuxControlGate(i)) { await status(i.runId, "failed", "intent-invalid"); return; }
+    tmuxManager = new TmuxControlClient({ executable: backendPath, socketPath: i.source.socketPath, sessionId: i.container.sessionId });
+    try { await tmuxManager.start(); } catch { await status(i.runId, "failed", "intent-invalid"); return; }
+    const controlRun = createTmuxControlCommandRunner(tmuxManager, i.source.socketPath);
+    tmuxCommand = async (args, options) => { const result = await controlRun(args, options); return { ...result, code: result.exitCode }; };
+  }
+  if (i.terminalMode === "cmux-pane") {
+    if (legacyCmuxHarness) cmuxCommand = async (args) => await command(backendPath, args);
+    else { cmuxManager = getCmuxControlRequestManager({ ...cmuxBrokerOptions, expectedControl: i.control }); cmuxCommand = createCmuxControlCommandRunner({ manager: cmuxManager }); }
+  }
   if (regularFile(i.backendPath, true) !== backendPath) { await status(i.runId, "failed", "intent-invalid"); return; }
   // A valid immutable decision is a completed checkpoint. A later broker must
   // not regress status or allocate another target, regardless of its kind.
   if (decision(await readExact(p("decision.json")), i.runId)) return;
   // The first immutable claim fences allocation. A duplicate process exits
   // silently; it must not overwrite the winning broker's status or risk state.
-  const claim = { version: 2, runId: i.runId, brokerNonce: expectedNonce, pid: process.pid, claimedAt: now() };
+  const brokerStartedAt = processStartedAt(process.pid);
+  if (brokerStartedAt === null) { await status(i.runId, "failed", "authority-mismatch"); return; }
+  const claim = { version: protocolVersion, runId: i.runId, brokerNonce: expectedNonce, pid: process.pid, brokerStartedAt, claimedAt: now() };
   if (await immutable(p("broker-claim.json"), claim) !== "published") return;
   if (decision(await readExact(p("decision.json")), i.runId)) return;
   await status(i.runId, "ready");
@@ -629,6 +843,7 @@ async function main() {
   }
   let target;
   try { target = i.terminalMode === "cmux-pane" ? await allocateCmux(i) : await allocateTmux(i); } catch (error) {
+    if (process.env.PI_SUBAGENT_ACCEPTANCE_HARNESS === "1") console.error(`[pi-subagent acceptance broker] allocation failed: ${error instanceof Error ? error.message : "unknown"}`);
     // Successful allocation with no canonical identity cannot be safely
     // rediscovered. Keep the intent/status for manual recovery.
     if (error?.message === "tmux possible-unrecorded-allocation" || error?.message === "tmux allocation reused source pane" || error?.message === "tmux split changed source container" || error?.message === "cmux possible-unrecorded-allocation" || error?.message === "cmux allocation reused source surface") await riskAndFail(i.runId);
@@ -636,18 +851,32 @@ async function main() {
     return;
   }
   const candidate = i.terminalMode === "cmux-pane"
-    ? { version: 2, runId: i.runId, terminalMode: i.terminalMode,
-      ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "cmux-pane", workspaceId: target.workspaceId, paneId: target.paneId } } : {}),
+    ? { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
+      ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "cmux-pane", workspaceId: target.workspaceId, paneId: target.paneId }, control: i.control } : {}),
       target: { workspaceId: target.workspaceId, surfaceId: target.surfaceId, paneId: target.paneId }, allocatedAt: now() }
-    : { version: 2, runId: i.runId, terminalMode: i.terminalMode,
-      ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "tmux-window", socketPath: target.socketPath, serverPid: target.serverPid, sessionId: target.sessionId, windowId: target.windowId, paneId: target.paneId, panePid: target.panePid } } : {}),
-      target: { socketPath: target.socketPath, serverPid: target.serverPid, paneId: target.paneId, panePid: target.panePid }, allocatedAt: now() };
+    : { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
+      ...(protocolVersion === 3 ? { transport: "tmux-control-v1", intentDigest: intentArtifact.digest } : {}),
+      ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "tmux-window", socketPath: target.socketPath, serverPid: target.serverPid, sessionId: target.sessionId, windowId: target.windowId, paneId: target.paneId, panePid: target.panePid, generation: target.generation } } : {}),
+      target: { socketPath: target.socketPath, serverPid: target.serverPid, paneId: target.paneId, panePid: target.panePid, generation: target.generation }, allocatedAt: now() };
   if (!allocationMatchesIntentSource(i, candidate)) {
     // A target equal to the source is parent-owned and must never be closed.
     if (!isSourceTarget(i, target)) {
       try { await rollback(target, i); } catch { /* residual risk is authoritative below */ }
     }
     await riskAndFail(i.runId);
+    return;
+  }
+  // Acceptance-only response-to-record kill window. The exact parsed
+  // candidate and PID/start/run binding are fsync-published before SIGSTOP;
+  // production never enters this branch. A watchdog resumes an abandoned
+  // checkpoint so the usual allocation publication/rollback path recovers.
+  try {
+    await stopAtAcceptancePostallocationCheckpoint(i, candidate, brokerStartedAt);
+  } catch {
+    let absent = false;
+    try { absent = await rollback(target, i); } catch { /* residual risk below */ }
+    if (absent) await status(i.runId, "failed", "allocation-failed");
+    else await residualRisk(i.runId);
     return;
   }
   if (target.allocationFailed) {
@@ -708,7 +937,7 @@ async function main() {
     durable = winner;
     target = winnerTarget;
   }
-  const commit = { version: 2, runId: i.runId, kind: "commit", decidedAt: now(), allocationPath: p("allocation.json"), launchPath: p("launch.json") };
+  const commit = { version: protocolVersion, runId: i.runId, kind: "commit", decidedAt: now(), allocationPath: p("allocation.json"), launchPath: p("launch.json") };
   let decided = decision(await readExact(p("decision.json")), i.runId);
   if (!decided) {
     await immutable(p("decision.json"), commit);
@@ -722,7 +951,9 @@ async function main() {
     else await status(i.runId, "failed", "commit-failed");
     return;
   }
-  const committed = { version: 2, runId: i.runId, terminalMode: i.terminalMode, allocationPath: p("allocation.json"), childSessionFile: i.childSessionFile, committedAt: now(), ownership: "parent-owned" };
+  const committed = { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
+    ...(protocolVersion === 3 ? { transport: "tmux-control-v1", allocationDigest: await exactDigest(p("allocation.json")) } : {}),
+    allocationPath: p("allocation.json"), childSessionFile: i.childSessionFile, committedAt: now(), ownership: "parent-owned" };
   if (await immutable(p("launch.json"), committed) !== "published" && !launch(await readExact(p("launch.json")), i.runId, i.terminalMode)) {
     await riskAndFail(i.runId); return;
   }
@@ -735,20 +966,32 @@ async function verifyCmuxGateTarget(a) {
   // authority is not restored until the wrapper starts after this verifier.
   return cmuxIdsEqual(process.env.CMUX_WORKSPACE_ID, a.target.workspaceId) && cmuxIdsEqual(process.env.CMUX_SURFACE_ID, a.target.surfaceId);
 }
-async function verifyTmuxGateTarget(a) {
+async function verifyTmuxGateTarget(a, intentRecord) {
   // A direct argv split preserves its initial pane PID across exec. A
   // non-exec shebang wrapper leaves the verifier as its one child instead.
   // Do not permit further ancestry: only the allocated pane process itself
   // or its direct child may claim this immutable target.
   if (process.pid !== a.target.panePid && process.ppid !== a.target.panePid) return false;
+  if (!tmuxGeneration(a.target.generation) || !currentTmuxGeneration(a.target.generation, a.target.serverPid)) return false;
   const socket = socketArgs(a.target.socketPath);
-  const server = await command(backendPath, [...socket, "display-message", "-p", "#{pid}"], 2_000);
+  const runTmux = tmuxCommand ?? (async (args) => await command(backendPath, args, 2_000));
+  const server = await runTmux([...socket, "display-message", "-p", "#{pid}"]);
   if (server.code || parsePidOutput(server.stdout) !== a.target.serverPid) return false;
   // A locale-free tmux client may sanitize control-character separators such
   // as tab to `_`. Pane IDs and decimal PIDs cannot contain `|`.
-  const panes = await command(backendPath, [...socket, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"], 2_000);
+  const panes = await runTmux([...socket, "list-panes", "-a", "-F", intentRecord.version === 3 ? "#{session_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{pane_pid}"]);
   if (panes.code !== 0) return false;
-  return parseTmuxPipePanePidList(panes.stdout, a.target.paneId) === a.target.panePid;
+  if (intentRecord.version !== 3) return parseTmuxPipePanePidList(panes.stdout, a.target.paneId) === a.target.panePid;
+  const rows = stripFinalLineEnding(panes.stdout).split("\n").map((line) => line.split("|"));
+  if (rows.some((fields) => fields.length !== 3 || !/^\$[0-9]+$/.test(fields[0]) || !/^%[0-9]+$/.test(fields[1]) || !Number.isSafeInteger(Number(fields[2])) || Number(fields[2]) <= 0)) return false;
+  const current = rows.map(([sessionId, paneId, panePid]) => ({ sessionId, paneId, panePid: Number(panePid) }));
+  if (new Set(current.map((row) => `${row.sessionId}:${row.paneId}`)).size !== current.length) return false;
+  const gateRecord = await readExact(intentRecord.transportGatePath);
+  if (!gateRecord?.probeResult?.paneRows || !Array.isArray(gateRecord.probeResult.paneRows)) return false;
+  const expected = [...gateRecord.probeResult.paneRows, { sessionId: a.container.sessionId, paneId: a.target.paneId, panePid: a.target.panePid }];
+  const order = (left, right) => Number(left.sessionId.slice(1)) - Number(right.sessionId.slice(1)) || Number(left.paneId.slice(1)) - Number(right.paneId.slice(1)) || left.panePid - right.panePid;
+  current.sort(order); expected.sort(order);
+  return JSON.stringify(current) === JSON.stringify(expected);
 }
 async function verifyGate() {
   // The staged process is independently invoked by tmux. Re-establish every
@@ -757,6 +1000,18 @@ async function verifyGate() {
   const i = intent(await readExact(p("launch-intent.json")));
   if (!i) return;
   backendMode = i.terminalMode;
+  protocolVersion = i.version;
+  if (i.version === 3) {
+    if (!await validateTmuxControlGate(i, true)) return;
+    tmuxManager = new TmuxControlClient({ executable: backendPath, socketPath: i.source.socketPath, sessionId: i.container.sessionId });
+    try { await tmuxManager.start(); } catch { return; }
+    const controlRun = createTmuxControlCommandRunner(tmuxManager, i.source.socketPath);
+    tmuxCommand = async (args, options) => { const result = await controlRun(args, options); return { ...result, code: result.exitCode }; };
+  }
+  if (i.terminalMode === "cmux-pane") {
+    if (legacyCmuxHarness) cmuxCommand = async (args) => await command(backendPath, args);
+    else { cmuxManager = getCmuxControlRequestManager({ ...cmuxBrokerOptions, expectedControl: i.control }); cmuxCommand = createCmuxControlCommandRunner({ manager: cmuxManager }); }
+  }
   if (regularFile(i.backendPath, true) !== backendPath) return;
   const wrapperAt = process.argv.indexOf("--wrapper"); const wrapper = wrapperAt >= 0 ? process.argv[wrapperAt + 1] : null;
   const deadline = Date.now() + 30_000;
@@ -773,11 +1028,11 @@ async function verifyGate() {
     if ((rawDecision && !d) || (rawAllocation && !a) || (rawLaunch && !l) || (rawGate && !g)
       || (a && (!allocationMatchesIntentSource(i, a) || a.terminalMode !== i.terminalMode)) || (l && l.terminalMode !== i.terminalMode) || (g && g.terminalMode !== i.terminalMode)) return;
     if (d?.kind === "cancel") return;
-    if (d?.kind === "commit" && d.allocationPath === p("allocation.json") && d.launchPath === p("launch.json") && a && allocationMatchesIntentSource(i, a) && a.terminalMode === i.terminalMode && l && l.terminalMode === i.terminalMode && g && g.terminalMode === i.terminalMode && validStateDependencies(a, d, l, g) && wrapper && path.resolve(wrapper) === p("cmux-wrapper.sh")) {
+    if (d?.kind === "commit" && d.allocationPath === p("allocation.json") && d.launchPath === p("launch.json") && a && allocationMatchesIntentSource(i, a) && a.terminalMode === i.terminalMode && l && l.terminalMode === i.terminalMode && g && g.terminalMode === i.terminalMode && validStateDependencies(a, d, l, g) && await validV3Chain(i, a, l) && wrapper && path.resolve(wrapper) === p("cmux-wrapper.sh")) {
       // Revalidate the selected executable immediately before the winning target
       // is probed; then probe only the strict winning allocation and its mode.
       if (regularFile(i.backendPath, true) !== backendPath) return;
-      if (a.terminalMode === "cmux-pane" ? !await verifyCmuxGateTarget(a) : !await verifyTmuxGateTarget(a)) return;
+      if (a.terminalMode === "cmux-pane" ? !await verifyCmuxGateTarget(a) : !await verifyTmuxGateTarget(a, i)) return;
       // Preserve a constrained bootstrap environment; the wrapper sources the
       // private explicit environment artifact before execing Pi.
       const { spawn: launch } = await import("node:child_process");
@@ -791,4 +1046,14 @@ async function verifyGate() {
   }
   process.exitCode = 0;
 }
-if (process.argv.includes("--verify-gate")) await verifyGate(); else await main();
+const verifyGateMode = process.argv.includes("--verify-gate");
+try {
+  if (verifyGateMode) await verifyGate(); else await main();
+} finally {
+  cmuxManager?.close();
+  tmuxManager?.close();
+}
+// The allocation broker is a one-shot process. Explicit exit prevents a
+// transport implementation detail from extending its lifetime; all durable
+// publications above are awaited and fsync-complete before this point.
+if (!verifyGateMode) process.exit(process.exitCode ?? 0);

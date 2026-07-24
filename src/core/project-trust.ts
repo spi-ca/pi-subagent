@@ -81,6 +81,38 @@ export function applySessionProjectTrustOverride(
   return projectRoot;
 }
 
+export function getSessionProjectTrustOverride(context: { isProjectTrusted?: unknown }): boolean | null {
+  const isProjectTrusted = context.isProjectTrusted;
+  if (typeof isProjectTrusted !== "function") return null;
+
+  try {
+    const trust = isProjectTrusted.call(context);
+    return trust === true || trust === false ? trust : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveSessionProjectTrust(
+  projectAgentsDir: string | null,
+  trustOverride: boolean | null,
+  sessionTrustedProjectRoots: Set<string>,
+  sessionDeniedProjectRoots: Set<string>,
+  options: Pick<ProjectTrustOptions, "configDir" | "trust"> = {},
+): boolean {
+  applySessionProjectTrustOverride(
+    projectAgentsDir,
+    trustOverride,
+    sessionTrustedProjectRoots,
+    sessionDeniedProjectRoots,
+  );
+  return isTrustedProjectAgentsDirWithSessionOverrides(projectAgentsDir, {
+    ...options,
+    sessionTrustedProjectRoots,
+    sessionDeniedProjectRoots,
+  });
+}
+
 export function isTrustedProjectAgentsDirWithSessionOverrides(
   projectAgentsDir: string | null,
   options: ProjectTrustOptions = {},

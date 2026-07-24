@@ -1,0 +1,17 @@
+{
+  "contract_id": "cmux-events-v1",
+  "minimum_app_version": "0.64.20",
+  "captured_app_version": "0.64.20",
+  "source": "live cmux 0.64.20 events.stream ack/heartbeat captured against pinned upstream commit 14e3400b; standalone event/error examples preserve exact upstream envelope shape",
+  "stream_request": { "names": ["__pi_fixture_no_event__"], "categories": [], "include_heartbeats": true },
+  "ack": {
+    "type": "ack", "protocol": "cmux-events", "version": 1, "boot_id": "57FC920E-C1C9-414E-BAC7-E4334A8CF4C1", "subscription_id": "297485D4-DCD8-4A93-973D-C7750BF5FBB9", "heartbeat_interval_seconds": 15, "replay_count": 0,
+    "resume": { "after_seq": null, "requested_after_seq": 44705, "oldest_seq": 40610, "latest_seq": 44705, "next_seq": 44706, "gap": false },
+    "filters": { "names": ["__pi_fixture_no_event__"], "categories": [] }
+  },
+  "event": {
+    "type": "event", "protocol": "cmux-events", "version": 1, "boot_id": "57FC920E-C1C9-414E-BAC7-E4334A8CF4C1", "seq": 1, "id": "57FC920E-C1C9-414E-BAC7-E4334A8CF4C1-1", "name": "surface.changed", "category": "surface", "source": "cmux", "occurred_at": "2026-07-20T00:00:00Z", "workspace_id": null, "surface_id": "0F61DF95-D7D5-44D4-B251-B2B44DF0CF8B", "pane_id": null, "window_id": null, "payload": {}
+  },
+  "heartbeat": { "type": "heartbeat", "protocol": "cmux-events", "version": 1, "boot_id": "57FC920E-C1C9-414E-BAC7-E4334A8CF4C1", "subscription_id": "297485D4-DCD8-4A93-973D-C7750BF5FBB9", "latest_seq": 44707, "occurred_at": "2026-07-21T20:19:16.460Z" },
+  "slow_consumer": { "type": "error", "ok": false, "error": { "code": "slow_consumer", "message": "subscriber fell behind", "latest_seq": 8 } }
+}

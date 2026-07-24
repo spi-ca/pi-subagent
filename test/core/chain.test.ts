@@ -26,6 +26,17 @@ describe("mixed chain helpers", () => {
     ] as any) ?? "", /requires a non-empty tasks array/);
   });
 
+  test("uses the configured chain parallel limit rather than the legacy default of eight", () => {
+    const stage = [{
+      label: "fan-out",
+      type: "parallel",
+      tasks: Array.from({ length: 9 }, (_, index) => ({ agent: `worker-${index}`, task: "Inspect" })),
+    }] as any;
+
+    assert.equal(validateChainStages(stage, 9), null);
+    assert.match(validateChainStages(stage, 8) ?? "", /Max is 8/);
+  });
+
   test("evaluates conditions from accumulated chain state", () => {
     assert.equal(shouldRunStage(undefined, { hadError: false, hadCompletedWithErrors: false, hadBlockingError: false } as any), true);
     assert.equal(shouldRunStage("on_success", { hadError: true, hadCompletedWithErrors: true, hadBlockingError: true } as any), false);

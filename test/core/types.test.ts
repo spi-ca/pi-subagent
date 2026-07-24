@@ -1,6 +1,6 @@
 import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import { getDefaultTerminalModeFromEnv, isInsideCmux, isInsideTmux } from "../../src/core/types";
+import { aggregateUsage, getDefaultTerminalModeFromEnv, isInsideCmux, isInsideTmux, type SingleResult } from "../../src/core/types";
 import { parseTmuxEnvironment } from "../../src/runtime/tmux";
 
 const TRACKED_ENV = ["CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "TMUX", "TMUX_PANE"] as const;
@@ -20,6 +20,43 @@ afterEach(() => {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
 	}
+});
+
+describe("usage aggregation", () => {
+	test("adds only additive usage fields and leaves context as a per-agent value", () => {
+		const results = [
+			{
+				agent: "first",
+				agentSource: "user",
+				task: "first task",
+				exitCode: 0,
+				messages: [],
+				stderr: "",
+				usage: { input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 0.1, contextTokens: 100, turns: 1 },
+				model: "model-a",
+			},
+			{
+				agent: "second",
+				agentSource: "user",
+				task: "second task",
+				exitCode: 0,
+				messages: [],
+				stderr: "",
+				usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.02, contextTokens: 200, turns: 2 },
+				model: "model-b",
+			},
+		] satisfies SingleResult[];
+
+		assert.deepEqual(aggregateUsage(results), {
+			input: 11,
+			output: 22,
+			cacheRead: 33,
+			cacheWrite: 44,
+			cost: 0.12000000000000001,
+			contextTokens: 0,
+			turns: 3,
+		});
+	});
 });
 
 describe("terminal environment detection", () => {

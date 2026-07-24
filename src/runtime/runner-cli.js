@@ -131,6 +131,18 @@ export function parseInheritedCliArgs(argv) {
         "--append-system-prompt",
         "--export",
         "--subagent-max-depth",
+        "--subagent-max-active",
+        "--subagent-max-parallel-tasks",
+        "--subagent-max-chain-steps",
+        "--subagent-max-concurrency",
+        "--subagent-max-chain-parallel-tasks",
+        "--subagent-max-background-jobs",
+        "--subagent-background-history-limit",
+        "--subagent-background-history-ttl-ms",
+        "--subagent-background-output-max-bytes",
+        "--subagent-background-shutdown-settle-ms",
+        "--subagent-parallel-heartbeat-ms",
+        "--subagent-pane-layout",
       ].includes(flagName)
     ) {
       const [, skip] = getValue();

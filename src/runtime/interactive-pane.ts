@@ -53,6 +53,8 @@ export interface InteractivePaneBackend {
 	inspect(handle: InteractivePaneHandle): Promise<InteractivePaneSnapshot | undefined>;
 	interrupt(handle: InteractivePaneHandle): Promise<boolean>;
 	close(handle: InteractivePaneHandle): Promise<boolean>;
+	/** Optional exact-target user-requested focus; unsupported backends fail closed. */
+	focus?(handle: InteractivePaneHandle): Promise<boolean>;
 }
 
 export const cmuxInteractivePaneBackend: InteractivePaneBackend = {

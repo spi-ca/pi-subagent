@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "contract_id": "cmux-layout-v1",
   "cmux_version": "0.64.20",
   "new_split_response": {
     "workspace_id": "2FF1CE1C-5160-461B-9412-A5630EA19054",

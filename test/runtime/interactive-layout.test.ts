@@ -197,11 +197,90 @@ describe("InteractiveLayoutCoordinator", () => {
 		assert.equal(closes, 1);
 		assert.equal((await next).request.placement, "cmux-split");
 	});
+
+	for (const count of [1, 6, 16, 17, 50]) test(`keeps root auto allocation deterministic for N=${count} under staggered reverse release`, async () => {
+		const coordinator = new InteractiveLayoutCoordinator({ validateCmuxPane: validPane });
+		const placements: string[] = [];
+		const leases = await Promise.all(Array.from({ length: count }, (_, index) => coordinator.allocateCmux({
+			source, depth: 0, layout: "auto", runId: `root-${count}-${index}`,
+			allocate: async (request) => {
+				placements.push(request.placement);
+				await Promise.resolve();
+				return committed(request, String(100 + index));
+			},
+		})));
+		assert.equal(placements.filter((placement) => placement === "cmux-split").length, 1);
+		assert.equal(placements.filter((placement) => placement === "cmux-new-surface").length, count - 1);
+		assert.equal(new Set(leases.map((lease) => lease.allocation.target.surfaceId.toLowerCase())).size, count);
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), count);
+
+		const closed: string[] = [];
+		const reverseLeases = [...leases].reverse();
+		for (const lease of reverseLeases) {
+			await Promise.resolve(); // deterministic stagger without relying on wall-clock timing
+			await coordinator.releaseCmux({ lease, close: async (allocation) => {
+				closed.push(allocation.target.surfaceId);
+				return true;
+			} });
+		}
+		assert.deepEqual(closed, reverseLeases.map((lease) => lease.allocation.target.surfaceId));
+		assert.equal(new Set(closed.map((id) => id.toLowerCase())).size, count);
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), 0);
+	});
+
+	for (const count of [1, 6, 16, 17, 50]) test(`uses independent root locks and exact nested sources for split N=${count}`, async () => {
+		const coordinator = new InteractiveLayoutCoordinator({ validateCmuxPane: validPane });
+		const secondRoot = { workspaceId, sourceSurfaceId: pane("080") };
+		const nestedSource = { workspaceId, sourceSurfaceId: pane("081") };
+		const requests = await Promise.all(Array.from({ length: count }, async (_, index) => {
+			const useNested = index % 2 === 1;
+			const currentSource = useNested ? nestedSource : index % 4 === 0 ? secondRoot : source;
+			const rootSource = useNested ? secondRoot : currentSource;
+			const lease = await coordinator.allocateCmux({
+				rootSource, source: currentSource, depth: useNested ? 3 : 0, layout: "split", runId: `split-${count}-${index}`,
+				allocate: async (request) => committed(request, String(200 + index)),
+			});
+			return { lease, currentSource };
+		}));
+		for (const { lease, currentSource } of requests) {
+			assert.equal(lease.request.placement, "cmux-split");
+			assert.deepEqual(lease.request.container, { kind: "cmux-source", workspaceId, sourceSurfaceId: currentSource.sourceSurfaceId });
+		}
+		assert.equal(new Set(requests.map(({ lease }) => lease.allocation.target.surfaceId.toLowerCase())).size, count);
+		await Promise.all(requests.map(({ lease }) => coordinator.releaseCmux({ lease, close: async () => true })));
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), 0);
+		assert.equal(coordinator.activeCmuxSurfaceCount(secondRoot), 0);
+	});
+
+	test("lets a queued root allocation recover from a failed first split without phantom shared state", async () => {
+		const coordinator = new InteractiveLayoutCoordinator({ validateCmuxPane: validPane });
+		let firstEntered!: () => void;
+		const firstReady = new Promise<void>((resolve) => { firstEntered = resolve; });
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const failed = coordinator.allocateCmux({
+			source, depth: 0, layout: "auto", runId: "failed-first",
+			allocate: async () => { firstEntered(); await firstGate; throw new Error("injected first split failure"); },
+		});
+		await firstReady;
+		const successor = coordinator.allocateCmux({
+			source, depth: 0, layout: "auto", runId: "successor",
+			allocate: async (request) => committed(request, "260"),
+		});
+		releaseFirst();
+		await assert.rejects(failed, /injected first split failure/);
+		const lease = await successor;
+		assert.equal(lease.request.placement, "cmux-split");
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), 1);
+		await coordinator.releaseCmux({ lease, close: async () => true });
+		assert.equal(coordinator.activeCmuxSurfaceCount(source), 0);
+	});
 });
 
 describe("tmux stateless layout selector", () => {
-	const tmuxSource = { socketPath: "/tmp/tmux.sock", serverPid: 10, sourcePaneId: "%1", sourcePanePid: 11 };
-	const topology = { kind: "tmux-source-pane" as const, socketPath: "/tmp/tmux.sock", serverPid: 10, sessionId: "$1", windowId: "@2", paneId: "%1", panePid: 11 };
+	const generation = { socketPath: "/tmp/tmux.sock", socketDev: "1", socketIno: "2", serverStartedAt: 3 };
+	const tmuxSource = { socketPath: "/tmp/tmux.sock", serverPid: 10, sourcePaneId: "%1", sourcePanePid: 11, generation };
+	const topology = { kind: "tmux-source-pane" as const, socketPath: "/tmp/tmux.sock", serverPid: 10, sessionId: "$1", windowId: "@2", paneId: "%1", panePid: 11, generation };
 
 	test("selects exact source topology for split and exact source session for auto", () => {
 		assert.deepEqual(selectTmuxInteractivePlacement({ layout: "split", source: tmuxSource, sourceTopology: topology }), {
@@ -209,7 +288,7 @@ describe("tmux stateless layout selector", () => {
 		});
 		assert.deepEqual(selectTmuxInteractivePlacement({ layout: "auto", source: tmuxSource, sourceTopology: topology }), {
 			layout: "auto", placement: "tmux-new-window",
-			container: { kind: "tmux-session", socketPath: "/tmp/tmux.sock", serverPid: 10, sessionId: "$1", sourceWindowId: "@2" },
+			container: { kind: "tmux-session", socketPath: "/tmp/tmux.sock", serverPid: 10, sessionId: "$1", sourceWindowId: "@2", generation },
 		});
 	});
 

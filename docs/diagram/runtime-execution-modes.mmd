@@ -1,0 +1,22 @@
+flowchart LR
+  E[현재 terminal 환경]
+  D{backend 감지}
+  I[inline<br/>child process]
+  C[cmux pane<br/>auto shared pane과 surface tabs]
+  T[tmux pane<br/>auto detached child windows]
+  IR[interactive result path<br/>session JSONL과 durable completion]
+  IO[inline result path<br/>stdout JSON events]
+  R[동일한 public 결과 계약]
+
+  E --> D
+  D -->|canonical cmux identity| C
+  D -->|canonical tmux identity| T
+  D -->|그 외 또는 Windows| I
+  C --> IR
+  T --> IR
+  I --> IO
+  IR --> R
+  IO --> R
+
+  classDef contract stroke-width:3px
+  class R contract

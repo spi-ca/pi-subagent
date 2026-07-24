@@ -1,0 +1,16 @@
+stateDiagram-v2
+  [*] --> VerifySocket
+  VerifySocket --> Authorize: path owner mode inode verified
+  Authorize --> Capabilities: auth if required
+  Capabilities --> Identify: required v2 methods
+  Identify --> Ready: stable app version >= 0.64.20
+  Ready --> Request: serialized RPC
+  Ready --> EventHint: separate events stream
+  EventHint --> Reconcile: gap boot change or close hint
+  Reconcile --> Ready: exact system.tree only
+  Request --> Ready: valid response
+  Request --> FailedClosed: protocol error or unknown mutation
+  Ready --> VerifySocket: disconnect then fresh read-only probe
+  VerifySocket --> FailedClosed: generation or identity mismatch
+  FailedClosed --> Recovery: retain residual metadata when needed
+  Recovery --> [*]

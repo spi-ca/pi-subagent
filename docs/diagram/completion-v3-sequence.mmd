@@ -1,0 +1,85 @@
+%% Diagram source: docs/diagram/completion-v3-sequence.mmd
+sequenceDiagram
+  participant P as parent monitor
+  participant C as child bridge / Pi
+  participant J as session JSONL
+  participant F as completion-fence.json
+  participant A as fence ACK
+  participant D as complete.json V3
+  participant S as exact surface or pane
+  participant L as process-local scheduler
+  participant Q as durable tree permit
+  participant R as startup reaper
+  participant V as bounded V3 verifier
+
+  alt child terminal completion
+    Note over P,C: At launch, a new parent strips inherited values and issues only negotiated exact v1 capabilities
+    C->>F: immutable fence (runId, nonce)
+    P->>P: run result FIFO, stop scheduling and drain parent lease writer (bounded)
+    alt lease drain and exact ACK succeed
+      P->>A: durable ACK bound to exact runId + nonce
+      alt success completion
+        alt parent issued metadata-tail success capability = v1
+          C->>J: capture final assistant plus linked metadata-tail boundary
+        else rolling old parent, capability absent
+          C->>J: capture legacy assistant-only success boundary
+        end
+      else generic failure / abort / orphan
+        alt parent issued failure-boundary capability = v1
+          C->>J: capture generic failure boundary
+        else rolling old parent, capability absent
+          Note over C,D: Publish strict legacy boundary-less failure, no exact final replay
+        end
+      end
+      C->>D: create-if-absent child V3 completion
+      C-->>P: completion-ready hint only
+    else ACK deadline and no exact-dead-parent proof
+      C->>D: create-if-absent boundary-less bridge-error V3
+      C-->>P: recovery hint only
+      Note over C,Q: No successful boundary, final drain, target close, or permit settlement
+    else exact parent death proved
+      C->>J: capture terminal boundary without ACK
+      C->>D: create-if-absent child V3 completion
+    end
+  else parent terminal failure / abort
+    P->>P: run FIFO, stop scheduling and drain lease writer (bounded)
+    alt terminal preparation is ready
+      P->>F: publish or verify immutable fence
+      P->>A: durable ACK bound to exact runId + nonce
+      P->>J: capture provable generic failure boundary
+      P->>D: create-if-absent parent V3 (incl. parent-aborted)
+    else drain, fence, ACK, or boundary wait times out/fails
+      P->>P: fail closed, retain exact target and recovery metadata
+    end
+  else stale startup recovery
+    R->>R: prove claim plus owner quiescence or exact death
+    R->>S: bounded exact inspect / cleanup only
+    R->>J: then capture provable generic failure boundary
+    R->>D: create-if-absent reaper observer failure
+    Note over R,D: Separate no-fence/no-ACK/no-parent-FIFO path
+  end
+
+  P->>D: read immutable winner
+  alt valid V3 with a session boundary
+    P->>V: reserve prefix and verify identity, offset, entry ID, digest (bounded)
+    alt verifier accepts before deadline
+      V->>J: descriptor-bound verified prefix
+      P->>J: replay exactly to boundary
+      P->>S: bounded exact interrupt / close / absence check
+      alt target absent
+        Note over S,Q: Target absence proves only target cleanup, never permit authority
+      else target unresolved or wait fails
+        P->>P: fail closed, retain target registry and recovery metadata
+      end
+    else verifier wait fails or times out
+      P->>P: fail closed, retain exact target and recovery metadata
+    end
+  else current boundary-less or invalid V3
+    P->>P: retain status, diagnostics, transcript, and exact target
+    Note over P,Q: No final replay, completion-authorized close, or immediate tree-permit settlement
+  end
+
+  P->>L: return from monitor, release process-local scheduler slot
+  Note over L,Q: This local release is independent of durable tree-permit settlement
+  Q->>Q: settlement watcher retains permit until durable child self-release/lease absence or exact child death
+  Note over S,Q: Neither target absence nor monitor return releases the durable tree permit

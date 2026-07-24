@@ -1,0 +1,54 @@
+flowchart TB
+  I[Invocation]
+
+  subgraph Parent[부모 Pi 프로세스]
+    direction TB
+    F[permit 이전: immutable fork source<br/>headerless bytes + manifest]
+    G[permit 이전: immutable child registration<br/>surface/run binding]
+    S[process-local scheduler]
+    TP[private durable tree permit authority<br/>nested-child hard cap]
+    W[permit 이후: child-private writable session]
+    BS[permit 이후: private bootstrap artifact]
+    PF[permit 이후: launch topology preflight<br/>generation-bound read-only evidence]
+    LA[lifecycle socket server<br/>hint receiver]
+    ST[descriptor-bound child-session JSONL tail<br/>signature index + serialized drain]
+    U[incremental aggregate UI / parent result<br/>Pi core render batching]
+    R[startup reaper coordinator<br/>lock / claim / quiesce]
+    CM[cmux control-v2 client<br/>exact backend authority]
+    TM[gated tmux -C client<br/>exact backend authority]
+  end
+
+  subgraph Broker[detached broker 프로세스]
+    B[allocation-first broker]
+    BB[독립 cmux request connection]
+    BT[독립 tmux control client]
+  end
+
+  subgraph Child[child Pi 프로세스]
+    C[child bridge와 child-session JSONL writer]
+    LC[lifecycle socket client<br/>hint channel]
+  end
+
+  subgraph Backend[exact backend]
+    X[cmux desktop app<br/>control socket v2]
+    T[tmux server<br/>textual control mode]
+  end
+
+  D[durable artifacts<br/>allocation / lease / CompletionRecordV3]
+
+  I --> F --> G --> S --> TP
+  TP -->|permit granted| W --> BS --> PF --> B -->|gate 뒤 child start| C
+  B --> BB -->|exact RPC| X
+  B --> BT -->|exact RPC| T
+  C --> LC -->|hint only| LA
+  C -->|child-session JSONL만 기록| ST -->|incremental result| U
+  B -->|allocation 먼저 publish| D
+  C -->|completion publish| D
+  R -->|durable evidence 검증| D
+  CM -->|exact RPC| X
+  TM -->|exact snapshot/action| T
+
+  classDef durable stroke-width:3px
+  classDef hint stroke-dasharray: 5 5
+  class TP,R,CM,TM,D durable
+  class LA,LC,PF hint

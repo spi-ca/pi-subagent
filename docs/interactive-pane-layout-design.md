@@ -24,12 +24,14 @@ cmux auto
 │                                           │ selected child Pi TUI │
 └───────────────────────────────────────────┴────────────────────────┘
 
- tmux auto
+ tmux auto (현재 production window 이름)
 window 0  parent Pi
-window 1  subagent:scout
-window 2  subagent:reviewer
-window 3  subagent:worker
+window 1  subagent:broker
+window 2  subagent:broker
+window 3  subagent:broker
 ```
+
+agent/run별 stable tmux window 이름은 아직 구현되지 않았으며 [별도 제안](./tmux-window-naming-design.md)에서 다룬다.
 
 ## 2. 문제 정의
 
@@ -42,7 +44,7 @@ cmux: cmux new-split right --surface <source>
 tmux: tmux split-window -h -t <source-pane>
 ```
 
-현재 최상위 병렬 호출 하나는 최대 50개 task를 받고 그 **호출 안에서만** 동시에 최대 16개를 실행한다. chain 병렬 단계는 별도로 최대 8개 task를 받는다. 이 16은 프로세스 전체의 global cap이 아니므로 foreground와 background 호출이 겹치면 전체 active allocation은 16을 넘을 수 있다. 같은 source pane을 반복해서 기본 비율로 나누면 대략 다음처럼 폭이 줄어든다.
+현재 최상위 병렬 호출 하나는 기본적으로 최대 50개 task를 받고 호출별 동시성 기본값 16을 사용한다. chain 병렬 단계의 기본 최대 task 수는 8이다. process-local scheduler가 queue fairness를 담당하고 private durable tree authority가 root parent와 모든 nested child의 실제 ACTIVE/RESERVED 합계를 `max-active`(기본 16) 이하로 제한한다. foreground parent permit transfer로 nested deadlock을 피하며 background는 spare permit만 사용한다. 같은 source pane을 반복해서 기본 비율로 나누면 대략 다음처럼 폭이 줄어든다.
 
 ```text
 첫 child:  parent 1/2
@@ -69,7 +71,7 @@ tmux: tmux split-window -h -t <source-pane>
 
 ### 목표
 
-1. 병렬 호출별 최대 동시성 16을 유지하되, 전역 foreground/background 합계를 16으로 제한하지 않는다.
+1. 병렬 호출별 동시성, process-local fairness와 tree-wide foreground/background `max-active` 상한을 설정 가능하게 유지한다.
 2. 동일 root source를 공유하는 활성 `pi-subagent` allocation에 대해 cmux가 새로 관리하는 pane을 최대 하나로 제한한다.
 3. tmux parent window의 크기를 interactive subagent가 변경하지 않게 한다.
 4. child별 stable handle, 독립 취소, 결과 수집과 reaper를 유지한다.
@@ -82,7 +84,7 @@ tmux: tmux split-window -h -t <source-pane>
 - 모든 child TUI를 동시에 한 화면에 표시
 - 사용자의 기존 pane을 자동 재배치하거나 균등화
 - cmux와 tmux에 완전히 같은 시각적 UI 강제
-- long-lived detached handoff 공개
+- pane layout 정책 밖의 장기 사용자 소유 surface; 구현된 `completion: "handoff"`는 parent-owned background interactive child를 `/subagent-return`까지 유지하지만 layout backend 계약을 확장하지 않음
 - `pi-cmux`의 command나 내부 helper를 layout backend로 재사용
 - terminal 크기를 읽어 모델이나 task 동시성을 자동 변경
 - 첫 구현에서 pane 비율, 방향, tab 정렬을 세밀한 사용자 설정으로 노출
@@ -149,6 +151,10 @@ CLI flag에서 결정된 값도 nested child가 같은 정책을 사용하도록
 
 ## 6. 공통 architecture와 authority 경계
 
+![Interactive layout coordination and authority](./diagram/interactive-layout-coordination.png)
+
+_2x PNG · [SVG](./diagram/interactive-layout-coordination.svg) · [Mermaid source](./diagram/interactive-layout-coordination.mmd)_
+
 현재 production interactive launch는 detached V2 broker가 allocation과 commit 전 rollback을 소유한다. layout은 이 안전 경계를 바꾸지 않는다. **parent-process coordinator**와 broker의 책임은 다음처럼 분리한다.
 
 ```text
@@ -207,6 +213,10 @@ broker는 `--focus false`를 유지하며 request가 요구한 canonical workspa
 
 ### 7.2 shared state와 마지막 surface
 
+![cmux shared pane lifecycle](./diagram/cmux-shared-pane-lifecycle.png)
+
+_2x PNG · [SVG](./diagram/cmux-shared-pane-lifecycle.svg) · [Mermaid source](./diagram/cmux-shared-pane-lifecycle.mmd)_
+
 root coordinator의 state는 `(workspaceId, sourceSurfaceId)`별로 adopt된 shared `paneId`와 active managed `surfaceId` 집합만 가진다. allocation과 release는 같은 mutex/promise queue로 직렬화한다. `coordinator.release`는 exact allocation을 닫기 **전에** 이 lock을 획득하고, close outcome 및 matching active-set 갱신·빈 state retire까지 lock을 유지한다. close가 terminal outcome을 확인하지 못하면 allocation/state는 recovery 대상으로 남기며, stale `paneId`를 다음 allocation에 재사용하지 않는다.
 
 ```text
@@ -221,7 +231,7 @@ release: lock → exact surface close → close outcome
 
 ### 7.3 Phase 0으로 확인된 cmux contract
 
-`test/fixtures/cmux-0.64.20-layout-probe.json`은 gated live probe가 고정한 sanitized fixture다. fixture가 지원하는 semantic cmux `0.64.20`에서 다음을 확인했으므로 Phase 0은 **GO**다.
+`test/fixtures/cmux-layout-contract-v1.json`은 gated live probe가 고정한 sanitized fixture다. fixture가 지원하는 semantic cmux `0.64.20`에서 다음을 확인했으므로 Phase 0은 **GO**다.
 
 - fixture의 `new-split`과 `new-surface` response가 direct top-level canonical `workspace_id`, `pane_id`, `surface_id`를 가지며, split과 new-surface는 같은 workspace/pane, 서로 다른 surface다.
 - 필요한 capabilities는 `surface.create`, `surface.close`, `surface.send_key`, `surface.respawn`이다.
@@ -242,9 +252,11 @@ tmux [-S <socket>] list-panes -a -F '#{pane_id}|#{session_id}|#{window_id}|#{pan
 ```text
 tmux [-S <socket>] new-window -d -P \
   -F '#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}' \
-  -t '<session-id>:' -n 'subagent:<agent>:<run-prefix>' \
+  -t '<session-id>:' -n 'subagent:broker' \
   -c <cwd> "<staged broker>"
 ```
+
+위 label은 현재 production 동작이다. 이를 `subagent:<agent>:<run-prefix>`로 바꾸는 구현 방법과 검증 계획은 [tmux window 이름 정책 제안](./tmux-window-naming-design.md)을 따른다.
 
 broker는 source socket/server/session 관계와 returned session/window/pane/PID를 검증한 뒤 exact allocation을 durable publish한다. parent는 commit 뒤 request와 matching allocation만 adopt한다. 모든 depth의 nested tmux도 같은 session의 detached window를 요청한다. source/ancestor window를 다시 split하지 않는다.
 
@@ -405,15 +417,17 @@ broker allocation 뒤 parent gate/respawn 또는 staged verifier의 wrapper 시�
 
 background 실행 여부와 focus 여부는 별개다. foreground subagent 호출도 child TUI로 focus를 강제 이동하지 않는다.
 
-### 12.2 title
+### 12.2 cross-backend pane title (구현됨)
 
-민감하거나 긴 task를 title에 넣지 않는다.
+wrapper는 cmux/tmux 모두에서 `subagent:<sanitized-agent>:<run-prefix>` 형식의 printable-ASCII 초기 OSC title을 설정하고, child bridge는 `ready`, `running`, `waiting`, `returning`, `failed` lifecycle에 따라 ` · ` 구분자가 포함될 수 있는 Pi UI title을 갱신한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
 
 ```text
 subagent:<agent-name>:<run-id 앞 8자>
 ```
 
-cmux는 surface tab title을, tmux는 window name을 설정할 수 있다. title 설정 실패는 lifecycle 실패로 승격하지 않는다.
+pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또는 관측 실패는 lifecycle 실패로 승격하지 않으며 `/subagents details`는 raw title 대신 managed title과 `matching|changed|unavailable`만 표시한다. production wrapper를 사용하는 gated live smoke에서 2026-07-23 실제 tmux `pane_title`과 cmux canonical topology의 initial/lifecycle title이 모두 PASS했다.
+
+현재 production tmux broker의 **window 이름**은 pane title과 달리 고정 `subagent:broker`다. agent/run별 stable window 이름으로 정렬하는 변경은 [tmux window 이름과 Pi pane title 정책 제안](./tmux-window-naming-design.md)에 현재 동작, strict protocol 전달, 안전 경계와 검증 계획을 구분해 기록한다.
 
 ### 12.3 어떤 child가 보이는가
 
@@ -440,7 +454,7 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 
 ## 14. 구현과 검증 상태
 
-`auto`와 `split` runtime wiring은 구현됐다. 현재 source에는 strict V2 layout branch·binding, cmux `new-surface`/topology, tmux same-session `new-window`/fingerprint, detached broker의 allocation-first publish, process-global coordinator의 adopt/release lock, runner의 gate·exact cleanup, CLI/env policy 전파가 연결돼 있다. `auto`는 기본값이고 `split`은 명시적 호환 모드다.
+`auto`와 `split` runtime wiring은 구현됐다. 이 문서의 historical layout PASS는 M0 performance benchmark나 JSONL/completion/wrapper polling 제거의 증거가 아니다. title은 별도 gated real tmux/cmux smoke로 검증한다. 현재 source에는 strict V2 layout branch·binding, cmux `new-surface`/topology, tmux same-session `new-window`/fingerprint, detached broker의 allocation-first publish, process-global coordinator의 adopt/release lock, runner의 gate·exact cleanup, CLI/env policy 전파가 연결돼 있다. `auto`는 기본값이고 `split`은 명시적 호환 모드다.
 
 이 구현 사실과 stress/acceptance 증거는 구분한다. static scope는 `test/runtime/interactive-layout.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/cmux.test.ts`, `test/runtime/tmux.test.ts`, `test/runtime/pane-launch-broker.test.ts` 및 관련 runner/reaper test가 다룬다. cmux와 tmux `auto` live layout smoke는 모두 **PASS**했지만, tmux는 3 top-level + parent/2 nested의 제한된 scenario만 다룬다.
 
@@ -449,21 +463,26 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 ### 15.1 static test에서 직접 확인한 범위
 
 - layout resolver의 `auto` 기본값, CLI > env 우선순위와 exact lowercase 거부
-- coordinator의 **동시 6개** root allocation: split 1회, `new-surface` 5회, release 뒤 active count 정리
+- coordinator root `auto`의 N=`1/6/16/17/50` deterministic stress: split 정확히 1회, `new-surface` N-1회, unique target, staggered reverse release와 final active count 0
+- `split`의 N=`1/6/16/17/50` stress: 모든 allocation이 split이고 nested caller의 exact source 및 independent root lock을 확인
+- 첫 split failure 중 queue된 allocator가 lock을 이어받아 새 split으로 성공하고 phantom shared state를 남기지 않음
 - nested source-pane request, explicit `split`, stale shared pane 무효화, exact allocation adopt, release/allocate race와 retry/idempotence
+- `mapConcurrent` N=`17/50`: worker 최대 16, 결과 index 보존, abort 뒤 dequeue 없음
 - cmux의 strict canonical topology·surface lifecycle과 tmux의 complete-row topology/fingerprint·same-session window primitive
 - broker/protocol의 strict layout branch, allocation-first publish, source/target alias 거부와 exact cleanup binding
+- runner public lifecycle seam과 deterministic fake backend component harness: foreground/background/parallel-chain overlap, cancel·external-close·shutdown·reload 이후 source/sentinel 비변형 및 exact target cleanup
 
 ### 15.2 아직 주장하지 않는 범위
 
 다음은 구현 wiring 또는 설계 목표이지만 현재 automated/live acceptance로 확인됐다고 주장하지 않는다.
 
-- `1..50`의 임의 N 전체, 또는 top-level 최대 50 task에 대한 layout stress
-- foreground/background가 겹쳐 active allocation이 16을 초과하는 stress
-- 결과 순서, cancel, chain parallel stage, background job을 실제 layout runtime과 함께 묶은 integration coverage
+- N=`1/6/16/17/50` deterministic component stress는 추가됐지만, 실제 broker→runner full-path에서 foreground/background가 겹쳐 active allocation이 16을 초과하는 live stress
+- 결과 순서, cancel, chain parallel stage, background job을 실제 broker/runtime과 함께 묶은 end-to-end integration coverage
 - child별 완료·cancel·`/reload`·parent crash·TUI 입력을 포함한 폭넓은 live smoke
 
-이 항목들은 별도 deterministic integration 또는 명시적으로 gated live acceptance가 추가되기 전까지 **planned/unverified**다.
+`acceptance:layout:dry-run`은 기존 isolated safety harness를 mutation 없이 호출해 required live gate와 source/sentinel 보존·exact cleanup evidence contract를 표시한다. `acceptance:layout`은 같은 harness를 실행하지만 `PI_SUBAGENT_LIVE_TMUX=1` 및 `PI_SUBAGENT_LIVE_CMUX=1`이 없으면 실패한다. dry-run은 live PASS를 주장하지 않는다.
+
+현재 broker launch closure에는 fake backend 주입 seam이 없으므로, M1은 public lifecycle helper와 coordinator를 결합한 deterministic component harness까지만 검증한다. 위 항목들은 별도 broker/runtime integration 또는 명시적으로 gated live acceptance가 추가되기 전까지 **planned/unverified**다.
 
 ### 15.3 live layout evidence
 
@@ -510,7 +529,7 @@ backend를 중첩해 PTY, keybinding, resize, cancel과 orphan 처리를 이중�
 
 ## 18. Phase 0: cmux CLI probe — GO readiness
 
-Phase 0 gated live probe 결과는 semantic cmux `0.64.20` 지원 fixture로 [`test/fixtures/cmux-0.64.20-layout-probe.json`](../test/fixtures/cmux-0.64.20-layout-probe.json)에 고정했다. 따라서 cmux CLI contract readiness는 **GO**다.
+Phase 0 gated live probe 결과는 semantic cmux `0.64.20` 지원 fixture로 [`test/fixtures/cmux-layout-contract-v1.json`](../test/fixtures/cmux-layout-contract-v1.json)에 고정했다. 따라서 cmux CLI contract readiness는 **GO**다.
 
 | 확인한 기준 | fixture 증거 |
 |---|---|

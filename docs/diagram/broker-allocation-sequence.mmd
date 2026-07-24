@@ -1,0 +1,24 @@
+sequenceDiagram
+  participant P as parent
+  participant B as detached broker
+  participant A as allocation.json
+  participant D as decision.json
+  participant G as launch gate
+  participant C as child
+
+  P->>P: preflight and private inputs
+  P->>B: immutable launch intent
+  B->>B: claim broker ownership
+  B->>B: allocate exact target
+  B->>A: allocation first publish
+  par commit and cancel race
+    P->>D: commit or cancel
+    B->>D: commit or cancel
+  end
+  alt cancel wins
+    B->>B: rollback exact target
+  else commit wins
+    B->>P: committed launch
+    P->>G: publish gate
+    P->>C: start child after gate
+  end

@@ -1,0 +1,19 @@
+flowchart TB
+  PS[pi-subagent]
+  PC[optional pi-cmux]
+  CM[cmux substrate]
+  MS[managed child surface]
+  US[user owned surface]
+
+  PS -->|allocate collect cancel lease reaper| MS
+  PC -->|sidebar progress log alerts| MS
+  CM -->|PTY workspace surface split| MS
+  PC -->|user workflow may create| US
+  CM -->|hosts| US
+  PS -.->|no lifecycle authority| US
+  PS -.->|does not use as backend| PC
+
+  classDef managed stroke-width:3px
+  classDef unmanaged stroke-dasharray: 5 5
+  class MS managed
+  class US unmanaged

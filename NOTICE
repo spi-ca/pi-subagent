@@ -10,4 +10,4 @@ Original copyright notice:
 
   Copyright (c) 2026 Michael Jakl
 
-Local modifications are maintained as a private/local editable Pi package.
+Local modifications are maintained in the spi-ca/pi-subagent fork and may also be used as an editable Pi package.

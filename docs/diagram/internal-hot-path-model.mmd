@@ -1,0 +1,75 @@
+%% Diagram source: docs/diagram/internal-hot-path-model.mmd
+flowchart TB
+  I[Invocation]
+
+  subgraph BeforePermit[Permit 이전: invocation-scoped 읽기/등록]
+    direction TB
+    D[read-only discovery cache<br/>trust-safe evidence]
+    F[immutable fork source<br/>headerless bytes + manifest]
+    G[child registration<br/>immutable child/surface binding]
+    D -. read evidence only .-> F --> G
+  end
+
+  subgraph Admission[Admission authority]
+    direction TB
+    S[process-local scheduler<br/>FIFO / round-robin]
+    P[Linux/macOS: durable fixed tree permit authority<br/>nested-child hard cap<br/>Windows: process-local fallback]
+    S --> P
+  end
+
+  subgraph AfterPermit[Permit 이후: child-private launch preparation]
+    direction TB
+    W[child-private writable session<br/>and bootstrap artifact]
+    T[launch topology preflight<br/>read-only generation-bound evidence]
+    J[task-local launch gate]
+    W --> J
+    T --> J
+  end
+
+  subgraph Transport[Transport lifecycle / exact backend authority]
+    direction TB
+    B[cmux control-v2 or gated tmux -C<br/>exact allocation / inspect / mutation]
+    X[child execution]
+    C[durable CompletionRecordV3<br/>terminal result only]
+    L[private lifecycle socket<br/>optional non-authoritative terminal-result hint]
+    B --> X --> C --> L
+  end
+
+  subgraph Settlement[Separate durable permit settlement]
+    direction TB
+    H[settlement watcher]
+    Z[durable child self-release / lease absence<br/>or exact child death]
+    H --> Z --> P
+  end
+
+  subgraph InternalExact[Internal exact result path]
+    direction TB
+    Q[child session JSONL]
+    E[exact tail / signature index<br/>generation, offset, identity, digest]
+    U[incremental aggregate UI<br/>Pi core render batching]
+    Q --> E --> U
+  end
+
+  subgraph Recovery[Startup recovery orchestration]
+    direction TB
+    A[durable exact allocation / completion evidence]
+    R[budgeted reaper<br/>lock + claim + quiesce]
+    A -. recovery evidence only .-> R
+  end
+
+  I --> D
+  G --> S
+  P -->|admission granted| W
+  P -->|admission granted| T
+  J --> B
+  X --> Q
+  C -->|publishes terminal result only| A
+  C -. completion observed; no direct release .-> H
+  L -. wakes parent; never authority .-> H
+
+  classDef authority stroke-width:3px
+  classDef readonly stroke-dasharray: 5 5
+  classDef hint stroke-dasharray: 3 3
+  class P,B,R,A authority
+  class D,T readonly
+  class L hint

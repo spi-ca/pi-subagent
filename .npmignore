@@ -1,0 +1,4 @@
+# macOS Finder and AppleDouble metadata must never be published.
+.DS_Store
+**/.DS_Store
+**/._*

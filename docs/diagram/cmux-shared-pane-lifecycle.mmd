@@ -1,0 +1,21 @@
+stateDiagram-v2
+  [*] --> Empty
+  Empty --> FirstAllocated: broker split and allocation publish
+  FirstAllocated --> FirstRollback: cancel wins
+  FirstAllocated --> Committed: commit wins
+  FirstRollback --> Empty: exact first target absent
+  FirstRollback --> Recovery: rollback unconfirmed
+  Committed --> Adopted: parent verifies and adopts
+  Adopted --> Ready
+  Ready --> AddSurface: serialized broker create
+  AddSurface --> SiblingAllocated: publish before decision
+  SiblingAllocated --> SiblingRollback: cancel wins
+  SiblingAllocated --> Committed: commit wins
+  SiblingRollback --> Ready: exact sibling absent, existing siblings preserved
+  SiblingRollback --> Recovery: rollback unconfirmed
+  Ready --> Release: coordinator lock
+  Release --> Ready: siblings remain
+  Release --> Retire: last exact surface absent
+  Release --> Recovery: close outcome unconfirmed
+  Retire --> Empty
+  Recovery --> [*]: retain durable recovery

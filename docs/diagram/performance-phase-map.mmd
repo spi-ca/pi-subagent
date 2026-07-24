@@ -1,0 +1,40 @@
+flowchart TB
+  subgraph TransportOwner[Canonical owner: interactive-runtime-performance-design.md]
+    direction LR
+    P0H[Phase 0 live harness<br/>schema-v4 two-tier implementation]
+    P0R[Phase 0 routine live benchmark<br/>routine-v1: captured 15 cells / 15 children<br/>repeated total 5-6m]
+    P0C[Phase 0 cmux concurrency live benchmark<br/>cmux-concurrency-16-v1: captured 1 cell / 16 children<br/>repeated total ~8.2m; explicit manual record + cmux16 gates]
+    P1[Phase 1 cmux control v2<br/>implemented]
+    P2[Phase 2 lifecycle V3<br/>implemented]
+    P3[Phase 3 tmux control 3.7b<br/>implemented]
+    P4[Phase 4 cmux events hint<br/>implemented]
+    P0H --> P0R
+    P0H --> P0C
+    P0R --> P1 --> P2 --> P3 --> P4
+  end
+
+  subgraph InternalOwner[Canonical owner: pi-subagent-hot-path-performance-design.md]
+    direction LR
+    P0A[Phase 0A parent-only hot path<br/>implemented]
+    P5[Phase 5 scheduler<br/>implemented]
+    P6[Phase 6 tail/signature index<br/>implemented]
+    P7[Phase 7 conservative reaper<br/>implemented]
+    P8[Phase 8 managed-child opt-in<br/>implemented; default inherit]
+    P8R[Portable OS hard resource policy<br/>and default transition: unimplemented]
+    P0A --> P5 --> P6 --> P7 --> P8 --> P8R
+  end
+
+  subgraph LeaseBoundary[Cross-owner Phase 2 prerequisite boundary]
+    direction LR
+    L0A[Phase 0A parent lease writer<br/>stopAndDrain + fenced publication]
+    L2[Phase 2 child lease checker<br/>stopAndDrain + fenced check]
+    L0A -->|prerequisite boundary| L2
+  end
+
+  P0A --> L0A
+  L2 --> P2
+
+  classDef implemented stroke-width:3px
+  classDef proposed stroke-dasharray: 5 5
+  class P0H,P0R,P0C,P0A,P1,P2,P3,P4,P5,P6,P7,P8,L0A,L2 implemented
+  class P8R proposed

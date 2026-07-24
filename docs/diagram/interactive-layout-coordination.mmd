@@ -1,0 +1,26 @@
+flowchart TB
+  subgraph Launch[placement and allocation]
+    direction LR
+    R[runner] --> C[coordinator]
+    C --> I[strict intent]
+    I --> B[detached broker]
+  end
+
+  subgraph Ownership[durable ownership]
+    direction LR
+    D[exact allocation] --> V[commit verification]
+    V --> H[adopted child handle]
+  end
+
+  X[cmux or tmux backend]
+  Z[reaper]
+
+  B -->|allocate| X
+  B -->|publish first| D
+  C -->|adopt and release| H
+  H -->|exact close| X
+  D -->|recovery authority| Z
+  Z -->|exact cleanup| X
+
+  classDef authority stroke-width:3px
+  class D authority

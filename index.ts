@@ -35,7 +35,8 @@ import {
   type ChainStageRecord,
   type ChainStageStatus,
   type ChainTaskStage,
-  validateChainStages,
+  validateChainLabels,
+  validateChainParallelLimit,
 } from "./src/core/chain-helpers.js";
 import { type AgentConfig, findNearestProjectAgentsDir, type AgentDiscoveryResult, type AgentScope, type DiscoverAgentOptions } from "./src/core/agents.js";
 import { AgentDiscoveryCache } from "./src/core/agent-discovery-cache.js";
@@ -47,7 +48,7 @@ import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, for
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
-import { applySessionProjectTrustOverride, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
+import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
 import { beginInteractiveShutdownForSession, focusInteractiveRun, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
 import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
@@ -71,7 +72,6 @@ import {
   formatStoredBackgroundToolText,
   formatBackgroundJobListEntry,
   formatBackgroundJobStatusText,
-  formatInvalidInvocationShapeMessage,
   formatSubagentSystemPrompt,
   formatSubagentToolDescription,
   getBackgroundJobSnapshot,
@@ -80,7 +80,9 @@ import {
   parseBackgroundAction,
   parseBackgroundFlag,
   parseCompletionMode,
-  validateCompletionInvocation,
+  validateSubagentInvocation,
+  formatSubagentInvocationValidationError,
+  formatSubagentOperationalError,
   pruneBackgroundJobs,
   type BackgroundJobRecord,
   type BackgroundJobToolResult,
@@ -120,6 +122,10 @@ const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
 const CONFIG_DIR_NAME = typeof (piCodingAgent as unknown as { CONFIG_DIR_NAME?: unknown }).CONFIG_DIR_NAME === "string"
   ? (piCodingAgent as unknown as { CONFIG_DIR_NAME: string }).CONFIG_DIR_NAME
   : ".pi";
+const getActiveAgentDir = (): string => {
+  const getAgentDir = (piCodingAgent as unknown as { getAgentDir?: unknown }).getAgentDir;
+  return typeof getAgentDir === "function" ? getAgentDir.call(piCodingAgent) : getConfigDir();
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -424,13 +430,9 @@ function inferInvocationMode(params: { agent?: unknown; task?: unknown; tasks?: 
 }
 
 function validateConfiguredChainLimits(chain: ChainStage[], limits: SubagentLimits): string | null {
-  if (chain.length > limits.maxChainSteps) return `Too many chain stages (${chain.length}). Max is ${limits.maxChainSteps}.`;
-  for (const stage of chain) {
-    if (getChainStageType(stage) === "parallel" && (stage as ChainParallelStage).tasks.length > limits.maxChainParallelTasks) {
-      return `Too many tasks in a chain parallel stage (${(stage as ChainParallelStage).tasks.length}). Max is ${limits.maxChainParallelTasks}.`;
-    }
-  }
-  return null;
+  return chain.length > limits.maxChainSteps
+    ? `Too many chain stages (${chain.length}). Max is ${limits.maxChainSteps}.`
+    : null;
 }
 
 function formatApprovalAgentNames(agents: AgentConfig[]): string {
@@ -828,9 +830,13 @@ export default function (pi: ExtensionAPI) {
       projectTrustOverride,
       sessionTrustedProjectDirs,
       sessionDeniedProjectDirs,
+      // Pi-subagent descendants always use --no-approve, regardless of the
+      // interactive extension policy. Preserve only their inherited exact-root
+      // authorization; explicit inherited denials still take priority.
+      { preserveInheritedSessionTrustOnDeny: currentDepth > 0 },
     );
     limits = await resolveSubagentLimitsForSession({
-      agentDir: piCodingAgent.getAgentDir(),
+      agentDir: getActiveAgentDir(),
       cwd: ctx.cwd,
       configDirName: CONFIG_DIR_NAME,
       projectTrusted: trustedProject,
@@ -971,7 +977,53 @@ export default function (pi: ExtensionAPI) {
       description: formatSubagentToolDescription(),
       parameters: SubagentParams,
 
+      // Reject raw model arguments before the host applies Value.Convert. The
+      // host's converter intentionally coerces values, while invocation shape
+      // validation must be strict and side-effect free.
+      prepareArguments(raw) {
+        const validationError = validateSubagentInvocation(raw);
+        if (validationError) throw new Error(formatSubagentInvocationValidationError(validationError));
+        return raw as never;
+      },
+
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        const rawValidationError = validateSubagentInvocation(params);
+        if (rawValidationError) throw new Error(formatSubagentInvocationValidationError(rawValidationError));
+        const failOperational = (
+          category: "runtime-policy" | "child-execution" | "cancellation",
+          message: string,
+        ): never => {
+          throw new Error(formatSubagentOperationalError(category, message));
+        };
+
+        const intendedMode = inferInvocationMode(params);
+        const terminalMode = getDefaultTerminalModeFromEnv();
+        const completionMode = parseCompletionMode(params.completion)!;
+        if (completionMode === "handoff" && terminalMode !== "cmux-pane" && terminalMode !== "tmux-pane") {
+          throw new Error(formatSubagentInvocationValidationError({
+            category: "option-combination",
+            message: "completion=handoff requires terminal mode cmux-pane or tmux-pane.",
+          }));
+        }
+        if (params.tasks && params.tasks.length > limits.maxParallelTasks) {
+          throw new Error(formatSubagentOperationalError(
+            "runtime-policy",
+            `Too many parallel tasks (${params.tasks.length}). Max is ${limits.maxParallelTasks}.`,
+          ));
+        }
+        if (params.chain) {
+          const chainLimitError = validateConfiguredChainLimits(params.chain as ChainStage[], limits)
+            ?? validateChainParallelLimit(params.chain as ChainStage[], limits.maxChainParallelTasks);
+          if (chainLimitError) throw new Error(formatSubagentOperationalError("runtime-policy", chainLimitError));
+          const chainLabelError = validateChainLabels(params.chain as ChainStage[]);
+          if (chainLabelError) {
+            throw new Error(formatSubagentInvocationValidationError({
+              category: "invocation-shape",
+              message: chainLabelError,
+            }));
+          }
+        }
+
         const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
         const earlyToolDetails = makeDetailsFactory(
           projectAgentsDir,
@@ -980,11 +1032,7 @@ export default function (pi: ExtensionAPI) {
         )("single")([]);
 
         if (sessionShuttingDown) {
-          return {
-            content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
-            details: earlyToolDetails,
-            isError: true,
-          };
+          failOperational("runtime-policy", "Cannot start subagents while the parent session is shutting down.");
         }
         // Capture only after the initial session check. A reset deliberately
         // creates a different generation, so stale approval/background work
@@ -996,109 +1044,17 @@ export default function (pi: ExtensionAPI) {
         const hasTasks = (params.tasks?.length ?? 0) > 0;
         const hasChain = (params.chain?.length ?? 0) > 0;
         const hasSingle = Boolean(params.agent && params.task);
+        // Raw validation above makes these parsers total for the accepted input.
         const action = parseBackgroundAction(params.action);
-        const background = parseBackgroundFlag(params.background);
-        const completionMode = parseCompletionMode(params.completion);
-        const terminalMode = getDefaultTerminalModeFromEnv();
-
-        if (params.action !== undefined && !action) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Invalid action \"${String(params.action)}\". Expected \"status\" or \"cancel\".`,
-              },
-            ],
-            details: earlyToolDetails,
-            isError: true,
-          };
-        }
-
-        if (background === null) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Invalid background value \"${String(params.background)}\". Expected true or false.`,
-              },
-            ],
-            details: earlyToolDetails,
-            isError: true,
-          };
-        }
-
-        if (!completionMode) {
-          return {
-            content: [{ type: "text", text: `Invalid completion \"${String(params.completion)}\". Expected \"one-shot\" or \"handoff\".` }],
-            details: earlyToolDetails,
-            isError: true,
-          };
-        }
-        const completionValidationError = validateCompletionInvocation({
-          completionMode,
-          hasSingle,
-          hasTasksField: params.tasks !== undefined,
-          hasChainField: params.chain !== undefined,
-          hasActionField: params.action !== undefined,
-          background,
-          terminalMode,
-        });
-        if (completionValidationError) {
-          return {
-            content: [{ type: "text", text: completionValidationError }],
-            details: earlyToolDetails,
-            isError: true,
-          };
-        }
+        const background = parseBackgroundFlag(params.background)!;
 
         if (action) {
-          const hasExecutionField = params.agent !== undefined || params.task !== undefined || params.model !== undefined || params.tasks !== undefined || params.chain !== undefined || params.cwd !== undefined || params.mode !== undefined || params.completion !== undefined;
-          if (hasExecutionField) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Invalid parameters. action cannot be combined with agent/task, tasks, or chain.",
-                },
-              ],
-              details: earlyToolDetails,
-              isError: true,
-            };
-          }
-          if (params.id !== undefined && typeof params.id !== "string") {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Invalid parameters. id must be a string when provided with action=\"status\" or action=\"cancel\".",
-                },
-              ],
-              details: earlyToolDetails,
-              isError: true,
-            };
-          }
-          if (params.background !== undefined) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Invalid parameters. background cannot be combined with action.",
-                },
-              ],
-              details: earlyToolDetails,
-              isError: true,
-            };
-          }
           pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
           if (action === "status") {
             if (typeof params.id === "string") {
               const job = getBackgroundJobSnapshot(params.id, backgroundJobs);
               if (!job) {
-                return {
-                  content: [{ type: "text", text: `Background subagent job ${params.id} was not found.` }],
-                  details: earlyToolDetails,
-                  isError: true,
-                };
+                return failOperational("runtime-policy", `Background subagent job ${params.id} was not found.`);
               }
               return {
                 content: [{ type: "text", text: formatBackgroundJobStatusText(job) }],
@@ -1121,11 +1077,7 @@ export default function (pi: ExtensionAPI) {
           const cancellation = cancelBackgroundJobs(backgroundJobs, typeof params.id === "string" ? params.id : undefined);
           for (const cancelledJob of cancellation.cancelled) uxRegistry.cancel(cancelledJob.id);
           if (!cancellation.found) {
-            return {
-              content: [{ type: "text", text: `Background subagent job ${String(params.id)} was not found.` }],
-              details: earlyToolDetails,
-              isError: true,
-            };
+            failOperational("runtime-policy", `Background subagent job ${String(params.id)} was not found.`);
           }
           if (typeof params.id === "string") {
             if (cancellation.cancelled.length > 0) {
@@ -1157,19 +1109,6 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        if (params.id !== undefined) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Invalid parameters. id can only be used with action=\"status\" or action=\"cancel\".",
-              },
-            ],
-            details: earlyToolDetails,
-            isError: true,
-          };
-        }
-
         const trustedProjectAtStart = isProjectTrustedForSession(projectAgentsDir);
         const untrustedProjectAgents = trustedProjectAtStart ? [] : discoverForSession(ctx.cwd, "project", { metadataOnly: true }).agents;
         const discovery = trustedProjectAtStart
@@ -1181,27 +1120,9 @@ export default function (pi: ExtensionAPI) {
         const { agents } = discovery;
         const visibleAgents = trustedProjectAtStart ? agents : discoverForSession(ctx.cwd, "user").agents;
 
-        const delegationMode = parseDelegationMode(params.mode);
+        const delegationMode = parseDelegationMode(params.mode)!;
         const parentSessionId = ctx.sessionManager.getSessionId();
         const parentSessionFile = ctx.sessionManager.getSessionFile();
-        const intendedMode = inferInvocationMode(params);
-        if (!delegationMode) {
-          const fallbackDetails = makeDetailsFactory(
-            discovery.projectAgentsDir,
-            DEFAULT_DELEGATION_MODE,
-            terminalMode,
-          );
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Invalid mode \"${String(params.mode)}\". Expected \"spawn\" or \"fork\".\nAvailable agents: ${formatAgentNames(visibleAgents)}`,
-              },
-            ],
-            details: fallbackDetails(intendedMode)([]),
-            isError: true,
-          };
-        }
 
         const detailsExtras = intendedMode === "chain" && Array.isArray(params.chain)
           ? { chainStageCount: params.chain.length }
@@ -1231,77 +1152,14 @@ export default function (pi: ExtensionAPI) {
           const forkBranchSource = buildForkBranchSourceJsonl(ctx.sessionManager);
           forkSessionSnapshotJsonl = forkBranchSource ?? undefined;
           if (forkBranchSource === null) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Cannot use mode=\"fork\": failed to snapshot current session context.",
-                },
-              ],
-              details: makeDetails(intendedMode, detailsExtras)([]),
-              isError: true,
-            };
+            failOperational("runtime-policy", "Cannot use mode=\"fork\": failed to snapshot current session context.");
           }
-        }
-
-        // Validate: exactly one invocation shape must be specified
-        if (Number(hasTasks) + Number(hasChain) + Number(hasSingle) !== 1) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: formatInvalidInvocationShapeMessage(formatAgentNames(visibleAgents)),
-              },
-            ],
-            details: makeDetails(intendedMode)([]),
-            isError: true,
-          };
-        }
-
-        if (params.tasks && params.tasks.length > limits.maxParallelTasks) {
-          return {
-            content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${limits.maxParallelTasks}.` }],
-            details: makeDetails("parallel")([]),
-            isError: true,
-          };
-        }
-
-        if (params.model !== undefined && !hasSingle) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Invalid parameters. top-level model can only be used with single {agent, task} invocations; put model on each task item for parallel or chain calls.",
-              },
-            ],
-            details: makeDetails(intendedMode)([]),
-            isError: true,
-          };
         }
 
         // Security: guard project-local agents before running
         const requested = new Set<string>();
         if (params.tasks) for (const t of params.tasks) requested.add(t.agent);
         if (params.chain) {
-          const chainLimitError = validateConfiguredChainLimits(params.chain as ChainStage[], limits);
-          if (chainLimitError) {
-            return {
-              content: [{ type: "text", text: chainLimitError }],
-              details: makeDetails("chain", { chainStageCount: params.chain.length })([]),
-              isError: true,
-            };
-          }
-          const chainValidationError = validateChainStages(
-            params.chain as ChainStage[],
-            limits.maxChainParallelTasks,
-          );
-          if (chainValidationError) {
-            return {
-              content: [{ type: "text", text: chainValidationError }],
-              details: makeDetails("chain", { chainStageCount: params.chain.length })([]),
-              isError: true,
-            };
-          }
           for (const name of collectRequestedAgentNamesFromChain(params.chain as ChainStage[])) requested.add(name);
         }
         if (params.agent) requested.add(params.agent);
@@ -1316,19 +1174,13 @@ export default function (pi: ExtensionAPI) {
               ancestorAgentStack.length > 0
                 ? ancestorAgentStack.join(" -> ")
                 : "(root)";
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Blocked: delegation cycle detected. Requested agent(s) already in the delegation stack: ${cycleViolations.join(", ")}.
+            failOperational(
+              "runtime-policy",
+              `Blocked: delegation cycle detected. Requested agent(s) already in the delegation stack: ${cycleViolations.join(", ")}.
 Current stack: ${stackText}
 
 This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A).`,
-                },
-              ],
-              details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-              isError: true,
-            };
+            );
           }
         }
 
@@ -1339,16 +1191,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           )
           : [];
         if (hiddenProjectShadowedUserAgents.length > 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Blocked: hidden project agent name collision for ${hiddenProjectShadowedUserAgents.join(", ")}. Trust the project first or rename one of the colliding agents before calling it by name.`,
-              },
-            ],
-            details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-            isError: true,
-          };
+          failOperational(
+            "runtime-policy",
+            `Blocked: hidden project agent name collision for ${hiddenProjectShadowedUserAgents.join(", ")}. Trust the project first or rename one of the colliding agents before calling it by name.`,
+          );
         }
         const requestedProjectAgentNames = trustedProjectAtStart
           ? requested
@@ -1382,16 +1228,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
                 sessionTrustedProjectDirs,
                 sessionDeniedProjectDirs,
               );
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Canceled: project-local agents not approved.",
-                  },
-                ],
-                details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-                isError: true,
-              };
+              failOperational("cancellation", "Canceled: project-local agents not approved.");
             }
             const projectRoot = applySessionProjectTrustOverride(
               discovery.projectAgentsDir,
@@ -1405,16 +1242,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               if (deniedIndex !== -1) deniedProjectRoots.splice(deniedIndex, 1);
             }
           } else if (!ctx.hasUI && shouldPrompt) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Blocked: project-local agent prompt confirmation is required in non-UI mode.\n${formatProjectAgentApprovalScope(currentProjectRoot, untrustedProjectAgents, requestedProjectAgents, visibleAgents)}\n\nRun from an interactive session and approve the entire listed project root for this session, or pass --approve to trust the entire listed project root for this session. Child Pi runs still use --no-approve and do not load other .pi project code.`,
-                },
-              ],
-              details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-              isError: true,
-            };
+            failOperational(
+              "runtime-policy",
+              `Blocked: project-local agent prompt confirmation is required in non-UI mode.\n${formatProjectAgentApprovalScope(currentProjectRoot, untrustedProjectAgents, requestedProjectAgents, visibleAgents)}\n\nRun from an interactive session and approve the entire listed project root for this session, or pass --approve to trust the entire listed project root for this session. Child Pi runs still use --no-approve and do not load other .pi project code.`,
+            );
           }
 
           const fullDiscovery = discoverForSession(ctx.cwd, "both");
@@ -1422,14 +1253,19 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           discoveredAgents = fullDiscovery.agents;
         }
 
+        const runnableAgentNames = new Set(runnableAgents.map((agent) => agent.name));
+        const unknownAgentNames = Array.from(requested).filter((name) => !runnableAgentNames.has(name)).sort();
+        if (unknownAgentNames.length > 0) {
+          failOperational(
+            "runtime-policy",
+            `Unknown agent(s): ${unknownAgentNames.join(", ")}. Available agents: ${formatAgentNames(runnableAgents)}`,
+          );
+        }
+
         // Approval can yield to session shutdown. Do not permit its old
         // invocation capture to start work after the fence/reset.
         if (!canStartInvocation()) {
-          return {
-            content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
-            details: makeDetails(intendedMode, detailsExtras)([]),
-            isError: true,
-          };
+          failOperational("runtime-policy", "Cannot start subagents while the parent session is shutting down.");
         }
 
         const schedulerHandle = scheduler.createHandle();
@@ -1449,7 +1285,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               forkManagers.delete(schedulerKey);
             }
             return {
-              content: [{ type: "text" as const, text: "Cannot start subagents while the parent session is shutting down." }],
+              content: [{
+                type: "text" as const,
+                text: formatSubagentOperationalError("runtime-policy", "Cannot start subagents while the parent session is shutting down."),
+              }],
               details: makeDetails(intendedMode, detailsExtras)([]),
               isError: true,
             };
@@ -1461,7 +1300,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               forkManagers.set(schedulerKey, forkManager);
             } catch (error) {
               const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
-              return { content: [{ type: "text" as const, text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+              return {
+                content: [{ type: "text" as const, text: formatSubagentOperationalError("runtime-policy", message) }],
+                details: makeDetails(intendedMode, detailsExtras)([]),
+                isError: true,
+              };
             }
           }
           let foregroundPermitScope: ForegroundDelegationScope | undefined;
@@ -1474,7 +1317,11 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               }
             } catch (error) {
               const message = `Cannot acquire tree-wide permit authority: ${error instanceof Error ? error.message : String(error)}`;
-              return { content: [{ type: "text" as const, text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+              return {
+                content: [{ type: "text" as const, text: formatSubagentOperationalError("runtime-policy", message) }],
+                details: makeDetails(intendedMode, detailsExtras)([]),
+                isError: true,
+              };
             }
             if (params.tasks && params.tasks.length > 0) {
             return await executeParallel(
@@ -1579,22 +1426,14 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // This check is separate from the callback check above: no job is
           // published as started after shutdown has fenced the invocation.
           if (!canStartInvocation()) {
-            return {
-              content: [{ type: "text", text: "Cannot start subagents while the parent session is shutting down." }],
-              details: makeDetails(intendedMode, detailsExtras)([]),
-              isError: true,
-            };
+            failOperational("runtime-policy", "Cannot start subagents while the parent session is shutting down.");
           }
           pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
           if (countRunningBackgroundJobs() >= limits.maxBackgroundJobs) {
-            return {
-              content: [{
-                type: "text",
-                text: `Cannot start background subagent job: ${limits.maxBackgroundJobs} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
-              }],
-              details: makeDetails(intendedMode, detailsExtras)([]),
-              isError: true,
-            };
+            failOperational(
+              "runtime-policy",
+              `Cannot start background subagent job: ${limits.maxBackgroundJobs} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
+            );
           }
 
           if (delegationMode === "fork") {
@@ -1602,7 +1441,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               forkManagers.set(`${schedulerHandle.generation}:${schedulerHandle.id}`, await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!));
             } catch (error) {
               const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
-              return { content: [{ type: "text", text: message }], details: makeDetails(intendedMode, detailsExtras)([]), isError: true };
+              failOperational("runtime-policy", message);
             }
           }
           const job = createBackgroundJobRecord({
@@ -1666,9 +1505,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         try {
           const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false));
           updateUxFromPartial(uxRun.id, uxGeneration, result);
-          if (foregroundController.signal.aborted) uxRegistry.cancelled(uxRun.id, uxGeneration);
-          else if ("isError" in result && result.isError) uxRegistry.fail(uxRun.id, uxGeneration);
-          else uxRegistry.complete(uxRun.id, uxGeneration);
+          if (foregroundController.signal.aborted) {
+            failOperational("cancellation", "Foreground subagent invocation was canceled.");
+          }
+          if ("isError" in result && result.isError) {
+            throw new Error(extractToolText(result) || formatSubagentOperationalError("child-execution", "Subagent invocation failed."));
+          }
+          uxRegistry.complete(uxRun.id, uxGeneration);
           return result;
         } catch (error) {
           if (foregroundController.signal.aborted) uxRegistry.cancelled(uxRun.id, uxGeneration);
@@ -1744,7 +1587,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         content: [
           {
             type: "text" as const,
-            text: `Agent ${result.stopReason || "failed"}: ${getResultSummaryText(result)}`,
+            text: formatSubagentOperationalError(
+              result.stopReason === "aborted" ? "cancellation" : "child-execution",
+              `Agent ${result.stopReason || "failed"}: ${getResultSummaryText(result)}`,
+            ),
           },
         ],
         details: makeDetails("single")([result]),
@@ -1782,24 +1628,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     schedulerHandle: SchedulerHandle,
     forkSourceOwnership?: ForkSourceOwnershipManager,
   ) {
-    const chainLimitError = validateConfiguredChainLimits(chain, limits);
-    if (chainLimitError) {
-      return {
-        content: [{ type: "text" as const, text: chainLimitError }],
-        details: makeDetails("chain", { chainStageCount: chain.length })([]),
-        isError: true,
-      };
-    }
-
-    const validationError = validateChainStages(chain, limits.maxChainParallelTasks);
-    if (validationError) {
-      return {
-        content: [{ type: "text" as const, text: validationError }],
-        details: makeDetails("chain", { chainStageCount: chain.length })([]),
-        isError: true,
-      };
-    }
-
     const stages: ChainStageRecord[] = [];
     const flattenedResults: SingleResult[] = [];
     const state: ChainExecutionState = { hadError: false, hadCompletedWithErrors: false, hadBlockingError: false };
@@ -1878,7 +1706,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           content: [
             {
               type: "text" as const,
-              text: `Chain aborted before stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              text: formatSubagentOperationalError(
+                "cancellation",
+                `Chain aborted before stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              ),
             },
           ],
           details: makeDetails("chain", chainDetails())(flattenedResults),
@@ -1986,7 +1817,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             content: [
               {
                 type: "text" as const,
-                text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+                text: formatSubagentOperationalError(
+                  "child-execution",
+                  `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+                ),
               },
             ],
             details: makeDetails("chain", chainDetails())(flattenedResults),
@@ -2065,7 +1899,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           content: [
             {
               type: "text" as const,
-              text: `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              text: formatSubagentOperationalError(
+                "child-execution",
+                `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              ),
             },
           ],
           details: makeDetails("chain", chainDetails())(flattenedResults),
@@ -2082,7 +1919,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       content: [
         {
           type: "text" as const,
-          text: `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}\n\n${formatChainStageSummaries(stages)}`,
+          text: state.hadError || state.hadCompletedWithErrors
+            ? formatSubagentOperationalError(
+              "child-execution",
+              `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}\n\n${formatChainStageSummaries(stages)}`,
+            )
+            : `Chain: ${completed}/${chain.length} stages completed${skipped ? `, ${skipped} skipped` : ""}\n\n${formatChainStageSummaries(stages)}`,
         },
       ],
       details: makeDetails("chain", chainDetails())(flattenedResults),
@@ -2109,14 +1951,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     schedulerHandle: SchedulerHandle,
     forkSourceOwnership?: ForkSourceOwnershipManager,
   ) {
-    if (tasks.length > limits.maxParallelTasks) {
-      return {
-        content: [{ type: "text" as const, text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.` }],
-        details: makeDetails("parallel")([]),
-        isError: true,
-      };
-    }
-
     // Preserve one placeholder per task while scheduler-queued work has not started.
     const resultSlots = new IncrementalResultSlots(tasks.map((task) => ({
       agent: task.agent,
@@ -2212,7 +2046,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       content: [
         {
           type: "text" as const,
-          text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+          text: successCount === results.length
+            ? `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`
+            : formatSubagentOperationalError(
+              "child-execution",
+              `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+            ),
         },
       ],
       details: makeDetails("parallel")(results),

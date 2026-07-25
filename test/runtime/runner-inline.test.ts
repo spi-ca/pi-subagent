@@ -256,7 +256,13 @@ describe("inline runner path", () => {
         makeDetails: (results) => ({ mode: "single", toolLabel: "Subagent", delegationMode: "fork", terminalMode: "inline", projectAgentsDir: null, results }),
       });
       assert.notEqual(result.exitCode, 0);
-      assert.deepEqual(await fs.promises.readdir(root), []);
+      const entries = await fs.promises.readdir(root);
+      const uidSuffix = typeof process.getuid === "function" ? `-${process.getuid()}` : "";
+      assert.deepEqual(entries, [`pi-subagent-runs${uidSuffix}`]);
+      assert.deepEqual(
+        await fs.promises.readdir(path.join(root, entries[0]!)),
+        ["state-root-marker.json"],
+      );
     } finally {
       if (originalTmpDir === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = originalTmpDir;

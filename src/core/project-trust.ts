@@ -9,6 +9,7 @@ interface ProjectTrustOptions {
   trust?: Record<string, unknown> | null;
   sessionTrustedProjectRoots?: Iterable<string>;
   sessionDeniedProjectRoots?: Iterable<string>;
+  preserveInheritedSessionTrustOnDeny?: boolean;
 }
 
 export function getConfigDir(): string {
@@ -98,14 +99,23 @@ export function resolveSessionProjectTrust(
   trustOverride: boolean | null,
   sessionTrustedProjectRoots: Set<string>,
   sessionDeniedProjectRoots: Set<string>,
-  options: Pick<ProjectTrustOptions, "configDir" | "trust"> = {},
+  options: Pick<ProjectTrustOptions, "configDir" | "trust" | "preserveInheritedSessionTrustOnDeny"> = {},
 ): boolean {
-  applySessionProjectTrustOverride(
-    projectAgentsDir,
-    trustOverride,
-    sessionTrustedProjectRoots,
-    sessionDeniedProjectRoots,
-  );
+  const projectRoot = getProjectRootFromAgentsDir(projectAgentsDir);
+  const preserveInheritedSessionTrust =
+    trustOverride === false &&
+    options.preserveInheritedSessionTrustOnDeny === true &&
+    projectRoot !== null &&
+    canonicalizeProjectRootSet(sessionTrustedProjectRoots).has(projectRoot) &&
+    !canonicalizeProjectRootSet(sessionDeniedProjectRoots).has(projectRoot);
+  if (!preserveInheritedSessionTrust) {
+    applySessionProjectTrustOverride(
+      projectAgentsDir,
+      trustOverride,
+      sessionTrustedProjectRoots,
+      sessionDeniedProjectRoots,
+    );
+  }
   return isTrustedProjectAgentsDirWithSessionOverrides(projectAgentsDir, {
     ...options,
     sessionTrustedProjectRoots,

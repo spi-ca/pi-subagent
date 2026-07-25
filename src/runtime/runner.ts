@@ -99,6 +99,7 @@ import {
   SUBAGENT_COMPLETION_FENCE_NONCE_ENV,
   SUBAGENT_RUN_ID_ENV,
   SUBAGENT_RUN_OWNERSHIP_ENV,
+  RUN_STATE_DIR_ENV,
   SUBAGENT_PROMOTION_REQUEST_PATH_ENV,
   SUBAGENT_PROMOTION_ACK_PATH_ENV,
   SUBAGENT_RUN_STATE_PATH_ENV,
@@ -107,6 +108,7 @@ import {
   atomicWriteJson,
   BROKER_PROTOCOL_VERSION,
   createRunId,
+  ensureRunStateRoot,
   getRunStateRoot,
   classifyParentProcessIdentity,
   getCurrentProcessStartedAt,
@@ -3466,6 +3468,7 @@ export function buildChildProcessEnv(opts: {
   }
 
   for (const name of [
+    RUN_STATE_DIR_ENV,
     SUBAGENT_RUN_ID_ENV,
     SUBAGENT_RUN_STATE_PATH_ENV,
     SUBAGENT_RUN_COMPLETION_PATH_ENV,
@@ -3800,6 +3803,36 @@ function isProjectAgentExplicitlyTrusted(
 // Public API
 // ---------------------------------------------------------------------------
 
+/**
+ * Select one state root before child launch. Existing roots are only accepted
+ * with their immutable marker; a missing root is initialized through the
+ * existing protocol path, never by repairing a markerless directory.
+ */
+async function resolveChildRunStateRoot(
+  treePermitLease?: Pick<TreePermitLease, "authority">,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const requestedRoot = treePermitLease?.authority.rootDir ?? getRunStateRoot(baseEnv);
+  const canonicalRoot = await ensureRunStateRoot(requestedRoot);
+  if (treePermitLease && canonicalRoot !== await fs.promises.realpath(treePermitLease.authority.rootDir)) {
+    throw new Error("Tree permit root does not match the validated child state root.");
+  }
+  return canonicalRoot;
+}
+
+/** Test seam for root selection and canonicalization without spawning Pi. */
+export async function resolveChildRunStateRootForTest(
+  treePermitLease?: Pick<TreePermitLease, "authority">,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  return await resolveChildRunStateRoot(treePermitLease, baseEnv);
+}
+
+function buildTreePermitChildEnv(treePermitLease: TreePermitLease | undefined, runStateRoot: string): Record<string, string> | undefined {
+  if (!treePermitLease) return undefined;
+  return { ...treePermitLease.exportChildEnv(), [TREE_PERMIT_ROOT_ENV]: runStateRoot };
+}
+
 export interface RunAgentOptions {
   /** Fallback working directory when the task doesn't specify one. */
   cwd: string;
@@ -4030,6 +4063,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     return result;
   }
 
+  let runStateRoot: string;
+  try {
+    runStateRoot = await resolveChildRunStateRoot(treePermitLease);
+  } catch (error) {
+    result.exitCode = 1;
+    result.stopReason = "error";
+    result.errorMessage = error instanceof Error ? error.message : String(error);
+    result.stderr = result.errorMessage;
+    await forkSourceOwnership?.markTerminal(forkChildId!, "launch-failed").catch(() => undefined);
+    return result;
+  }
+
   const interactiveBackend = getInteractivePaneBackend(terminalMode);
   if (interactiveBackend) {
     return await runAgentInInteractivePane({
@@ -4061,6 +4106,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       forkSourceOwnership,
       forkChildId,
       treePermitLease,
+      runStateRoot,
     });
   }
 
@@ -4111,7 +4157,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       parentDepth, parentAgentStack, maxDepth, maxActive, limits, preventCycles,
       interactivePaneLayout, trustedProjectRoots, deniedProjectRoots, makeDetails,
       completionMode, inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv, assistantSignatureIndexDir: taskTmpDir,
-      forkSourceOwnership, forkChildId, forkBootstrapPath, treePermitLease,
+      forkSourceOwnership, forkChildId, forkBootstrapPath, treePermitLease, runStateRoot,
     });
   } finally {
     // Attempt every cleanup without replacing an already produced child result.
@@ -4147,6 +4193,8 @@ interface RunAgentExecutionOptions {
   forkChildId?: string;
   forkBootstrapPath?: string;
   treePermitLease?: TreePermitLease;
+  /** One parent-validated, canonical root passed explicitly to this child. */
+  runStateRoot: string;
   makeDetails: (results: SingleResult[]) => SubagentDetails;
 }
 
@@ -4558,6 +4606,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     forkChildId,
     forkBootstrapPath,
     treePermitLease,
+    runStateRoot,
   } = opts;
 
   const managedChild = resolveManagedChildPolicy() === "managed";
@@ -4595,8 +4644,11 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
       inheritedApiKeyAgentDir,
       phase0LiveProofEnv,
       completionMode: opts.completionMode,
-      runProtocolEnv: forkBootstrapPath ? { [SUBAGENT_FORK_BOOTSTRAP_PATH_ENV]: forkBootstrapPath } : undefined,
-      treePermitEnv: treePermitLease?.exportChildEnv(),
+      runProtocolEnv: {
+        [RUN_STATE_DIR_ENV]: runStateRoot,
+        ...(forkBootstrapPath ? { [SUBAGENT_FORK_BOOTSTRAP_PATH_ENV]: forkBootstrapPath } : {}),
+      },
+      treePermitEnv: buildTreePermitChildEnv(treePermitLease, runStateRoot),
     }),
   });
 
@@ -4725,6 +4777,8 @@ interface RunAgentInInteractivePaneOptions {
   forkSourceOwnership?: ForkSourceOwnershipManager;
   forkChildId?: string;
   treePermitLease?: TreePermitLease;
+  /** One parent-validated, canonical root used for this run and its child. */
+  runStateRoot: string;
 }
 
 const MULTIPLEXER_IDENTITY_ENV = new Set(["TMUX", "TMUX_PANE", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID"]);
@@ -4759,7 +4813,7 @@ const CHILD_BOOTSTRAP_ENV = new Set([
   PI_AGENT_DIR_ENV, SUBAGENT_ORIGINAL_AGENT_DIR_ENV, SUBAGENT_INHERITED_API_KEY_ENV, SUBAGENT_MANAGED_TITLE_ENV,
   SUBAGENT_DEPTH_ENV, SUBAGENT_MAX_DEPTH_ENV, SUBAGENT_MAX_ACTIVE_ENV, SUBAGENT_STACK_ENV, SUBAGENT_PREVENT_CYCLES_ENV, SUBAGENT_MANAGED_CHILD_POLICY_ENV,
   INTERACTIVE_PANE_LAYOUT_ENV, SUBAGENT_TRUSTED_PROJECTS_ENV, SUBAGENT_DENIED_PROJECTS_ENV, PI_OFFLINE_ENV,
-  SUBAGENT_RUN_ID_ENV, SUBAGENT_RUN_STATE_PATH_ENV, SUBAGENT_RUN_COMPLETION_PATH_ENV,
+  RUN_STATE_DIR_ENV, SUBAGENT_RUN_ID_ENV, SUBAGENT_RUN_STATE_PATH_ENV, SUBAGENT_RUN_COMPLETION_PATH_ENV,
   SUBAGENT_COMPLETION_FENCE_PATH_ENV, SUBAGENT_COMPLETION_FENCE_ACK_PATH_ENV, SUBAGENT_COMPLETION_FENCE_NONCE_ENV,
   TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV,
   SUBAGENT_PARENT_LEASE_PATH_ENV, SUBAGENT_CHILD_SESSION_PATH_ENV, SUBAGENT_RUN_OWNERSHIP_ENV, SUBAGENT_PROMOTION_REQUEST_PATH_ENV, SUBAGENT_PROMOTION_ACK_PATH_ENV, SUBAGENT_FORK_BOOTSTRAP_PATH_ENV, SUBAGENT_COMPLETION_MODE_ENV, SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV, SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
@@ -5321,7 +5375,11 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   try {
     const parentStartedAt = getCurrentProcessStartedAt();
     if (parentStartedAt === null) throw new Error("Unable to establish parent process start identity.");
-    paths = await prepareRunArtifactPaths({ runId: options.forkChildId, initialParentLease: { parentPid: process.pid, parentStartedAt } });
+    paths = await prepareRunArtifactPaths({ rootDir: options.runStateRoot, runId: options.forkChildId, initialParentLease: { parentPid: process.pid, parentStartedAt } });
+    if (paths.rootDir !== options.runStateRoot || await fs.promises.realpath(paths.rootDir) !== options.runStateRoot) {
+      throw new Error("Interactive run state root does not match the validated child root.");
+    }
+    await assertSafeRunArtifactPaths(paths);
     const runPaths = paths;
     const runId = path.basename(paths.runDir);
     // Publish liveness immediately after the private run directory marker, before
@@ -5530,6 +5588,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         };
       }
       const protocolEnv = {
+        [RUN_STATE_DIR_ENV]: options.runStateRoot,
         [SUBAGENT_RUN_ID_ENV]: runId, ...(forkBootstrapPath ? { [SUBAGENT_FORK_BOOTSTRAP_PATH_ENV]: forkBootstrapPath } : {}), [SUBAGENT_RUN_STATE_PATH_ENV]: runPaths.statePath,
         [SUBAGENT_RUN_COMPLETION_PATH_ENV]: runPaths.completionPath,
         [SUBAGENT_COMPLETION_FENCE_PATH_ENV]: runPaths.completionFencePath, [SUBAGENT_COMPLETION_FENCE_ACK_PATH_ENV]: runPaths.completionFenceAckPath,
@@ -5551,7 +5610,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         maxDepth: options.maxDepth, maxActive: options.maxActive, limits: options.limits, preventCycles: options.preventCycles, interactivePaneLayout: options.interactivePaneLayout,
         trustedProjectRoots: options.trustedProjectRoots, deniedProjectRoots: options.deniedProjectRoots,
         inheritedApiKeyBinding: options.inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv: options.phase0LiveProofEnv, completionMode: options.completionMode, baseEnv: process.env, runProtocolEnv: protocolEnv,
-        treePermitEnv: options.treePermitLease?.exportChildEnv(),
+        treePermitEnv: buildTreePermitChildEnv(options.treePermitLease, options.runStateRoot),
       });
       await writePrivateFile(runPaths.secretEnvPath, buildPrivateChildEnvironmentScript(childEnv));
       if (!isInteractivePiVersionProofCurrent(piVersionProof)) throw new Error("Pi executable changed after version preflight.");

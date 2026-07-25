@@ -2,11 +2,13 @@ import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { mkdir } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
   buildChildProcessEnv,
   buildPrivateChildEnvironmentScript,
+  resolveChildRunStateRootForTest,
   buildPiArgs,
   PHASE0_LIVE_GATE_ENV,
   PHASE0_LIVE_PROOF_BARRIER_PATH_ENV,
@@ -27,6 +29,7 @@ import {
 } from "../../src/runtime/runner";
 import { SUBAGENT_LIMIT_DEFINITIONS, type SubagentLimits } from "../../src/core/subagent-limits";
 import {
+  RUN_STATE_DIR_ENV,
   SUBAGENT_COMPLETION_MODE_ENV,
   SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
   V3_FAILURE_BOUNDARY_CAPABILITY,
@@ -37,6 +40,8 @@ import {
   SUBAGENT_COMPLETION_FENCE_PATH_ENV,
   SUBAGENT_LEASE_CHECK_MS_ENV,
   SUBAGENT_PROMOTION_ACK_PATH_ENV,
+  prepareRunArtifactPaths,
+  removeRunArtifacts,
   SUBAGENT_PROMOTION_REQUEST_PATH_ENV,
 } from "../../src/runtime/run-protocol";
 import {
@@ -46,6 +51,7 @@ import {
   TREE_PERMIT_ROOT_ENV,
   TREE_PERMIT_ROOT_ID_ENV,
   TREE_PERMIT_TOKEN_ENV,
+  type TreePermitLease,
 } from "../../src/runtime/tree-permit-authority";
 
 const tempDirs: string[] = [];
@@ -111,6 +117,51 @@ describe("subagent auth propagation", () => {
     assert.equal(limited.PI_SUBAGENT_PARALLEL_HEARTBEAT_MS, "10");
     const lifecycle = buildChildProcessEnv({ ...common, baseEnv: { [SUBAGENT_LEASE_CHECK_MS_ENV]: "37" }, runProtocolEnv: { [SUBAGENT_LEASE_CHECK_MS_ENV]: "37" } });
     assert.equal(lifecycle[SUBAGENT_LEASE_CHECK_MS_ENV], "37");
+  });
+
+  test("replaces stale run-state root with the exact private child value", () => {
+    const root = "/private/validated/pi-subagent-runs";
+    const child = buildChildProcessEnv({
+      agentName: "worker", parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true,
+      baseEnv: { [RUN_STATE_DIR_ENV]: "/stale/ancestor-root" },
+      runProtocolEnv: { [RUN_STATE_DIR_ENV]: root },
+    });
+    assert.equal(child[RUN_STATE_DIR_ENV], root);
+    assert.match(buildPrivateChildEnvironmentScript(child), new RegExp(`^export ${RUN_STATE_DIR_ENV}='${root}'$`, "m"));
+
+    const omitted = buildChildProcessEnv({
+      agentName: "worker", parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true,
+      baseEnv: { [RUN_STATE_DIR_ENV]: "/stale/ancestor-root" },
+    });
+    assert.equal(omitted[RUN_STATE_DIR_ENV], undefined);
+  });
+
+  test("prefers the canonical tree-permit root over a divergent nested configured root", async () => {
+    const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-root-divergence-"));
+    tempDirs.push(container);
+    const configuredRoot = path.join(container, "nested", "configured");
+    const treeRoot = path.join(container, "nested", "tree-permit");
+    await mkdir(path.join(configuredRoot, ".tree-permits"), { recursive: true });
+    const treePaths = await prepareRunArtifactPaths({ rootDir: treeRoot });
+    await removeRunArtifacts(treePaths);
+    const resolved = await resolveChildRunStateRootForTest(
+      { authority: { rootDir: treeRoot } } as Pick<TreePermitLease, "authority">,
+      { [RUN_STATE_DIR_ENV]: configuredRoot },
+    );
+    assert.equal(resolved, await fs.promises.realpath(treeRoot));
+    assert.notEqual(resolved, await fs.promises.realpath(configuredRoot));
+    assert.equal(fs.existsSync(path.join(configuredRoot, "state-root-marker.json")), false);
+  });
+
+  test("rejects rather than repairs an existing markerless run-state root", async () => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-markerless-root-"));
+    tempDirs.push(root);
+    await mkdir(path.join(root, ".tree-permits"));
+    await assert.rejects(
+      resolveChildRunStateRootForTest(undefined, { [RUN_STATE_DIR_ENV]: root }),
+      /ownership marker is missing from nonempty root/,
+    );
+    assert.equal(fs.existsSync(path.join(root, "state-root-marker.json")), false);
   });
 
   test("replaces stale completion mode with the exact private child value", () => {

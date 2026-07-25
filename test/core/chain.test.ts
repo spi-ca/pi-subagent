@@ -1,10 +1,15 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import { buildChainTaskFromStages, shouldRunStage, validateChainStages } from "../../src/core/chain-helpers";
+import {
+  buildChainTaskFromStages,
+  shouldRunStage,
+  validateChainLabels,
+  validateChainParallelLimit,
+} from "../../src/core/chain-helpers";
 
 describe("mixed chain helpers", () => {
   test("accepts sequential stages and parallel stages", () => {
-    const error = validateChainStages([
+    const error = validateChainLabels([
       { label: "discover", type: "parallel", tasks: [
         { agent: "scout", task: "Inspect local code" },
         { agent: "researcher", task: "Check docs" },
@@ -15,15 +20,11 @@ describe("mixed chain helpers", () => {
     assert.equal(error, null);
   });
 
-  test("rejects duplicate labels and empty parallel groups", () => {
-    assert.match(validateChainStages([
+  test("rejects duplicate labels", () => {
+    assert.match(validateChainLabels([
       { label: "x", agent: "scout", task: "Inspect" },
       { label: "x", agent: "planner", task: "Plan" },
     ] as any) ?? "", /Duplicate chain label/);
-
-    assert.match(validateChainStages([
-      { label: "empty", type: "parallel", tasks: [] },
-    ] as any) ?? "", /requires a non-empty tasks array/);
   });
 
   test("uses the configured chain parallel limit rather than the legacy default of eight", () => {
@@ -33,8 +34,8 @@ describe("mixed chain helpers", () => {
       tasks: Array.from({ length: 9 }, (_, index) => ({ agent: `worker-${index}`, task: "Inspect" })),
     }] as any;
 
-    assert.equal(validateChainStages(stage, 9), null);
-    assert.match(validateChainStages(stage, 8) ?? "", /Max is 8/);
+    assert.equal(validateChainParallelLimit(stage, 9), null);
+    assert.match(validateChainParallelLimit(stage, 8) ?? "", /Max is 8/);
   });
 
   test("evaluates conditions from accumulated chain state", () => {

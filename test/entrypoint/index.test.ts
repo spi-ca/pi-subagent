@@ -129,8 +129,8 @@ describe("subagent tool schema", () => {
       type: "object",
       required: ["agent", "task"],
       properties: {
-        agent: { type: "string" },
-        task: { type: "string" },
+        agent: { type: "string", minLength: 1 },
+        task: { type: "string", minLength: 1 },
         cwd: { type: "string" },
         model: { type: "string" },
       },
@@ -147,12 +147,13 @@ describe("subagent tool schema", () => {
         id: { type: "string" },
         background: { type: "boolean" },
         completion: { type: "string", enum: ["one-shot", "handoff"], default: "one-shot" },
-        agent: { type: "string" },
-        task: { type: "string" },
+        agent: { type: "string", minLength: 1 },
+        task: { type: "string", minLength: 1 },
         model: { type: "string" },
-        tasks: { type: "array", items: taskItem },
+        tasks: { type: "array", minItems: 1, items: taskItem },
         chain: {
           type: "array",
+          minItems: 1,
           items: {
             anyOf: [
               {
@@ -161,8 +162,8 @@ describe("subagent tool schema", () => {
                 properties: {
                   type: { type: "string", const: "chain" },
                   label: { type: "string" },
-                  agent: { type: "string" },
-                  task: { type: "string" },
+                  agent: { type: "string", minLength: 1 },
+                  task: { type: "string", minLength: 1 },
                   cwd: { type: "string" },
                   model: { type: "string" },
                   condition,
@@ -175,7 +176,7 @@ describe("subagent tool schema", () => {
                 properties: {
                   type: { type: "string", const: "parallel" },
                   label: { type: "string" },
-                  tasks: { type: "array", items: taskItem },
+                  tasks: { type: "array", minItems: 1, items: taskItem },
                   condition,
                   continueOnError: { type: "boolean" },
                 },
@@ -187,6 +188,87 @@ describe("subagent tool schema", () => {
         cwd: { type: "string" },
       },
     });
+  });
+
+  test("rejects raw arguments before conversion and preserves valid strings", async () => {
+    let subagentTool: {
+      prepareArguments?: (raw: unknown) => unknown;
+      execute?: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; isError?: boolean }>;
+    } | undefined;
+    const pi = {
+      registerFlag: () => undefined,
+      getFlag: () => undefined,
+      registerCommand: () => undefined,
+      registerTool: (tool: unknown) => {
+        const candidate = tool as {
+          name?: unknown;
+          prepareArguments?: (raw: unknown) => unknown;
+          execute?: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; isError?: boolean }>;
+        };
+        if (candidate.name === "subagent") subagentTool = candidate;
+      },
+      on: () => undefined,
+      events: { emit: () => undefined },
+      getAllTools: () => [],
+      getCommands: () => [],
+    };
+
+    registerPiSubagent(pi as never);
+    assert.ok(subagentTool?.prepareArguments);
+    let prepareError: unknown;
+    try {
+      subagentTool!.prepareArguments!({ agent: 1, task: "raw-secret" });
+    } catch (error) {
+      prepareError = error;
+    }
+    assert.ok(prepareError instanceof Error);
+    assert.match(prepareError.message, /Invalid parameters \(input-type\)/);
+    assert.equal(prepareError.message.includes("raw-secret"), false);
+
+    const raw = { agent: " worker ", task: " inspect " };
+    const prepared = subagentTool!.prepareArguments!(raw) as typeof raw;
+    assert.equal(prepared.agent, raw.agent);
+    assert.equal(prepared.task, raw.task);
+    for (const valid of [
+      { action: "status" },
+      { tasks: [{ agent: "worker", task: "inspect" }] },
+      { chain: [{ agent: "worker", task: "inspect" }] },
+    ]) assert.deepEqual(subagentTool!.prepareArguments!(valid), valid);
+
+    await assert.rejects(
+      () => subagentTool!.execute!("raw-call", { agent: "worker", task: " " }, new AbortController().signal, undefined, undefined),
+      /Invalid parameters \(input-type\)/,
+    );
+    await assert.rejects(
+      () => subagentTool!.execute!(
+        "duplicate-label",
+        { chain: [{ label: "same", agent: "worker", task: "one" }, { label: "same", agent: "worker", task: "two" }] },
+        new AbortController().signal,
+        undefined,
+        undefined,
+      ),
+      /Invalid parameters \(invocation-shape\).*Duplicate chain label/,
+    );
+
+    const executionContext = {
+      cwd: process.cwd(),
+      hasUI: false,
+      sessionManager: { getSessionId: () => "test-session", getSessionFile: () => undefined },
+    };
+    for (const background of [false, true]) {
+      await assert.rejects(
+        () => subagentTool!.execute!(
+          `unknown-${background}`,
+          { agent: "missing-agent-for-validation", task: "secret-task", background },
+          new AbortController().signal,
+          undefined,
+          executionContext,
+        ),
+        (error: unknown) => error instanceof Error
+          && /Subagent error \(runtime-policy\)\. Unknown agent/.test(error.message)
+          && !error.message.includes("secret-task"),
+      );
+    }
   });
 
   test("centralizes essential behavior in the tool description", () => {
@@ -385,26 +467,26 @@ describe("project-agent root confirmation", () => {
 
       registerPiSubagent(pi as never);
       assert.ok(subagentTool, "extension must register the subagent tool");
-      const result = await subagentTool.execute(
-        "approval-test",
-        { agent: "requested", task: "review this" },
-        new AbortController().signal,
-        () => undefined,
-        {
-          cwd,
-          hasUI: true,
-          ui: {
-            confirm: async (title: string, body: string) => {
-              confirmations.push({ title, body });
-              return false;
+      await assert.rejects(
+        () => subagentTool!.execute(
+          "approval-test",
+          { agent: "requested", task: "review this" },
+          new AbortController().signal,
+          () => undefined,
+          {
+            cwd,
+            hasUI: true,
+            ui: {
+              confirm: async (title: string, body: string) => {
+                confirmations.push({ title, body });
+                return false;
+              },
             },
+            sessionManager: { getSessionId: () => "session", getSessionFile: () => path.join(tempDir, "session.jsonl") },
           },
-          sessionManager: { getSessionId: () => "session", getSessionFile: () => path.join(tempDir, "session.jsonl") },
-        },
+        ),
+        /Subagent error \(cancellation\)\. Canceled: project-local agents not approved\./,
       );
-
-      assert.equal((result as { isError?: boolean }).isError, true);
-      assert.equal((result as { content?: Array<{ text?: string }> }).content?.[0]?.text, "Canceled: project-local agents not approved.");
       assert.equal(confirmations.length, 1);
       const confirmation = confirmations[0]!;
       assert.equal(confirmation.title, "Trust project-local agent root for this session?");
@@ -416,19 +498,26 @@ describe("project-agent root confirmation", () => {
       assert.match(confirmation.body, /Project agents may shadow same-named user agents\./);
       assert.doesNotMatch(confirmation.body, /only these/i);
 
-      const nonUiResult = await subagentTool.execute(
-        "approval-test-non-ui",
-        { agent: "requested", task: "review this" },
-        new AbortController().signal,
-        () => undefined,
-        {
-          cwd,
-          hasUI: false,
-          ui: { confirm: async () => false },
-          sessionManager: { getSessionId: () => "session", getSessionFile: () => path.join(tempDir, "session.jsonl") },
-        },
-      );
-      const nonUiText = (nonUiResult as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "";
+      let nonUiError: unknown;
+      try {
+        await subagentTool.execute(
+          "approval-test-non-ui",
+          { agent: "requested", task: "review this" },
+          new AbortController().signal,
+          () => undefined,
+          {
+            cwd,
+            hasUI: false,
+            ui: { confirm: async () => false },
+            sessionManager: { getSessionId: () => "session", getSessionFile: () => path.join(tempDir, "session.jsonl") },
+          },
+        );
+      } catch (error) {
+        nonUiError = error;
+      }
+      assert.ok(nonUiError instanceof Error);
+      assert.match(nonUiError.message, /Subagent error \(runtime-policy\)/);
+      const nonUiText = nonUiError.message;
       assert.match(nonUiText, /Project agents in this root: "requested", "shadowed"/);
       assert.match(nonUiText, /Requested project agents: "requested"/);
       assert.match(nonUiText, /Project\/user name collisions: "shadowed"/);
@@ -438,6 +527,63 @@ describe("project-agent root confirmation", () => {
     } finally {
       if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("pi-subagent child project trust", () => {
+  test("retains inherited exact-root approval despite the child's --no-approve state", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-managed-trust-"));
+    const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const previousTrustedRoots = process.env.PI_SUBAGENT_TRUSTED_PROJECTS;
+    const previousDeniedRoots = process.env.PI_SUBAGENT_DENIED_PROJECTS;
+    const projectRoot = path.join(tempDir, "project");
+    const projectAgentsDir = path.join(projectRoot, ".pi", "agents");
+    try {
+      await fs.mkdir(path.join(tempDir, "config", "agents"), { recursive: true });
+      await fs.mkdir(projectAgentsDir, { recursive: true });
+      await fs.writeFile(path.join(projectAgentsDir, "project-worker.md"), "---\nname: project-worker\ndescription: trusted project worker\n---\nProject prompt\n");
+      process.env.PI_CODING_AGENT_DIR = path.join(tempDir, "config");
+      process.env.PI_SUBAGENT_DEPTH = "1";
+      process.env.PI_SUBAGENT_TRUSTED_PROJECTS = JSON.stringify([projectRoot]);
+      process.env.PI_SUBAGENT_DENIED_PROJECTS = "[]";
+
+      const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+      const pi = {
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: () => undefined,
+        on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      };
+      registerPiSubagent(pi as never);
+
+      const sessionContext = {
+        cwd: projectRoot,
+        hasUI: false,
+        isProjectTrusted: () => false,
+        sessionManager: {
+          getSessionId: () => "managed-child-session",
+          getSessionFile: () => path.join(tempDir, "session.jsonl"),
+        },
+      };
+      await handlers.get("session_start")!({}, sessionContext);
+      const beforeStart = await handlers.get("before_agent_start")!({ systemPrompt: "" });
+      assert.match((beforeStart as { systemPrompt?: string }).systemPrompt ?? "", /project-worker/);
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+      if (previousTrustedRoots === undefined) delete process.env.PI_SUBAGENT_TRUSTED_PROJECTS;
+      else process.env.PI_SUBAGENT_TRUSTED_PROJECTS = previousTrustedRoots;
+      if (previousDeniedRoots === undefined) delete process.env.PI_SUBAGENT_DENIED_PROJECTS;
+      else process.env.PI_SUBAGENT_DENIED_PROJECTS = previousDeniedRoots;
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });

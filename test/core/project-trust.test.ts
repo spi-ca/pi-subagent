@@ -181,6 +181,57 @@ describe("project trust boundaries", () => {
     }
   });
 
+  test("preserves only inherited exact-root approvals when pi-subagent descendants report no approval", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-trust-"));
+    try {
+      const projectRoot = path.join(tempDir, "project");
+      const agentsDir = path.join(projectRoot, ".pi", "agents");
+      await fs.mkdir(agentsDir, { recursive: true });
+      const canonicalProjectRoot = await fs.realpath(projectRoot);
+
+      const inheritedTrustedRoots = new Set([projectRoot]);
+      const inheritedDeniedRoots = new Set<string>();
+      assert.equal(
+        resolveSessionProjectTrust(
+          agentsDir,
+          false,
+          inheritedTrustedRoots,
+          inheritedDeniedRoots,
+          { trust: {}, preserveInheritedSessionTrustOnDeny: true },
+        ),
+        true,
+      );
+      assert.deepEqual(Array.from(inheritedTrustedRoots), [projectRoot]);
+      assert.deepEqual(Array.from(inheritedDeniedRoots), []);
+
+      const explicitlyDeniedTrustedRoots = new Set([projectRoot]);
+      const explicitlyDeniedRoots = new Set([projectRoot]);
+      assert.equal(
+        resolveSessionProjectTrust(
+          agentsDir,
+          false,
+          explicitlyDeniedTrustedRoots,
+          explicitlyDeniedRoots,
+          { trust: {}, preserveInheritedSessionTrustOnDeny: true },
+        ),
+        false,
+      );
+      assert.deepEqual(Array.from(explicitlyDeniedTrustedRoots), []);
+      assert.deepEqual(Array.from(explicitlyDeniedRoots), [canonicalProjectRoot]);
+
+      const rootTrustedRoots = new Set([projectRoot]);
+      const rootDeniedRoots = new Set<string>();
+      assert.equal(
+        resolveSessionProjectTrust(agentsDir, false, rootTrustedRoots, rootDeniedRoots, { trust: {} }),
+        false,
+      );
+      assert.deepEqual(Array.from(rootTrustedRoots), []);
+      assert.deepEqual(Array.from(rootDeniedRoots), [canonicalProjectRoot]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("requires exact-root session approvals and lets denied roots override them", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-trust-"));
     try {

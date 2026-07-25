@@ -54,33 +54,29 @@ export function collectRequestedAgentNamesFromChain(chain: ChainStage[]): Set<st
   return requested;
 }
 
-export function validateChainStages(chain: ChainStage[], maxParallelTasks = 8): string | null {
+export function validateChainLabels(chain: ChainStage[]): string | null {
   const labels = new Set<string>();
+  for (const stage of chain) {
+    const label = stage.label?.trim();
+    if (!label) continue;
+    if (labels.has(label)) return `Duplicate chain label "${label}". Labels must be unique.`;
+    labels.add(label);
+  }
+  return null;
+}
+
+export function validateChainParallelLimit(chain: ChainStage[], maxParallelTasks = 8): string | null {
   for (let i = 0; i < chain.length; i++) {
     const stage = chain[i];
-    const label = stage.label?.trim();
-    if (label) {
-      if (labels.has(label)) return `Duplicate chain label "${label}". Labels must be unique.`;
-      labels.add(label);
-    }
-
-    if (getChainStageType(stage) === "parallel") {
-      const parallel = stage as ChainParallelStage;
-      if (!Array.isArray(parallel.tasks) || parallel.tasks.length === 0) {
-        return `Invalid chain stage ${i + 1}: type="parallel" requires a non-empty tasks array.`;
-      }
-      if (parallel.tasks.length > maxParallelTasks) {
-        return `Too many parallel tasks in chain stage ${i + 1} (${parallel.tasks.length}). Max is ${maxParallelTasks}.`;
-      }
-    } else {
-      const task = stage as ChainTaskStage;
-      if (!task.agent || !task.task) {
-        return `Invalid chain stage ${i + 1}: sequential chain stages require agent and task.`;
-      }
+    if (getChainStageType(stage) !== "parallel") continue;
+    const parallel = stage as ChainParallelStage;
+    if (parallel.tasks.length > maxParallelTasks) {
+      return `Too many parallel tasks in chain stage ${i + 1} (${parallel.tasks.length}). Max is ${maxParallelTasks}.`;
     }
   }
   return null;
 }
+
 
 export function shouldRunStage(condition: StepConditionName | undefined, state: ChainExecutionState): boolean {
   switch (condition ?? "on_success") {

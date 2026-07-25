@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const CLEAN_CHECKOUT_DEV_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "0.81.1",
-  "@earendil-works/pi-ai": "0.81.1",
-  "@earendil-works/pi-coding-agent": "0.81.1",
-  "@earendil-works/pi-tui": "0.81.1",
+  "@earendil-works/pi-agent-core": "0.82.0",
+  "@earendil-works/pi-ai": "0.82.0",
+  "@earendil-works/pi-coding-agent": "0.82.0",
+  "@earendil-works/pi-tui": "0.82.0",
   typebox: "1.1.38",
 } as const;
 

@@ -103,7 +103,7 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 ## 개발 의존성
 
-클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. 개발 의존성은 Pi `0.81.1` 및 호환되는 `typebox` 버전에 정확히 고정되어 있으며, `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
+클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. 개발 의존성은 Pi `0.82.0` 및 호환되는 `typebox` 버전에 정확히 고정되어 있으며, `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
 
 배포 시 호스트 Pi와의 호환성 범위는 별도 peer dependency가 담당합니다. 특히 `@earendil-works/pi-coding-agent`의 production 최소 버전은 `>=0.80.10`으로 유지됩니다.
 

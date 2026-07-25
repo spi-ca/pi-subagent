@@ -5,15 +5,15 @@
   "planDigest": "a4c1d1e6058ce00ce66132ab9f1b304906ee7cb3da59241feed2e7050c568836",
   "phase": "M0-live",
   "evidenceKind": "gated-provider-transport-benchmark",
-  "capturedAt": "2026-07-24T07:44:56.049Z",
+  "capturedAt": "2026-07-25T12:09:58.481Z",
   "environment": {
     "os": "darwin",
     "arch": "arm64",
     "bunVersion": "1.3.14",
-    "piVersion": "0.81.1",
-    "sourceRevision": "0d41660243c32abe8e43fc8d190632f19d1c97d1",
+    "piVersion": "0.82.0",
+    "sourceRevision": "ca5a86ac7187ad96064225e24d7e52f6583b6a11",
     "sourceDirty": true,
-    "worktreeDigest": "723a54e4aa63fe27f06da115564eac61350633c64d9db99539e33e89ddcf80fa"
+    "worktreeDigest": "9b0acf17a8b7815e130e0588e8175f2502a379d2b2cf12b4acfe4af15f885027"
   },
   "requested": {
     "provider": "openai-codex",
@@ -26,155 +26,155 @@
       "activeRuns": 16,
       "workload": "short-response",
       "timing": {
-        "monotonicElapsedMs": 490339.763083,
-        "settlementLatencyMs": 33734.983874999976,
-        "eventLoopDelayMeanMs": 31.661151670832268,
-        "eventLoopDelayMaxMs": 280.434625,
-        "eventLoopDelayP99Ms": 37.289983
+        "monotonicElapsedMs": 490258.52,
+        "settlementLatencyMs": 34951.71429199999,
+        "eventLoopDelayMeanMs": 35.29198791347754,
+        "eventLoopDelayMaxMs": 280.733,
+        "eventLoopDelayP99Ms": 42.729471
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 595776
+        "peakRssKiB": 598144
       },
       "descendants": {
         "peakCount": 16,
         "peakIdentities": [
           {
-            "pid": 30763,
-            "startedAt": 1784911006000
+            "pid": 460,
+            "startedAt": 1785013699000
           },
           {
-            "pid": 33054,
-            "startedAt": 1784911036000
+            "pid": 3240,
+            "startedAt": 1785013729000
           },
           {
-            "pid": 35335,
-            "startedAt": 1784911066000
+            "pid": 5348,
+            "startedAt": 1785013759000
           },
           {
-            "pid": 37598,
-            "startedAt": 1784911096000
+            "pid": 72743,
+            "startedAt": 1785013309000
           },
           {
-            "pid": 39842,
-            "startedAt": 1784911126000
+            "pid": 74854,
+            "startedAt": 1785013338000
           },
           {
-            "pid": 42068,
-            "startedAt": 1784911156000
+            "pid": 76983,
+            "startedAt": 1785013368000
           },
           {
-            "pid": 44278,
-            "startedAt": 1784911186000
+            "pid": 79128,
+            "startedAt": 1785013398000
           },
           {
-            "pid": 46465,
-            "startedAt": 1784911216000
+            "pid": 81275,
+            "startedAt": 1785013428000
           },
           {
-            "pid": 48645,
-            "startedAt": 1784911246000
+            "pid": 83394,
+            "startedAt": 1785013458000
           },
           {
-            "pid": 50825,
-            "startedAt": 1784911276000
+            "pid": 85475,
+            "startedAt": 1785013488000
           },
           {
-            "pid": 53004,
-            "startedAt": 1784911306000
+            "pid": 87597,
+            "startedAt": 1785013518000
           },
           {
-            "pid": 55197,
-            "startedAt": 1784911336000
+            "pid": 89731,
+            "startedAt": 1785013548000
           },
           {
-            "pid": 57385,
-            "startedAt": 1784911366000
+            "pid": 91793,
+            "startedAt": 1785013578000
           },
           {
-            "pid": 59585,
-            "startedAt": 1784911396000
+            "pid": 93908,
+            "startedAt": 1785013608000
           },
           {
-            "pid": 61781,
-            "startedAt": 1784911426000
+            "pid": 96283,
+            "startedAt": 1785013638000
           },
           {
-            "pid": 63980,
-            "startedAt": 1784911456000
+            "pid": 98310,
+            "startedAt": 1785013669000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 30763,
-            "startedAt": 1784911006000
+            "pid": 460,
+            "startedAt": 1785013699000
           },
           {
-            "pid": 33054,
-            "startedAt": 1784911036000
+            "pid": 3240,
+            "startedAt": 1785013729000
           },
           {
-            "pid": 35335,
-            "startedAt": 1784911066000
+            "pid": 5348,
+            "startedAt": 1785013759000
           },
           {
-            "pid": 37598,
-            "startedAt": 1784911096000
+            "pid": 72743,
+            "startedAt": 1785013309000
           },
           {
-            "pid": 39842,
-            "startedAt": 1784911126000
+            "pid": 74854,
+            "startedAt": 1785013338000
           },
           {
-            "pid": 42068,
-            "startedAt": 1784911156000
+            "pid": 76983,
+            "startedAt": 1785013368000
           },
           {
-            "pid": 44278,
-            "startedAt": 1784911186000
+            "pid": 79128,
+            "startedAt": 1785013398000
           },
           {
-            "pid": 46465,
-            "startedAt": 1784911216000
+            "pid": 81275,
+            "startedAt": 1785013428000
           },
           {
-            "pid": 48645,
-            "startedAt": 1784911246000
+            "pid": 83394,
+            "startedAt": 1785013458000
           },
           {
-            "pid": 50825,
-            "startedAt": 1784911276000
+            "pid": 85475,
+            "startedAt": 1785013488000
           },
           {
-            "pid": 53004,
-            "startedAt": 1784911306000
+            "pid": 87597,
+            "startedAt": 1785013518000
           },
           {
-            "pid": 55197,
-            "startedAt": 1784911336000
+            "pid": 89731,
+            "startedAt": 1785013548000
           },
           {
-            "pid": 57385,
-            "startedAt": 1784911366000
+            "pid": 91793,
+            "startedAt": 1785013578000
           },
           {
-            "pid": 59585,
-            "startedAt": 1784911396000
+            "pid": 93908,
+            "startedAt": 1785013608000
           },
           {
-            "pid": 61781,
-            "startedAt": 1784911426000
+            "pid": 96283,
+            "startedAt": 1785013638000
           },
           {
-            "pid": 63980,
-            "startedAt": 1784911456000
+            "pid": 98310,
+            "startedAt": 1785013669000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 660.0000000000018,
-          "peakAggregateCpuMs": 302250,
-          "peakAggregateRssKiB": 3556640,
-          "peakIndividualRssKiB": 227456
+          "cumulativeCpuMs": 880,
+          "peakAggregateCpuMs": 347300,
+          "peakAggregateRssKiB": 3568288,
+          "peakIndividualRssKiB": 231712
         }
       },
       "backend": {
@@ -182,22 +182,22 @@
         "transportCounters": {
           "source": "authoritative-live-artifact:transport-cmux",
           "availability": "measured",
-          "backendRequests": 206,
+          "backendRequests": 372,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 4,
-          "byteBacklogHighWater": 13704,
+          "lineBacklogHighWater": 7,
+          "byteBacklogHighWater": 12521,
           "controlDisconnects": 0,
           "reconnects": 0,
           "unknownOutcomes": 0,
-          "exactSnapshots": 138,
+          "exactSnapshots": 304,
           "exactCleanupMutations": 0,
           "residualRecovery": 0,
           "persistentClientCreates": 17,
           "persistentClientRestarts": 0,
           "healthyPeriodicStatusQueries": 0,
           "notificationToReconcileLatencyMs": 0,
-          "lifecycleCompletionLatencyMs": 78
+          "lifecycleCompletionLatencyMs": 43
         }
       },
       "verifiedProviderChildren": 16,

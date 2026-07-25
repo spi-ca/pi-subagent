@@ -5,15 +5,15 @@
   "planDigest": "a4c1d1e6058ce00ce66132ab9f1b304906ee7cb3da59241feed2e7050c568836",
   "phase": "M0-live",
   "evidenceKind": "gated-provider-transport-benchmark",
-  "capturedAt": "2026-07-25T12:09:58.481Z",
+  "capturedAt": "2026-07-25T15:50:48.202Z",
   "environment": {
     "os": "darwin",
     "arch": "arm64",
     "bunVersion": "1.3.14",
     "piVersion": "0.82.0",
-    "sourceRevision": "ca5a86ac7187ad96064225e24d7e52f6583b6a11",
+    "sourceRevision": "ee45f6529db216df242d34a579f37aa3cdb93830",
     "sourceDirty": true,
-    "worktreeDigest": "9b0acf17a8b7815e130e0588e8175f2502a379d2b2cf12b4acfe4af15f885027"
+    "worktreeDigest": "f0cacdd751ac9128ed8307fdafeebbdcc62372d1a8d3ebbeab85b84c04f16c46"
   },
   "requested": {
     "provider": "openai-codex",
@@ -26,155 +26,155 @@
       "activeRuns": 16,
       "workload": "short-response",
       "timing": {
-        "monotonicElapsedMs": 490258.52,
-        "settlementLatencyMs": 34951.71429199999,
-        "eventLoopDelayMeanMs": 35.29198791347754,
-        "eventLoopDelayMaxMs": 280.733,
-        "eventLoopDelayP99Ms": 42.729471
+        "monotonicElapsedMs": 492172.00325,
+        "settlementLatencyMs": 36533.94716600003,
+        "eventLoopDelayMeanMs": 36.97378187527457,
+        "eventLoopDelayMaxMs": 315.151458,
+        "eventLoopDelayP99Ms": 41.943039
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 598144
+        "peakRssKiB": 599696
       },
       "descendants": {
         "peakCount": 16,
         "peakIdentities": [
           {
-            "pid": 460,
-            "startedAt": 1785013699000
+            "pid": 372,
+            "startedAt": 1785026976000
           },
           {
-            "pid": 3240,
-            "startedAt": 1785013729000
+            "pid": 3124,
+            "startedAt": 1785027006000
           },
           {
-            "pid": 5348,
-            "startedAt": 1785013759000
+            "pid": 71194,
+            "startedAt": 1785026556000
           },
           {
-            "pid": 72743,
-            "startedAt": 1785013309000
+            "pid": 73179,
+            "startedAt": 1785026586000
           },
           {
-            "pid": 74854,
-            "startedAt": 1785013338000
+            "pid": 75213,
+            "startedAt": 1785026616000
           },
           {
-            "pid": 76983,
-            "startedAt": 1785013368000
+            "pid": 77249,
+            "startedAt": 1785026646000
           },
           {
-            "pid": 79128,
-            "startedAt": 1785013398000
+            "pid": 79288,
+            "startedAt": 1785026676000
           },
           {
-            "pid": 81275,
-            "startedAt": 1785013428000
+            "pid": 81363,
+            "startedAt": 1785026706000
           },
           {
-            "pid": 83394,
-            "startedAt": 1785013458000
+            "pid": 83584,
+            "startedAt": 1785026736000
           },
           {
-            "pid": 85475,
-            "startedAt": 1785013488000
+            "pid": 85657,
+            "startedAt": 1785026766000
           },
           {
-            "pid": 87597,
-            "startedAt": 1785013518000
+            "pid": 87728,
+            "startedAt": 1785026796000
           },
           {
-            "pid": 89731,
-            "startedAt": 1785013548000
+            "pid": 89807,
+            "startedAt": 1785026826000
           },
           {
-            "pid": 91793,
-            "startedAt": 1785013578000
+            "pid": 91895,
+            "startedAt": 1785026856000
           },
           {
-            "pid": 93908,
-            "startedAt": 1785013608000
+            "pid": 93992,
+            "startedAt": 1785026886000
           },
           {
-            "pid": 96283,
-            "startedAt": 1785013638000
+            "pid": 96097,
+            "startedAt": 1785026916000
           },
           {
-            "pid": 98310,
-            "startedAt": 1785013669000
+            "pid": 98181,
+            "startedAt": 1785026946000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 460,
-            "startedAt": 1785013699000
+            "pid": 372,
+            "startedAt": 1785026976000
           },
           {
-            "pid": 3240,
-            "startedAt": 1785013729000
+            "pid": 3124,
+            "startedAt": 1785027006000
           },
           {
-            "pid": 5348,
-            "startedAt": 1785013759000
+            "pid": 71194,
+            "startedAt": 1785026556000
           },
           {
-            "pid": 72743,
-            "startedAt": 1785013309000
+            "pid": 73179,
+            "startedAt": 1785026586000
           },
           {
-            "pid": 74854,
-            "startedAt": 1785013338000
+            "pid": 75213,
+            "startedAt": 1785026616000
           },
           {
-            "pid": 76983,
-            "startedAt": 1785013368000
+            "pid": 77249,
+            "startedAt": 1785026646000
           },
           {
-            "pid": 79128,
-            "startedAt": 1785013398000
+            "pid": 79288,
+            "startedAt": 1785026676000
           },
           {
-            "pid": 81275,
-            "startedAt": 1785013428000
+            "pid": 81363,
+            "startedAt": 1785026706000
           },
           {
-            "pid": 83394,
-            "startedAt": 1785013458000
+            "pid": 83584,
+            "startedAt": 1785026736000
           },
           {
-            "pid": 85475,
-            "startedAt": 1785013488000
+            "pid": 85657,
+            "startedAt": 1785026766000
           },
           {
-            "pid": 87597,
-            "startedAt": 1785013518000
+            "pid": 87728,
+            "startedAt": 1785026796000
           },
           {
-            "pid": 89731,
-            "startedAt": 1785013548000
+            "pid": 89807,
+            "startedAt": 1785026826000
           },
           {
-            "pid": 91793,
-            "startedAt": 1785013578000
+            "pid": 91895,
+            "startedAt": 1785026856000
           },
           {
-            "pid": 93908,
-            "startedAt": 1785013608000
+            "pid": 93992,
+            "startedAt": 1785026886000
           },
           {
-            "pid": 96283,
-            "startedAt": 1785013638000
+            "pid": 96097,
+            "startedAt": 1785026916000
           },
           {
-            "pid": 98310,
-            "startedAt": 1785013669000
+            "pid": 98181,
+            "startedAt": 1785026946000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 880,
-          "peakAggregateCpuMs": 347300,
-          "peakAggregateRssKiB": 3568288,
-          "peakIndividualRssKiB": 231712
+          "cumulativeCpuMs": 870,
+          "peakAggregateCpuMs": 337350,
+          "peakAggregateRssKiB": 3566320,
+          "peakIndividualRssKiB": 229840
         }
       },
       "backend": {
@@ -182,22 +182,22 @@
         "transportCounters": {
           "source": "authoritative-live-artifact:transport-cmux",
           "availability": "measured",
-          "backendRequests": 372,
+          "backendRequests": 317,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 7,
-          "byteBacklogHighWater": 12521,
+          "lineBacklogHighWater": 6,
+          "byteBacklogHighWater": 14649,
           "controlDisconnects": 0,
           "reconnects": 0,
           "unknownOutcomes": 0,
-          "exactSnapshots": 304,
+          "exactSnapshots": 249,
           "exactCleanupMutations": 0,
           "residualRecovery": 0,
           "persistentClientCreates": 17,
           "persistentClientRestarts": 0,
           "healthyPeriodicStatusQueries": 0,
           "notificationToReconcileLatencyMs": 0,
-          "lifecycleCompletionLatencyMs": 43
+          "lifecycleCompletionLatencyMs": 30
         }
       },
       "verifiedProviderChildren": 16,

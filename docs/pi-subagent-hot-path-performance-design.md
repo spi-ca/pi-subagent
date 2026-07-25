@@ -1,6 +1,6 @@
 # Pi-subagent internal hot-path 성능 개선 설계
 
-> 상태: **Phase 0A hot paths, hardened lease sub-gate, Phase 5 scheduler, Phase 6 exact tail/signature, conservative Phase 7 reaper와 Phase 8 managed-child opt-in profile이 구현됨; portable OS hard resource policy와 default 전환은 미구현**. 이 문서는 parent/child 내부 hot path의 성능 개선과 multi-agent 사용량 가시성을 다룬다. 현재 동작의 최종 source of truth는 코드와 테스트다.
+> 상태: **Phase 0A hot paths, hardened lease sub-gate, Phase 5 scheduler, Phase 6 exact tail/signature, conservative Phase 7 reaper와 Phase 8 managed-child opt-in profile이 구현됨; managed-child default 전환은 미구현**. 이 문서는 parent/child 내부 hot path의 성능 개선과 multi-agent 사용량 가시성을 다룬다. 현재 동작의 최종 source of truth는 코드와 테스트다.
 
 > **Authority:** lifecycle Unix socket, `CompletionRecordV3` transport schema·settlement, cmux desktop control socket v2, `tmux -C`, polling 제거, exact-target mutation/recovery/fencing 및 transport Phases 0–4의 canonical register는 [interactive runtime transport 성능 설계](./interactive-runtime-performance-design.md)가 authoritative하다. 이 문서는 아래 internal runtime 항목과 Phase 0A, Phase 2 lease sub-gate, Phases 5–8, 그리고 상세 security/test/benchmark/acceptance/status/order의 authoritative owner다.
 
@@ -18,7 +18,7 @@
 8. bounded in-memory session-tail/signature state와 exact on-disk index
 9. budgeted streaming reaper, process lock 및 exclusive claim
 
-또한 process-local scheduler, managed-child profile, tool context 및 resource policy는 internal runtime performance 범위에 속한다. 이 설계는 transport authority를 대체하지 않는다. 특히 lifecycle completion, `CompletionRecordV3`, cmux/tmux adapter mutation, exact-target recovery와 transport polling phase의 세부 계약은 반드시 [transport 설계](./interactive-runtime-performance-design.md)를 따른다.
+또한 process-local scheduler, managed-child profile 및 tool context는 internal runtime performance 범위에 속한다. 이 설계는 transport authority를 대체하지 않는다. 특히 lifecycle completion, `CompletionRecordV3`, cmux/tmux adapter mutation, exact-target recovery와 transport polling phase의 세부 계약은 반드시 [transport 설계](./interactive-runtime-performance-design.md)를 따른다.
 
 아래 moved sections는 기존 anchor/section numbering의 연속성을 보존한다.
 
@@ -270,21 +270,7 @@ owner가 cleanup 또는 shutdown handoff를 시작하면 더 이상 mutation을 
 
 source는 모든 child ref가 resolved된 뒤에도 manifest bytes/digest/inode를 재검증한 경우에만 unlink한다. crash window, malformed artifact, launch outcome unknown 또는 cleanup error는 삭제 근거가 아니라 retention 근거다. task, credential, auth overlay, lifecycle token, child JSONL과 run recovery artifact는 `.fork-sources` source ownership 대상이 아니다. tests는 concurrent inline/interactive fork, byte/inode binding, seal/quiesced handoff, startup reconciliation, launch-unknown retention 및 cleanup race를 다룬다.
 
-### 13.5 OS resource control (제안, 미구현)
-
-향후 선택적 고급 정책으로 process priority나 cgroup을 검토할 수 있다. 아래 이름은 설계 후보일 뿐 현재 runtime이 인식하는 설정이 아니다.
-
-```text
-PI_SUBAGENT_NICE=<n>              # proposed only
-PI_SUBAGENT_MEMORY_BUDGET_MB=<n>  # proposed only
-```
-
-- Unix `nice`는 interactive 응답성을 떨어뜨릴 수 있으므로 opt-in으로 둔다.
-- Linux cgroup v2는 전체 child process tree의 CPU/RSS 제한에 가장 정확하다.
-- macOS와 일반 desktop에서는 hard RSS kill보다 scheduler backpressure를 우선한다.
-- `process.memoryUsage()`는 한 Node process만 보여 주므로 전체 Pi process tree의 hard enforcement 근거로 사용하지 않는다.
-
-### 13.6 Warm pool을 사용하지 않는 이유
+### 13.5 Warm pool을 사용하지 않는 이유
 
 Pi process 재사용은 startup을 줄일 수 있지만 session, extension reload, credential, agent configuration, TUI terminal ownership과 crash recovery 경계를 복잡하게 만든다. idle process의 RSS도 계속 남는다.
 
@@ -315,7 +301,7 @@ Pi process 재사용은 startup을 줄일 수 있지만 session, extension reloa
 
 내부 구현은 process/session/invocation-scoped state이며 종료 시 폐기한다. topology batch, discovery cache, preflight memo, lease state, aggregate slots, fork ownership manifest, tail/signature index와 reaper claim은 public tool argument나 cross-process shared mutable object가 아니다. child 간에 공유 가능한 것은 byte-for-byte read-only base prompt와 headerless fork branch source뿐이며, task·credential·auth overlay·child session·lifecycle/recovery metadata는 공유하지 않는다.
 
-`maxActive`/`--subagent-max-active`/`PI_SUBAGENT_MAX_ACTIVE`는 구현된 프로세스 로컬·session-start 재로드 설정이며 기본값 16이 이미 확정되어 있다. managed-child는 구현된 session-level opt-in이고, portable resource policy와 managed default 전환만 후보로 남아 있다.
+`maxActive`/`--subagent-max-active`/`PI_SUBAGENT_MAX_ACTIVE`는 구현된 프로세스 로컬·session-start 재로드 설정이며 기본값 16이 이미 확정되어 있다. managed-child는 구현된 session-level opt-in이고, managed default 전환만 후보로 남아 있다.
 
 ```text
 --subagent-max-active <n>
@@ -323,9 +309,7 @@ PI_SUBAGENT_MAX_ACTIVE=<n>
 PI_SUBAGENT_CMUX_CHILD_POLICY=inherit|managed
 ```
 
-`PI_SUBAGENT_NICE`와 `PI_SUBAGENT_MEMORY_BUDGET_MB`는 현재 지원 설정이 아니라 §13.5의 제안 이름이다.
-
-우선순위는 `--subagent-max-active`, `PI_SUBAGENT_MAX_ACTIVE`, 신뢰된 프로젝트 파일, 전역 파일, 기본값 16 순서다. managed-child/resource policy의 기본 전환은 benchmark 및 integration/UX 검증 뒤에만 확정한다.
+우선순위는 `--subagent-max-active`, `PI_SUBAGENT_MAX_ACTIVE`, 신뢰된 프로젝트 파일, 전역 파일, 기본값 16 순서다. managed-child 기본 전환은 benchmark 및 integration/UX 검증 뒤에만 확정한다.
 
 ## 16. Failure와 보안 경계
 
@@ -372,7 +356,7 @@ enumeration 전 startup budget, same `opendir` iterator ownership transfer 또�
 
 ### Phase 8: Managed-child 경량화
 
-installed Pi의 `--no-extensions` + explicit extension loading capability를 확인하고 최소 extension/tool profile과 `inherit`/`managed` opt-in을 도입했다. RPC session-start registry acceptance로 child bridge, allowlist equivalence와 inherited tool 부재를 검증하고, 별도 live gate는 실제 provider-backed inline nested delegation을 검증한다. extension-defined custom provider는 managed profile에서 제외되며 해당 provider 전용 model은 fail-closed한다. portable OS hard resource policy는 별도 미구현 범위다.
+installed Pi의 `--no-extensions` + explicit extension loading capability를 확인하고 최소 extension/tool profile과 `inherit`/`managed` opt-in을 도입했다. RPC session-start registry acceptance로 child bridge, allowlist equivalence와 inherited tool 부재를 검증하고, 별도 live gate는 실제 provider-backed inline nested delegation을 검증한다. extension-defined custom provider는 managed profile에서 제외되며 해당 provider 전용 model은 fail-closed한다.
 
 재현 명령은 `PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE=1 bun run acceptance:managed-child`이며, 실제 nested provider 호출까지 실행하려면 `PI_SUBAGENT_MANAGED_CHILD_LIVE_NESTED=1`도 설정한다. 전자는 설치된 Pi binary가 현재 checkout의 explicit extension source를 로드하는 integration 범위이며 설치 tarball 자체의 package-layout 검증은 아니다. live gate는 현재 `openai-codex/gpt-5.4-mini`, 원본 agent directory의 유효한 `auth.json`, network/provider availability를 요구한다. auth는 test 전용 0700 agent directory의 0600 복사본으로만 사용하고 transcript나 credential은 결과에 출력하지 않는다.
 
@@ -433,7 +417,7 @@ test/runtime/reaper-streaming-budget.test.ts
 
 ## 19. 현재 구현 상태
 
-이 문서가 authoritative한 internal 개선안 중 Phase 0A, Phase 2 lease sub-gate, Phase 5 scheduler에 더해 Phase 6 exact tail/signature와 Phase 7의 conservative proven-dead reaper branch가 구현되었다. Phase 7은 live owner를 quiesced ack 없이 acquire하지 않고 retain하며, parent·broker·child의 PID/start identity가 모두 반복 검증된 dead proof일 때만 cleanup claim을 acquired로 전환한다. 이 상태는 portable OS hard resource policy, default 전환 또는 전체 goal 완료 선언이 아니다.
+이 문서가 authoritative한 internal 개선안 중 Phase 0A, Phase 2 lease sub-gate, Phase 5 scheduler에 더해 Phase 6 exact tail/signature와 Phase 7의 conservative proven-dead reaper branch가 구현되었다. Phase 7은 live owner를 quiesced ack 없이 acquire하지 않고 retain하며, parent·broker·child의 PID/start identity가 모두 반복 검증된 dead proof일 때만 cleanup claim을 acquired로 전환한다. 이 상태는 managed-child default 전환 또는 전체 goal 완료 선언이 아니다.
 
 - [x] generation-scoped topology snapshot batch (same generation/canonical key의 in-flight read-only fetch만 공유, settle 즉시 폐기, timeout/failure `unknown` fan-out 및 metrics focused tests)
 - [x] trust-safe session agent-discovery cache (session generation/keyed trust context, metadata/full-body separation, manifest revalidation, shutdown clear 및 focused core tests)
@@ -449,7 +433,7 @@ test/runtime/reaper-streaming-budget.test.ts
 - [x] Phase 7 budgeted reaper conservative branch (`opendir` same-handle foreground→background transfer, 200ms/50-entry startup budget, validation concurrency 8, unified O(V+E) graph, malformed/cycle/unknown retention, private root lock reclaim, root-lock-bound per-run requested→acquired→released claim과 parent/broker/child proven-dead evidence, mutation-time lease/state/claim 재검증, cancel fences)
   - live owner는 현재 acquire하지 않으므로 live quiesced-ack 전이를 추측하지 않는다. broker claim 전 지연은 allocation-free cancel winner로 fence하고, run-directory 생성 반환 전 initial parent lease를 게시한다.
 - [x] Phase 8 managed-child opt-in profile (`inherit|managed`, `--no-extensions` + self/interactive bridge, nested env propagation, unsupported extension-tool fail-closed)
-- [ ] portable OS hard resource policy와 managed default 전환
+- [ ] managed-child default 전환
 - [x] Phase 7 local benchmark harness (`benchmark:phase7:*`): actual private marked 10,000-run enumeration/classification, 100,000-node graph, startup/total/RSS/event-loop/concurrency/mutation/cleanup을 current-source-bound local fixture로 record/verify; revision/dirty/content-mode digest mismatch는 fail-closed하며 100,000 actual filesystem override는 opt-in이고 baseline에는 명시적으로 not-run
 - [ ] 전체 Phase 0–8 before/after 종합 benchmark
 
@@ -462,6 +446,6 @@ test/runtime/reaper-streaming-budget.test.ts
 3. Phase 0A parent writer와 Phase 2 child checker를 함께 hard gate로 묶고 slow-I/O/terminal-race 및 terminal 뒤 late-rename 부재 evidence를 확인한다.
 4. Phase 5 scheduler를 적용한 뒤 queue fairness, foreground/background overlap과 nested delegation boundary를 검증한다.
 5. Phase 6 tail/signature와 Phase 7 reaper를 각각 exactness/claim evidence가 준비된 뒤 enable한다.
-6. Phase 8 managed-child opt-in은 integration/acceptance을 통과했다. 남은 portable resource policy와 managed default 전환 여부는 별도 benchmark와 호환성 증거 뒤에만 결정한다.
+6. Phase 8 managed-child opt-in은 integration/acceptance을 통과했다. managed-child default 전환 여부는 별도 benchmark와 호환성 증거 뒤에만 결정한다.
 
 각 internal milestone은 선행 transport lifecycle safety와 이 문서의 acceptance를 모두 충족한 뒤 진행한다. transport implementation 순서는 canonical register를 따른다.

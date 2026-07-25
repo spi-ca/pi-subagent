@@ -2,7 +2,7 @@
 
 - **문서 상태:** 현재 구현과 acceptance 근거의 authority 문서
 - **목적:** foreground `subagent` 사용량이 Pi canonical session accounting으로 전달되는 범위와, background의 의도적인 한계를 설명한다.
-- **범위 밖:** provider 청구서, child 자체 session의 총계, footer의 시각적 렌더링 정확성
+- **범위 밖:** provider 청구서, child 자체 session의 총계
 
 ## 호환성 및 Pi 계약
 
@@ -35,7 +35,7 @@ interactive preview는 사용량 authority가 아니다. `onUpdate`로 보이는
 | --- | --- |
 | foreground / inline | assistant, nested tool, compaction, branch-summary usage를 최종 subagent `toolResult.usage`로 한 번 전달 |
 | foreground / interactive | child JSONL에서 같은 범위를 모아 최종 subagent `toolResult.usage`로 한 번 전달 |
-| background / inline 또는 interactive | launch result만 즉시 persist; completion usage에는 canonical sink가 없어 **포함하지 않음** |
+| background / inline 또는 interactive | launch result만 즉시 persist; completion usage는 canonical totals에 **의도적으로 포함하지 않음** |
 
 background completion은 `sendMessage()` steer와 `status`로 알리고 결과를 compact한다. 이 채널은 canonical accounting이 아니며, background usage를 다음 foreground 호출에 전가하거나 raw session JSONL을 수정하지 않는다. completion 알림 뒤 새 부모 assistant 응답이 생기면 그 응답의 usage만 일반 Pi assistant usage로 별도 집계된다.
 
@@ -61,11 +61,9 @@ bun run acceptance:managed-child
 
 이 acceptance는 managed inline child 하나에서 foreground `subagent` tool result와 nested `accountingUsage`의 `input`, `output`, `cacheRead`, `cacheWrite`, `totalTokens` 다섯 base token field가 정확히 일치하는지 확인한다. 같은 다섯 값이 private parent session JSONL의 `toolResult`에 persist되고, `get_session_stats` RPC의 `input`, `output`, `cacheRead`, `cacheWrite`, `total` token totals에 정확히 반영되는지도 확인한다. `cost`, `cacheWrite1h`, `reasoning` 등 optional usage field는 이 acceptance의 비교 대상이 아니다. 성공 stdout JSON 계약에는 `"foregroundUsagePersistence":true`가 포함된다. private session directory는 test 종료 때 정리되므로 저장소에 retained report path는 없다.
 
-이 evidence는 session JSONL과 RPC stats까지의 persistence를 확인한다. footer 또는 `/session`의 **시각적 렌더링**을 확인한 증거는 아니므로 그러한 렌더링을 주장하지 않는다.
+## Background 사용량 회계: 명시적 비목표
 
-## 경계와 후속 요구
-
-foreground는 현재 Pi 공개 `toolResult.usage` 계약으로 처리한다. background를 canonical total에 넣으려면 Pi upstream의 session-bound·idempotent external usage sink가 필요하다. 최소 계약은 origin session ID, idempotency key, normalized usage, outcome 및 재시도/duplicate acknowledgement를 포함해야 한다. 그 API가 없으므로 extension-private diagnostic ledger를 만들더라도 Pi canonical footer, `/session`, RPC totals이라고 표기해서는 안 된다.
+background completion 사용량 회계는 이 패키지에서 의도적으로 구현하지 않는 명시적 비목표이며, upstream 대기나 후속 요구가 아니다. completion usage는 canonical totals에 넣지 않고, 다음 foreground 호출, completion steer 또는 `status` 출력, raw parent session JSONL로 전가하지 않는다. private ledger나 external sink도 제안하지 않는다.
 
 ## 관련 문서
 

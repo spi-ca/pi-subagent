@@ -579,7 +579,7 @@ _2x PNG · [SVG](./diagram/performance-phase-map.svg) · [Mermaid source](./diag
 | 5 | [companion §17](./pi-subagent-hot-path-performance-design.md#phase-5-scheduler--구현됨) | process-local scheduler |
 | 6 | [companion §17](./pi-subagent-hot-path-performance-design.md#phase-6-exact-session-tailsignature-work) | exact tail/signature index |
 | 7 | [companion §17](./pi-subagent-hot-path-performance-design.md#phase-7-budgeted-reaper) | budgeted reaper/claim algorithm |
-| 8 | [companion §17](./pi-subagent-hot-path-performance-design.md#phase-8-managed-child-경량화) | managed-child profile/resource policy |
+| 8 | [companion §17](./pi-subagent-hot-path-performance-design.md#phase-8-managed-child-경량화) | managed-child profile |
 
 Transport compatibility, security boundary, verification, acceptance, status and implementation order are owned by this document. The companion owns only the internal cache, lease/check, scheduler, tail/signature, UI, fork/I/O and reaper algorithms; §14 is the canonical cross-document phase map.
 

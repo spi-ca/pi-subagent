@@ -224,7 +224,7 @@ README는 진입점만 담고, 세부 내용은 주제별 문서로 나눕니다
 | 선택적 `pi-cmux` UX의 설치 판단, 기능 비교, 연동·검증과 운영 정책 | [`docs/pi-cmux-integration.md`](docs/pi-cmux-integration.md) |
 | 별도 `pi-cmux-presence`와의 generic presence producer, wire contract, observer 경계 | [`docs/pi-cmux-presence-integration.md`](docs/pi-cmux-presence-integration.md) |
 | interactive pane layout 설계·검증 현황 | [`docs/interactive-pane-layout-design.md`](docs/interactive-pane-layout-design.md) |
-| Pi 0.81 foreground assistant/tool 및 background subagent 사용량 회계 설계·구현 현황 | [`docs/pi-081-usage-accounting-design.md`](docs/pi-081-usage-accounting-design.md) |
+| Pi 0.81 foreground assistant/tool 사용량 영속화와 background completion usage 회계의 명시적 비목표 | [`docs/pi-081-usage-accounting-design.md`](docs/pi-081-usage-accounting-design.md) |
 | tmux child window 이름과 Pi pane title 정책 제안(미구현) | [`docs/tmux-window-naming-design.md`](docs/tmux-window-naming-design.md) |
 | 에이전트용 문서 작성 지침 | [`docs/guidelines/`](docs/guidelines/) |
 

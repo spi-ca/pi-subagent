@@ -20,8 +20,7 @@ flowchart TB
     P6[Phase 6 tail/signature index<br/>implemented]
     P7[Phase 7 conservative reaper<br/>implemented]
     P8[Phase 8 managed-child opt-in<br/>implemented; default inherit]
-    P8R[Portable OS hard resource policy<br/>and default transition: unimplemented]
-    P0A --> P5 --> P6 --> P7 --> P8 --> P8R
+    P0A --> P5 --> P6 --> P7 --> P8
   end
 
   subgraph LeaseBoundary[Cross-owner Phase 2 prerequisite boundary]
@@ -35,6 +34,4 @@ flowchart TB
   L2 --> P2
 
   classDef implemented stroke-width:3px
-  classDef proposed stroke-dasharray: 5 5
   class P0H,P0R,P0C,P0A,P1,P2,P3,P4,P5,P6,P7,P8,L0A,L2 implemented
-  class P8R proposed

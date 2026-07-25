@@ -223,7 +223,7 @@ interactive child의 provider credential/configuration은 inline과 같은 Pi `0
 
 ## 사용량 회계
 
-이 패키지의 Pi 최소 버전은 `>=0.80.10`이며, 사용량 회계는 Pi `0.81` 이상에서만 조건부로 적용됩니다. foreground(`background` 없음 또는 `false`)에서는 child assistant, nested tool, compaction, branch-summary generation usage를 모아 최종 `subagent` tool result의 top-level `usage`로 Pi 세션 총계에 전달합니다. interactive compaction의 `retainedTail` 재생분은 합산하지 않습니다. Background child의 완료 usage는 launch 뒤 steer/status에 canonical accounting sink가 없어 세션 총계에 포함되지 않습니다. 완료 알림으로 새 부모 assistant 응답이 생성되면 그 부모 응답 자체의 usage만 일반 Pi assistant usage로 별도 집계됩니다. 범위와 acceptance 근거는 [Pi 0.81 subagent 사용량 회계](pi-081-usage-accounting-design.md)를 참고하세요.
+이 패키지의 Pi 최소 버전은 `>=0.80.10`이며, 사용량 회계는 Pi `0.81` 이상에서만 조건부로 적용됩니다. foreground(`background` 없음 또는 `false`)에서는 child assistant, nested tool, compaction, branch-summary generation usage를 모아 최종 `subagent` tool result의 top-level `usage`로 Pi 세션 총계에 전달합니다. interactive compaction의 `retainedTail` 재생분은 합산하지 않습니다. Background child의 완료 usage 회계는 명시적 비목표이므로 세션 총계에 포함하지 않으며, 완료 알림 뒤 새 부모 assistant 응답이 생성되면 그 부모 응답 자체의 usage만 일반 Pi assistant usage로 별도 집계됩니다. 범위와 acceptance 근거는 [Pi 0.81 subagent 사용량 회계](pi-081-usage-accounting-design.md)를 참고하세요.
 
 ## 성능 작업 상태
 

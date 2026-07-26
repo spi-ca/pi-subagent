@@ -237,8 +237,12 @@ describe("inline runner path", () => {
 
   test("cleans async prompt, fork session, and task artifacts after a cwd launch failure", async () => {
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-inline-cleanup-"));
+    const uidSuffix = typeof process.getuid === "function" ? `-${process.getuid()}` : "";
+    const runStateDir = path.join(root, `pi-subagent-runs${uidSuffix}`);
     const originalTmpDir = process.env.TMPDIR;
+    const originalRunStateDir = process.env.PI_SUBAGENT_RUN_STATE_DIR;
     process.env.TMPDIR = root;
+    process.env.PI_SUBAGENT_RUN_STATE_DIR = runStateDir;
     try {
       const result = await runAgent({
         cwd: process.cwd(),
@@ -257,15 +261,16 @@ describe("inline runner path", () => {
       });
       assert.notEqual(result.exitCode, 0);
       const entries = await fs.promises.readdir(root);
-      const uidSuffix = typeof process.getuid === "function" ? `-${process.getuid()}` : "";
-      assert.deepEqual(entries, [`pi-subagent-runs${uidSuffix}`]);
+      assert.deepEqual(entries, [path.basename(runStateDir)]);
       assert.deepEqual(
-        await fs.promises.readdir(path.join(root, entries[0]!)),
+        await fs.promises.readdir(runStateDir),
         ["state-root-marker.json"],
       );
     } finally {
       if (originalTmpDir === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = originalTmpDir;
+      if (originalRunStateDir === undefined) delete process.env.PI_SUBAGENT_RUN_STATE_DIR;
+      else process.env.PI_SUBAGENT_RUN_STATE_DIR = originalRunStateDir;
       await fs.promises.rm(root, { recursive: true, force: true });
     }
   });

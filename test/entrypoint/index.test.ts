@@ -131,9 +131,10 @@ describe("subagent tool schema", () => {
       properties: {
         agent: { type: "string", minLength: 1 },
         task: { type: "string", minLength: 1 },
-        cwd: { type: "string" },
-        model: { type: "string" },
+        cwd: { type: "string", minLength: 1 },
+        model: { type: "string", minLength: 1 },
       },
+      additionalProperties: false,
     };
     const condition = {
       type: "string",
@@ -144,12 +145,12 @@ describe("subagent tool schema", () => {
       type: "object",
       properties: {
         action: { type: "string", enum: ["status", "cancel"] },
-        id: { type: "string" },
+        id: { type: "string", minLength: 1 },
         background: { type: "boolean" },
         completion: { type: "string", enum: ["one-shot", "handoff"], default: "one-shot" },
         agent: { type: "string", minLength: 1 },
         task: { type: "string", minLength: 1 },
-        model: { type: "string" },
+        model: { type: "string", minLength: 1 },
         tasks: { type: "array", minItems: 1, items: taskItem },
         chain: {
           type: "array",
@@ -164,11 +165,12 @@ describe("subagent tool schema", () => {
                   label: { type: "string" },
                   agent: { type: "string", minLength: 1 },
                   task: { type: "string", minLength: 1 },
-                  cwd: { type: "string" },
-                  model: { type: "string" },
+                  cwd: { type: "string", minLength: 1 },
+                  model: { type: "string", minLength: 1 },
                   condition,
                   continueOnError: { type: "boolean" },
                 },
+                additionalProperties: false,
               },
               {
                 type: "object",
@@ -180,17 +182,19 @@ describe("subagent tool schema", () => {
                   condition,
                   continueOnError: { type: "boolean" },
                 },
+                additionalProperties: false,
               },
             ],
           },
         },
         mode: { type: "string", enum: ["spawn", "fork"], default: "spawn" },
-        cwd: { type: "string" },
+        cwd: { type: "string", minLength: 1 },
       },
+      additionalProperties: false,
     });
   });
 
-  test("rejects raw arguments before conversion and preserves valid strings", async () => {
+  test("rejects raw arguments before conversion and at runtime without leaking arguments", async () => {
     let subagentTool: {
       prepareArguments?: (raw: unknown) => unknown;
       execute?: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; isError?: boolean }>;
@@ -225,10 +229,25 @@ describe("subagent tool schema", () => {
     assert.match(prepareError.message, /Invalid parameters \(input-type\)/);
     assert.equal(prepareError.message.includes("raw-secret"), false);
 
-    const raw = { agent: " worker ", task: " inspect " };
+    const unsupportedKey = "raw-secret-key";
+    const unsupportedValue = "raw-secret-value";
+    assert.throws(
+      () => subagentTool!.prepareArguments!({ agent: "worker", task: "inspect", [unsupportedKey]: unsupportedValue }),
+      (error: unknown) => error instanceof Error
+        && /Invalid parameters \(input-type\).*Subagent parameters/.test(error.message)
+        && !error.message.includes(unsupportedKey)
+        && !error.message.includes(unsupportedValue),
+    );
+    assert.throws(
+      () => subagentTool!.prepareArguments!({ agent: "worker", task: "raw-handoff-secret", completion: "handoff", background: false }),
+      (error: unknown) => error instanceof Error
+        && /Invalid parameters \(option-combination\).*completion="handoff"/.test(error.message)
+        && !error.message.includes("raw-handoff-secret"),
+    );
+
+    const raw = { agent: " worker ", task: " inspect ", model: " model ", cwd: " /tmp/project " };
     const prepared = subagentTool!.prepareArguments!(raw) as typeof raw;
-    assert.equal(prepared.agent, raw.agent);
-    assert.equal(prepared.task, raw.task);
+    assert.deepEqual(prepared, raw);
     for (const valid of [
       { action: "status" },
       { tasks: [{ agent: "worker", task: "inspect" }] },
@@ -236,8 +255,62 @@ describe("subagent tool schema", () => {
     ]) assert.deepEqual(subagentTool!.prepareArguments!(valid), valid);
 
     await assert.rejects(
-      () => subagentTool!.execute!("raw-call", { agent: "worker", task: " " }, new AbortController().signal, undefined, undefined),
-      /Invalid parameters \(input-type\)/,
+      () => subagentTool!.execute!(
+        "raw-call",
+        { agent: "worker", task: "runtime-secret", "runtime-secret-key": "runtime-secret-value" },
+        new AbortController().signal,
+        undefined,
+        undefined,
+      ),
+      (error: unknown) => error instanceof Error
+        && /Invalid parameters \(input-type\).*Subagent parameters/.test(error.message)
+        && !error.message.includes("runtime-secret")
+        && !error.message.includes("runtime-secret-key")
+        && !error.message.includes("runtime-secret-value"),
+    );
+    await assert.rejects(
+      () => subagentTool!.execute!(
+        "handoff-shape",
+        { agent: "worker", task: "runtime-handoff-secret", completion: "handoff", background: false },
+        new AbortController().signal,
+        undefined,
+        undefined,
+      ),
+      (error: unknown) => error instanceof Error
+        && /Invalid parameters \(option-combination\).*completion="handoff"/.test(error.message)
+        && !error.message.includes("runtime-handoff-secret"),
+    );
+    const inheritedTerminalEnv = {
+      CMUX_WORKSPACE_ID: process.env.CMUX_WORKSPACE_ID,
+      CMUX_SURFACE_ID: process.env.CMUX_SURFACE_ID,
+      TMUX: process.env.TMUX,
+      TMUX_PANE: process.env.TMUX_PANE,
+    };
+    let inlineHandoffRejection: Promise<unknown>;
+    try {
+      delete process.env.CMUX_WORKSPACE_ID;
+      delete process.env.CMUX_SURFACE_ID;
+      delete process.env.TMUX;
+      delete process.env.TMUX_PANE;
+      // execute performs invocation validation synchronously before its first await.
+      inlineHandoffRejection = subagentTool!.execute!(
+        "handoff-inline",
+        { agent: "worker", task: "runtime-inline-secret", completion: "handoff", background: true },
+        new AbortController().signal,
+        undefined,
+        undefined,
+      );
+    } finally {
+      for (const [name, value] of Object.entries(inheritedTerminalEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    await assert.rejects(
+      inlineHandoffRejection!,
+      (error: unknown) => error instanceof Error
+        && /Invalid parameters \(option-combination\).*terminal mode cmux-pane or tmux-pane/.test(error.message)
+        && !error.message.includes("runtime-inline-secret"),
     );
     await assert.rejects(
       () => subagentTool!.execute!(
@@ -296,7 +369,7 @@ describe("subagent tool schema", () => {
 
   test("keeps the serialized schema and description within the compact budget", () => {
     const staticChars = JSON.stringify(SubagentParams).length + formatSubagentToolDescription().length;
-    assert.ok(staticChars <= 2_300, `static schema and description are ${staticChars} characters`);
+    assert.ok(staticChars <= 2_400, `static schema and description are ${staticChars} characters`);
   });
 
   test("validates handoff as an opt-in background interactive single invocation", () => {

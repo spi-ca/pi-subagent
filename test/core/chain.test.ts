@@ -20,11 +20,14 @@ describe("mixed chain helpers", () => {
     assert.equal(error, null);
   });
 
-  test("rejects duplicate labels", () => {
-    assert.match(validateChainLabels([
-      { label: "x", agent: "scout", task: "Inspect" },
-      { label: "x", agent: "planner", task: "Plan" },
-    ] as any) ?? "", /Duplicate chain label/);
+  test("rejects duplicate labels without exposing their raw value", () => {
+    const secretLabel = "secret-chain-label";
+    const message = validateChainLabels([
+      { label: secretLabel, agent: "scout", task: "Inspect" },
+      { label: secretLabel, agent: "planner", task: "Plan" },
+    ] as any) ?? "";
+    assert.match(message, /Duplicate chain label at chain\[1\]/);
+    assert.equal(message.includes(secretLabel), false);
   });
 
   test("uses the configured chain parallel limit rather than the legacy default of eight", () => {

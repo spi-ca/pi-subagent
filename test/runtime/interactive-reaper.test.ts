@@ -126,6 +126,48 @@ describe("stale interactive run reaper", () => {
 		assert.equal(fs.existsSync(manager.paths.invocationDir), true, "the live owner remains authoritative while the reserved root is skipped");
 	});
 
+	test("keeps normal retained fork-source records silent", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		await ForkSourceOwnershipManager.create('{"x":1}\n', { rootDir: root });
+		const outcome = await reapStaleInteractiveRuns({
+			rootDir: root,
+			reconcileForkSources: async () => ({
+				scanned: ["invocation"], resolved: [], retained: ["invocation/source"], removed: [], invalid: [],
+			}),
+		});
+		assert.deepEqual(outcome.diagnostics, []);
+	});
+
+	test("reports malformed fork-source records as one structured warning", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		await ForkSourceOwnershipManager.create('{"x":1}\n', { rootDir: root });
+		const forkOutcome = {
+			scanned: ["invocation"], resolved: [], retained: ["invocation/source"], removed: [], invalid: ["invocation"],
+		};
+		const outcome = await reapStaleInteractiveRuns({ rootDir: root, reconcileForkSources: async () => forkOutcome });
+		assert.deepEqual(outcome.diagnostics, [{
+			severity: "warning",
+			code: "fork-source-invalid",
+			message: "Fork source ownership records require inspection. Run /subagents doctor for status.",
+			details: forkOutcome,
+		}]);
+	});
+
+	test("reports fork-source reconciliation exceptions without writing to the terminal", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		await ForkSourceOwnershipManager.create('{"x":1}\n', { rootDir: root });
+		const outcome = await reapStaleInteractiveRuns({
+			rootDir: root,
+			reconcileForkSources: async () => { throw new Error("reconcile fixture failed"); },
+		});
+		assert.deepEqual(outcome.diagnostics, [{
+			severity: "error",
+			code: "fork-source-reconciliation-failed",
+			message: "Fork source ownership reconciliation failed. Durable records were retained; run /subagents doctor.",
+			details: { error: "reconcile fixture failed" },
+		}]);
+	});
+
 	test("ignores an unmarked UUID-looking directory under a marked root", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-"));
 		tempDirs.push(root);
@@ -153,7 +195,13 @@ describe("stale interactive run reaper", () => {
 		});
 		await handle.startup;
 		const outcome = await handle.completion;
-		assert.match(outcome.diagnostic ?? "", /entry cap/);
+		assert.deepEqual(outcome.diagnostics, [{
+			severity: "debug",
+			code: "graph-entry-cap",
+			message: "Reaper graph entry cap exceeded; all mutation was deferred.",
+			details: { limit: 100_000 },
+		}]);
+		assert.match(outcome.diagnostic ?? "", /entry cap/, "legacy direct consumers retain overflow visibility");
 		assert.equal(outcome.scanned, 0);
 		assert.equal(classifications, 0, "overflow must prevent every classification and mutation");
 	});

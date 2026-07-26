@@ -6,6 +6,7 @@ import * as os from "node:os";
 import { getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getResultSummaryText } from "../core/runner-events.js";
+import { getStageLabel } from "../core/chain-helpers.js";
 import {
 	type DelegationMode,
 	type DisplayItem,
@@ -205,7 +206,7 @@ export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold
 	if (args.chain && args.chain.length > 0) {
 		let text = toolTitle + theme.fg("accent", `chain: ${args.chain.length} stages`) + modeBadge;
 		for (const [index, stage] of args.chain.slice(0, 3).entries()) {
-			const generatedLabel = stage.label || `step-${index + 1}`;
+			const generatedLabel = getStageLabel(stage, index);
 			if (stage.type === "parallel") {
 				const count = Array.isArray(stage.tasks) ? stage.tasks.length : 0;
 				const name = `${generatedLabel}(parallel)`;

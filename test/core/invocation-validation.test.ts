@@ -7,6 +7,7 @@ import {
   validateSubagentInvocation,
   type SubagentInvocationValidationError,
 } from "../../src/core/subagent-config";
+import { getStageLabel } from "../../src/core/chain-helpers";
 
 function expectValidationError(raw: unknown, category: SubagentInvocationValidationError["category"], location?: string): string {
   const error = validateSubagentInvocation(raw);
@@ -39,7 +40,47 @@ describe("raw subagent invocation validation", () => {
     ]) {
       expectValidationError(raw, "input-type");
     }
-    assert.equal(validateSubagentInvocation({ agent: " worker ", task: " inspect " }), null);
+    const raw = { agent: " worker ", task: " inspect ", model: " model ", cwd: " /tmp/project " };
+    assert.equal(validateSubagentInvocation(raw), null);
+    assert.deepEqual(raw, { agent: " worker ", task: " inspect ", model: " model ", cwd: " /tmp/project " });
+  });
+
+  test("rejects unsupported own enumerable fields at every public object layer without exposing them", () => {
+    const secretKey = "unsupported-secret-key";
+    const secretValue = "unsupported-secret-value";
+    const cases: Array<[unknown, string]> = [
+      [{ agent: "worker", task: "inspect", [secretKey]: secretValue }, "Subagent parameters"],
+      [{ tasks: [{ agent: "worker", task: "inspect", [secretKey]: secretValue }] }, "tasks[0]"],
+      [{ chain: [{ agent: "worker", task: "inspect", [secretKey]: secretValue }] }, "chain[0]"],
+      [{ chain: [{ type: "parallel", tasks: [{ agent: "worker", task: "inspect" }], [secretKey]: secretValue }] }, "chain[0]"],
+      [{ chain: [{ type: "parallel", tasks: [{ agent: "worker", task: "inspect", [secretKey]: secretValue }] }] }, "chain[0].tasks[0]"],
+    ];
+
+    for (const [raw, location] of cases) {
+      const message = expectValidationError(raw, "input-type", location);
+      assert.equal(message.includes(secretKey), false);
+      assert.equal(message.includes(secretValue), false);
+    }
+  });
+
+  test("requires non-blank id, model, and cwd at every applicable location", () => {
+    const cases: Array<[unknown, string]> = [
+      [{ action: "status", id: "" }, "id"],
+      [{ action: "status", id: " \t" }, "id"],
+      [{ agent: "worker", task: "inspect", model: " " }, "model"],
+      [{ agent: "worker", task: "inspect", cwd: "\n" }, "cwd"],
+      [{ tasks: [{ agent: "worker", task: "inspect", model: " " }] }, "tasks[0].model"],
+      [{ tasks: [{ agent: "worker", task: "inspect", cwd: " " }] }, "tasks[0].cwd"],
+      [{ chain: [{ agent: "worker", task: "inspect", model: " " }] }, "chain[0].model"],
+      [{ chain: [{ agent: "worker", task: "inspect", cwd: " " }] }, "chain[0].cwd"],
+      [{ chain: [{ type: "parallel", tasks: [{ agent: "worker", task: "inspect", model: " " }] }] }, "chain[0].tasks[0].model"],
+      [{ chain: [{ type: "parallel", tasks: [{ agent: "worker", task: "inspect", cwd: " " }] }] }, "chain[0].tasks[0].cwd"],
+    ];
+    for (const [raw, location] of cases) expectValidationError(raw, "input-type", location);
+
+    const action = { action: "status", id: " job-id " };
+    assert.equal(validateSubagentInvocation(action), null);
+    assert.equal(action.id, " job-id ");
   });
 
   test("requires non-empty parallel tasks with non-blank raw task positions", () => {
@@ -74,6 +115,12 @@ describe("raw subagent invocation validation", () => {
     }), null);
   });
 
+  test("preserves blank chain labels because execution falls back to numbered steps", () => {
+    const stage = { label: " \t", agent: "worker", task: "inspect" };
+    assert.equal(validateSubagentInvocation({ chain: [stage] }), null);
+    assert.equal(getStageLabel(stage, 1), "step-2");
+  });
+
   test("accepts valid action forms", () => {
     assert.equal(validateSubagentInvocation({ action: "status" }), null);
     assert.equal(validateSubagentInvocation({ action: "status", id: "job-id" }), null);
@@ -91,7 +138,30 @@ describe("raw subagent invocation validation", () => {
     expectValidationError({ action: "cancel", background: false }, "option-combination");
     expectValidationError({ id: "job-id" }, "option-combination", "id");
     expectValidationError({ tasks: [{ agent: "worker", task: "inspect" }], model: "model" }, "option-combination", "model");
-    expectValidationError({ agent: "worker", task: "inspect", completion: "handoff", background: false }, "option-combination", "handoff");
+    expectValidationError({ agent: "worker", task: "inspect", completion: "handoff", background: false }, "option-combination", "completion");
+  });
+
+  test("uses one handoff validation matrix with optional terminal context", () => {
+    const handoff = { agent: "worker", task: "inspect", completion: "handoff" as const, background: true };
+    // Preparation has no terminal context, but must still reject all non-terminal handoff combinations.
+    assert.equal(validateSubagentInvocation(handoff), null);
+    assert.equal(validateSubagentInvocation(handoff, { terminalMode: "cmux-pane" }), null);
+    assert.equal(validateSubagentInvocation(handoff, { terminalMode: "tmux-pane" }), null);
+
+    for (const raw of [
+      { ...handoff, background: false },
+      { completion: "handoff", background: true, tasks: [{ agent: "worker", task: "inspect" }] },
+      { completion: "handoff", background: true, chain: [{ agent: "worker", task: "inspect" }] },
+      { completion: "handoff", background: true, action: "status" },
+    ]) {
+      const message = expectValidationError(raw, "option-combination", "completion");
+      assert.match(message, /exactly one agent\+task invocation|background=true/);
+    }
+    const terminalError = validateSubagentInvocation(handoff, { terminalMode: "inline" });
+    assert.deepEqual(terminalError, {
+      category: "option-combination",
+      message: "Invalid completion=\"handoff\". It requires terminal mode cmux-pane or tmux-pane.",
+    });
   });
 
   test("formats failures without exposing raw task contents and distinguishes operational failures", () => {
@@ -106,12 +176,23 @@ describe("raw subagent invocation validation", () => {
 
   test("publishes portable non-empty schema constraints", () => {
     const schema = JSON.parse(JSON.stringify(SubagentParams));
+    assert.equal(schema.additionalProperties, false);
+    assert.equal(schema.properties.id.minLength, 1);
     assert.equal(schema.properties.agent.minLength, 1);
     assert.equal(schema.properties.task.minLength, 1);
+    assert.equal(schema.properties.model.minLength, 1);
+    assert.equal(schema.properties.cwd.minLength, 1);
     assert.equal(schema.properties.tasks.minItems, 1);
     assert.equal(schema.properties.chain.minItems, 1);
     assert.equal(schema.properties.chain.items.anyOf[1].properties.tasks.minItems, 1);
     assert.equal(schema.properties.tasks.items.properties.agent.minLength, 1);
     assert.equal(schema.properties.tasks.items.properties.task.minLength, 1);
+    assert.equal(schema.properties.tasks.items.properties.model.minLength, 1);
+    assert.equal(schema.properties.tasks.items.properties.cwd.minLength, 1);
+    assert.equal(schema.properties.tasks.items.additionalProperties, false);
+    assert.equal(schema.properties.chain.items.anyOf[0].properties.model.minLength, 1);
+    assert.equal(schema.properties.chain.items.anyOf[0].properties.cwd.minLength, 1);
+    assert.equal(schema.properties.chain.items.anyOf[0].additionalProperties, false);
+    assert.equal(schema.properties.chain.items.anyOf[1].additionalProperties, false);
   });
 });

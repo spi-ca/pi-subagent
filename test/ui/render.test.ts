@@ -29,7 +29,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 	},
 }));
 mock.module("@earendil-works/pi-tui", () => ({ Container, Markdown, Spacer, Text }));
-const { renderResult } = await import("../../src/ui/render");
+const { renderCall, renderResult } = await import("../../src/ui/render");
 
 const theme = {
 	fg: (_color: string, text: string) => text,
@@ -71,6 +71,19 @@ function renderText(detailsValue: SubagentDetails, expanded: boolean): string {
 function totalLine(text: string): string {
 	return text.split("\n").find((line) => line.includes("Total")) ?? "";
 }
+
+test("chain call rendering uses canonical trimmed and generated labels", () => {
+	const component = renderCall({
+		chain: [
+			{ label: " \t", agent: "scout", task: "Inspect" },
+			{ label: " plan ", agent: "planner", task: "Plan" },
+		],
+	}, theme);
+	const text = component.render(160).join("\n");
+	assert.match(text, /step-1\(scout\)/);
+	assert.match(text, /plan\(planner\)/);
+	assert.doesNotMatch(text, / plan /);
+});
 
 describe("parallel and chain usage rendering", () => {
 	test("uses the expanded renderer while running and shows each agent usage/model", () => {

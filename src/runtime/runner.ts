@@ -1554,13 +1554,48 @@ export async function shutdownActiveInteractiveRuns(): Promise<void> {
 
 const INTERNAL_REAPER_CONTEXT: unique symbol = Symbol("internal-reaper-context");
 
+export interface ReaperDiagnostic {
+  severity: "debug" | "warning" | "error";
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
+export function forkSourceReconciliationFailureDiagnostic(error: unknown, shutdown = false): ReaperDiagnostic {
+  return {
+    severity: "error",
+    code: shutdown ? "fork-source-shutdown-reconciliation-failed" : "fork-source-reconciliation-failed",
+    message: shutdown
+      ? "Fork source ownership shutdown reconciliation failed. Durable records were retained."
+      : "Fork source ownership reconciliation failed. Durable records were retained; run /subagents doctor.",
+    details: { error: error instanceof Error ? error.message : String(error) },
+  };
+}
+
+const GRAPH_ENTRY_CAP_DIAGNOSTIC = `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation`;
+
+function graphEntryCapDiagnostic(): ReaperDiagnostic {
+  return {
+    severity: "debug",
+    code: "graph-entry-cap",
+    message: "Reaper graph entry cap exceeded; all mutation was deferred.",
+    details: { limit: MAX_REAPER_GRAPH_ENTRIES },
+  };
+}
+
 export interface ReapStaleInteractiveRunsResult {
   scanned: number;
   reaped: string[];
   skipped: string[];
   invalid: string[];
-  /** Whole-root classification was deferred before any mutation. */
+  diagnostics: ReaperDiagnostic[];
+  /** @deprecated Use structured `diagnostics`; retained for direct consumers. */
   diagnostic?: string;
+}
+
+function recordGraphEntryCap(outcome: ReapStaleInteractiveRunsResult): void {
+  outcome.diagnostic = GRAPH_ENTRY_CAP_DIAGNOSTIC;
+  outcome.diagnostics.push(graphEntryCapDiagnostic());
 }
 
 export async function reapStaleInteractiveRuns(options: {
@@ -1589,6 +1624,8 @@ export async function reapStaleInteractiveRuns(options: {
   isTmuxControlGateCurrent?: typeof isTmuxControlTransportGateCurrent;
   /** Test seam observing active side-effect-free artifact validation workers. */
   onValidationConcurrency?: (active: number) => void;
+  /** Test seam for fork-source ownership reconciliation outcomes. */
+  reconcileForkSources?: typeof reconcileForkSourceOwnershipRoot;
   /** Exact, non-mutating promoted-target inspection seam. */
   inspectPromotedTarget?: (runId: string, allocation: AllocationRecordV2 | AllocationRecordV3) => Promise<"absent" | "live" | "unknown">;
   signal?: AbortSignal;
@@ -1598,7 +1635,7 @@ export async function reapStaleInteractiveRuns(options: {
   [INTERNAL_REAPER_CONTEXT]?: { entries: string[]; rootLock: ReaperRootLock };
 } = {}): Promise<ReapStaleInteractiveRunsResult> {
   const rootDir = path.resolve(options.rootDir ?? getRunStateRoot());
-  const outcome: ReapStaleInteractiveRunsResult = { scanned: 0, reaped: [], skipped: [], invalid: [] };
+  const outcome: ReapStaleInteractiveRunsResult = { scanned: 0, reaped: [], skipped: [], invalid: [], diagnostics: [] };
   if (!await fileExists(rootDir)) return outcome;
   try {
     await assertSafeStateRoot(rootDir);
@@ -1613,7 +1650,7 @@ export async function reapStaleInteractiveRuns(options: {
   try {
   let entryNames = internalContext?.entries;
   if (entryNames && entryNames.length > MAX_REAPER_GRAPH_ENTRIES) {
-    outcome.diagnostic = `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation`;
+    recordGraphEntryCap(outcome);
     return outcome;
   }
   if (!entryNames) {
@@ -1621,7 +1658,7 @@ export async function reapStaleInteractiveRuns(options: {
     const startupEntries = await enumeration.startup;
     const [remainingEntries, overflow] = await Promise.all([enumeration.completion, enumeration.overflow]);
     if (overflow) {
-      outcome.diagnostic = `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation`;
+      recordGraphEntryCap(outcome);
       return outcome;
     }
     entryNames = [...startupEntries, ...remainingEntries];
@@ -1938,7 +1975,7 @@ export async function reapStaleInteractiveRuns(options: {
   ];
   const graphPlan = planUnifiedReaperGraph(graphNodes);
   if (graphPlan.overflow) {
-    outcome.diagnostic = `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation`;
+    recordGraphEntryCap(outcome);
     return outcome;
   }
   for (const invalid of deferredInvalid) if (invalid.kind === "malformed") graphPlan.unresolved.add(invalid.runId);
@@ -2462,7 +2499,7 @@ export async function reapStaleInteractiveRuns(options: {
     // effort and never turns completed run cleanup into a false success.
     if (!options.signal?.aborted) {
       try {
-        const forkOutcome = await reconcileForkSourceOwnershipRoot({
+        const forkOutcome = await (options.reconcileForkSources ?? reconcileForkSourceOwnershipRoot)({
           stateRoot: rootDir,
           ownerStatus: ({ pid, startedAt }) => options.isProcessIdentityAlive
             ? options.isProcessIdentityAlive(pid, startedAt) ? "live" : "dead"
@@ -2470,11 +2507,16 @@ export async function reapStaleInteractiveRuns(options: {
           signal: options.signal,
           now: () => options.now ?? Date.now(),
         });
-        if (forkOutcome.retained.length > 0 || forkOutcome.invalid.length > 0) {
-          console.warn("Fork source ownership reconciliation retained durable records.", forkOutcome);
+        if (forkOutcome.invalid.length > 0) {
+          outcome.diagnostics.push({
+            severity: "warning",
+            code: "fork-source-invalid",
+            message: "Fork source ownership records require inspection. Run /subagents doctor for status.",
+            details: forkOutcome,
+          });
         }
       } catch (error) {
-        console.warn("Fork source ownership reconciliation failed; durable records were retained.", error);
+        outcome.diagnostics.push(forkSourceReconciliationFailureDiagnostic(error));
       }
     }
     await rootLock.release();
@@ -2494,7 +2536,7 @@ export async function startStaleInteractiveReaper(
 ): Promise<StaleInteractiveReaperHandle> {
   const startedAt = performance.now();
   const rootDir = path.resolve(options.rootDir ?? getRunStateRoot());
-  const empty: ReapStaleInteractiveRunsResult = { scanned: 0, reaped: [], skipped: [], invalid: [] };
+  const empty: ReapStaleInteractiveRunsResult = { scanned: 0, reaped: [], skipped: [], invalid: [], diagnostics: [] };
   if (!await fileExists(rootDir)) return { startup: Promise.resolve(), completion: Promise.resolve(empty), cancelAndDrain: async () => undefined };
   await assertSafeStateRoot(rootDir);
   const ownerStartedAt = getCurrentProcessStartedAt();
@@ -2510,7 +2552,11 @@ export async function startStaleInteractiveReaper(
   const completion = Promise.all([startupNames, enumeration.completion, enumeration.overflow]).then(async ([initial, remaining, overflow]) => {
     // Overflow is a whole-root result, not a partial-list warning. Do not
     // classify or mutate even the startup prefix when the graph is too large.
-    if (overflow) return { ...empty, diagnostic: `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation` };
+    if (overflow) {
+      const overflowOutcome = { ...empty, diagnostics: [] };
+      recordGraphEntryCap(overflowOutcome);
+      return overflowOutcome;
+    }
     delegatedLock = true;
     return await reapStaleInteractiveRuns({ ...options, signal: controller.signal, [INTERNAL_REAPER_CONTEXT]: { entries: [...initial, ...remaining], rootLock } });
   }).finally(async () => {

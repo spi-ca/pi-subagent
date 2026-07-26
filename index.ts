@@ -45,11 +45,12 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, parseSubagentsCommand } from "./src/core/subagent-ux.js";
+import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
-import { beginInteractiveShutdownForSession, focusInteractiveRun, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
+import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
 import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
 import {
@@ -551,6 +552,15 @@ export default function (pi: ExtensionAPI) {
     await foregroundPermitScopes.release(scope);
   const backgroundSessionFence = new BackgroundJobSessionFence();
   const uxRegistry = new SubagentUxRegistry({ recentLimit: 20 });
+  const reaperDiagnosticUx = new ReaperDiagnosticUx();
+  let reaperDiagnosticGeneration = 0;
+  const reportReaperDiagnostic = (expectedGeneration: number, diagnostic: ReaperDiagnostic, ctx: { hasUI: boolean; ui: { notify: (message: string, type: "warning" | "error") => void } }): void => {
+    reaperDiagnosticUx.report(expectedGeneration, diagnostic, {
+      hasUI: ctx.hasUI,
+      notify: (message, type) => ctx.ui.notify(message, type),
+      warn: (message, details) => console.warn(message, details),
+    });
+  };
   const dashboardPublisher = currentDepth === 0
     ? createPiSubagentDashboardPublisher({
       emit: (channel, payload) => pi.events.emit(channel, payload),
@@ -621,6 +631,7 @@ export default function (pi: ExtensionAPI) {
             `child policy: ${resolveManagedChildPolicy()}`,
             `scheduler: ${scheduler.activeCount} active, ${scheduler.queuedCount} queued, max ${scheduler.maxActive}`,
             `interactive authority: ${listActiveInteractiveRunIds().length} active`,
+            ...reaperDiagnosticUx.formatDoctorStatus(),
             `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
             "control readiness: validated per interactive launch (no doctor probe)",
           ];
@@ -843,9 +854,11 @@ export default function (pi: ExtensionAPI) {
       getFlag: (name) => pi.getFlag(name),
     });
 
-    // A new session never inherits old-session background records. Invalidate
-    // first so a late finalizer cannot republish one after this clear.
+    // A new session never inherits old-session background records or reaper
+    // diagnostics. Advance the fence before cancellation so a late old-session
+    // completion cannot notify the replacement TUI.
     backgroundSessionFence.startSession();
+    reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
     cancelBackgroundJobs(backgroundJobs);
     backgroundJobs.clear();
     unsubscribeUxStatus?.();
@@ -892,15 +905,38 @@ export default function (pi: ExtensionAPI) {
     await resetInteractiveShutdownForSession();
     if (currentDepth === 0) {
       await cancelStartupReaperBounded();
+      const diagnosticGeneration = reaperDiagnosticGeneration;
       try {
         const reaper = await startStaleInteractiveReaper();
         startupReaper = reaper;
+        // Observe completion before awaiting startup: both promises can reject
+        // from the same enumeration failure, and neither may go unhandled.
+        const observedCompletion = reaper.completion.then(
+          (outcome) => ({ outcome } as const),
+          (error: unknown) => ({ error } as const),
+        );
+        void observedCompletion.finally(() => { if (startupReaper === reaper) startupReaper = null; });
         await reaper.startup;
-        void reaper.completion.catch((error) => {
-          console.warn(`[pi-subagent] Failed to reap stale interactive runs: ${error instanceof Error ? error.message : String(error)}`);
-        }).finally(() => { if (startupReaper === reaper) startupReaper = null; });
+        void observedCompletion.then((settled) => {
+          if (diagnosticGeneration !== reaperDiagnosticGeneration || sessionShuttingDown) return;
+          if ("outcome" in settled) {
+            for (const diagnostic of settled.outcome.diagnostics) reportReaperDiagnostic(diagnosticGeneration, diagnostic, ctx);
+            return;
+          }
+          reportReaperDiagnostic(diagnosticGeneration, {
+            severity: "error",
+            code: "reaper-completion-failed",
+            message: "Stale interactive run cleanup failed. Run /subagents doctor.",
+            details: { error: settled.error instanceof Error ? settled.error.message : String(settled.error) },
+          }, ctx);
+        });
       } catch (error) {
-        console.warn(`[pi-subagent] Failed to start stale interactive reaper: ${error instanceof Error ? error.message : String(error)}`);
+        reportReaperDiagnostic(diagnosticGeneration, {
+          severity: "error",
+          code: "reaper-start-failed",
+          message: "Stale interactive run cleanup could not start. Run /subagents doctor.",
+          details: { error: error instanceof Error ? error.message : String(error) },
+        }, ctx);
       }
     }
     if (!canDelegate) return;
@@ -916,6 +952,7 @@ export default function (pi: ExtensionAPI) {
     // old-session finalizer cannot repopulate the registry or send a steer.
     sessionShuttingDown = true;
     backgroundSessionFence.invalidate();
+    reaperDiagnosticGeneration = reaperDiagnosticUx.invalidateSession();
     const priorSessionSettlements = Array.from(backgroundJobSettlements.values());
     cancelBackgroundJobs(backgroundJobs);
     backgroundJobs.clear();
@@ -942,8 +979,13 @@ export default function (pi: ExtensionAPI) {
     await settleWithUnrefTimeout(priorSessionSettlements, limits.backgroundShutdownSettleMs);
     await shutdownActiveInteractiveRuns();
     const strandedForkManagers = Array.from(forkManagers.entries());
+    const shutdownDiagnosticGeneration = reaperDiagnosticGeneration;
     const handoffs = strandedForkManagers.map(([key, manager]) => handoffForkManager(manager)
-      .catch((error) => console.warn(`[pi-subagent] Fork source shutdown handoff retained artifacts: ${error instanceof Error ? error.message : String(error)}`))
+      .catch((error) => reportReaperDiagnostic(
+        shutdownDiagnosticGeneration,
+        forkSourceReconciliationFailureDiagnostic(error, true),
+        { hasUI: false, ui: ctx.ui },
+      ))
       .finally(() => { if (forkManagers.get(key) === manager) forkManagers.delete(key); }));
     await settleWithUnrefTimeout(handoffs, limits.backgroundShutdownSettleMs);
   });
@@ -987,7 +1029,9 @@ export default function (pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
-        const rawValidationError = validateSubagentInvocation(params);
+        const invocationDiagnosticGeneration = reaperDiagnosticGeneration;
+        const terminalMode = getDefaultTerminalModeFromEnv();
+        const rawValidationError = validateSubagentInvocation(params, { terminalMode });
         if (rawValidationError) throw new Error(formatSubagentInvocationValidationError(rawValidationError));
         const failOperational = (
           category: "runtime-policy" | "child-execution" | "cancellation",
@@ -997,14 +1041,7 @@ export default function (pi: ExtensionAPI) {
         };
 
         const intendedMode = inferInvocationMode(params);
-        const terminalMode = getDefaultTerminalModeFromEnv();
         const completionMode = parseCompletionMode(params.completion)!;
-        if (completionMode === "handoff" && terminalMode !== "cmux-pane" && terminalMode !== "tmux-pane") {
-          throw new Error(formatSubagentInvocationValidationError({
-            category: "option-combination",
-            message: "completion=handoff requires terminal mode cmux-pane or tmux-pane.",
-          }));
-        }
         if (params.tasks && params.tasks.length > limits.maxParallelTasks) {
           throw new Error(formatSubagentOperationalError(
             "runtime-policy",
@@ -1281,8 +1318,18 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           if (!canStartInvocation()) {
             const pendingForkManager = forkManagers.get(schedulerKey);
             if (pendingForkManager) {
-              await handoffForkManager(pendingForkManager).catch(() => undefined);
-              forkManagers.delete(schedulerKey);
+              const pendingDiagnosticGeneration = reaperDiagnosticGeneration;
+              try {
+                await handoffForkManager(pendingForkManager);
+                forkManagers.delete(schedulerKey);
+              } catch (error) {
+                reportReaperDiagnostic(
+                  pendingDiagnosticGeneration,
+                  forkSourceReconciliationFailureDiagnostic(error, true),
+                  { hasUI: false, ui: ctx.ui },
+                );
+                // Keep failed authority registered for the shutdown pass.
+              }
             }
             return {
               content: [{
@@ -1409,14 +1456,27 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               if (!resumed) console.warn("[pi-subagent] Tree permit parent remained parked because descendant ownership is unresolved.");
             }
             if (forkManager) {
+              let handoffFinished = false;
               try {
-                const outcome = await handoffForkManager(forkManager);
-                if (!outcome.removed) console.warn(`[pi-subagent] Retained fork source artifacts: ${outcome.retained.join(", ")}`);
+                // A retained outcome is conservative ownership state, not a
+                // user-facing failure. Startup recovery will retry it.
+                await handoffForkManager(forkManager);
+                handoffFinished = true;
               } catch (error) {
                 // Cleanup cannot replace an already successful child result.
-                console.warn(`[pi-subagent] Fork source cleanup failed; artifacts retained: ${error instanceof Error ? error.message : String(error)}`);
+                // During shutdown the invocation token is intentionally stale;
+                // route through the current shutdown token and stderr because
+                // the closing TUI can no longer guarantee notification render.
+                const duringShutdown = sessionShuttingDown && invocationDiagnosticGeneration !== reaperDiagnosticGeneration;
+                reportReaperDiagnostic(
+                  duringShutdown ? reaperDiagnosticGeneration : invocationDiagnosticGeneration,
+                  forkSourceReconciliationFailureDiagnostic(error, duringShutdown),
+                  duringShutdown ? { hasUI: false, ui: ctx.ui } : ctx,
+                );
               } finally {
-                forkManagers.delete(schedulerKey);
+                // Keep a failed manager registered so session shutdown can
+                // preserve and report the unresolved durable handoff.
+                if (handoffFinished) forkManagers.delete(schedulerKey);
               }
             }
           }

@@ -56,10 +56,10 @@ export function collectRequestedAgentNamesFromChain(chain: ChainStage[]): Set<st
 
 export function validateChainLabels(chain: ChainStage[]): string | null {
   const labels = new Set<string>();
-  for (const stage of chain) {
+  for (const [index, stage] of chain.entries()) {
     const label = stage.label?.trim();
     if (!label) continue;
-    if (labels.has(label)) return `Duplicate chain label "${label}". Labels must be unique.`;
+    if (labels.has(label)) return `Duplicate chain label at chain[${index}]. Labels must be unique.`;
     labels.add(label);
   }
   return null;

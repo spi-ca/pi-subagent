@@ -85,9 +85,9 @@ describe("release packaging and live acceptance workflow", () => {
     }
 
     assert.equal(
-      [...workflow.matchAll(/- uses: actions\/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4\.2\.2\n\s+with:\n\s+persist-credentials: false/g)].length,
+      [...workflow.matchAll(/- uses: actions\/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4\.2\.2\n\s+with:\n\s+fetch-depth: 0\n\s+persist-credentials: false/g)].length,
       2,
-      "checkout must not persist GitHub credentials",
+      "checkout must fetch full history without persisting GitHub credentials",
     );
   });
 

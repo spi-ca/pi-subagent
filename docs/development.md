@@ -61,7 +61,13 @@ PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:cmux
 bun run benchmark:phase0:live:preflight
 
 # provider-backed record; scripts가 --execute-live, record gate, tier ack를 고정함
+PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE=/absolute/path/to/pi \
+TMUX_BIN=/absolute/path/to/tmux \
+CMUX_BIN=/absolute/path/to/cmux \
 bun run benchmark:phase0:live:routine:record
+PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE=/absolute/path/to/pi \
+TMUX_BIN=/absolute/path/to/tmux \
+CMUX_BIN=/absolute/path/to/cmux \
 bun run benchmark:phase0:live:concurrency:record
 
 # fixed tier fixture paths의 current-source binding을 각각 검증
@@ -70,9 +76,9 @@ bun run benchmark:phase0:live:concurrency:verify
 bun run benchmark:phase0:live:verify
 ```
 
-record에는 공통으로 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live` 및 tier별 `--ack-provider-child-runs=15|16`가 필요합니다. concurrency에는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 필요합니다. 기록 대상은 고정된 `test/fixtures/transport-performance-phase0-live-routine.json` 및 `test/fixtures/transport-performance-phase0-live-concurrency.json`뿐입니다.
+provider-live는 caller `PATH`를 탐색해 Pi·tmux·cmux를 찾지 않습니다. operator는 native이며 stable `>=0.81.1`인 Pi executable과 canonical safe tmux/cmux executable의 절대 경로를 각각 `PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE=/absolute/path/to/pi`, `TMUX_BIN=/absolute/path/to/tmux`, `CMUX_BIN=/absolute/path/to/cmux`로 각 record 명령 앞에 명시적으로 prefix해야 합니다(패키지 script는 이를 설정하지 않습니다). Pi는 preflight generation을 runtime root의 private staged native copy로 한 번 고정해 각 cell이 그 copy만 재검증·spawn합니다. synthetic child runtime의 interpreter/backend resolution은 여전히 operator가 sanitize한 `PATH`를 신뢰하므로, `PATH`에는 trusted immutable entry만 넣어야 합니다. record에는 공통으로 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live` 및 tier별 `--ack-provider-child-runs=15|16`가 필요합니다. concurrency에는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 필요합니다. 기록 대상은 고정된 `test/fixtures/transport-performance-phase0-live-routine.json` 및 `test/fixtures/transport-performance-phase0-live-concurrency.json`뿐입니다.
 
-checkpoint schema는 v3입니다. routine의 `--max-cells=1..15` completed prefix만 resume할 수 있고, claim 뒤 각 provider cell 전에 terminalize되어 one-use입니다. concurrency partial resume과 automatic retry는 지원하지 않습니다. fixture 유효성은 routine 및 concurrency current-source verifier가 모두 성공할 때만 판정합니다. source/test/docs 변경은 **amend하지 않고** 먼저 commit한 뒤 fixture를 regenerate하고, 그 생성물만 담은 두 번째 fixture-only commit을 만듭니다. fixture-only commit은 이전 effective source revision을 유지합니다. effective revision은 fixture를 제외한 source commit에 도달할 수 있는 Git history가 있어야 조회됩니다. fixture-only HEAD에서 history가 shallow/incomplete하면 fail closed하여 source revision lookup이 실패하며 HEAD를 source revision으로 취급하지 않습니다. CI checkout은 full history여야 합니다. source 변경과 fixture를 섞어 commit하면 effective source revision이 전진하므로, 그 commit 뒤 다시 regenerate하여 fixture-only commit을 새로 만들어야 합니다. 그 전의 fixture를 최종 검증 결과로 간주하지 않습니다. 세부 계약은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md#m0-harness-상태)를 따릅니다.
+checkpoint schema는 v4입니다. routine의 `--max-cells=1..15` completed prefix만 resume할 수 있고, claim 뒤 각 provider cell 전에 terminalize되어 one-use입니다. resume은 recorded Pi version이 현재 preflight Pi version과 정확히 같고 source/tier/plan binding도 모두 일치할 때만 가능합니다. backend version은 evidence나 checkpoint continuity claim에 기록하지 않습니다. concurrency partial resume과 automatic retry는 지원하지 않습니다. live synthetic parent는 명시 allowlist의 PATH/HOME/locale, proxy/CA와 명시 transport/harness 값만 받으며 ambient `PI_SUBAGENT_*`, credential, loader/shell hook, 임의 변수와 multiplexer state를 상속하지 않습니다. 실패 root를 retain할 때에는 raw diagnostic log 대신 top-level private `0600`의 bounded `failure-summary.json` 하나만 scrub 뒤 남을 수 있습니다. scrub은 default-deny이며 valid top-level checkpoint(있다면)와 valid summary 외 모든 파일·directory·symlink를 제거하고, 둘 다 없는 terminal root 또는 malformed summary면 root 전체를 폐기합니다. final summary overwrite가 증명되지 않으면 이전 summary가 남아 있어도 root를 폐기합니다. `cleanupProven`은 cell과 transport cleanup이 모두 증명된 경우에만 true입니다. fixture 유효성은 routine 및 concurrency current-source verifier가 모두 성공할 때만 판정합니다. source/test/docs 변경은 **amend하지 않고** 먼저 commit한 뒤 fixture를 regenerate하고, 그 생성물만 담은 두 번째 fixture-only commit을 만듭니다. fixture-only commit은 이전 effective source revision을 유지합니다. effective revision은 fixture를 제외한 source commit에 도달할 수 있는 Git history가 있어야 조회됩니다. fixture-only HEAD에서 history가 shallow/incomplete하면 fail closed하여 source revision lookup이 실패하며 HEAD를 source revision으로 취급하지 않습니다. CI checkout은 full history여야 합니다. source 변경과 fixture를 섞어 commit하면 effective source revision이 전진하므로, 그 commit 뒤 다시 regenerate하여 fixture-only commit을 새로 만들어야 합니다. 그 전의 fixture를 최종 검증 결과로 간주하지 않습니다. 세부 계약은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md#m0-harness-상태)를 따릅니다.
 
 ### Generic presence producer 집중 검증
 
@@ -156,7 +162,6 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 - [`pi-cmux-presence-integration.md`](./pi-cmux-presence-integration.md) — root-only generic presence producer, duplicated wire contract, replay/privacy/authority 경계와 focused 검증
 - [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — 구현된 `auto`/`split` layout의 설계·정적 테스트 범위와 live 검증 상태. cmux와 tmux `auto` smoke는 2026-07-20에 모두 **PASS**했으며, tmux smoke는 제한된 3 top-level + parent/2 nested 범위입니다. 기존 tmux crash/reaper **PASS**는 별도 acceptance입니다.
 - [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — Linux/macOS transport 설계와 구현 상태. cmux control-socket v2, private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거, optional events hint와 stable-minimum gated `tmux -C`가 구현됐습니다. Windows는 forced-inline입니다.
-- [`foreground-steer-background-transition-design.md`](./foreground-steer-background-transition-design.md) — 사용자 steer가 queue될 때 foreground invocation을 조건부로 background 전환하는 **미구현 후속 제안**; capacity 부족 시 전환하지 않고 기존 blocking을 유지합니다.
 - [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — transport 설계 다음에 읽는 companion 문서. Phase 0A cache/preflight/UI/fork·async I/O, hardened lease, Phase 5 scheduler, Phase 6 exact tail/signature와 conservative Phase 7 reaper와 managed-child opt-in profile이 구현됐고 managed-child default 전환은 남아 있습니다.
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 foreground assistant/tool/summary usage persistence, interactive verified-final replay와 advisory preview의 구분, provider-backed installed-Pi acceptance, background completion usage 회계의 명시적 비목표
 - [`tmux-window-naming-design.md`](./tmux-window-naming-design.md) — tmux child window 이름과 Pi pane title의 역할을 분리하는 **미구현 제안**; 현재 runtime 동작이나 live PASS를 주장하지 않음

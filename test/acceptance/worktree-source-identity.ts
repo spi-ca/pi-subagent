@@ -19,9 +19,16 @@ export type WorktreeSourceIdentity = {
   worktreeDigest: string;
 };
 
-function sourceRevision(root: string): "unknown" | string {
-  const result = spawnSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  return result.status === 0 && /^[0-9a-f]{40}$/i.test(result.stdout.trim()) ? result.stdout.trim().toLowerCase() : "unknown";
+function sourceRevision(root: string, pathspec: readonly string[]): "unknown" | string {
+  const options = { cwd: root, encoding: "utf8" as const, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"] };
+  const shallow = spawnSync("git", ["rev-parse", "--is-shallow-repository"], options);
+  if (shallow.error || shallow.status !== 0 || shallow.stdout.trim() !== "false") throw new Error("could not bind evidence to the source revision");
+  const result = spawnSync("git", ["log", "-1", "--format=%H", "HEAD", ...pathspec], options);
+  if (result.error || result.status !== 0) throw new Error("could not bind evidence to the source revision");
+  const revision = result.stdout.trim();
+  if (revision === "") return "unknown";
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(revision)) throw new Error("could not bind evidence to the source revision");
+  return revision.toLowerCase();
 }
 
 function relativeFixturePath(root: string, fixture: string): string {
@@ -37,8 +44,16 @@ function relativeFixturePath(root: string, fixture: string): string {
  */
 export function currentWorktreeSourceIdentity(root: string, excludedFixtures: readonly string[]): WorktreeSourceIdentity {
   const exclusions = excludedFixtures.map((fixture) => relativeFixturePath(root, fixture));
+  for (const fixture of exclusions) {
+    try {
+      const stat = lstatSync(path.resolve(root, fixture));
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("excluded evidence fixture is not a regular file");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
   const options = { cwd: root, encoding: "buffer" as const, maxBuffer: MAX_WORKTREE_EVIDENCE_BYTES, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"] };
-  const pathspec = ["--", ".", ...exclusions.map((fixture) => `:(exclude)${fixture}`)];
+  const pathspec = ["--", ".", ...exclusions.map((fixture) => `:(top,literal,exclude)${fixture}`)];
   const status = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", ...pathspec], options);
   const diff = spawnSync("git", ["diff", "--binary", "HEAD", ...pathspec], options);
   if (status.status !== 0 || diff.status !== 0 || status.error || diff.error) throw new Error("could not bind evidence to the worktree");
@@ -57,5 +72,5 @@ export function currentWorktreeSourceIdentity(root: string, excludedFixtures: re
     if (untrackedBytes > MAX_WORKTREE_EVIDENCE_BYTES) throw new Error("untracked worktree content exceeds the evidence digest budget");
     digest.update("untracked\0").update(relative).update("\0file\0").update(`${stat.mode & 0o777}:${stat.size}\0`).update(readFileSync(candidate));
   }
-  return { sourceRevision: sourceRevision(root), sourceDirty: status.stdout.length > 0, worktreeDigest: digest.digest("hex") };
+  return { sourceRevision: sourceRevision(root, pathspec), sourceDirty: status.stdout.length > 0, worktreeDigest: digest.digest("hex") };
 }

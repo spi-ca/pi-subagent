@@ -49,9 +49,12 @@ describe("two-tier gated Phase 0 live harness", () => {
     assert.doesNotThrow(() => requireLiveGate({ execute: true, tier: CMUX_CONCURRENCY_TIER_ID }, { [LIVE_GATE]: "1", [LIVE_CMUX16_GATE]: "1" }));
   });
 
-  test("uses schema v4 tier discriminators and exact ordered cardinality", () => {
+  test("uses schema v4 tier discriminators, 40/64-hex source revisions, and exact ordered cardinality", () => {
     const routine = evidence(ROUTINE_TIER_ID), concurrency = evidence(CMUX_CONCURRENCY_TIER_ID);
     assert.equal(validateLiveEvidence(routine), true); assert.equal(validateLiveEvidence(concurrency), true);
+    for (const sourceRevision of ["a".repeat(40), "b".repeat(64)]) {
+      assert.equal(validateLiveEvidence(evidence(ROUTINE_TIER_ID, { sourceRevision, sourceDirty: false, worktreeDigest: "c".repeat(64) })), true);
+    }
     const wrongVersion = structuredClone(routine) as any; wrongVersion.schemaVersion = 3; assert.equal(validateLiveEvidence(wrongVersion), false);
     const reordered = structuredClone(routine); [reordered.matrix[0], reordered.matrix[1]] = [reordered.matrix[1]!, reordered.matrix[0]!]; assert.equal(validateLiveEvidence(reordered), false);
     const tierConfusion = structuredClone(routine) as any; tierConfusion.tier = CMUX_CONCURRENCY_TIER_ID; assert.equal(validateLiveEvidence(tierConfusion), false);

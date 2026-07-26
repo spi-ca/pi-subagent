@@ -14,6 +14,10 @@ function git(root: string, args: string[]): void {
   execFileSync("git", args, { cwd: root, stdio: "ignore" });
 }
 
+function gitOutput(root: string, args: string[]): string {
+  return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+}
+
 async function repository(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-identity-"));
   roots.push(root);
@@ -51,7 +55,83 @@ describe("worktree source identity", () => {
     assert.notEqual(currentWorktreeSourceIdentity(root, []).worktreeDigest, untrackedContent.worktreeDigest);
   });
 
-  test("excludes exactly the generated benchmark-evidence set and rejects untracked symlinks", async () => {
+  test("preserves the full identity after a fixture-only commit", async () => {
+    const root = await repository();
+    const before = currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES);
+
+    for (const fixture of GENERATED_BENCHMARK_EVIDENCE_FIXTURES) {
+      const evidence = path.join(root, fixture);
+      await fs.mkdir(path.dirname(evidence), { recursive: true });
+      await fs.writeFile(evidence, `generated:${fixture}\n`);
+    }
+    git(root, ["add", "test/fixtures"]);
+    git(root, ["commit", "-m", "regenerate benchmark evidence"]);
+
+    assert.deepEqual(currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES), before);
+  });
+
+  test("fails closed for a fixture-only shallow checkout with no reachable source revision", async () => {
+    const root = await repository();
+    for (const fixture of GENERATED_BENCHMARK_EVIDENCE_FIXTURES) {
+      const evidence = path.join(root, fixture);
+      await fs.mkdir(path.dirname(evidence), { recursive: true });
+      await fs.writeFile(evidence, `generated:${fixture}\n`);
+    }
+    git(root, ["add", "test/fixtures"]);
+    git(root, ["commit", "-m", "regenerate benchmark evidence"]);
+
+    const shallow = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-worktree-identity-shallow-"));
+    await fs.rm(shallow, { recursive: true, force: true });
+    roots.push(shallow);
+    git(root, ["clone", "--depth=1", `file://${root}`, shallow]);
+
+    assert.throws(() => currentWorktreeSourceIdentity(shallow, GENERATED_BENCHMARK_EVIDENCE_FIXTURES), /could not bind evidence to the source revision/);
+  });
+
+  test("advances source revision for non-fixture and mixed commits", async () => {
+    const root = await repository();
+    const initial = currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES);
+
+    const source = path.join(root, "src", "other-source.ts");
+    await fs.mkdir(path.dirname(source), { recursive: true });
+    await fs.writeFile(source, "export const value = 1;\n");
+    git(root, ["add", "src/other-source.ts"]);
+    git(root, ["commit", "-m", "change source"]);
+    const afterSource = currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES);
+    assert.equal(afterSource.sourceRevision, gitOutput(root, ["rev-parse", "HEAD"]));
+    assert.notEqual(afterSource.sourceRevision, initial.sourceRevision);
+
+    const fixture = path.join(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES[0]);
+    const docs = path.join(root, "docs", "other-doc.md");
+    await fs.mkdir(path.dirname(fixture), { recursive: true });
+    await fs.mkdir(path.dirname(docs), { recursive: true });
+    await fs.writeFile(fixture, "generated\n");
+    await fs.writeFile(docs, "source-bound documentation\n");
+    git(root, ["add", GENERATED_BENCHMARK_EVIDENCE_FIXTURES[0], "docs/other-doc.md"]);
+    git(root, ["commit", "-m", "change docs and regenerate evidence"]);
+    const afterMixed = currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES);
+    assert.equal(afterMixed.sourceRevision, gitOutput(root, ["rev-parse", "HEAD"]));
+    assert.notEqual(afterMixed.sourceRevision, afterSource.sourceRevision);
+  });
+
+  test("rejects an exclusion that exists as a directory, symlink, or non-regular file", async () => {
+    if (process.platform === "win32") return;
+    const root = await repository(), fixture = path.join(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES[0]);
+    await fs.mkdir(path.dirname(fixture), { recursive: true });
+
+    await fs.mkdir(fixture);
+    assert.throws(() => currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES), /excluded evidence fixture is not a regular file/);
+    await fs.rm(fixture, { recursive: true });
+
+    await fs.symlink("../../tracked.txt", fixture);
+    assert.throws(() => currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES), /excluded evidence fixture is not a regular file/);
+    await fs.rm(fixture);
+
+    execFileSync("mkfifo", [fixture]);
+    assert.throws(() => currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES), /excluded evidence fixture is not a regular file/);
+  });
+
+  test("excludes uncommitted exact generated evidence and rejects untracked symlinks", async () => {
     if (process.platform === "win32") return;
     const root = await repository();
     assert.deepEqual(GENERATED_BENCHMARK_EVIDENCE_FIXTURES, [
@@ -65,6 +145,8 @@ describe("worktree source identity", () => {
       await fs.mkdir(path.dirname(evidence), { recursive: true });
       await fs.writeFile(evidence, "first\n");
     }
+    git(root, ["add", "test/fixtures"]);
+    git(root, ["commit", "-m", "add generated benchmark evidence"]);
 
     const before = currentWorktreeSourceIdentity(root, GENERATED_BENCHMARK_EVIDENCE_FIXTURES);
     for (const fixture of GENERATED_BENCHMARK_EVIDENCE_FIXTURES) {

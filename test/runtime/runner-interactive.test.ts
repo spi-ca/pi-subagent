@@ -803,7 +803,7 @@ describe("interactive pane runner preparation", () => {
 		const inspectResume = new Promise<void>((resolve) => { resumeInspect = resolve; });
 		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { if (pauseInspect) { inspectEntered(); await inspectResume; } return { exists: true, title: paneTitle }; }, interrupt: async () => true, close: async () => true, focus: async () => { focused += 1; return true; } };
 		try {
-			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, agent: "worker", depth: 2, completionMode: "handoff", generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, agent: "worker", depth: 2, generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
 			assert.equal(await focusInteractiveRun(runId), true); assert.equal(focused, 1);
 			const inspected = await inspectInteractiveRunForUx(runId);
 			assert.equal(inspected?.title, "worker [depth=2;run=ux-promo]"); assert.equal(inspected?.titleState, "changed");
@@ -834,7 +834,6 @@ describe("interactive pane runner preparation", () => {
 			await shutdown;
 			assert.equal(released, 0);
 			assert.equal(fs.existsSync(paths.detachedOwnershipPath), true);
-			assert.equal((JSON.parse(await fs.promises.readFile(paths.detachedOwnershipPath, "utf8")) as { completionMode?: string }).completionMode, "handoff");
 			assert.equal(fs.existsSync(paths.userOwnershipPath), false);
 			assert.equal(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.ownership, "detached");
 		} finally {
@@ -907,7 +906,7 @@ describe("interactive pane runner preparation", () => {
 		try {
 			const request = {
 				contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId,
-				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 				parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: process.pid, startedAt: childStartedAt! }, requestedAt: Date.now(),
 			};
 			await fs.promises.writeFile(paths.promotionRequestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 });
@@ -945,7 +944,7 @@ describe("interactive pane runner preparation", () => {
 		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
 		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
 		const request = { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174005", runId,
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: process.pid, startedAt: childStartedAt! }, requestedAt: Date.now() };
 		const { requestedAt: _requestedAt, ...shared } = request;
 		await fs.promises.writeFile(paths.promotionRequestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 });

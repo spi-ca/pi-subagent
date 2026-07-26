@@ -24,7 +24,6 @@
 - [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — cmux/tmux 기반 실제 Pi TUI 전환 설계
 - [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — 다중 subagent interactive pane layout(`auto`/`split`) 설계
 - [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — interactive subagent runtime transport 성능 개선 설계
-- [`foreground-steer-background-transition-design.md`](./foreground-steer-background-transition-design.md) — 사용자 steer 시 foreground 실행을 background로 전환하는 후속 설계(제안 — 미구현)
 - [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — 내부 hot-path 성능 개선 설계(위 transport 문서의 companion)
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 subagent 사용량 회계 설계
 - [`pi-cmux-integration.md`](./pi-cmux-integration.md) — 선택적 `pi-cmux` UX 연동 가이드

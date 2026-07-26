@@ -80,7 +80,6 @@ import {
   listBackgroundJobSnapshots,
   parseBackgroundAction,
   parseBackgroundFlag,
-  parseCompletionMode,
   validateSubagentInvocation,
   formatSubagentInvocationValidationError,
   formatSubagentOperationalError,
@@ -1071,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const invocationDiagnosticGeneration = reaperDiagnosticGeneration;
         const terminalMode = getDefaultTerminalModeFromEnv();
-        const rawValidationError = validateSubagentInvocation(params, { terminalMode });
+        const rawValidationError = validateSubagentInvocation(params);
         if (rawValidationError) throw new Error(formatSubagentInvocationValidationError(rawValidationError));
         const failOperational = (
           category: "runtime-policy" | "child-execution" | "cancellation",
@@ -1081,7 +1080,6 @@ export default function (pi: ExtensionAPI) {
         };
 
         const intendedMode = inferInvocationMode(params);
-        const completionMode = parseCompletionMode(params.completion)!;
         if (params.tasks && params.tasks.length > limits.maxParallelTasks) {
           throw new Error(formatSubagentOperationalError(
             "runtime-policy",
@@ -1462,7 +1460,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               params.model,
               delegationMode,
               terminalMode,
-              completionMode,
               interactivePaneLayout,
               trustedProjectRoots,
               deniedProjectRoots,
@@ -1639,7 +1636,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     model: string | undefined,
     delegationMode: DelegationMode,
     terminalMode: TerminalMode,
-    completionMode: "one-shot" | "handoff",
     interactivePaneLayout: InteractivePaneLayout,
     trustedProjectRoots: string[],
     deniedProjectRoots: string[],
@@ -1664,7 +1660,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       model,
       delegationMode,
       terminalMode,
-      completionMode,
       interactivePaneLayout,
       trustedProjectRoots,
       deniedProjectRoots,

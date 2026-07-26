@@ -94,11 +94,11 @@ Pi 안에서 `subagent` 도구를 호출합니다.
 }
 ```
 
-한 번의 호출에는 네 가지 형태 중 하나만 사용합니다: `agent`/`task`, `tasks`, `chain`, 또는 백그라운드 작업 관리를 위한 `action`/`id?`. 선택적 최상위 `completion`은 실행 호출 형태인 `agent`/`task`, `tasks`, `chain`에만 적용되며 `"one-shot"` 또는 `"handoff"`만 허용하고, 생략하면 `"one-shot"`입니다. `action: "status"`와 `action: "cancel"` 호출에는 `completion`을 지정하지 않습니다. 호출별 `model`은 에이전트 파일의 `model`보다 우선하며, 최상위 `model`은 단일 호출에서만 사용합니다. 병렬 호출은 각 task item에, 체인 호출은 순차 chain step 또는 parallel stage 안의 각 `tasks[]` 항목에 `model`을 넣습니다.
+한 번의 호출에는 네 가지 형태 중 하나만 사용합니다: `agent`/`task`, `tasks`, `chain`, 또는 백그라운드 작업 관리를 위한 `action`/`id?`. 호출별 `model`은 에이전트 파일의 `model`보다 우선하며, 최상위 `model`은 단일 호출에서만 사용합니다. 병렬 호출은 각 task item에, 체인 호출은 순차 chain step 또는 parallel stage 안의 각 `tasks[]` 항목에 `model`을 넣습니다.
 
 지원하지 않는 입력 필드는 모든 공개 호출 객체에서 거부합니다. 제공하는 `agent`, `task`, `id`, `model`, `cwd`는 공백만으로 이루어지지 않은 문자열이어야 하며, 유효 문자열은 자동으로 `trim`하지 않습니다. 공백뿐인 체인 `label`은 호환을 위해 허용하고 표시할 때 `step-N` 자동 라벨로 대체합니다. 자세한 검증 범위는 [`docs/usage.md`의 입력 검증](docs/usage.md#입력-검증)을 참고하세요.
 
-기존 `agent`/`task`, `tasks`, `chain` 호출은 그대로 블로킹 실행으로 유지됩니다. 단일 모드는 한 실행의 결과 요약을, 병렬/체인은 작업·단계 라벨과 상태/오류 요약을 포함한 모드별 결과 래퍼를 반환합니다. 여기에 선택적 최상위 `background: true`를 추가하면 호출이 즉시 반환되고 완료/실패/취소 알림은 나중에 자동 steer 메시지로 전달됩니다. 백그라운드 작업은 `subagent({ action: "status" })`, `subagent({ action: "status", id })`, `subagent({ action: "cancel" })`, `subagent({ action: "cancel", id })`로 조회/취소할 수 있습니다. `status` 목록은 현재 프로세스 메모리 기준이며, 종료된 작업은 기본적으로 최대 20개/약 1시간 범위에서만 보존됩니다. 호출 크기·동시성·백그라운드 한계는 도구 필드가 아닌 Pi CLI/환경 변수 또는 `pi-subagent.json` 설정입니다. 기본 `subagent` 도구 호출 계약(`agent`/`task`, `tasks`, `chain`, `action`, 선택 `background`, 실행 호출에만 선택 `completion`)은 이 파일 설정으로 바뀌지 않습니다. [설정](docs/configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
+기존 `agent`/`task`, `tasks`, `chain` 호출은 그대로 블로킹 실행으로 유지됩니다. 단일 모드는 한 실행의 결과 요약을, 병렬/체인은 작업·단계 라벨과 상태/오류 요약을 포함한 모드별 결과 래퍼를 반환합니다. 여기에 선택적 최상위 `background: true`를 추가하면 호출이 즉시 반환되고 완료/실패/취소 알림은 나중에 자동 steer 메시지로 전달됩니다. 백그라운드 작업은 `subagent({ action: "status" })`, `subagent({ action: "status", id })`, `subagent({ action: "cancel" })`, `subagent({ action: "cancel", id })`로 조회/취소할 수 있습니다. `status` 목록은 현재 프로세스 메모리 기준이며, 종료된 작업은 기본적으로 최대 20개/약 1시간 범위에서만 보존됩니다. 호출 크기·동시성·백그라운드 한계는 도구 필드가 아닌 Pi CLI/환경 변수 또는 `pi-subagent.json` 설정입니다. 기본 `subagent` 도구 호출 계약(`agent`/`task`, `tasks`, `chain`, `action`, 선택 `background`)은 이 파일 설정으로 바뀌지 않습니다. [설정](docs/configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
 
 ## `pi-subagent.json` 설정
 
@@ -146,12 +146,6 @@ CLI > 환경 변수 > 신뢰된 프로젝트 파일 > 전역 파일 > 내장 기
 
 `pi-subagent.schema.json`은 패키지 루트에 있으며 배포 파일에 포함됩니다. 선택적인 문자열 `$schema` 키는 에디터의 로컬 schema 연결용이며, 확장은 이 값을 해석하거나 네트워크에서 schema를 가져오지 않습니다. 스키마 및 CLI/환경 변수 대응표는 [`docs/configuration.md`](docs/configuration.md#pi-subagentjson-파일-설정)를 참고하세요.
 
-### Interactive completion
-
-`completion`은 `agent`/`task`, `tasks`, `chain` 실행 호출에만 쓰는 public `subagent` 필드입니다. `action: "status"`와 `action: "cancel"`에는 지정할 수 없습니다. 기본 `"one-shot"`은 첫 정상 `agent_settled` 뒤 결과를 반환하고 child surface/pane을 정리합니다. `"handoff"`은 **정확히 하나의** `agent`/`task` 호출에만 쓸 수 있고, `background: true` 및 `cmux-pane` 또는 `tmux-pane` 실행이 모두 필요합니다. 병렬·체인·inline 실행·`background: false`는 handoff validation error입니다.
-
-handoff child는 `agent_settled` 뒤에도 idle 상태로 남습니다. child 사용자가 인자 없이 `/subagent-return`을 실행해야 마지막 응답을 부모에 반환하고 종료합니다. parent의 취소 또는 session shutdown은 completion mode와 관계없이 parent-owned target에 Escape를 보낸 뒤 exact surface/pane을 닫습니다.
-
 설정 파일은 `session_start`마다 다시 읽습니다. 따라서 `/reload`, 새 세션, `/resume`, `/fork`에서 파일 변경이 현재 Pi process의 process-local scheduler에 적용됩니다. CLI 인수는 Pi를 다시 시작해야 바꿀 수 있습니다. Linux/macOS에서 이미 생성·adopt한 durable tree authority의 `maxActive`는 root Pi process 수명 동안 고정됩니다. 같은 tree의 nested child는 그 authority의 cap을 채택하므로 reload로 tree-wide cap을 바꿀 수 없으며, 새 root Pi process에서 새 tree를 시작해야 합니다. Windows는 tree-wide hard cap을 지원하지 않고 process-local scheduling으로 fallback합니다.
 
 `maxActive`는 JSON 파일 대상에 포함됩니다. 위임 의미를 바꾸는 `--subagent-max-depth`와 순환 방지, terminal topology를 선택하는 interactive pane layout은 의도적으로 CLI/환경 변수 전용입니다. broker/runtime path, transport identity, lease/lifecycle/reaper 안전 cadence와 artifact 경로는 내부 또는 환경 전달용 authority라 JSON 설정으로 노출하지 않습니다. managed child profile도 extension-registry trust 정책이므로 `PI_SUBAGENT_CMUX_CHILD_POLICY=inherit|managed` 환경 변수 전용입니다.
@@ -183,7 +177,7 @@ _2x PNG · [SVG](docs/diagram/runtime-execution-modes.svg) · [Mermaid source](d
 
 `--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`로 바꿀 수 있습니다. CLI > 환경 변수 > 기본 `auto` 순이며 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
 
-interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. child의 기본값은 parent-owned `one-shot` 실행이며 첫 정상 settle 뒤 결과를 부모에 전달하고 정확한 surface/pane만 닫습니다. `completion: "handoff"`는 settled 뒤에도 child를 유지하고 `/subagent-return`으로 명시적으로 끝내는 제한된 background interactive 대안입니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
+interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달하고 정확한 surface/pane만 닫습니다. parent 취소 또는 session shutdown은 parent-owned target에 Escape를 보낸 뒤 exact surface/pane을 닫습니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
 
 ### 위임 보호 장치
 

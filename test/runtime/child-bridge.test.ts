@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
-import childBridge, { parseChildCompletionMode, readAssignedPhase0Barrier, registerChildBridge, registerPhase0LiveProviderProof } from "../../src/runtime/child-bridge";
+import childBridge, { readAssignedPhase0Barrier, registerChildBridge, registerPhase0LiveProviderProof } from "../../src/runtime/child-bridge";
 import { derivePhase0LiveProofCapability, Phase0LiveProofServer } from "../../src/runtime/phase0-live-proof";
 import { TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV } from "../../src/runtime/tree-permit-authority";
 
@@ -21,7 +21,6 @@ import {
 	RUN_PROTOCOL_VERSION,
 	getCurrentProcessStartedAt,
 	SUBAGENT_CHILD_SESSION_PATH_ENV,
-	SUBAGENT_COMPLETION_MODE_ENV,
 	SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
 	V3_FAILURE_BOUNDARY_CAPABILITY,
 	SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
@@ -72,7 +71,6 @@ async function setupBridge(runId: string, options: {
 	readLease?: (filePath: string) => Promise<unknown | null>;
 	title?: string;
 	hasUI?: boolean;
-	completionMode?: "one-shot" | "handoff";
 	publishPromotionAck?: (filePath: string, value: unknown) => Promise<"published" | "exists">;
 	readPromotionAck?: (filePath: string) => Promise<unknown | null>;
 	readCompletionFence?: (filePath: string) => Promise<unknown | null>;
@@ -103,7 +101,6 @@ async function setupBridge(runId: string, options: {
 	process.env[SUBAGENT_RUN_OWNERSHIP_ENV] = "parent-owned";
 	process.env[SUBAGENT_PROMOTION_REQUEST_PATH_ENV] = paths.promotionRequestPath;
 	process.env[SUBAGENT_PROMOTION_ACK_PATH_ENV] = paths.promotionAckPath;
-	process.env[SUBAGENT_COMPLETION_MODE_ENV] = options.completionMode ?? "one-shot";
 	if (options.failureBoundaryCapability === false) delete process.env[SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV];
 	else process.env[SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV] = V3_FAILURE_BOUNDARY_CAPABILITY;
 	if (options.metadataTailSuccessBoundaryCapability) process.env[SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV] = V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY;
@@ -342,13 +339,6 @@ describe("child lifecycle bridge", () => {
 		await assert.rejects(() => readAssignedPhase0Barrier(regular, regular, RELEASE_TOKEN, Date.now() + 10_000));
 	});
 
-	test("parses both supported completion modes and rejects malformed child values", () => {
-		assert.equal(parseChildCompletionMode(undefined), "one-shot");
-		assert.equal(parseChildCompletionMode("one-shot"), "one-shot");
-		assert.equal(parseChildCompletionMode("handoff"), "handoff");
-		assert.equal(parseChildCompletionMode("later"), null);
-	});
-
 	test("is a no-op when it is inherited without run protocol environment", () => {
 		delete process.env[SUBAGENT_RUN_ID_ENV];
 		let registrations = 0;
@@ -398,34 +388,6 @@ describe("child lifecycle bridge", () => {
 		const noSuffixRoom = await setupBridge("run-title-too-long", { title: "x".repeat(85), hasUI: true });
 		await noSuffixRoom.emit("session_start");
 		assert.deepEqual(noSuffixRoom.titles, []);
-	});
-
-	test("keeps handoff turns idle until an explicit return command publishes V3 completion", async () => {
-		const title = "subagent:worker:handoff";
-		const bridge = await setupBridge("run-handoff", { completionMode: "handoff", title, hasUI: true });
-		assert.ok(bridge.commands.has("subagent-return"));
-		await bridge.emit("session_start");
-		await bridge.emit("agent_start");
-		await bridge.emit("agent_end", { messages: [assistant("error", "")] });
-		await bridge.emit("agent_settled");
-		await bridge.emit("agent_start");
-		await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		await bridge.emit("agent_settled");
-		assert.equal(await readJsonFile(bridge.paths.completionPath), null);
-		assert.equal(bridge.lifecycle.shutdown, false);
-		assert.equal(parseRunState(await readJsonFile(bridge.paths.statePath), "run-handoff")?.lastEvent, "agent_settled:handoff-waiting");
-		assert.equal(bridge.titles.at(-1), `${title} · waiting`);
-
-		const command = bridge.commands.get("subagent-return")!;
-		await command.handler("unexpected", bridge.ctx);
-		assert.deepEqual(bridge.notifications, [{ message: "Usage: /subagent-return", level: "error" }]);
-		assert.equal(await readJsonFile(bridge.paths.completionPath), null);
-		await command.handler("", bridge.ctx);
-		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-handoff");
-		assert.equal(completion?.version, 3);
-		assert.equal(completion?.status, "completed");
-		assert.equal(bridge.lifecycle.shutdown, true);
-		assert.equal(bridge.titles.at(-1), `${title} · returning`);
 	});
 
 	test("waits for an exact completion-fence ACK before capturing completion", async () => {
@@ -593,9 +555,8 @@ describe("child lifecycle bridge", () => {
 		assert.ok(legacyCompletion.session.byteOffset < modernCompletion.session.byteOffset, "legacy success excludes post-assistant usage metadata");
 	});
 
-	test("keeps one-shot completion and does not register a return command", async () => {
+	test("completes settled turns", async () => {
 		const bridge = await setupBridge("run-complete");
-		assert.equal(bridge.commands.has("subagent-return"), false);
 		await bridge.emit("session_start", { reason: "startup" });
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
@@ -823,7 +784,7 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-child")!;
 		const request = { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId: "transfer-child",
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() };
 		await atomicWriteJson(bridge.paths.promotionRequestPath, request);
 		await new Promise((resolve) => setTimeout(resolve, 60));
@@ -851,7 +812,7 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-finish-first")!;
-		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174010", runId: "transfer-finish-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot", parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174010", runId: "transfer-finish-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		assert.equal(fs.existsSync(bridge.paths.promotionAckPath), false);
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-finish-first")?.status, "completed");
@@ -877,7 +838,7 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-ack-first")!;
-		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174011", runId: "transfer-ack-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot", parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174011", runId: "transfer-ack-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-ack-first"));
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "concurrent finish must not publish after detached ACK");
@@ -899,7 +860,7 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-release-recovery")!;
-		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174013", runId: "transfer-release-recovery", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot", parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174013", runId: "transfer-release-recovery", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 80));
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-release-recovery"));
 		await bridge.emit("agent_start");
@@ -919,7 +880,7 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-post-detach")!;
-		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174012", runId: "transfer-post-detach", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot", parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174012", runId: "transfer-post-detach", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 80));
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-post-detach"));
 		await bridge.emit("agent_start");
@@ -948,7 +909,7 @@ describe("child lifecycle bridge", () => {
 			await bridge.emit("session_start");
 			const child = parseRunState(await readJsonFile(bridge.paths.statePath), runId)!;
 			await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: `123e4567-e89b-12d3-a456-4266141740${label === "valid" ? "08" : "09"}`, runId,
-				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 				parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 			await new Promise((resolve) => setTimeout(resolve, 80));
 			assert.equal(fs.existsSync(bridge.paths.promotionAckPath), false, `${label} completion must prevent ACK publication`);
@@ -962,7 +923,7 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-malformed-ack")!;
 		const request = { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174005", runId: "transfer-malformed-ack",
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() };
 		await atomicWriteJson(bridge.paths.promotionRequestPath, request);
 		await fs.promises.writeFile(bridge.paths.promotionAckPath, "{malformed}\n", { mode: 0o600 });
@@ -986,7 +947,7 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-ack-ambiguous")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174007", runId: "transfer-ack-ambiguous",
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
@@ -1007,7 +968,7 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-ack-failure")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174006", runId: "transfer-ack-failure",
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot",
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		assert.ok(publishAttempts > 0);

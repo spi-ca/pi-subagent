@@ -10,8 +10,7 @@
     "runId",
     "owner",
     "detachedAt",
-    "allocation",
-    "completionMode"
+    "allocation"
   ],
   "properties": {
     "contract": { "const": "pi-subagent.detached-ownership" },
@@ -27,7 +26,6 @@
         "algorithm": { "const": "sha256" },
         "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
-    },
-    "completionMode": { "enum": ["one-shot", "handoff"] }
+    }
   }
 }

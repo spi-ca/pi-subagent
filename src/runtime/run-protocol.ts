@@ -24,8 +24,6 @@ export const SUBAGENT_PROMOTION_REQUEST_PATH_ENV = "PI_SUBAGENT_PROMOTION_REQUES
 export const SUBAGENT_PROMOTION_ACK_PATH_ENV = "PI_SUBAGENT_PROMOTION_ACK_PATH";
 /** Immutable fork descriptor consumed by child-bridge before agent input. */
 export const SUBAGENT_FORK_BOOTSTRAP_PATH_ENV = "PI_SUBAGENT_FORK_BOOTSTRAP_PATH";
-/** Explicit child lifecycle behavior; inherited values are cleared by the parent. */
-export const SUBAGENT_COMPLETION_MODE_ENV = "PI_SUBAGENT_COMPLETION_MODE";
 /** Opt-in only: newer parents permit child V3 failures to carry a session boundary. */
 export const SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV = "PI_SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY";
 export const V3_FAILURE_BOUNDARY_CAPABILITY = "v1";
@@ -156,7 +154,6 @@ export interface OwnershipTransferRequestV1 {
 	transferId: string;
 	runId: string;
 	allocation: { algorithm: "sha256"; digest: string };
-	completionMode: "one-shot" | "handoff";
 	parent: { pid: number; startedAt: number };
 	child: { pid: number; startedAt: number };
 	requestedAt: number;
@@ -169,11 +166,10 @@ export interface OwnershipTransferAckV1 extends Omit<OwnershipTransferRequestV1,
 
 function parseOwnershipTransferBase(value: unknown, runId: string, kind: "request" | "ack"): OwnershipTransferRequestV1 | OwnershipTransferAckV1 | null {
 	const timing = kind === "request" ? "requestedAt" : "acknowledgedAt";
-	const keys = ["contract", "version", "kind", "transferId", "runId", "allocation", "completionMode", "parent", "child", timing];
+	const keys = ["contract", "version", "kind", "transferId", "runId", "allocation", "parent", "child", timing];
 	if (!isRecord(value) || !hasExactKeys(value, keys) || value.contract !== "pi-subagent.detached-transfer" || value.version !== 1
 		|| value.kind !== kind || value.runId !== runId || !isSafeRunId(value.runId)
 		|| typeof value.transferId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.transferId)
-		|| (value.completionMode !== "one-shot" && value.completionMode !== "handoff")
 		|| !isRecord(value.allocation) || !hasExactKeys(value.allocation, ["algorithm", "digest"]) || value.allocation.algorithm !== "sha256" || typeof value.allocation.digest !== "string" || !/^[0-9a-f]{64}$/.test(value.allocation.digest)
 		|| !isRecord(value.parent) || !hasExactKeys(value.parent, ["pid", "startedAt"]) || !pid(value.parent.pid) || !positive(value.parent.startedAt)
 		|| !isRecord(value.child) || !hasExactKeys(value.child, ["pid", "startedAt"]) || !pid(value.child.pid) || !positive(value.child.startedAt)
@@ -190,7 +186,7 @@ export function parseOwnershipTransferAck(value: unknown, runId: string): Owners
 }
 
 export function sameOwnershipTransfer(request: OwnershipTransferRequestV1, ack: OwnershipTransferAckV1): boolean {
-	return request.transferId === ack.transferId && request.runId === ack.runId && request.completionMode === ack.completionMode
+	return request.transferId === ack.transferId && request.runId === ack.runId
 		&& request.allocation.digest === ack.allocation.digest && request.parent.pid === ack.parent.pid && request.parent.startedAt === ack.parent.startedAt
 		&& request.child.pid === ack.child.pid && request.child.startedAt === ack.child.startedAt;
 }
@@ -202,15 +198,14 @@ export interface DetachedOwnershipRecordV1 {
 	owner: "user";
 	detachedAt: number;
 	allocation: { algorithm: "sha256"; digest: string };
-	completionMode: "one-shot" | "handoff";
 }
 
 /** Strict parser for the public detached ownership v1 marker. */
 export function parseDetachedOwnershipRecord(value: unknown, runId: string): DetachedOwnershipRecordV1 | null {
-	if (!isRecord(value) || !hasExactKeys(value, ["contract", "version", "runId", "owner", "detachedAt", "allocation", "completionMode"])) return null;
+	if (!isRecord(value) || !hasExactKeys(value, ["contract", "version", "runId", "owner", "detachedAt", "allocation"])) return null;
 	if (value.contract !== "pi-subagent.detached-ownership" || value.version !== 1 || value.runId !== runId || !isSafeRunId(value.runId)
 		|| value.owner !== "user" || !Number.isSafeInteger(value.detachedAt) || (value.detachedAt as number) <= 0
-		|| (value.completionMode !== "one-shot" && value.completionMode !== "handoff") || !isRecord(value.allocation)
+		|| !isRecord(value.allocation)
 		|| !hasExactKeys(value.allocation, ["algorithm", "digest"]) || value.allocation.algorithm !== "sha256"
 		|| typeof value.allocation.digest !== "string" || !/^[0-9a-f]{64}$/.test(value.allocation.digest)) return null;
 	return value as unknown as DetachedOwnershipRecordV1;

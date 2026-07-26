@@ -98,7 +98,7 @@ child tool allowlist와 제외 목록은 `cmux_open_terminal` 같은 도구의 �
 | 이벤트/주체 | 의미 |
 |---|---|
 | `pi-cmux`의 `agent_end` 처리 | 현재 agent run의 sidebar 최종 표시, flash와 알림 생성 |
-| `pi-subagent` child bridge의 `agent_settled` 처리 | retry, compaction retry와 queued follow-up까지 끝난 기본 one-shot child의 semantic completion 확정; handoff child는 idle로 남음 |
+| `pi-subagent` child bridge의 `agent_settled` 처리 | retry, compaction retry와 queued follow-up까지 끝난 child의 semantic completion을 확정하고 결과 반환과 exact surface/pane 정리를 시작 |
 
 `agent_end` 뒤에도 자동 실행이 남을 수 있으므로 `pi-subagent`는 이를 child 종료 신호로 사용하지 않는다. 반대로 현재 `pi-cmux`의 sidebar와 알림은 `agent_end`에서 갱신되므로, 표시상 완료가 `pi-subagent`의 최종 완료보다 먼저 보일 수 있다.
 
@@ -301,7 +301,7 @@ parent 화면을 과도하게 차지하지 않도록 기본 status는 한 줄로
 
 #### surface title 설정 (구현됨)
 
-managed base title은 `<agent> [depth=<n>;run=<prefix>]`다. wrapper는 effective environment와 `cwd`를 설치한 뒤 tree permit이 child를 `STOP`할 수 **전에** OSC로 `<base> · queued`를 발행한다. 그 뒤 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 따라서 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort와 handoff settlement는 별도 suffix가 아니라 `waiting`이다.
+managed base title은 `<agent> [depth=<n>;run=<prefix>]`다. wrapper는 effective environment와 `cwd`를 설치한 뒤 tree permit이 child를 `STOP`할 수 **전에** OSC로 `<base> · queued`를 발행한다. 그 뒤 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 따라서 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort는 별도 suffix가 아니라 `waiting`이다.
 
 ```text
 scout [depth=1;run=a14f82c1] · queued
@@ -364,7 +364,7 @@ foreground/background callback과 interactive session drain에서 얻은 public 
 
 `/subagents keep <run-id>`는 exact live target을 재확인한 뒤 session-local ownership을 `kept`로 바꾸어 정상 completion close를 보류한다. session shutdown은 generation/fence 아래 이를 강제로 정리한다. kept tmux run의 shutdown cleanup은 active pooled client lease와 분리된 새 generation-bound control client를 열고, immutable gate digest·executable/socket/server·source/session/window·exact target을 다시 검증한 뒤에만 실행한다. 이 client는 각 cleanup 뒤 닫히며, 불확실한 close mutation은 새 연결에서 재실행하지 않는다.
 
-`/subagents promote <run-id>`는 local ownership을 먼저 `transferring`으로 바꾸고 process-local parent mutation authority를 철회한다. 그 뒤 exact allocation digest에 결속된 private immutable `promotion-request.json`을 publish하고, exact child ACK인 `promotion-ack.json`을 확인한 뒤 durable tree permit을 detach한다. 마지막으로 public immutable `detached-ownership.json`을 publish해 final detached ownership을 표시한다. record는 패키지 루트의 `pi-subagent.detached-ownership.schema.json` v1을 따르고 `completionMode`도 기록한다. `user-ownership.json`은 legacy read-only compatibility marker이며 새 promotion은 publish하지 않는다. 결과는 `promoted`, `already-promoted`, `ownership-unknown`, `rejected`로 구분한다. ACK timeout, partial chain, 또는 기존 marker가 malformed·unreadable·다른 digest이면 run을 목록에서 지우지 않고 recovery metadata를 retain하는 `ownership-unknown`으로 남긴다. UI는 cleanup authority가 unknown/revoked라 자동 cleanup이 중지되었다고 명시하고, startup reaper도 이 불확실한 상태를 보수적으로 유지하며 target을 mutate하지 않는다. 정상 promoted target도 reaper가 절대 mutate하지 않지만 task/prompt/auth/token/wrapper artifacts는 scrub하고, child session은 PID/start identity가 명시적으로 dead일 때만 제거한다. focus/keep/promote는 session shutdown fence와 per-run operation queue로 직렬화된다.
+`/subagents promote <run-id>`는 local ownership을 먼저 `transferring`으로 바꾸고 process-local parent mutation authority를 철회한다. 그 뒤 exact allocation digest에 결속된 private immutable `promotion-request.json`을 publish하고, exact child ACK인 `promotion-ack.json`을 확인한 뒤 durable tree permit을 detach한다. 마지막으로 public immutable `detached-ownership.json`을 publish해 final detached ownership을 표시한다. record는 패키지 루트의 `pi-subagent.detached-ownership.schema.json` v1을 따른다. `user-ownership.json`은 legacy read-only compatibility marker이며 새 promotion은 publish하지 않는다. 결과는 `promoted`, `already-promoted`, `ownership-unknown`, `rejected`로 구분한다. ACK timeout, partial chain, 또는 기존 marker가 malformed·unreadable·다른 digest이면 run을 목록에서 지우지 않고 recovery metadata를 retain하는 `ownership-unknown`으로 남긴다. UI는 cleanup authority가 unknown/revoked라 자동 cleanup이 중지되었다고 명시하고, startup reaper도 이 불확실한 상태를 보수적으로 유지하며 target을 mutate하지 않는다. 정상 promoted target도 reaper가 절대 mutate하지 않지만 task/prompt/auth/token/wrapper artifacts는 scrub하고, child session은 PID/start identity가 명시적으로 dead일 때만 제거한다. focus/keep/promote는 session shutdown fence와 per-run operation queue로 직렬화된다.
 
 ### 이번 범위에서 제외할 기능
 
@@ -382,7 +382,7 @@ Pi TUI terminal toast는 `failed` invocation에만 warning으로 표시한다. `
 - 일반 command를 split/tab에서 실행
 - zoxide directory 이동
 - 수동 review session 생성
-- general-purpose arbitrary-session continuation (제한된 parent-owned `completion: "handoff"`와 `/subagent-return`은 구현됨)
+- general-purpose arbitrary-session continuation
 - worktree 생성
 - general-purpose cmux split command
 

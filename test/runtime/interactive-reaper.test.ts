@@ -253,7 +253,7 @@ describe("stale interactive run reaper", () => {
 		await atomicWriteJson(paths.allocationPath, allocation);
 		await fs.promises.writeFile(paths.taskPath, "sensitive task", { mode: 0o600 });
 		await fs.promises.writeFile(paths.childSessionPath, '{"type":"session"}\n', { mode: 0o600 });
-		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "handoff" });
+		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") } });
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: Date.now() + 20_000, staleAfterMs: 1 });
 		assert.equal(outcome.skipped.includes(runId), true);
 		assert.equal(outcome.reaped.includes(runId), false);
@@ -272,12 +272,12 @@ describe("stale interactive run reaper", () => {
 		const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
 		const allocation = { version: 2, runId, terminalMode: "cmux-pane" as const, target: { workspaceId: CMUX_WORKSPACE_ID, surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 		const digest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
-		const request = { contract: "pi-subagent.detached-transfer" as const, version: 1 as const, kind: "request" as const, transferId: "123e4567-e89b-12d3-a456-426614174014", runId, allocation: { algorithm: "sha256" as const, digest }, completionMode: "one-shot" as const, parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 };
+		const request = { contract: "pi-subagent.detached-transfer" as const, version: 1 as const, kind: "request" as const, transferId: "123e4567-e89b-12d3-a456-426614174014", runId, allocation: { algorithm: "sha256" as const, digest }, parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 };
 		await atomicWriteJson(paths.allocationPath, allocation);
 		await atomicWriteJson(paths.promotionRequestPath, request);
 		const { requestedAt: _requestedAt, ...ack } = request;
 		await atomicWriteJson(paths.promotionAckPath, { ...ack, kind: "ack", acknowledgedAt: 6 });
-		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 7, allocation: request.allocation, completionMode: request.completionMode });
+		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 7, allocation: request.allocation });
 		const failed = await reapStaleInteractiveRuns({
 			rootDir: root,
 			inspectPromotedTarget: async () => "absent",
@@ -298,7 +298,7 @@ describe("stale interactive run reaper", () => {
 		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: CMUX_WORKSPACE_ID, surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 		await atomicWriteJson(paths.allocationPath, allocation);
 		await atomicWriteJson(paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId,
-			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, completionMode: "one-shot", parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 });
+			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 });
 		let mutations = 0;
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: Date.now() + 20_000, staleAfterMs: 1, cmuxRun: async () => { mutations += 1; return { exitCode: 0, stdout: "", stderr: "", aborted: false }; } });
 		assert.equal(outcome.invalid.includes(runId), true);
@@ -316,12 +316,12 @@ describe("stale interactive run reaper", () => {
 			const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: CMUX_WORKSPACE_ID, surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 			const digest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
 			const request = { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId,
-				allocation: { algorithm: "sha256", digest }, completionMode: "one-shot", parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 };
+				allocation: { algorithm: "sha256", digest }, parent: { pid: 1, startedAt: 2 }, child: { pid: 3, startedAt: 4 }, requestedAt: 5 };
 			await atomicWriteJson(paths.allocationPath, allocation);
 			await atomicWriteJson(paths.promotionRequestPath, request);
 			const { requestedAt: _requestedAt, ...shared } = request;
 			await atomicWriteJson(paths.promotionAckPath, { ...shared, kind: "ack", acknowledgedAt: 6 });
-			await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 7, allocation: request.allocation, completionMode: request.completionMode });
+			await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 7, allocation: request.allocation });
 			if (typeof completion === "string") await fs.promises.writeFile(paths.completionPath, completion, { mode: 0o600 });
 			else await atomicWriteJson(paths.completionPath, { ...completion, runId });
 			let mutations = 0;
@@ -358,7 +358,7 @@ describe("stale interactive run reaper", () => {
 		const runId = "mismatched-detached-ownership";
 		const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
 		await atomicWriteJson(paths.allocationPath, { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: CMUX_WORKSPACE_ID, surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 });
-		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest: "a".repeat(64) }, completionMode: "one-shot" });
+		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest: "a".repeat(64) } });
 		let mutations = 0;
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: Date.now() + 20_000, staleAfterMs: 1, cmuxRun: async () => { mutations += 1; return { exitCode: 0, stdout: "", stderr: "", aborted: false }; } });
 		assert.equal(outcome.invalid.includes(runId), true);
@@ -374,7 +374,7 @@ describe("stale interactive run reaper", () => {
 		const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: CMUX_WORKSPACE_ID, surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 		await atomicWriteJson(paths.allocationPath, allocation);
 		const digest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
-		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest }, completionMode: "one-shot" });
+		await atomicWriteJson(paths.detachedOwnershipPath, { contract: "pi-subagent.detached-ownership", version: 1, runId, owner: "user", detachedAt: 1, allocation: { algorithm: "sha256", digest } });
 		await atomicWriteJson(paths.userOwnershipPath, { version: 1, runId, promotedAt: 1, allocationDigest: "b".repeat(64) });
 		let mutations = 0;
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: Date.now() + 20_000, staleAfterMs: 1, cmuxRun: async () => { mutations += 1; return { exitCode: 0, stdout: "", stderr: "", aborted: false }; } });

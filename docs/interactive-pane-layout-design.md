@@ -84,7 +84,7 @@ tmux: tmux split-window -h -t <source-pane>
 - 모든 child TUI를 동시에 한 화면에 표시
 - 사용자의 기존 pane을 자동 재배치하거나 균등화
 - cmux와 tmux에 완전히 같은 시각적 UI 강제
-- pane layout 정책 밖의 장기 사용자 소유 surface; 구현된 `completion: "handoff"`는 parent-owned background interactive child를 `/subagent-return`까지 유지하지만 layout backend 계약을 확장하지 않음
+- pane layout 정책 밖의 장기 사용자 소유 surface
 - `pi-cmux`의 command나 내부 helper를 layout backend로 재사용
 - terminal 크기를 읽어 모델이나 task 동시성을 자동 변경
 - 첫 구현에서 pane 비율, 방향, tab 정렬을 세밀한 사용자 설정으로 노출
@@ -419,7 +419,7 @@ background 실행 여부와 focus 여부는 별개다. foreground subagent 호�
 
 ### 12.2 cross-backend pane title (구현됨)
 
-wrapper는 cmux/tmux 모두에서 printable-ASCII base title `<agent> [depth=<n>;run=<prefix>]`를 사용한다. effective child environment와 `cwd`를 설치한 직후, tree permit이 child를 `STOP`할 수 **전에** wrapper가 `<base> · queued` OSC title을 발행한다. 이어 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 즉 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort/handoff settlement는 `waiting`으로 표시한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
+wrapper는 cmux/tmux 모두에서 printable-ASCII base title `<agent> [depth=<n>;run=<prefix>]`를 사용한다. effective child environment와 `cwd`를 설치한 직후, tree permit이 child를 `STOP`할 수 **전에** wrapper가 `<base> · queued` OSC title을 발행한다. 이어 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 즉 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort는 `waiting`으로 표시한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
 
 ```text
 reviewer [depth=2;run=a14f82c1] · queued

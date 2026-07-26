@@ -239,7 +239,7 @@ async function clearFakeTarget(socketPath: string): Promise<void> {
 async function runFake(task: string, options: { signal?: AbortSignal; onUpdate?: (update: any) => void } = {}): Promise<SingleResult> {
   return await runAgent({
     cwd: process.cwd(), agents: [agent], agentName: agent.name, task,
-    delegationMode: "spawn", terminalMode: "tmux-pane", completionMode: "one-shot", interactivePaneLayout: "split",
+    delegationMode: "spawn", terminalMode: "tmux-pane", interactivePaneLayout: "split",
     parentDepth: 0, parentAgentStack: [], maxDepth: 5, maxActive: 2, preventCycles: true,
     signal: options.signal, onUpdate: options.onUpdate, makeDetails: details,
   });

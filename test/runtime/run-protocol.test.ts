@@ -258,7 +258,7 @@ describe("run protocol", () => {
 
 	test("strictly binds immutable ownership transfer request and acknowledgement", () => {
 		const request = { contract: "pi-subagent.detached-transfer" as const, version: 1 as const, kind: "request" as const,
-			transferId: "123e4567-e89b-12d3-a456-426614174001", runId: "transfer-run", allocation: { algorithm: "sha256" as const, digest: "a".repeat(64) }, completionMode: "handoff" as const,
+			transferId: "123e4567-e89b-12d3-a456-426614174001", runId: "transfer-run", allocation: { algorithm: "sha256" as const, digest: "a".repeat(64) },
 			parent: { pid: 11, startedAt: 12 }, child: { pid: 13, startedAt: 14 }, requestedAt: 15 };
 		const { requestedAt: _requestedAt, ...transfer } = request;
 		const ack = { ...transfer, kind: "ack" as const, acknowledgedAt: 16 };
@@ -283,12 +283,12 @@ describe("run protocol", () => {
 	test("strictly parses public detached ownership records", () => {
 		const record = {
 			contract: "pi-subagent.detached-ownership" as const, version: 1 as const, runId: "detached-run", owner: "user" as const,
-			detachedAt: 1, allocation: { algorithm: "sha256" as const, digest: "a".repeat(64) }, completionMode: "handoff" as const,
+			detachedAt: 1, allocation: { algorithm: "sha256" as const, digest: "a".repeat(64) },
 		};
 		assert.deepEqual(parseDetachedOwnershipRecord(record, "detached-run"), record);
 		for (const malformed of [
 			{ ...record, unexpected: true }, { ...record, allocation: { ...record.allocation, digest: "A".repeat(64) } },
-			{ ...record, detachedAt: 0 }, { ...record, detachedAt: 1.5 }, { ...record, completionMode: "later" },
+			{ ...record, detachedAt: 0 }, { ...record, detachedAt: 1.5 },
 			{ ...record, runId: "../unsafe" }, { ...record, allocation: { algorithm: "sha1", digest: record.allocation.digest } },
 		]) assert.equal(parseDetachedOwnershipRecord(malformed, "detached-run"), null);
 	});
@@ -296,12 +296,11 @@ describe("run protocol", () => {
 	test("publishes a package-included detached ownership schema with strict representative shape", async () => {
 		const schema = JSON.parse(await fs.promises.readFile(path.join(process.cwd(), "pi-subagent.detached-ownership.schema.json"), "utf8"));
 		assert.equal(schema.additionalProperties, false);
-		assert.deepEqual(schema.required, ["contract", "version", "runId", "owner", "detachedAt", "allocation", "completionMode"]);
+		assert.deepEqual(schema.required, ["contract", "version", "runId", "owner", "detachedAt", "allocation"]);
 		assert.equal(schema.properties.runId.pattern, "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$");
 		assert.equal(schema.properties.detachedAt.maximum, Number.MAX_SAFE_INTEGER);
 		assert.equal(schema.properties.allocation.additionalProperties, false);
 		assert.equal(schema.properties.allocation.properties.digest.pattern, "^[0-9a-f]{64}$");
-		assert.deepEqual(schema.properties.completionMode.enum, ["one-shot", "handoff"]);
 	});
 
 	test("validates cmux and tmux launch records", () => {

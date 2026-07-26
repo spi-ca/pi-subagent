@@ -9,7 +9,6 @@ import {
 	DEFAULT_PARENT_LEASE_STALE_MS,
 	RUN_PROTOCOL_VERSION,
 	SUBAGENT_CHILD_SESSION_PATH_ENV,
-	SUBAGENT_COMPLETION_MODE_ENV,
 	SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
 	SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
 	SUBAGENT_LEASE_CHECK_MS_ENV,
@@ -75,7 +74,6 @@ interface BridgeConfig {
 	allocationPath: string;
 	childSessionPath: string;
 	ownership: RunOwnership;
-	completionMode: "one-shot" | "handoff";
 	/** Only a newer parent explicitly opts this child into boundary-bearing V3 failures. */
 	failureBoundaryCapability: boolean;
 	/** Only a newer parent accepts success boundaries ending in linked Pi metadata. */
@@ -126,12 +124,6 @@ function parsePositiveNumber(raw: string | undefined): number | null {
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-/** Undefined keeps legacy one-shot behavior; every other value is exact. */
-export function parseChildCompletionMode(raw: string | undefined): "one-shot" | "handoff" | null {
-	if (raw === undefined) return "one-shot";
-	return raw === "one-shot" || raw === "handoff" ? raw : null;
-}
-
 function resolveBridgeConfig(env: NodeJS.ProcessEnv): BridgeConfig | null {
 	const runId = env[SUBAGENT_RUN_ID_ENV]?.trim();
 	const statePath = env[SUBAGENT_RUN_STATE_PATH_ENV]?.trim();
@@ -169,8 +161,6 @@ function resolveBridgeConfig(env: NodeJS.ProcessEnv): BridgeConfig | null {
 	if (!path.isAbsolute(promotionRequestPath) || !path.isAbsolute(promotionAckPath)
 		|| path.dirname(promotionRequestPath) !== runDir || path.dirname(promotionAckPath) !== runDir
 		|| path.basename(promotionRequestPath) !== "promotion-request.json" || path.basename(promotionAckPath) !== "promotion-ack.json") return null;
-	const completionMode = parseChildCompletionMode(env[SUBAGENT_COMPLETION_MODE_ENV]);
-	if (!completionMode) return null;
 	const failureBoundaryCapability = hasV3FailureBoundaryCapability(env[SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV]);
 	const metadataTailSuccessBoundaryCapability = hasV3MetadataTailSuccessBoundaryCapability(env[SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV]);
 	const expectedParentPid = parsePositiveNumber(env[SUBAGENT_EXPECTED_PARENT_PID_ENV]);
@@ -189,7 +179,6 @@ function resolveBridgeConfig(env: NodeJS.ProcessEnv): BridgeConfig | null {
 		allocationPath,
 		childSessionPath,
 		ownership,
-		completionMode,
 		failureBoundaryCapability,
 		metadataTailSuccessBoundaryCapability,
 		...(ownership === "parent-owned" ? { expectedParentPid: expectedParentPid!, expectedParentStartedAt: expectedParentStartedAt! } : {}),
@@ -651,20 +640,6 @@ export function registerChildBridge(
 		ctx.shutdown();
 	};
 
-	if (config.completionMode === "handoff") {
-		pi.registerCommand("subagent-return", {
-			description: "Finish this interactive subagent and return its final response to the parent.",
-			handler: async (rawArgs, ctx) => {
-			if (rawArgs.trim()) {
-				ctx.ui.notify("Usage: /subagent-return", "error");
-				return;
-			}
-			await ctx.waitForIdle();
-			if (terminal) return;
-			await finish(ctx, "completed", "subagent-return");
-			},
-		});
-	}
 
 	const readPromotionAck = async () => await (options.readPromotionAck
 		?? ((filePath: string) => readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true })))(config.promotionAckPath);
@@ -751,8 +726,7 @@ export function registerChildBridge(
 			);
 			allocation = await readBoundedPrivateJson(config.allocationPath, { requireSingleLineTerminated: true });
 		} catch { return false; }
-		if (!request || request.completionMode !== config.completionMode
-			|| request.parent.pid !== config.expectedParentPid || request.parent.startedAt !== config.expectedParentStartedAt
+		if (!request || request.parent.pid !== config.expectedParentPid || request.parent.startedAt !== config.expectedParentStartedAt
 			|| request.child.pid !== process.pid || request.child.startedAt !== childStartedAt) return false;
 		if (!allocation || crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") !== request.allocation.digest
 			// A valid, malformed, or unreadable completion pathname is terminal
@@ -782,7 +756,7 @@ export function registerChildBridge(
 			scheduleChecker(ctx);
 		};
 		const ack = { contract: "pi-subagent.detached-transfer" as const, version: 1 as const, kind: "ack" as const,
-			transferId: request.transferId, runId: request.runId, allocation: request.allocation, completionMode: request.completionMode,
+			transferId: request.transferId, runId: request.runId, allocation: request.allocation,
 			parent: request.parent, child: request.child, acknowledgedAt: Date.now() };
 		let publicationMayHaveSucceeded = Boolean(existingAck);
 		try {
@@ -954,11 +928,6 @@ export function registerChildBridge(
 	(pi.on as unknown as AgentSettledRegistrar)("agent_settled", async (_event, ctx) => {
 		if (!agentStarted || terminal) return;
 		lifecycleClient?.send("agent-settled");
-		if (config.completionMode === "handoff") {
-			setRuntimeTitle(ctx, "waiting");
-			await writeState("idle", "agent_settled:handoff-waiting").catch(reportBridgeError);
-			return;
-		}
 		if (lastAssistant.stopReason === "aborted") {
 			setRuntimeTitle(ctx, "waiting");
 			await writeState("idle", "agent_settled:aborted").catch(reportBridgeError);

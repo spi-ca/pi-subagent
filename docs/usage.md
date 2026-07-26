@@ -6,7 +6,7 @@
 
 모델 선택 우선순위는 호출별 `model` → 에이전트 파일 `model` → 부모 CLI 모델 오버라이드 → Pi 기본 모델입니다.
 
-호출 크기·동시성·백그라운드 보존/출력/종료 대기는 `subagent` 호출의 새 JSON 필드가 아닙니다. Pi CLI 플래그, 환경 변수 또는 `pi-subagent.json`의 열한 가지 한계 키로 설정하며, 이 설정은 기존 `agent`/`task`, `tasks`, `chain`, `action`과 선택 `background`, 그리고 실행 호출에만 적용되는 선택 `completion` 계약을 바꾸지 않습니다. `action: "status"`와 `action: "cancel"`에는 `completion`을 지정하지 않습니다. 파일 경로·신뢰 조건·우선순위와 전체 mapping·기본값·검증은 [설정의 `pi-subagent.json` 파일 설정](./configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
+호출 크기·동시성·백그라운드 보존/출력/종료 대기는 `subagent` 호출의 새 JSON 필드가 아닙니다. Pi CLI 플래그, 환경 변수 또는 `pi-subagent.json`의 열한 가지 한계 키로 설정하며, 이 설정은 기존 `agent`/`task`, `tasks`, `chain`, `action`과 선택 `background` 계약을 바꾸지 않습니다. 파일 경로·신뢰 조건·우선순위와 전체 mapping·기본값·검증은 [설정의 `pi-subagent.json` 파일 설정](./configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
 
 ## 입력 검증
 
@@ -35,7 +35,6 @@
 - `cwd`: 자식 프로세스의 작업 디렉터리
 - `model`: 이 호출에 사용할 선택적 모델 오버라이드. 에이전트 파일의 `model`보다 우선합니다.
 - `background`: `true`면 즉시 반환하는 백그라운드 작업으로 실행합니다.
-- `completion`: `"one-shot"`(기본) 또는 `"handoff"`; handoff의 제한은 아래를 따릅니다.
 
 ## 병렬 모드
 
@@ -139,23 +138,9 @@
 { "agent": "writer", "task": "Draft release notes", "background": true }
 ```
 
-## Interactive completion
+## Interactive lifecycle
 
-`completion`은 실행 호출 형태인 `agent`/`task`, `tasks`, `chain`에만 쓰는 public top-level 필드이며 정확히 `"one-shot"` 또는 `"handoff"`만 허용합니다. 생략하면 `"one-shot"`입니다. `action: "status"`와 `action: "cancel"` 호출에는 `completion`을 지정하지 않습니다.
-
-- `one-shot`: `agent`/`task`, `tasks`, `chain` 실행 호출에서 사용할 수 있는 기본값입니다. interactive child는 첫 정상 `agent_settled` 뒤 결과를 부모에 전달하고 exact surface/pane을 정리합니다.
-- `handoff`: **하나의** `agent`/`task` 호출에만 사용할 수 있습니다. `background: true`와 terminal mode `cmux-pane` 또는 `tmux-pane`가 필수입니다. `tasks`, `chain`, inline 실행 또는 `background: false`를 같이 지정하면 실행 전 validation error가 납니다.
-
-```json
-{
-  "agent": "reviewer",
-  "task": "Inspect the current diff, then wait for a user decision.",
-  "background": true,
-  "completion": "handoff"
-}
-```
-
-handoff child는 정상 settle 뒤 결과를 자동 반환하거나 종료하지 않고 idle로 남습니다. child TUI에서 인자 없이 `/subagent-return`을 실행하면 idle을 확인한 뒤 completion을 publish하고 마지막 응답을 부모에 돌려보냅니다. parent 취소와 session shutdown은 mode를 구분하지 않습니다. parent-owned child에 Escape를 요청하고 grace 뒤 기록된 exact surface/pane을 닫습니다.
+interactive child는 parent-owned 고정 lifecycle로 동작합니다. 첫 정상 `agent_settled` 뒤 결과를 부모에 전달하고 기록된 exact surface/pane을 정리합니다. parent 취소와 session shutdown에서는 parent-owned child에 Escape를 요청한 뒤 grace period 후 기록된 exact surface/pane을 닫습니다.
 
 ## 상태 확인과 취소
 
@@ -207,11 +192,11 @@ presence progress는 structured details와 호출 형태의 알려진 work count
 
 각 하위 에이전트는 별도의 `pi` 프로세스에서 실행됩니다. cmux와 tmux에서는 실제 interactive Pi TUI가 표시되며, 기본 `auto` layout에서 cmux root sibling은 새 오른쪽 shared pane의 surface를 공유하고 nested descendant는 source pane에 쌓입니다. tmux child는 parent와 같은 session의 detached window를 각각 사용하므로 parent window를 split하지 않습니다. `--subagent-pane-layout split` 또는 `PI_SUBAGENT_PANE_LAYOUT=split`은 child별 기존 오른쪽 split 호환 동작입니다. 값의 우선순위·유효성·중첩 상속은 [configuration의 Interactive pane layout](./configuration.md#interactive-pane-layout)을 참고하세요.
 
-child TUI stdout은 부모 결과 channel로 사용하지 않으며, 부모는 durable child session JSONL에서 새로 작성된 최종 assistant message와 usage만 읽습니다. fork의 상속 snapshot은 결과에 다시 포함되지 않습니다. 기본 `one-shot` child는 첫 정상 `agent_settled` 뒤 종료되고 해당 child의 정확한 pane/surface만 닫힙니다. `handoff` child는 `/subagent-return` 전까지 settle 뒤에도 남습니다.
+child TUI stdout은 부모 결과 channel로 사용하지 않으며, 부모는 durable child session JSONL에서 새로 작성된 최종 assistant message와 usage만 읽습니다. fork의 상속 snapshot은 결과에 다시 포함되지 않습니다. interactive child는 첫 정상 `agent_settled` 뒤 종료되고 해당 child의 정확한 pane/surface만 닫힙니다.
 
 Interactive runtime의 broker/backend resolver 우선순위(`PI_SUBAGENT_BROKER_RUNTIME` → `PATH`의 `bun` → `node`, cmux는 app control socket v2 직접 사용, tmux는 `PATH`의 `tmux`)와 symlink/shebang shim 지원 범위는 [configuration의 V2 broker runtime과 backend resolver](./configuration.md#v2-broker-runtime과-backend-resolver)를 참고하세요.
 
-interactive child의 provider credential/configuration은 inline과 같은 Pi `0.80.10` 지원 변수만 private `0600` artifact로 전달됩니다. `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`, Azure/Cloudflare/Bedrock/Vertex 설정, proxy/CA 변수의 정확한 목록과 arbitrary environment 제외 규칙은 [configuration의 Interactive provider 환경 전달](./configuration.md#interactive-provider-환경-전달)을 참고하세요.
+interactive child의 provider credential/configuration은 inline과 같은 Pi `0.80.10` 지원 변수만 private `0600` artifact로 전달됩니다. `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`, Azure/Cloudflare/Bedrock/Vertex 설정, proxy/CA 변수의 정확한 목록과 arbitrary environment 제외 규칙은 [configuration의 Interactive provider 환경 전달](./configuration.md#interactive-provider-환경-전달)을 참고하세요. 별도 Phase 0 provider-live acceptance synthetic parent는 production child 환경을 바꾸지 않는 harness이며, explicit allowlist의 PATH/HOME/locale, proxy/CA와 명시 transport/harness 값만 받습니다. ambient `PI_SUBAGENT_*`, credential, shell/loader hook, arbitrary variable, multiplexer state는 전달하지 않습니다. 실패 root를 retain할 경우 raw error/output 대신 bounded private top-level `failure-summary.json` 하나만 남을 수 있습니다. recovery scrub은 valid checkpoint(있다면)와 valid summary 외 artifact를 보존하지 않으며, `cleanupProven`은 cell과 transport cleanup 모두가 증명됐을 때만 true입니다.
 
 프로젝트 에이전트 승인 범위는 해당 에이전트 프롬프트뿐입니다. 프로젝트에서 실행되는 child Pi는 항상 `--no-context-files --no-approve`를 사용하므로 그 승인만으로 `AGENTS.md`/`CLAUDE.md`, `.pi/settings.json`, extensions, packages, themes 같은 프로젝트 코드를 로드하지 않습니다. 신뢰된 에이전트 프롬프트는 확장이 직접 전달합니다.
 
@@ -227,7 +212,7 @@ interactive child의 provider credential/configuration은 inline과 같은 Pi `0
 
 병렬/체인 TUI는 실행 중에도 Ctrl+O로 확장할 수 있습니다. 확장·접힘 모두 각 agent block에 수신된 usage와 model을 표시합니다. 실행 중 aggregate는 `Total so far`, 종료 뒤에는 `Total`이며 turns/input/output/cache/cost만 합산합니다. `ctx(last)`와 model은 agent별 값이므로 aggregate하지 않습니다. usage가 0이어도 알려진 model은 표시하며, 이 표시는 기존 child update와 기본 1초 병렬 heartbeat snapshot만 사용하므로 usage를 얻기 위한 추가 polling이나 query는 없습니다.
 
-이 방식은 부모 컨텍스트를 깔끔하게 유지하면서도 TUI에서 자식 진행 상황을 확인할 수 있게 합니다. interactive child pane에서 사용자가 현재 turn을 Escape로 중단하면 이를 정상 완료로 오인하지 않으며, 부모의 `cancel` 또는 session shutdown은 parent-owned pane/surface를 최종적으로 닫습니다. `handoff`는 user-owned detached run이 아니라 parent-owned child를 settled 뒤 유지하는 completion mode입니다.
+이 방식은 부모 컨텍스트를 깔끔하게 유지하면서도 TUI에서 자식 진행 상황을 확인할 수 있게 합니다. interactive child pane에서 사용자가 현재 turn을 Escape로 중단하면 이를 정상 완료로 오인하지 않으며, 부모의 `cancel` 또는 session shutdown은 parent-owned pane/surface를 최종적으로 닫습니다.
 
 ## 사용량 회계
 
@@ -249,6 +234,6 @@ interactive child의 provider credential/configuration은 inline과 같은 Pi `0
 
 `bun run benchmark:phase0:preflight`은 non-mutating schema/runtime preflight이고 `bun run benchmark:phase0:verify`는 current-source-bound measured local evidence를 검증합니다. fixture 갱신은 고정 안전 workload만 실행하는 명시적 `bun run benchmark:phase0:record-local`로만 합니다. Phase 0 local, Phase 7 local, 그리고 두 live fixture는 하나의 generated evidence set으로 `sourceDirty`와 identity digest 양쪽에서 제외됩니다. 나머지 source/test/docs를 포함한 tracked/untracked content·mode는 현재 worktree와 대조합니다. 이 local evidence는 provider, cmux, tmux를 변경하지 않으며, layout 또는 crash/reaper acceptance의 historical PASS와도 별개입니다.
 
-live preflight는 `bun run benchmark:phase0:live:preflight`로 수행합니다. `routine-v1`은 `inline | tmux | cmux` × 다섯 workload × `activeRuns=1`, 즉 15 cells/15 provider children이며 반복 capture에서 총 5~6분이 관찰됐습니다. `cmux-concurrency-16-v1`은 `cmux` short-response `activeRuns=16` 한 cell/16 children이며 반복 capture에서 약 8.2분이 관찰됐습니다. 두 값은 SLA가 아닙니다. 모든 provider-backed record에는 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live`, tier별 `--ack-provider-child-runs=15|16`가 필요하며, concurrency는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 필요합니다. fixed paths의 두 fixture를 각각 검증하려면 `bun run benchmark:phase0:live:routine:verify`와 `bun run benchmark:phase0:live:concurrency:verify`를, 둘을 함께 검증하려면 `bun run benchmark:phase0:live:verify`를 사용합니다.
+live preflight는 `bun run benchmark:phase0:live:preflight`로 수행합니다. provider-live는 caller `PATH`에서 Pi·tmux·cmux를 찾지 않으므로, native stable `>=0.81.1` Pi 및 canonical safe tmux/cmux executable의 절대 경로를 각 실행 앞에 `PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE=/absolute/path/to/pi`, `TMUX_BIN=/absolute/path/to/tmux`, `CMUX_BIN=/absolute/path/to/cmux`로 prefix해야 합니다. 이 환경 변수는 package script가 대신 설정하지 않습니다. Pi preflight generation은 private runtime root에 한 번 staged되어 각 credentialed cell이 그 staged native executable만 재검증·spawn하며, synthetic child runtime의 interpreter/backend resolution은 operator-sanitized `PATH`를 계속 신뢰하므로 trusted immutable entry만 포함해야 합니다. `routine-v1`은 `inline | tmux | cmux` × 다섯 workload × `activeRuns=1`, 즉 15 cells/15 provider children이며 반복 capture에서 총 5~6분이 관찰됐습니다. `cmux-concurrency-16-v1`은 `cmux` short-response `activeRuns=16` 한 cell/16 children이며 반복 capture에서 약 8.2분이 관찰됐습니다. 두 값은 SLA가 아닙니다. 모든 provider-backed record에는 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live`, tier별 `--ack-provider-child-runs=15|16`가 필요하며, concurrency는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 필요합니다. fixed paths의 두 fixture를 각각 검증하려면 `bun run benchmark:phase0:live:routine:verify`와 `bun run benchmark:phase0:live:concurrency:verify`를, 둘을 함께 검증하려면 `bun run benchmark:phase0:live:verify`를 사용합니다.
 
-routine만 `--max-cells=1..15` ordered-prefix checkpoint/resume을 허용합니다. resume root는 provider 실행 전에 claim되고 각 attempted cell 전 checkpoint가 terminalize되므로 one-use이며, concurrency는 partial checkpoint/resume을 허용하지 않습니다. harness는 automatic retry를 하지 않습니다. routine/concurrency record 명령과 전체 규칙은 [transport 설계의 M0 harness 상태](./interactive-runtime-performance-design.md#m0-harness-상태)를 따릅니다. source/test/docs 변경은 **amend하지 않고** 먼저 commit하고, fixture를 regenerate한 뒤 생성물만 담은 fixture-only commit을 만드세요. fixture-only commit은 이전 effective source revision을 유지합니다. effective revision lookup에는 fixture를 제외한 source commit까지 도달 가능한 Git history가 필요합니다. fixture-only HEAD의 shallow/incomplete checkout은 fail closed하여 source revision lookup이 실패하고 HEAD를 source revision으로 취급하지 않으므로 CI에서는 full-history checkout을 사용해야 합니다. source 변경과 fixture가 섞인 commit은 revision을 전진시키므로 그 뒤 다시 regenerate하여 fixture-only commit을 새로 만들어야 합니다. 그 전의 fixture를 최종 검증 결과로 주장하지 않습니다. concurrency record는 명시적 수동 실행만 허용합니다.
+routine만 `--max-cells=1..15` ordered-prefix checkpoint/resume을 허용합니다. resume root는 provider 실행 전에 claim되고 각 attempted cell 전 checkpoint가 terminalize되므로 one-use이며, recorded Pi version이 현재 preflight Pi version과 정확히 같고 source/tier/plan binding도 일치해야 합니다. backend version은 evidence나 resume continuity contract에 포함하지 않습니다. concurrency는 partial checkpoint/resume을 허용하지 않습니다. harness는 automatic retry를 하지 않습니다. routine/concurrency record 명령과 전체 규칙은 [transport 설계의 M0 harness 상태](./interactive-runtime-performance-design.md#m0-harness-상태)를 따릅니다. source/test/docs 변경은 **amend하지 않고** 먼저 commit하고, fixture를 regenerate한 뒤 생성물만 담은 fixture-only commit을 만드세요. fixture-only commit은 이전 effective source revision을 유지합니다. effective revision lookup에는 fixture를 제외한 source commit까지 도달 가능한 Git history가 필요합니다. fixture-only HEAD의 shallow/incomplete checkout은 fail closed하여 source revision lookup이 실패하고 HEAD를 source revision으로 취급하지 않으므로 CI에서는 full-history checkout을 사용해야 합니다. source 변경과 fixture가 섞인 commit은 revision을 전진시키므로 그 뒤 다시 regenerate하여 fixture-only commit을 새로 만들어야 합니다. 그 전의 fixture를 최종 검증 결과로 주장하지 않습니다. concurrency record는 명시적 수동 실행만 허용합니다.

@@ -82,7 +82,6 @@ import {
   DEFAULT_PARENT_LEASE_STALE_MS,
   RUN_PROTOCOL_VERSION,
   SUBAGENT_CHILD_SESSION_PATH_ENV,
-  SUBAGENT_COMPLETION_MODE_ENV,
   SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
   V3_FAILURE_BOUNDARY_CAPABILITY,
   SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
@@ -233,7 +232,6 @@ import {
 } from "../core/types.js";
 import { canonicalizePathForTrust } from "../core/trust-path.js";
 import { DEFAULT_MAX_ACTIVE, SUBAGENT_MAX_ACTIVE_ENV } from "./process-local-scheduler.js";
-import type { CompletionMode } from "../core/subagent-config.js";
 import { TopologySnapshotBatch } from "./topology-snapshot-batch.js";
 import {
   executableGenerationKey,
@@ -433,8 +431,6 @@ interface ActiveInteractiveRun {
   startedAt: number;
   updatedAt: number;
   preview?: string;
-  /** Private lifecycle behavior; intentionally absent from public snapshots. */
-  completionMode: CompletionMode;
   surfaceTitle: string;
   focusSupported: boolean;
   generation: number;
@@ -953,7 +949,7 @@ type OwnershipMarkerState = "missing" | "matching" | "unknown";
  * its lease checker.  They may predate an interrupted transfer, so promotion
  * still requires the child-bound request/ack exchange below.
  */
-async function classifyExistingOwnershipMarkers(paths: RunArtifactPaths, runId: string, allocationDigest: string, completionMode: CompletionMode): Promise<OwnershipMarkerState> {
+async function classifyExistingOwnershipMarkers(paths: RunArtifactPaths, runId: string, allocationDigest: string): Promise<OwnershipMarkerState> {
   const [detachedArtifact, legacyArtifact] = await Promise.all([
     readBrokerArtifact(paths.detachedOwnershipPath),
     readBrokerArtifact(paths.userOwnershipPath),
@@ -963,7 +959,7 @@ async function classifyExistingOwnershipMarkers(paths: RunArtifactPaths, runId: 
   if (!detachedExists && !legacyExists) return "missing";
   const detached = detachedArtifact.outcome === "valid" ? parseDetachedOwnershipRecord(detachedArtifact.value, runId) : null;
   const legacy = legacyArtifact.outcome === "valid" ? parseUserOwnershipRecord(legacyArtifact.value, runId) : null;
-  if (detachedExists && (!detached || detached.allocation.digest !== allocationDigest || detached.completionMode !== completionMode)) return "unknown";
+  if (detachedExists && (!detached || detached.allocation.digest !== allocationDigest)) return "unknown";
   if (legacyExists && (!legacy || legacy.allocationDigest !== allocationDigest)) return "unknown";
   // Mixed-era records must still name the same immutable allocation.
   if (detached && legacy && detached.allocation.digest !== legacy.allocationDigest) return "unknown";
@@ -982,13 +978,13 @@ async function waitForOwnershipTransferAck(paths: RunArtifactPaths, request: Ret
 }
 
 /** Revalidate a settled transfer before accepting an in-memory detached state. */
-async function hasCompleteDetachedOwnershipTransfer(paths: RunArtifactPaths, runId: string, completionMode: CompletionMode): Promise<boolean> {
+async function hasCompleteDetachedOwnershipTransfer(paths: RunArtifactPaths, runId: string): Promise<boolean> {
   const allocation = await readBoundedPrivateJson(paths.allocationPath, { requireSingleLineTerminated: true });
   const parsedAllocation = allocation && typeof allocation === "object" && !Array.isArray(allocation) && (allocation as { version?: unknown }).version === 3
     ? parseAllocationRecordV3(allocation, runId) : parseAllocationRecordV2(allocation, runId);
   if (!parsedAllocation) return false;
   const allocationDigest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
-  if (await classifyExistingOwnershipMarkers(paths, runId, allocationDigest, completionMode) !== "matching") return false;
+  if (await classifyExistingOwnershipMarkers(paths, runId, allocationDigest) !== "matching") return false;
   const [requestArtifact, ackArtifact, detachedArtifact, completionArtifact] = await Promise.all([
     readBrokerArtifact(paths.promotionRequestPath),
     readBrokerArtifact(paths.promotionAckPath),
@@ -1002,7 +998,7 @@ async function hasCompleteDetachedOwnershipTransfer(paths: RunArtifactPaths, run
   const ack = ackArtifact.outcome === "valid" ? parseOwnershipTransferAck(ackArtifact.value, runId) : null;
   const detached = detachedArtifact.outcome === "valid" ? parseDetachedOwnershipRecord(detachedArtifact.value, runId) : null;
   return request !== null && ack !== null && detached !== null
-    && request.allocation.digest === allocationDigest && request.completionMode === completionMode
+    && request.allocation.digest === allocationDigest
     && sameOwnershipTransfer(request, ack);
 }
 
@@ -1055,7 +1051,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     // the pane has exited. Durable protocol evidence, not target liveness, is
     // the sole authority for this idempotent outcome.
     if (run.ownership === "detached") {
-      if (!await hasCompleteDetachedOwnershipTransfer(run.paths!, runId, run.completionMode)) {
+      if (!await hasCompleteDetachedOwnershipTransfer(run.paths!, runId)) {
         run.ownership = "ownership-unknown";
         run.updatedAt = Date.now();
         return "ownership-unknown";
@@ -1075,17 +1071,17 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       ? parseAllocationRecordV3(allocation, runId) : parseAllocationRecordV2(allocation, runId);
     if (!parsedAllocation) return "rejected";
     const allocationDigest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
-    const existingMarker = await classifyExistingOwnershipMarkers(run.paths!, runId, allocationDigest, run.completionMode);
+    const existingMarker = await classifyExistingOwnershipMarkers(run.paths!, runId, allocationDigest);
     if (existingMarker === "unknown") { run.ownership = "ownership-unknown"; run.updatedAt = Date.now(); return "ownership-unknown"; }
     const child = parseRunState(await readBoundedPrivateJson(run.paths!.statePath), runId);
     const parentStartedAt = getCurrentProcessStartedAt();
     if (!child?.childPid || !child.childStartedAt || parentStartedAt === null) return "rejected";
     const expected = {
-      allocationDigest, completionMode: run.completionMode,
+      allocationDigest,
       parentPid: process.pid, parentStartedAt, childPid: child.childPid, childStartedAt: child.childStartedAt,
     };
     const isCurrentRequest = (request: ReturnType<typeof parseOwnershipTransferRequest>): request is NonNullable<typeof request> => request !== null
-      && request.allocation.digest === expected.allocationDigest && request.completionMode === expected.completionMode
+      && request.allocation.digest === expected.allocationDigest
       && request.parent.pid === expected.parentPid && request.parent.startedAt === expected.parentStartedAt
       && request.child.pid === expected.childPid && request.child.startedAt === expected.childStartedAt;
     const requestArtifact = await readBrokerArtifact(run.paths!.promotionRequestPath);
@@ -1103,7 +1099,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     if (requestArtifact.outcome === "missing") {
       request = {
         contract: "pi-subagent.detached-transfer" as const, version: 1 as const, kind: "request" as const,
-        transferId: crypto.randomUUID(), runId, allocation: { algorithm: "sha256" as const, digest: allocationDigest }, completionMode: run.completionMode,
+        transferId: crypto.randomUUID(), runId, allocation: { algorithm: "sha256" as const, digest: allocationDigest },
         parent: { pid: process.pid, startedAt: parentStartedAt }, child: { pid: child.childPid, startedAt: child.childStartedAt }, requestedAt: detachedAt,
       };
       // Revocation precedes publication: a request that wins concurrently must
@@ -1143,9 +1139,9 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       // must never be hidden behind a final detached marker.
       if ((await readBrokerArtifact(run.paths!.completionPath)).outcome !== "missing") return markOwnershipUnknown();
       const finalRecord = { contract: "pi-subagent.detached-ownership" as const, version: 1 as const, runId, owner: "user" as const,
-        detachedAt, allocation: request.allocation, completionMode: request.completionMode };
+        detachedAt, allocation: request.allocation };
       await publishImmutableJson(run.paths!.detachedOwnershipPath, finalRecord);
-      if (await classifyExistingOwnershipMarkers(run.paths!, runId, allocationDigest, run.completionMode) !== "matching") throw new Error("detached marker verification failed");
+      if (await classifyExistingOwnershipMarkers(run.paths!, runId, allocationDigest) !== "matching") throw new Error("detached marker verification failed");
       if ((await readBrokerArtifact(run.paths!.completionPath)).outcome !== "missing") return markOwnershipUnknown();
       const committed = await withInteractiveFenceMutex(() => {
         if (activeInteractiveRuns.get(runId) !== run || run.ownership !== "transferring") return false;
@@ -1253,7 +1249,7 @@ export async function releaseRegisteredInteractiveRun(runId: string, force = fal
 
 /** Register immediately on durable commit, before any one-way launch action. */
 export function registerCommittedInteractiveRun(
-  run: { runId: string; backend: InteractivePaneBackend; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; completionMode?: CompletionMode; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
+  run: { runId: string; backend: InteractivePaneBackend; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
 ): boolean {
   const underlyingRelease = run.release ?? (() => closeInteractiveTarget(run.backend, run.handle));
   const now = Date.now();
@@ -1263,7 +1259,7 @@ export function registerCommittedInteractiveRun(
     agent: sanitizeInteractivePreview(run.agent, 96) ?? "unknown", depth: Number.isSafeInteger(run.depth) && (run.depth ?? -1) >= 0 ? run.depth! : 0,
     surfaceTitle: buildChildRuntimeTitle(run.agent ?? "unknown", run.runId, run.depth),
     focusSupported: run.focusSupported ?? typeof run.backend.focus === "function", generation: run.generation,
-    completionMode: run.completionMode ?? "one-shot", ownership: "managed", startedAt: now, updatedAt: now, operation: Promise.resolve(),
+    ownership: "managed", startedAt: now, updatedAt: now, operation: Promise.resolve(),
     ...(run.treePermitLease ? { treePermitLease: run.treePermitLease } : {}),
     ...(run.sessionIdentity ? { sessionIdentity: run.sessionIdentity } : {}),
     ...(run.sessionResultStartOffset !== undefined ? { sessionResultStartOffset: run.sessionResultStartOffset } : {}),
@@ -1884,7 +1880,7 @@ export async function reapStaleInteractiveRuns(options: {
         // target; only marker-only historical promotions remain compatible.
         const promoted = transferPresent
           ? request !== null && ack !== null && sameOwnershipTransfer(request, ack) && validDetached
-            && request.allocation.digest === allocationDigest && request.completionMode === detached.completionMode
+            && request.allocation.digest === allocationDigest
             && (legacyOwnershipArtifact.outcome === "missing" || validLegacy && legacy!.allocationDigest === request.allocation.digest)
           : (detachedArtifact.outcome !== "missing" && legacyOwnershipArtifact.outcome !== "missing"
             ? validDetached && validLegacy && detached!.allocation.digest === legacy!.allocationDigest
@@ -3508,8 +3504,6 @@ export function buildChildProcessEnv(opts: {
   inheritedApiKeyAgentDir?: string | null;
   /** Gated Phase 0 child-only proof fields; controller paths are never propagated. */
   phase0LiveProofEnv?: Phase0LiveProofEnv;
-  /** Explicit lifecycle mode for this child; never inherit a stale parent value. */
-  completionMode?: CompletionMode;
   baseEnv?: NodeJS.ProcessEnv;
   runProtocolEnv?: Record<string, string>;
   /** Exact tree authority and lease capability minted for this child launch. */
@@ -3550,7 +3544,6 @@ export function buildChildProcessEnv(opts: {
     SUBAGENT_PROMOTION_REQUEST_PATH_ENV,
     SUBAGENT_PROMOTION_ACK_PATH_ENV,
     SUBAGENT_FORK_BOOTSTRAP_PATH_ENV,
-    SUBAGENT_COMPLETION_MODE_ENV,
     SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
     SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
     SUBAGENT_LEASE_CHECK_MS_ENV,
@@ -3581,8 +3574,6 @@ export function buildChildProcessEnv(opts: {
     delete env[name];
   }
   Object.assign(env, opts.runProtocolEnv ?? {}, opts.phase0LiveProofEnv ?? {}, opts.treePermitEnv ?? {});
-  // Only an explicit, validated run value crosses the child boundary.
-  env[SUBAGENT_COMPLETION_MODE_ENV] = opts.completionMode === "handoff" ? "handoff" : "one-shot";
   env[SUBAGENT_MANAGED_TITLE_ENV] = buildChildRuntimeTitle(opts.agentName, opts.runProtocolEnv?.[SUBAGENT_RUN_ID_ENV], opts.parentDepth + 1);
   // Parent pi-cmux policy is not a child bootstrap authority. Remove every
   // inherited PI_CMUX_* value, then add only the reviewed child profile when
@@ -3920,8 +3911,6 @@ export interface RunAgentOptions {
   delegationMode: DelegationMode;
   /** Execution surface for child runs. */
   terminalMode: TerminalMode;
-  /** Child lifecycle behavior; defaults to one-shot completion. */
-  completionMode?: CompletionMode;
   /** Exact parent-resolved interactive pane placement policy. */
   interactivePaneLayout?: InteractivePaneLayout;
   /** Trusted project roots to propagate to child processes as temporary approvals. */
@@ -3980,7 +3969,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     model: modelOverride,
     delegationMode,
     terminalMode,
-    completionMode = "one-shot",
     interactivePaneLayout = resolveInteractivePaneLayout(undefined),
     trustedProjectRoots,
     deniedProjectRoots,
@@ -4153,7 +4141,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       taskCwd,
       modelOverride,
       delegationMode,
-      completionMode,
       interactivePaneLayout,
       forkSessionSnapshotJsonl,
       parentSessionId,
@@ -4224,7 +4211,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       result, cwd, taskCwd, piArgs, signal, onUpdate: emitUpdate,
       parentDepth, parentAgentStack, maxDepth, maxActive, limits, preventCycles,
       interactivePaneLayout, trustedProjectRoots, deniedProjectRoots, makeDetails,
-      completionMode, inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv, assistantSignatureIndexDir: taskTmpDir,
+      inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv, assistantSignatureIndexDir: taskTmpDir,
       forkSourceOwnership, forkChildId, forkBootstrapPath, treePermitLease, runStateRoot,
     });
   } finally {
@@ -4254,7 +4241,6 @@ interface RunAgentExecutionOptions {
   inheritedApiKeyBinding?: InheritedCliApiKeyEnvBinding | null;
   inheritedApiKeyAgentDir?: string | null;
   phase0LiveProofEnv?: Phase0LiveProofEnv;
-  completionMode: CompletionMode;
   /** Existing private task-artifact directory; cleanup removes the index too. */
   assistantSignatureIndexDir?: string | null;
   forkSourceOwnership?: ForkSourceOwnershipManager;
@@ -4711,7 +4697,6 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
       inheritedApiKeyBinding,
       inheritedApiKeyAgentDir,
       phase0LiveProofEnv,
-      completionMode: opts.completionMode,
       runProtocolEnv: {
         [RUN_STATE_DIR_ENV]: runStateRoot,
         ...(forkBootstrapPath ? { [SUBAGENT_FORK_BOOTSTRAP_PATH_ENV]: forkBootstrapPath } : {}),
@@ -4824,7 +4809,6 @@ interface RunAgentInInteractivePaneOptions {
   taskCwd?: string;
   modelOverride?: string;
   delegationMode: DelegationMode;
-  completionMode: CompletionMode;
   forkSessionSnapshotJsonl?: string;
   parentSessionId?: string;
   parentSessionFile?: string;
@@ -4884,7 +4868,7 @@ const CHILD_BOOTSTRAP_ENV = new Set([
   RUN_STATE_DIR_ENV, SUBAGENT_RUN_ID_ENV, SUBAGENT_RUN_STATE_PATH_ENV, SUBAGENT_RUN_COMPLETION_PATH_ENV,
   SUBAGENT_COMPLETION_FENCE_PATH_ENV, SUBAGENT_COMPLETION_FENCE_ACK_PATH_ENV, SUBAGENT_COMPLETION_FENCE_NONCE_ENV,
   TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV,
-  SUBAGENT_PARENT_LEASE_PATH_ENV, SUBAGENT_CHILD_SESSION_PATH_ENV, SUBAGENT_RUN_OWNERSHIP_ENV, SUBAGENT_PROMOTION_REQUEST_PATH_ENV, SUBAGENT_PROMOTION_ACK_PATH_ENV, SUBAGENT_FORK_BOOTSTRAP_PATH_ENV, SUBAGENT_COMPLETION_MODE_ENV, SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV, SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
+  SUBAGENT_PARENT_LEASE_PATH_ENV, SUBAGENT_CHILD_SESSION_PATH_ENV, SUBAGENT_RUN_OWNERSHIP_ENV, SUBAGENT_PROMOTION_REQUEST_PATH_ENV, SUBAGENT_PROMOTION_ACK_PATH_ENV, SUBAGENT_FORK_BOOTSTRAP_PATH_ENV, SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV, SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
   SUBAGENT_LEASE_CHECK_MS_ENV, SUBAGENT_LEASE_STALE_MS_ENV, SUBAGENT_EXPECTED_PARENT_PID_ENV, SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV,
   SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV,
   PHASE0_LIVE_GATE_ENV, PHASE0_LIVE_PROOF_SOCKET_ENV, PHASE0_LIVE_PROOF_ID_ENV, PHASE0_LIVE_PROOF_CAPABILITY_ENV, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV,
@@ -5666,7 +5650,6 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         [SUBAGENT_COMPLETION_FENCE_NONCE_ENV]: completionFenceNonce, [SUBAGENT_PARENT_LEASE_PATH_ENV]: runPaths.parentLeasePath,
         [SUBAGENT_CHILD_SESSION_PATH_ENV]: runPaths.childSessionPath, [SUBAGENT_RUN_OWNERSHIP_ENV]: "parent-owned",
         [SUBAGENT_PROMOTION_REQUEST_PATH_ENV]: runPaths.promotionRequestPath, [SUBAGENT_PROMOTION_ACK_PATH_ENV]: runPaths.promotionAckPath,
-        [SUBAGENT_COMPLETION_MODE_ENV]: options.completionMode,
         // Explicitly negotiate these extensions: rolling older parents reject
         // failure session keys and success boundaries ending in metadata tails.
         [SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV]: V3_FAILURE_BOUNDARY_CAPABILITY,
@@ -5680,7 +5663,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         agentName: result.agent, parentDepth: options.parentDepth, parentAgentStack: options.parentAgentStack,
         maxDepth: options.maxDepth, maxActive: options.maxActive, limits: options.limits, preventCycles: options.preventCycles, interactivePaneLayout: options.interactivePaneLayout,
         trustedProjectRoots: options.trustedProjectRoots, deniedProjectRoots: options.deniedProjectRoots,
-        inheritedApiKeyBinding: options.inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv: options.phase0LiveProofEnv, completionMode: options.completionMode, baseEnv: process.env, runProtocolEnv: protocolEnv,
+        inheritedApiKeyBinding: options.inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv: options.phase0LiveProofEnv, baseEnv: process.env, runProtocolEnv: protocolEnv,
         treePermitEnv: buildTreePermitChildEnv(options.treePermitLease, options.runStateRoot),
       });
       await writePrivateFile(runPaths.secretEnvPath, buildPrivateChildEnvironmentScript(childEnv));
@@ -5785,7 +5768,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     // container state and is registered after the same committed binding.
     // Registration is the final exact generation/fence check before any gate.
     if (!registerCommittedInteractiveRun({
-      runId, backend, handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, completionMode: options.completionMode, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
+      runId, backend, handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
       sessionIdentity, sessionResultStartOffset, applyCompletionWinner, stopLeaseWriterAndDrain,
       publishParentCompletion: async (status, errorCode) => await publishTerminalParentCompletion(runPaths, runId, status, errorCode),
       // Preserve the post-commit observation even if a reset races adoption.

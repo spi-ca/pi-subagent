@@ -11,9 +11,7 @@ import {
   formatSubagentToolDescription,
   getProjectRootFromAgentsDir,
   parseProjectRootEnvValue,
-  parseCompletionMode,
   truncateAgentDescription,
-  validateCompletionInvocation,
 } from "../../src/core/subagent-config";
 import { buildForkBranchSourceJsonl } from "../../src/core/fork-session";
 import { settleWithUnrefTimeout } from "../../src/core/async-settle";
@@ -147,7 +145,6 @@ describe("subagent tool schema", () => {
         action: { type: "string", enum: ["status", "cancel"] },
         id: { type: "string", minLength: 1 },
         background: { type: "boolean" },
-        completion: { type: "string", enum: ["one-shot", "handoff"], default: "one-shot" },
         agent: { type: "string", minLength: 1 },
         task: { type: "string", minLength: 1 },
         model: { type: "string", minLength: 1 },
@@ -238,13 +235,6 @@ describe("subagent tool schema", () => {
         && !error.message.includes(unsupportedKey)
         && !error.message.includes(unsupportedValue),
     );
-    assert.throws(
-      () => subagentTool!.prepareArguments!({ agent: "worker", task: "raw-handoff-secret", completion: "handoff", background: false }),
-      (error: unknown) => error instanceof Error
-        && /Invalid parameters \(option-combination\).*completion="handoff"/.test(error.message)
-        && !error.message.includes("raw-handoff-secret"),
-    );
-
     const raw = { agent: " worker ", task: " inspect ", model: " model ", cwd: " /tmp/project " };
     const prepared = subagentTool!.prepareArguments!(raw) as typeof raw;
     assert.deepEqual(prepared, raw);
@@ -267,50 +257,6 @@ describe("subagent tool schema", () => {
         && !error.message.includes("runtime-secret")
         && !error.message.includes("runtime-secret-key")
         && !error.message.includes("runtime-secret-value"),
-    );
-    await assert.rejects(
-      () => subagentTool!.execute!(
-        "handoff-shape",
-        { agent: "worker", task: "runtime-handoff-secret", completion: "handoff", background: false },
-        new AbortController().signal,
-        undefined,
-        undefined,
-      ),
-      (error: unknown) => error instanceof Error
-        && /Invalid parameters \(option-combination\).*completion="handoff"/.test(error.message)
-        && !error.message.includes("runtime-handoff-secret"),
-    );
-    const inheritedTerminalEnv = {
-      CMUX_WORKSPACE_ID: process.env.CMUX_WORKSPACE_ID,
-      CMUX_SURFACE_ID: process.env.CMUX_SURFACE_ID,
-      TMUX: process.env.TMUX,
-      TMUX_PANE: process.env.TMUX_PANE,
-    };
-    let inlineHandoffRejection: Promise<unknown>;
-    try {
-      delete process.env.CMUX_WORKSPACE_ID;
-      delete process.env.CMUX_SURFACE_ID;
-      delete process.env.TMUX;
-      delete process.env.TMUX_PANE;
-      // execute performs invocation validation synchronously before its first await.
-      inlineHandoffRejection = subagentTool!.execute!(
-        "handoff-inline",
-        { agent: "worker", task: "runtime-inline-secret", completion: "handoff", background: true },
-        new AbortController().signal,
-        undefined,
-        undefined,
-      );
-    } finally {
-      for (const [name, value] of Object.entries(inheritedTerminalEnv)) {
-        if (value === undefined) delete process.env[name];
-        else process.env[name] = value;
-      }
-    }
-    await assert.rejects(
-      inlineHandoffRejection!,
-      (error: unknown) => error instanceof Error
-        && /Invalid parameters \(option-combination\).*terminal mode cmux-pane or tmux-pane/.test(error.message)
-        && !error.message.includes("runtime-inline-secret"),
     );
     await assert.rejects(
       () => subagentTool!.execute!(
@@ -353,7 +299,6 @@ describe("subagent tool schema", () => {
     assert.match(description, /recovery.*continueOnError.*failed stage/is);
     assert.match(description, /spawn default.*fork.*parent context/is);
     assert.match(description, /background=true returns immediately.*results auto-deliver.*do not poll/is);
-    assert.match(description, /completion=handoff.*background=true.*agent\+task.*cmux\/tmux.*subagent-return/is);
 
     const prompt = formatSubagentSystemPrompt({
       agentList: JSON.stringify(["worker", "edits files"]),
@@ -372,29 +317,6 @@ describe("subagent tool schema", () => {
     assert.ok(staticChars <= 2_400, `static schema and description are ${staticChars} characters`);
   });
 
-  test("validates handoff as an opt-in background interactive single invocation", () => {
-    assert.equal(parseCompletionMode(undefined), "one-shot");
-    assert.equal(parseCompletionMode("handoff"), "handoff");
-    assert.equal(parseCompletionMode("later"), null);
-    const valid = {
-      completionMode: "handoff" as const,
-      hasSingle: true,
-      hasTasksField: false,
-      hasChainField: false,
-      hasActionField: false,
-      background: true,
-      terminalMode: "cmux-pane",
-    };
-    assert.equal(validateCompletionInvocation(valid), null);
-    for (const invalid of [
-      { ...valid, background: false },
-      { ...valid, terminalMode: "inline" },
-      { ...valid, hasTasksField: true },
-      { ...valid, hasChainField: true },
-      { ...valid, hasActionField: true },
-      { ...valid, hasSingle: false },
-    ]) assert.match(validateCompletionInvocation(invalid) ?? "", /Invalid completion="handoff"/);
-  });
 
   test("truncates agent descriptions for injected prompts", () => {
     assert.equal(truncateAgentDescription("  edits   files  safely  ", 20), "edits files safely");

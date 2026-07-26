@@ -154,10 +154,6 @@ managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이�
 
 Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1` producer를 만들며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
 
-## Completion mode
-
-`completion`은 `subagent` 호출의 public top-level 필드입니다. 허용값은 `"one-shot"`(기본)과 `"handoff"`뿐입니다. `handoff`는 정확히 하나의 `agent`/`task` 호출, `background: true`, 그리고 `cmux-pane` 또는 `tmux-pane`을 요구합니다. 병렬·체인·`action` 호출 및 inline mode에서는 거부됩니다. handoff child는 `agent_settled` 뒤 idle로 유지되며 `/subagent-return`으로만 결과를 반환하고 종료합니다. parent 취소와 session shutdown은 두 mode 모두 parent-owned exact target을 Escape 후 close/kill합니다.
-
 ## 컨텍스트 모드
 
 `subagent` 도구는 최상위 `mode` 옵션을 받습니다.
@@ -219,7 +215,7 @@ _2x PNG · [SVG](./diagram/interactive-layout-coordination.svg) · [Mermaid sour
 
 - stdout/stderr를 renderer나 FIFO로 pipe하지 않습니다.
 - 부모 결과는 child session JSONL과 lifecycle sidecar에서 읽습니다.
-- 기본 `completion: "one-shot"` child는 `parent-owned`이며 첫 `agent_settled` 뒤 종료됩니다. `completion: "handoff"` child는 `/subagent-return` 전까지 settle 뒤에도 유지됩니다.
+- interactive child는 `parent-owned` 고정 lifecycle로 첫 정상 `agent_settled` 뒤 종료됩니다.
 - 부모 취소·session shutdown에서는 먼저 Escape를 보내고, grace period 뒤 surface를 닫습니다.
 - 부모가 비정상 종료되면 2초 주기의 lease와 12초 stale threshold로 child가 orphan 상태를 감지합니다.
 - stale run은 다음 root session 시작 시 leaf-first reaper가 다시 정리합니다.

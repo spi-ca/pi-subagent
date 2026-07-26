@@ -28,7 +28,7 @@ TMUX + TMUX_PANE                   → tmux-pane
 - child stdout을 부모 결과 channel로 사용하지 않음
 - native Pi session JSONL에서 assistant message와 usage 수집
 - child bridge extension이 lifecycle state와 typed completion sidecar 기록
-- 기본 `one-shot` child는 `agent_settled`에서 정상 종료하고, 제한된 `handoff` child는 `/subagent-return`까지 유지
+- interactive child는 첫 정상 `agent_settled`에서 결과를 반환하고 정확한 pane/surface를 정리
 - parent lease와 startup reaper로 orphan 정리
 - parent session shutdown과 명시적 취소에서 Escape 후 pane 종료
 
@@ -89,7 +89,7 @@ runAgent()
   │
   └─ interactive pane
       ├─ preflight: available runtime / backend / broker entrypoint
-      ├─ detached one-shot launch broker
+      ├─ detached launch broker
       ├─ backend: cmux | tmux
       ├─ private run directory 생성
       ├─ fresh child session 생성
@@ -305,7 +305,7 @@ stdout/stderr는 terminal PTY에 직접 붙는다. `|`, `tee`, FIFO, renderer가
 
 ### 8.1 적용 범위와 V1 경계
 
-V2는 detached one-shot broker가 pane allocation과 commit 전 rollback을 소유하는 production 경로다. 기존 direct adapter 경로는 legacy/V1 launch record 단위 테스트와 호환성·비교를 위해 남아 있지만, production interactive launch는 broker를 사용한다.
+V2는 detached broker가 pane allocation과 commit 전 rollback을 소유하는 production 경로다. 기존 direct adapter 경로는 legacy/V1 launch record 단위 테스트와 호환성·비교를 위해 남아 있지만, production interactive launch는 broker를 사용한다.
 
 `state.json`과 `parent-lease.json`의 schema는 V1(`version: 1`) 그대로다. V2 run에서 이 파일들은 child lifecycle 및 parent liveness를 전달할 뿐, allocation·ownership 또는 cleanup target authority가 아니다. V2 authority는 아래 immutable artifact 조합으로만 결정한다.
 
@@ -323,7 +323,7 @@ V2는 detached one-shot broker가 pane allocation과 commit 전 rollback을 소�
 | `launch.gate` | parent | immutable; committed launch 뒤 child start를 허가하는 one-way gate |
 | `broker-status.json` | broker 또는 parent | replaceable; polling/diagnostic용이며 cleanup authority가 아님 |
 | `residual-risk.json` | broker | immutable; 안전하게 rediscover할 수 없는 allocation 불확실성을 retained risk로 표시 |
-| `detached-ownership.json` | parent promotion | public immutable user-detachment authority; `pi-subagent.detached-ownership.schema.json` v1에 맞는 allocation SHA-256 binding과 completion mode를 기록하고 reaper target mutation을 제외 |
+| `detached-ownership.json` | parent promotion | public immutable user-detachment authority; `pi-subagent.detached-ownership.schema.json` v1에 맞는 allocation SHA-256 binding을 기록하고 reaper target mutation을 제외 |
 | `user-ownership.json` | legacy | 이전 marker의 read-only compatibility 경로; 새 promotion은 이 형식을 publish하지 않음 |
 | `state.json` | child bridge | **V1 replaceable** lifecycle state |
 | `parent-lease.json` | parent | **V1 replaceable** parent liveness lease |
@@ -498,7 +498,7 @@ bun run acceptance:dry-run
 
 따라서 `bun run acceptance:dry-run`은 provider 호출이나 fixture mutation 없이 routine 및 concurrency의 current-source evidence를 각각 검증한다. 두 source verifier가 모두 성공해야 하며, aggregate `bun run benchmark:phase0:live:verify`도 같은 두 fixture의 current-source binding을 요구한다.
 
-schema v4 provider-live contract는 `routine-v1`(15 active-1 cells/15 children)과 `cmux-concurrency-16-v1`(cmux short-response active-16 한 cell/16 children)으로 분리된다. 반복 capture에서 관찰한 총시간은 각각 5~6분과 약 8.2분이며 SLA가 아니다. record는 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live`, tier별 `--ack-provider-child-runs=15|16`를 요구하고, concurrency에는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 요구한다. evidence schema는 v4, checkpoint schema는 v3이다. routine의 intentional `--max-cells=1..15` prefix checkpoint만 resume할 수 있으며 provider cell 전 claim/terminalization으로 one-use가 된다. concurrency partial resume과 automatic retry는 없으며 concurrency record는 명시적 수동 실행만 허용한다. 문서 변경 뒤에는 네 source-bound fixture를 다시 생성한 후 routine과 concurrency의 current-source verifier를 모두 통과해야 최종 source 검증이 완료된다.
+schema v4 provider-live contract는 `routine-v1`(15 active-1 cells/15 children)과 `cmux-concurrency-16-v1`(cmux short-response active-16 한 cell/16 children)으로 분리된다. 반복 capture에서 관찰한 총시간은 각각 5~6분과 약 8.2분이며 SLA가 아니다. record는 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live`, tier별 `--ack-provider-child-runs=15|16`를 요구하고, concurrency에는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 요구한다. evidence schema는 v4, checkpoint schema는 v4이다. routine의 intentional `--max-cells=1..15` prefix checkpoint만 resume할 수 있으며 recorded Pi version이 current preflight Pi version과 정확히 같고 source/tier/plan binding도 일치해야 한다. backend version은 evidence나 resume continuity contract에 기록하지 않으며 provider cell 전 claim/terminalization으로 one-use가 된다. concurrency partial resume과 automatic retry는 없으며 concurrency record는 명시적 수동 실행만 허용한다. 문서 변경 뒤에는 네 source-bound fixture를 다시 생성한 후 routine과 concurrency의 current-source verifier를 모두 통과해야 최종 source 검증이 완료된다.
 
 ### 12.2 Live tmux control V3 (PASS — 2026-07-21)
 
@@ -558,7 +558,7 @@ PI_SUBAGENT_PACKAGE_ACCEPTANCE=1 bun run acceptance:package -- --keep
 
 ## 13. Layout 완료 상태와 운영상 제한
 
-- interactive run의 기본 `completion`은 parent-owned `one-shot`이며 첫 정상 `agent_settled` 뒤 child를 닫는다. `handoff`는 정확히 하나의 background `agent`/`task` interactive invocation에서만 허용되고, settled child를 `/subagent-return` 전까지 유지한다.
+- interactive run은 parent-owned 고정 lifecycle로 첫 정상 `agent_settled` 뒤 결과를 반환하고 child의 exact surface/pane을 닫는다.
 - `--subagent-pane-layout auto|split`과 `PI_SUBAGENT_PANE_LAYOUT`은 CLI > 환경 변수 > 기본 `auto` 순으로 해석된다. 값은 정확히 소문자 `auto` 또는 `split`이어야 하며 resolved policy는 child에 상속된다.
 - `auto`에서 cmux root sibling은 process-global coordinator가 직렬화해 새 오른쪽 shared pane 하나의 surface를 공유한다. nested descendant는 정확한 source pane에 surface로 쌓인다. tmux는 child별 같은-session detached window를 사용한다.
 - `split`은 cmux/tmux 모두 child별 기존 오른쪽 split을 유지하는 명시적 호환 모드다.
@@ -566,4 +566,4 @@ PI_SUBAGENT_PACKAGE_ACCEPTANCE=1 bun run acceptance:package -- --keep
 - lifecycle은 child의 exact surface/pane만 Escape·close/kill한다. cmux shared pane, tmux window/session 또는 caller container를 넓게 닫지 않는다.
 - cmux/tmux backend launch 실패 시 inline으로 자동 fallback하지 않으며 diagnostic retention 시간은 사용자 설정으로 노출하지 않는다.
 
-cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#19-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke도 2026-07-23 tmux와 cmux에서 **PASS**했지만, title 형식 변경 전 historical evidence다. 현재 agent/depth/run base와 `queued` barrier를 사용하는 title smoke는 harness만 갱신됐으며 live 재실행 통과를 주장하지 않는다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. `completion: "handoff"`와 public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.
+cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#19-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke도 2026-07-23 tmux와 cmux에서 **PASS**했지만, title 형식 변경 전 historical evidence다. 현재 agent/depth/run base와 `queued` barrier를 사용하는 title smoke는 harness만 갱신됐으며 live 재실행 통과를 주장하지 않는다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.

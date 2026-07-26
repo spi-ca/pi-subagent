@@ -30,7 +30,6 @@ import {
 import { SUBAGENT_LIMIT_DEFINITIONS, type SubagentLimits } from "../../src/core/subagent-limits";
 import {
   RUN_STATE_DIR_ENV,
-  SUBAGENT_COMPLETION_MODE_ENV,
   SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV,
   V3_FAILURE_BOUNDARY_CAPABILITY,
   SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
@@ -162,19 +161,6 @@ describe("subagent auth propagation", () => {
       /ownership marker is missing from nonempty root/,
     );
     assert.equal(fs.existsSync(path.join(root, "state-root-marker.json")), false);
-  });
-
-  test("replaces stale completion mode with the exact private child value", () => {
-    const common = {
-      agentName: "worker", parentDepth: 0, parentAgentStack: [], maxDepth: 3,
-      preventCycles: true, baseEnv: { [SUBAGENT_COMPLETION_MODE_ENV]: "handoff" },
-    };
-    const oneShot = buildChildProcessEnv(common);
-    assert.equal(oneShot[SUBAGENT_COMPLETION_MODE_ENV], "one-shot");
-    assert.match(buildPrivateChildEnvironmentScript(oneShot), /^export PI_SUBAGENT_COMPLETION_MODE='one-shot'$/m);
-    const handoff = buildChildProcessEnv({ ...common, completionMode: "handoff" });
-    assert.equal(handoff[SUBAGENT_COMPLETION_MODE_ENV], "handoff");
-    assert.match(buildPrivateChildEnvironmentScript(handoff), /^export PI_SUBAGENT_COMPLETION_MODE='handoff'$/m);
   });
 
   test("does not inherit ancestor promotion paths but allows the current run's explicit paths", () => {

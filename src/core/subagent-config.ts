@@ -6,7 +6,6 @@ import { DEFAULT_DELEGATION_MODE } from "./types.js";
 import type { AccountingUsage } from "./accounting-usage.js";
 
 export const BACKGROUND_BEHAVIOR_GUIDANCE = "background=true returns immediately; results auto-deliver; do not poll.";
-export type CompletionMode = "one-shot" | "handoff";
 
 export const SUBAGENT_INVOCATION_SHAPES_GUIDANCE = "Provide exactly one: agent+task, tasks, chain, or action.";
 export const MODEL_OVERRIDE_DESCRIPTION = "Model overrides the agent default at any call, task, or stage.";
@@ -26,7 +25,6 @@ export function formatSubagentToolDescription(): string {
     `${MODEL_OVERRIDE_DESCRIPTION} Chain labels must be unique.`,
     "Chain defaults to on_success; recovery requires continueOnError on the failed stage.",
     `mode: spawn default; fork adds parent context. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
-    "completion=handoff requires background=true with one agent+task in a cmux/tmux pane; use /subagent-return to finish.",
   ].join("\n");
 }
 
@@ -82,35 +80,6 @@ export function parseBackgroundFlag(raw: unknown): boolean | null {
   return typeof raw === "boolean" ? raw : null;
 }
 
-export function parseCompletionMode(raw: unknown): CompletionMode | null {
-  if (raw === undefined) return "one-shot";
-  return raw === "one-shot" || raw === "handoff" ? raw : null;
-}
-
-/** Validates the opt-in interactive handoff shape before any child is started. */
-export function validateCompletionInvocation(options: {
-  completionMode: CompletionMode;
-  hasSingle: boolean;
-  hasTasksField: boolean;
-  hasChainField: boolean;
-  hasActionField: boolean;
-  background: boolean;
-  /** Omit when terminal context is not available during raw argument preparation. */
-  terminalMode?: string;
-}): string | null {
-  if (options.completionMode !== "handoff") return null;
-  if (!options.hasSingle || options.hasTasksField || options.hasChainField || options.hasActionField) {
-    return "Invalid completion=\"handoff\". It requires exactly one agent+task invocation; parallel, chain, and action calls are not supported.";
-  }
-  if (!options.background) {
-    return "Invalid completion=\"handoff\". It requires background=true.";
-  }
-  if (options.terminalMode !== undefined && options.terminalMode !== "cmux-pane" && options.terminalMode !== "tmux-pane") {
-    return "Invalid completion=\"handoff\". It requires terminal mode cmux-pane or tmux-pane.";
-  }
-  return null;
-}
-
 export type SubagentInvocationValidationCategory = "input-type" | "invocation-shape" | "option-combination";
 
 export interface SubagentInvocationValidationError {
@@ -119,18 +88,12 @@ export interface SubagentInvocationValidationError {
 }
 
 const VALID_ACTIONS = ["status", "cancel"] as const;
-const VALID_COMPLETIONS = ["one-shot", "handoff"] as const;
 const VALID_MODES = ["spawn", "fork"] as const;
 const VALID_CONDITIONS = ["always", "on_success", "on_error", "on_completed_with_errors"] as const;
-const TOP_LEVEL_FIELDS = ["action", "id", "background", "completion", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
+const TOP_LEVEL_FIELDS = ["action", "id", "background", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
 const TASK_ITEM_FIELDS = ["agent", "task", "cwd", "model"] as const;
 const CHAIN_TASK_STAGE_FIELDS = ["type", "label", "agent", "task", "cwd", "model", "condition", "continueOnError"] as const;
 const CHAIN_PARALLEL_STAGE_FIELDS = ["type", "label", "tasks", "condition", "continueOnError"] as const;
-
-export interface SubagentInvocationValidationOptions {
-  /** Supply terminal mode during execution; raw preparation intentionally has none. */
-  terminalMode?: string;
-}
 
 function validationError(
   category: SubagentInvocationValidationCategory,
@@ -196,17 +159,13 @@ function validateChainStage(value: unknown, index: number): SubagentInvocationVa
  * Keep this before TypeBox conversion: Value.Convert intentionally accepts
  * coercible values that are not valid invocation arguments.
  */
-export function validateSubagentInvocation(
-  raw: unknown,
-  options: SubagentInvocationValidationOptions = {},
-): SubagentInvocationValidationError | null {
+export function validateSubagentInvocation(raw: unknown): SubagentInvocationValidationError | null {
   if (!isRecord(raw)) return validationError("input-type", "Subagent parameters must be an object.");
   if (hasUnsupportedOwnEnumerableField(raw, TOP_LEVEL_FIELDS)) return validationError("input-type", "Subagent parameters contain an unsupported field.");
 
   if (raw.action !== undefined && !isStringEnum(raw.action, VALID_ACTIONS)) return validationError("input-type", "action must be status or cancel.");
   if (raw.id !== undefined && !isNonBlankString(raw.id)) return validationError("input-type", "id must be a non-blank string.");
   if (raw.background !== undefined && typeof raw.background !== "boolean") return validationError("input-type", "background must be a boolean.");
-  if (raw.completion !== undefined && !isStringEnum(raw.completion, VALID_COMPLETIONS)) return validationError("input-type", "completion is invalid.");
   if (raw.mode !== undefined && !isStringEnum(raw.mode, VALID_MODES)) return validationError("input-type", "mode is invalid.");
   for (const field of ["agent", "task"] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== "string") return validationError("input-type", `${field} must be a string.`);
@@ -244,19 +203,9 @@ export function validateSubagentInvocation(
   const hasTasks = raw.tasks !== undefined;
   const hasChain = raw.chain !== undefined;
   const shapeCount = Number(hasSingle) + Number(hasTasks) + Number(hasChain) + Number(hasAction);
-  const completionError = validateCompletionInvocation({
-    completionMode: (raw.completion ?? "one-shot") as CompletionMode,
-    hasSingle,
-    hasTasksField: hasTasks,
-    hasChainField: hasChain,
-    hasActionField: hasAction,
-    background: raw.background === true,
-    terminalMode: options.terminalMode,
-  });
-  if (completionError) return validationError("option-combination", completionError);
 
   if (hasAction) {
-    const hasExecutionField = hasSingle || raw.model !== undefined || hasTasks || hasChain || raw.cwd !== undefined || raw.mode !== undefined || raw.completion !== undefined;
+    const hasExecutionField = hasSingle || raw.model !== undefined || hasTasks || hasChain || raw.cwd !== undefined || raw.mode !== undefined;
     if (hasExecutionField || raw.background !== undefined) return validationError("option-combination", "action cannot be combined with execution options.");
   } else {
     if (raw.id !== undefined) return validationError("option-combination", "id can only be used with action.");
@@ -591,7 +540,6 @@ export const SubagentParams = Type.Object({
   action: Type.Optional(StringEnum(["status", "cancel"])),
   id: Type.Optional(Type.String({ minLength: 1 })),
   background: Type.Optional(Type.Boolean()),
-  completion: Type.Optional(StringEnum(["one-shot", "handoff"], { default: "one-shot" })),
   agent: Type.Optional(Type.String({ minLength: 1 })),
   task: Type.Optional(Type.String({ minLength: 1 })),
   model: Type.Optional(Type.String({ minLength: 1 })),

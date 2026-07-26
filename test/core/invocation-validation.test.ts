@@ -138,30 +138,6 @@ describe("raw subagent invocation validation", () => {
     expectValidationError({ action: "cancel", background: false }, "option-combination");
     expectValidationError({ id: "job-id" }, "option-combination", "id");
     expectValidationError({ tasks: [{ agent: "worker", task: "inspect" }], model: "model" }, "option-combination", "model");
-    expectValidationError({ agent: "worker", task: "inspect", completion: "handoff", background: false }, "option-combination", "completion");
-  });
-
-  test("uses one handoff validation matrix with optional terminal context", () => {
-    const handoff = { agent: "worker", task: "inspect", completion: "handoff" as const, background: true };
-    // Preparation has no terminal context, but must still reject all non-terminal handoff combinations.
-    assert.equal(validateSubagentInvocation(handoff), null);
-    assert.equal(validateSubagentInvocation(handoff, { terminalMode: "cmux-pane" }), null);
-    assert.equal(validateSubagentInvocation(handoff, { terminalMode: "tmux-pane" }), null);
-
-    for (const raw of [
-      { ...handoff, background: false },
-      { completion: "handoff", background: true, tasks: [{ agent: "worker", task: "inspect" }] },
-      { completion: "handoff", background: true, chain: [{ agent: "worker", task: "inspect" }] },
-      { completion: "handoff", background: true, action: "status" },
-    ]) {
-      const message = expectValidationError(raw, "option-combination", "completion");
-      assert.match(message, /exactly one agent\+task invocation|background=true/);
-    }
-    const terminalError = validateSubagentInvocation(handoff, { terminalMode: "inline" });
-    assert.deepEqual(terminalError, {
-      category: "option-combination",
-      message: "Invalid completion=\"handoff\". It requires terminal mode cmux-pane or tmux-pane.",
-    });
   });
 
   test("formats failures without exposing raw task contents and distinguishes operational failures", () => {

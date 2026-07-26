@@ -6,13 +6,13 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const CLEAN_CHECKOUT_DEV_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "0.82.0",
-  "@earendil-works/pi-ai": "0.82.0",
-  "@earendil-works/pi-coding-agent": "0.82.0",
-  "@earendil-works/pi-tui": "0.82.0",
-  typebox: "1.1.38",
+const PI_CORE_DEPENDENCIES = {
+  "@earendil-works/pi-agent-core": "^0.82.0",
+  "@earendil-works/pi-ai": "^0.82.0",
+  "@earendil-works/pi-coding-agent": "^0.82.0",
+  "@earendil-works/pi-tui": "^0.82.0",
 } as const;
+const CLEAN_CHECKOUT_DEV_DEPENDENCIES = { typebox: "1.1.38" } as const;
 
 function packedPaths(): string[] {
   const result = spawnSync(process.execPath, ["pm", "pack", "--dry-run", "--ignore-scripts"], {
@@ -25,7 +25,7 @@ function packedPaths(): string[] {
 }
 
 describe("release packaging and live acceptance workflow", () => {
-  test("pins clean-checkout typecheck dependencies and resolves them from the lockfile", () => {
+  test("allows the current Pi 0.82 patch line and resolves clean-checkout dependencies from the lockfile", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       devDependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
@@ -35,8 +35,20 @@ describe("release packaging and live acceptance workflow", () => {
       compilerOptions: { paths?: unknown };
     };
 
-    assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.80.10");
     assert.equal(tsconfig.compilerOptions.paths, undefined, "typechecking must not require a sibling Pi checkout");
+    for (const [packageName, version] of Object.entries(PI_CORE_DEPENDENCIES)) {
+      assert.equal(manifest.peerDependencies[packageName], "*", `${packageName} must accept all Pi core versions`);
+      assert.equal(manifest.devDependencies[packageName], version, `${packageName} must allow the current Pi 0.82 patch line`);
+
+      const packageJsonPath = path.join(ROOT, "node_modules", ...packageName.split("/"), "package.json");
+      const installedManifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { version: string };
+      assert.match(installedManifest.version, /^0\.82\.\d+$/, `${packageName} must stay on the Pi 0.82 patch line`);
+      assert.ok(
+        lockfile.includes(`\"${packageName}\": [\"${packageName}@${installedManifest.version}\"`),
+        `bun.lock must resolve ${packageName}@${installedManifest.version}`,
+      );
+      assert.match(import.meta.resolve(packageName), /node_modules\//, `${packageName} must resolve after bun install --frozen-lockfile`);
+    }
     for (const [packageName, version] of Object.entries(CLEAN_CHECKOUT_DEV_DEPENDENCIES)) {
       assert.equal(manifest.devDependencies[packageName], version, `${packageName} must be exactly pinned for clean checkouts`);
       assert.ok(

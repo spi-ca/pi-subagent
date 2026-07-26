@@ -61,10 +61,10 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.82.0",
-    "@earendil-works/pi-ai": "0.82.0",
-    "@earendil-works/pi-coding-agent": "0.82.0",
-    "@earendil-works/pi-tui": "0.82.0",
+    "@earendil-works/pi-agent-core": "^0.82.0",
+    "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@earendil-works/pi-tui": "^0.82.0",
     "@types/node": "^25.2.3",
     "typebox": "1.1.38",
     "typescript": "^5.9.3"
@@ -72,7 +72,7 @@
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": ">=0.80.10",
+    "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },

@@ -78,6 +78,58 @@ describe("pi presence producer wire contract", () => {
     assert.equal(hints, 1);
   });
 
+  test("keeps cached replay immutable and blocks synchronous ready recursion", () => {
+    const emitted: any[] = [];
+    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
+    producer = createPiSubagentPresenceProducer({
+      emit: (_channel, payload: any) => {
+        emitted.push(payload);
+        try { payload.counts.completed = 999; } catch { /* frozen observer payload */ }
+        if (payload.sequence === 2) producer.handleReady({ version: 1, sessionId: "session-1" });
+      },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [{ id: "done", status: "completed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2 }]));
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.equal(emitted.length, 2, "a replay-triggered ready cannot recurse synchronously");
+    assert.equal(emitted[1].counts.completed, 1);
+    assert.equal(emitted[1].attention, "none");
+    assert.equal(Object.isFrozen(emitted[0]), true);
+    assert.equal(Object.isFrozen(emitted[0].counts), true);
+  });
+
+  test("emits background-only attention, selects terminal state by newest completion, and projects queue state", () => {
+    const emitted: any[] = [];
+    let scheduler = { active: 0, queued: 0 };
+    const producer = createPiSubagentPresenceProducer({
+      emit: (_channel, payload) => emitted.push(payload), getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    const completed = { id: "completed", status: "completed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 30 };
+    const failed = { id: "failed", status: "failed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 20, completedAt: 20 };
+    producer.publish(snapshot(0, [completed, failed]));
+    assert.deepEqual(emitted[0].counts, { active: 0, completed: 1, failed: 1, queued: 0, cancelled: 0, total: 2 });
+    assert.equal(emitted[0].state, "success", "newest terminal determines state, independent of snapshot order");
+    assert.equal(emitted[0].attention, "error", "a background failure wins over a simultaneous success");
+
+    const cancelled = { id: "cancelled", status: "cancelled", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 40, completedAt: 40 };
+    producer.publish(snapshot(0, [cancelled]));
+    assert.equal(emitted[1].state, "cancelled");
+    assert.equal(emitted[1].attention, "none");
+
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.equal(emitted[2].state, "cancelled");
+    assert.equal(emitted[2].attention, "none", "replays never demand attention");
+
+    scheduler = { active: 0, queued: 1 };
+    producer.publish(snapshot());
+    assert.equal(emitted[3].state, "waiting");
+    scheduler = { active: 1, queued: 1 };
+    producer.publish(snapshot());
+    assert.equal(emitted[4].state, "running");
+  });
+
   test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {
     const emitted: any[] = [];
     const producer = createPiSubagentPresenceProducer({
@@ -90,8 +142,8 @@ describe("pi presence producer wire contract", () => {
     producer.publish(snapshot(0, [two])); // one has been pruned from registry history
     assert.deepEqual(emitted.map((event) => event.counts.completed), [1, 1]);
     assert.deepEqual(emitted.map((event) => event.counts.failed), [0, 1]);
-    assert.equal(emitted[0].attention, "success");
-    assert.equal(emitted[1].attention, "error");
+    assert.deepEqual(emitted.map((event) => event.state), ["success", "error"]);
+    assert.deepEqual(emitted.map((event) => event.attention), ["none", "none"]);
 
     const throwing = createPiSubagentPresenceProducer({ emit: () => { throw new Error("listener"); }, getSchedulerCounts: () => { throw new Error("scheduler"); }, getInteractiveActiveCount: () => { throw new Error("interactive"); } });
     throwing.startSession("session-1", 0);

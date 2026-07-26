@@ -56,14 +56,15 @@ async function privateRoot(prefix: string): Promise<string> {
   return root;
 }
 
-async function writeWrapper(root: string, initialTitle: string, dynamicTitle: string): Promise<string> {
+async function writeWrapper(root: string, baseTitle: string, dynamicTitle: string): Promise<string> {
   const wrapper = path.join(root, "title-wrapper.sh");
+  const dynamicRelease = path.join(root, "release-dynamic-title");
   const script = buildInteractivePaneWrapperScript({
     effectiveCwd: root,
-    childCommand: ["/bin/bash", "-c", `printf '\\033]2;%s\\007' ${JSON.stringify(dynamicTitle)}; /bin/sleep 8`],
+    childCommand: ["/bin/bash", "-c", `while [ ! -f ${JSON.stringify(dynamicRelease)} ]; do /bin/sleep 0.05; done; printf '\\033]2;%s\\007' ${JSON.stringify(dynamicTitle)}; /bin/sleep 8`],
     exportedEnv: { PATH: "/usr/bin:/bin" },
     wrapperStatusPath: path.join(root, "wrapper-status"),
-    surfaceTitle: initialTitle,
+    surfaceTitle: baseTitle,
   });
   await fs.promises.writeFile(wrapper, script, { mode: 0o700 });
   await fs.promises.chmod(wrapper, 0o700);
@@ -75,11 +76,12 @@ async function tmuxTitleSmoke(): Promise<Record<string, unknown>> {
   const root = await privateRoot("pi-subagent-title-tmux-");
   const socket = path.join(root, "tmux.sock");
   const session = `pi-subagent-title-${crypto.randomUUID()}`;
-  const initialTitle = "subagent:title-smoke:initial";
-  const dynamicTitle = "subagent:title-smoke:running";
+  const baseTitle = "title-smoke [depth=1;run=initial]";
+  const initialTitle = `${baseTitle} · queued`;
+  const dynamicTitle = `${baseTitle} · running`;
   let targetPane: string | null = null;
   try {
-    const wrapper = await writeWrapper(root, initialTitle, dynamicTitle);
+    const wrapper = await writeWrapper(root, baseTitle, dynamicTitle);
     const created = await run(tmux, ["-S", socket, "new-session", "-d", "-s", session, "-P", "-F", "#{pane_id}", "/bin/sleep", "30"]);
     if (created.code !== 0 || !/^%\d+$/.test(created.stdout.trim())) throw new Error(created.stderr || "tmux source creation failed");
     const sourcePane = created.stdout.trim();
@@ -90,7 +92,8 @@ async function tmuxTitleSmoke(): Promise<Record<string, unknown>> {
     targetPane = target.stdout.trim();
     if (target.code !== 0 || !/^%\d+$/.test(targetPane) || [sourcePane, sentinelPane].includes(targetPane)) throw new Error("tmux title target creation failed");
     const title = async () => (await run(tmux, ["-S", socket, "display-message", "-p", "-t", targetPane!, "#{pane_title}"])).stdout.trim();
-    await waitFor(async () => [initialTitle, dynamicTitle].includes(await title()), "tmux managed title");
+    await waitFor(async () => await title() === initialTitle, "tmux queued title");
+    await fs.promises.writeFile(path.join(root, "release-dynamic-title"), "release\n", { mode: 0o600 });
     await waitFor(async () => await title() === dynamicTitle, "tmux lifecycle title");
     const survivors = await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}"]);
     if (!survivors.stdout.split(/\s+/).includes(sourcePane) || !survivors.stdout.split(/\s+/).includes(sentinelPane)) throw new Error("tmux source/sentinel changed during title smoke");
@@ -145,12 +148,13 @@ async function cmuxTitleSmoke(): Promise<Record<string, unknown>> {
   }
   const root = await privateRoot("pi-subagent-title-cmux-");
   const workspaceName = `pi-subagent-title-${crypto.randomUUID()}`;
-  const initialTitle = "subagent:title-smoke:initial";
-  const dynamicTitle = "subagent:title-smoke:running";
+  const baseTitle = "title-smoke [depth=1;run=initial]";
+  const initialTitle = `${baseTitle} · queued`;
+  const dynamicTitle = `${baseTitle} · running`;
   let workspaceId: string | null = null;
   let targetSurface: string | null = null;
   try {
-    const wrapper = await writeWrapper(root, initialTitle, dynamicTitle);
+    const wrapper = await writeWrapper(root, baseTitle, dynamicTitle);
     const created = await run(cmux, ["--json", "--id-format", "both", "new-workspace", "--name", workspaceName, "--cwd", root, "--focus", "false"]);
     let source = created.code === 0 ? cmuxWorkspaceCreateIdentity(created.stdout) : null;
     if (!source) {
@@ -176,7 +180,8 @@ async function cmuxTitleSmoke(): Promise<Record<string, unknown>> {
       const tree = await run(cmux, ["--json", "--id-format", "both", "tree", "--all"]);
       return tree.code === 0 ? inspectCanonicalCmuxSurfaceTree(tree.stdout, workspaceId!, targetSurface!) : undefined;
     };
-    await waitFor(async () => [initialTitle, dynamicTitle].includes((await snapshot())?.title ?? ""), "cmux managed title");
+    await waitFor(async () => (await snapshot())?.title === initialTitle, "cmux queued title");
+    await fs.promises.writeFile(path.join(root, "release-dynamic-title"), "release\n", { mode: 0o600 });
     await waitFor(async () => (await snapshot())?.title === dynamicTitle, "cmux lifecycle title");
     const finalTree = await run(cmux, ["--json", "--id-format", "both", "tree", "--all"]);
     if (!inspectCanonicalCmuxSurfaceTree(finalTree.stdout, workspaceId, source.surfaceId)?.exists

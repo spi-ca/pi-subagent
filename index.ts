@@ -44,13 +44,13 @@ import { settleWithUnrefTimeout } from "./src/core/async-settle.js";
 import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
-import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, parseSubagentsCommand } from "./src/core/subagent-ux.js";
+import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
-import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
+import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
 import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
 import {
@@ -118,6 +118,38 @@ const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
+/** Keeps the TUI selector responsive even when configured concurrency is high. */
+const SUBAGENT_UX_SELECTOR_LIMIT = 32;
+const INTERACTIVE_OWNERSHIP_PRESENTATION: Readonly<Record<InteractiveRunUxSnapshot["ownership"], { readonly icon: string; readonly label: string; readonly attention: number }>> = Object.freeze({
+  "ownership-unknown": { icon: "⚠", label: "ownership unknown", attention: 0 },
+  // This is the only exact waiting-like ownership state available in snapshots;
+  // do not infer a pane lifecycle state from it.
+  transferring: { icon: "◌", label: "transferring", attention: 1 },
+  managed: { icon: "●", label: "managed", attention: 2 },
+  kept: { icon: "◌", label: "kept", attention: 3 },
+  detached: { icon: "↗", label: "detached", attention: 4 },
+});
+
+function compareInteractiveRunsForUx(left: InteractiveRunUxSnapshot, right: InteractiveRunUxSnapshot): number {
+  return INTERACTIVE_OWNERSHIP_PRESENTATION[left.ownership].attention - INTERACTIVE_OWNERSHIP_PRESENTATION[right.ownership].attention
+    || left.startedAt - right.startedAt
+    || left.runId.localeCompare(right.runId);
+}
+
+function formatInteractiveOwnershipForUx(ownership: InteractiveRunUxSnapshot["ownership"]): string {
+  const presentation = INTERACTIVE_OWNERSHIP_PRESENTATION[ownership];
+  return `${presentation.icon} ${presentation.label}`;
+}
+
+function formatSubagentElapsedForUx(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60}m`;
+}
+
 // CONFIG_DIR_NAME is public in current Pi hosts. Retain the documented default
 // for older compatible hosts whose package root does not export it yet.
 const CONFIG_DIR_NAME = typeof (piCodingAgent as unknown as { CONFIG_DIR_NAME?: unknown }).CONFIG_DIR_NAME === "string"
@@ -708,20 +740,31 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const jobs = uxRegistry.list();
-        const interactive = listInteractiveRunUxSnapshots();
+        const interactive = [...listInteractiveRunUxSnapshots()].sort(compareInteractiveRunsForUx);
         const commandMode = (ctx as typeof ctx & { mode?: string }).mode;
         if (rawArgs.trim() === "" && commandMode === "tui" && jobs.length + interactive.length > 0) {
+          const jobAttention: Record<(typeof jobs)[number]["status"], number> = { failed: 0, cancelling: 1, running: 2, completed: 3, cancelled: 4 };
           const entries = [
-            ...jobs.map((job) => ({ label: `${job.id} · ${job.agent} · ${job.status} · ${Math.max(0, (job.completedAt ?? Date.now()) - job.startedAt)}ms${job.preview ? ` · ${job.preview}` : ""}`, detail: formatSubagentUxDetail(job) })),
-            ...interactive.map((run) => ({ label: `${run.runId} · ${run.agent} · interactive/${run.ownership} · ${Math.max(0, Date.now() - run.startedAt)}ms${run.preview ? ` · ${run.preview}` : ""}`, detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.` })),
-          ];
+            ...jobs.map((job) => ({
+              rank: jobAttention[job.status], startedAt: job.startedAt, id: job.id,
+              label: `${job.agent} · ${formatSubagentUxStatus(job.status)} · ${formatSubagentElapsedForUx((job.completedAt ?? Date.now()) - job.startedAt)} · ${job.id}${job.preview ? ` · ${job.preview}` : ""}`,
+              detail: formatSubagentUxDetail(job), focusRunId: undefined as string | undefined,
+            })),
+            ...interactive.map((run) => ({
+              rank: INTERACTIVE_OWNERSHIP_PRESENTATION[run.ownership].attention, startedAt: run.startedAt, id: run.runId,
+              label: `${run.agent} · interactive/${formatInteractiveOwnershipForUx(run.ownership)} · d${run.depth} · ${formatSubagentElapsedForUx(Date.now() - run.startedAt)} · ${run.runId}${run.preview ? ` · ${run.preview}` : ""}`,
+              detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.`,
+              focusRunId: run.runId,
+            })),
+          ].sort((left, right) => left.rank - right.rank || left.startedAt - right.startedAt || left.id.localeCompare(right.id)).slice(0, SUBAGENT_UX_SELECTOR_LIMIT);
           const selected = await ctx.ui.select("Subagents", entries.map((entry) => entry.label));
           const entry = entries.find((candidate) => candidate.label === selected);
+          if (entry?.focusRunId && await focusInteractiveRun(entry.focusRunId)) return;
           if (entry) ctx.ui.notify(entry.detail, "info");
           return;
         }
         const invocationText = formatSubagentUxList(jobs);
-        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${run.ownership}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
+        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${formatInteractiveOwnershipForUx(run.ownership)}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
         ctx.ui.notify(`${invocationText}\n${interactiveText}`, "info");
       },
     });
@@ -870,14 +913,14 @@ export default function (pi: ExtensionAPI) {
       dashboardPublisher.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
       presenceProducer?.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
       const notifiedTerminalIds = new Set<string>();
-      const updateObservers = (snapshot: PiSubagentUxSnapshotLike) => {
+      const updateObservers = (snapshot: PiSubagentUxSnapshotLike, schedulerQueued = scheduler.queuedCount) => {
         dashboardPublisher.publish(snapshot);
         presenceProducer?.publish(snapshot);
         if (ctx.hasUI) {
-          ctx.ui.setStatus("pi-subagent-runs", formatSubagentUxFooter(snapshot));
+          ctx.ui.setStatus("pi-subagent-runs", formatSubagentUxFooter(snapshot, schedulerQueued));
           for (const item of snapshot.recent) {
-            if (item.status !== "completed" && item.status !== "failed" && item.status !== "cancelled"
-              || notifiedTerminalIds.has(item.id)) continue;
+            const notification = subagentUxTerminalNotification(item.status);
+            if (!notification || notifiedTerminalIds.has(item.id)) continue;
             notifiedTerminalIds.add(item.id);
             while (notifiedTerminalIds.size > 256) {
               const oldest = notifiedTerminalIds.values().next().value;
@@ -885,16 +928,13 @@ export default function (pi: ExtensionAPI) {
               notifiedTerminalIds.delete(oldest);
             }
             try {
-              ctx.ui.notify(
-                `Subagent ${item.agent} (${item.id}) ${item.status}.`,
-                item.status === "completed" ? "info" : "warning",
-              );
+              ctx.ui.notify(`Subagent ${item.agent} (${item.id}) failed.`, notification);
             } catch { /* Pi TUI notifications are non-authoritative. */ }
           }
         }
       };
       unsubscribeUxStatus = uxRegistry.subscribe(updateObservers);
-      unsubscribeSchedulerStatus = scheduler.subscribe(() => updateObservers(uxRegistry.snapshot()));
+      unsubscribeSchedulerStatus = scheduler.subscribe((state) => updateObservers(uxRegistry.snapshot(), state.queued));
       updateObservers(uxRegistry.snapshot());
     }
     backgroundJobSettlements.clear();

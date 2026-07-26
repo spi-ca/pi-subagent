@@ -419,15 +419,17 @@ background 실행 여부와 focus 여부는 별개다. foreground subagent 호�
 
 ### 12.2 cross-backend pane title (구현됨)
 
-wrapper는 cmux/tmux 모두에서 `subagent:<sanitized-agent>:<run-prefix>` 형식의 printable-ASCII 초기 OSC title을 설정하고, child bridge는 `ready`, `running`, `waiting`, `returning`, `failed` lifecycle에 따라 ` · ` 구분자가 포함될 수 있는 Pi UI title을 갱신한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
+wrapper는 cmux/tmux 모두에서 printable-ASCII base title `<agent> [depth=<n>;run=<prefix>]`를 사용한다. effective child environment와 `cwd`를 설치한 직후, tree permit이 child를 `STOP`할 수 **전에** wrapper가 `<base> · queued` OSC title을 발행한다. 이어 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 즉 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort/handoff settlement는 `waiting`으로 표시한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
 
 ```text
-subagent:<agent-name>:<run-id 앞 8자>
+reviewer [depth=2;run=a14f82c1] · queued
+reviewer [depth=2;run=a14f82c1] · running
+reviewer [depth=2;run=a14f82c1] · returning
 ```
 
-pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또는 관측 실패는 lifecycle 실패로 승격하지 않으며 `/subagents details`는 raw title 대신 managed title과 `matching|changed|unavailable`만 표시한다. production wrapper를 사용하는 gated live smoke에서 2026-07-23 실제 tmux `pane_title`과 cmux canonical topology의 initial/lifecycle title이 모두 PASS했다.
+pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또는 관측 실패는 lifecycle 실패로 승격하지 않으며 `/subagents details`는 raw title 대신 managed title과 `matching|changed|unavailable`만 표시한다. gated live smoke는 `queued` title을 먼저 정확히 관측한 뒤 barrier를 해제해 lifecycle title을 검증하도록 갱신됐다. 2026-07-23의 tmux/cmux PASS는 이전 title 형식의 historical evidence이며, 현재 형식의 live 재실행 통과를 이 문서에서 주장하지 않는다.
 
-현재 production tmux broker의 **window 이름**은 pane title과 달리 고정 `subagent:broker`다. agent/run별 stable window 이름으로 정렬하는 변경은 [tmux window 이름과 Pi pane title 정책 제안](./tmux-window-naming-design.md)에 현재 동작, strict protocol 전달, 안전 경계와 검증 계획을 구분해 기록한다.
+현재 production tmux broker의 **window 이름**은 pane title과 달리 고정 `subagent:broker`다. 이 title 변경은 window 이름 변경을 뜻하지 않는다. agent/run별 stable window 이름으로 정렬하는 변경은 [tmux window 이름과 Pi pane title 정책 제안](./tmux-window-naming-design.md)에 현재 동작, strict protocol 전달, 안전 경계와 검증 계획을 구분해 기록한다.
 
 ### 12.3 어떤 child가 보이는가
 
@@ -439,7 +441,7 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 
 각 cmux surface에서 로드된 `pi-cmux` sidebar/progress/log는 그대로 동작할 수 있다. surface별 status key를 사용하므로 stacked surface끼리 충돌하지 않는다.
 
-`agent_end` 알림과 flash가 병렬 child마다 발생할 수 있는 문제는 layout과 별개다. child 전용 알림 정책은 [`pi-subagent`와 `pi-cmux` 연동 가이드](./pi-cmux-integration.md)의 후속 항목으로 남긴다.
+`agent_end` 알림과 flash가 병렬 child마다 발생할 수 있는 문제는 layout과 별개다. 이 억제는 더 이상 후속 항목이 아니다. `inherit` child에는 `pi-subagent`가 검토된 `subagent-child-v1` profile로 `PI_CMUX_NOTIFY_LEVEL=disabled`와 `PI_CMUX_SIDEBAR_FLASH=disabled`를 주입하며, parent 알림은 유지한다. `managed` child는 inherited `pi-cmux` 자체를 로드하지 않는다. 자세한 package 경계와 profile은 [`pi-subagent`와 `pi-cmux` 연동 가이드](./pi-cmux-integration.md)를 따른다.
 
 ## 13. 보안과 안전
 

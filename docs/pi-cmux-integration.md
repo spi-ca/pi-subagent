@@ -2,9 +2,9 @@
 
 > **상태:** 현재 동작과 권장 운영 정책
 
-이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. 별도 `pi-cmux-presence`에는 root-only generic presence producer가 구현되어 있으며, wire contract·replay·observer 경계 같은 세부 계약은 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)에서만 다룬다. interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
+이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. root-only generic presence **producer는 `pi-subagent`에 구현되어** 있고, 별도 `pi-cmux-presence`는 이를 선택적으로 소비하는 package다. wire contract·replay·observer 경계 같은 세부 계약은 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)에서 다룬다. interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
 
-`pi-cmux`는 `pi-subagent`의 실행, 결과 반환, 취소와 cleanup에 필요하지 않은 **선택적 workflow UX 확장**이다. child surface별 sidebar와 command/review 작업 흐름이 필요할 때 설치한다. root Pi/subagent 집계의 socket-only status·progress·attention은 별도 `pi-cmux-presence`가 제공할 수 있다.
+`pi-cmux`는 `pi-subagent`의 실행, 결과 반환, 취소와 cleanup에 필요하지 않은 **선택적 workflow UX 확장**이다. child surface별 sidebar와 command/review 작업 흐름이 필요할 때 설치한다. root Pi/subagent 집계의 generic status·progress·attention은 `pi-subagent` producer를 설치·로드된 `pi-cmux-presence` consumer가 표시할 수 있다.
 
 ## 1. 결론
 
@@ -14,7 +14,7 @@
 |---|---|
 | `pi-subagent` | subagent 위임, child surface 생성·종료, 결과 수집, 취소, lease와 orphan 정리, root parent dashboard/aggregate/detached event 및 generic `pi-presence:update:v1` publish, Pi TUI status/notification |
 | 외부 event consumer (선택) | public dashboard/aggregate/detached event를 검증해 필요한 UI를 best-effort로 갱신한다. `pi-subagent`에 포함되지 않는다. |
-| `pi-cmux-presence` (선택) | 같은 Pi process의 generic presence update를 소비할 수 있는 별도 observer/UI다. `pi-cmux` package나 lifecycle authority와 연결되지 않는다. |
+| `pi-cmux-presence` (선택) | `pi-subagent`가 같은 Pi process에서 발행한 generic presence update를 소비할 수 있는 별도 observer/UI다. `pi-cmux` package나 lifecycle authority와 연결되지 않는다. |
 | `pi-cmux` (선택) | 각 Pi surface의 sidebar, progress, log, 알림과 사용자 작업 흐름을 제공한다. public event consumer의 소유자나 설치 조건이 아니다. |
 | cmux | PTY, workspace, surface와 split 제공 |
 
@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작하고, `pi-cmux-presence`가 설치·로드된 경우에만 같은 process에서 선택적으로 소비할 수 있다. wire contract, source 식별자, replay attention, progress·terminal count 계산과 observer 경계는 이 문서에서 다루지 않으며 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
+root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작한다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
 
 ## 5. 권장 운영 정책
 
@@ -256,12 +256,12 @@ slash command는 하나만 등록한다. session-local foreground/background inv
 /subagents promote <run-id>   durable user ownership으로 승격
 ```
 
-인자 없이 실행하면 TUI mode에서 항목이 있을 때 실행 중이거나 최근 완료된 child를 selector로 보여 주고, 항목이 없거나 non-TUI이면 plain list notification을 표시한다.
+인자 없이 실행하면 TUI mode에서 항목이 있을 때 실행 중이거나 최근 완료된 child를 **attention-first** selector로 보여 준다. `failed` → `cancelling` → `running` → `completed` → `cancelled` 순서이며, interactive run은 `ownership unknown`, `transferring`, `managed`, `kept`, `detached` ownership label과 아이콘을 표시하고 그 ownership attention rank도 같은 정렬에 포함한다. selector는 응답성을 위해 최대 32개 항목만 보이고, duration은 raw millisecond가 아닌 `1m24s` 같은 사람이 읽는 elapsed time으로 표시한다. interactive 항목을 선택하면 negotiated `surface.focus`가 지원되고 성공할 때 해당 surface로 focus하며, 지원되지 않거나 실패하면 해당 항목의 detail notification을 표시한다. 항목이 없거나 non-TUI이면 plain list notification을 표시한다.
 
 ```text
-> scout       running     1m24s
-  reviewer    running       48s
-  worker      completed     12s
+> scout · ✕ failed · 1m24s · <invocation-id>
+  reviewer · interactive/● managed · d1 · 48s · <run-id>
+  worker · ✓ completed · 12s · <invocation-id>
 ```
 
 현재 구현은 별도의 sanitized session-local UX registry와 exact interactive authority registry를 사용하며 Pi의 `registerCommand()`, `ctx.ui.select()`, `ctx.ui.notify()`, `ctx.ui.confirm()`, `setStatus()`만 사용한다. doctor는 새 CLI/control handshake/topology probe를 실행하지 않고 현재 환경 identity, scheduler 수치, active interactive authority 수와 Pi registry provenance만 보고한다. `details`와 ownership action만 선택한 exact run의 기존 generation-bound backend를 검사한다. promotion marker authority가 불확실하면 `details`/list에 run을 계속 보존하고 local cleanup을 revoke한다. cmux focus는 negotiated `surface.focus`가 있을 때만 persistent control-v2로 수행하고 tmux focus는 안전한 caller-client authority가 없어 fail-closed한다. production cmux CLI fallback은 없다. subcommand completion은 UI 편의이며 LLM tool schema에 추가하지 않는다.
@@ -270,8 +270,10 @@ slash command는 하나만 등록한다. session-local foreground/background inv
 
 `pi-cmux` native sidebar를 직접 확장하지 않고 parent Pi의 status에 session-local foreground/background invocation 상태를 표시한다. root parent는 별도로 versioned dashboard/aggregate event를 외부 선택 consumer에게 publish한다. `pi-subagent`는 이 event를 내부 cmux adapter로 소비하지 않고 cmux CLI/socket mutation도 수행하지 않는다.
 
+footer는 invocation lifecycle이나 queue authority를 만들지 않는 표시 전용 집계이며, 항상 다음 exact icon/count 순서를 사용한다. `◷`는 개별 invocation position이 아니라 process-local scheduler의 aggregate queue count다.
+
 ```text
-subagents: ●3 ✓1 ✕0
+subagents: ●<running> ◷<scheduler-queued> ◌<cancelling> ✓<completed> ✕<failed> –<cancelled>
 ```
 
 상세 화면이 필요하면 `/subagents`에서 다음 정보를 제공한다.
@@ -299,14 +301,15 @@ parent 화면을 과도하게 차지하지 않도록 기본 status는 한 줄로
 
 #### surface title 설정 (구현됨)
 
-wrapper는 child 시작 직전 OSC title로 짧은 managed title을 설정하고 child bridge는 `ready`/`running`/`waiting`/`returning`/`failed` lifecycle에 맞춰 Pi UI title을 계속 갱신한다. abort는 별도 suffix가 아니라 `waiting`으로 표시한다.
+managed base title은 `<agent> [depth=<n>;run=<prefix>]`다. wrapper는 effective environment와 `cwd`를 설치한 뒤 tree permit이 child를 `STOP`할 수 **전에** OSC로 `<base> · queued`를 발행한다. 그 뒤 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 따라서 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort와 handoff settlement는 별도 suffix가 아니라 `waiting`이다.
 
 ```text
-subagent:scout:a14f82c1
-subagent:reviewer:39bc730e
+scout [depth=1;run=a14f82c1] · queued
+scout [depth=1;run=a14f82c1] · running
+reviewer [depth=2;run=39bc730e] · returning
 ```
 
-표시 정보는 sanitized agent name과 run ID prefix로 제한한다. base title은 printable ASCII이고, 동적 lifecycle suffix는 ` · `를 포함할 수 있지만 control character 없이 전체 title은 96자로 제한한다. task, prompt, secret 또는 긴 경로는 title에 넣지 않는다. `details`는 raw title을 공개하지 않고 managed title과 `matching|changed|unavailable` 상태만 보여 준다. gated production-wrapper smoke에서 실제 tmux pane title과 cmux topology title의 initial/lifecycle 갱신을 검증했다.
+표시 정보는 sanitized agent name, depth와 run ID prefix로 제한한다. base title은 printable ASCII이고, 동적 lifecycle suffix는 ` · `를 포함할 수 있지만 control character 없이 전체 title은 96자로 제한한다. task, prompt, secret 또는 긴 경로는 title에 넣지 않는다. `details`는 raw title을 공개하지 않고 managed title과 `matching|changed|unavailable` 상태만 보여 준다. gated production-wrapper smoke는 `queued`를 먼저 정확히 관측한 뒤 lifecycle title로 진행하도록 갱신됐지만, 현재 title 형식의 live cmux/tmux 재실행 통과를 여기서 주장하지 않는다.
 
 #### `/subagents doctor` integration health 진단 (구현됨)
 
@@ -372,7 +375,7 @@ foreground/background callback과 interactive session drain에서 얻은 public 
 - public v1 dashboard/aggregate/detached contract 밖의 lifecycle event 또는 `pi-cmux:surface-ready` 같은 신규 외부 event
 - Pi core 또는 cmux 자체 수정
 
-parent 집계 알림은 Pi TUI notification으로 표시되고, versioned `pi-subagent:aggregate-completed:v1` event는 외부 선택 consumer에게 publish된다. `pi-subagent`는 aggregate event를 cmux CLI로 전달하지 않으며, external consumer failure가 agent 결과나 lifecycle authority를 바꾸지 않는다. 이는 `pi-cmux` notification renderer나 sidebar internal module을 재사용하는 것이 아니고, public v1 contract 밖의 event도 추가하지 않는다.
+Pi TUI terminal toast는 `failed` invocation에만 warning으로 표시한다. `completed`와 `cancelled`는 footer·tool result로 확인하며 별도 toast를 만들지 않는다. background job의 result/error delivery는 기존처럼 Pi `steer`로 유지된다. versioned `pi-subagent:aggregate-completed:v1` event는 외부 선택 consumer에게 publish되지만, `pi-subagent`는 이를 cmux CLI로 전달하지 않으며 external consumer failure가 agent 결과나 lifecycle authority를 바꾸지 않는다. 이는 `pi-cmux` notification renderer나 sidebar internal module을 재사용하는 것이 아니고, public v1 contract 밖의 event도 추가하지 않는다.
 
 다음 일반 기능은 이미 `pi-cmux`가 제공하므로 `pi-subagent`에서 중복 구현하지 않는다.
 

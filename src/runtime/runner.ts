@@ -363,6 +363,26 @@ export const SUBAGENT_MANAGED_CHILD_POLICY_ENV = "PI_SUBAGENT_CMUX_CHILD_POLICY"
 export const SUBAGENT_MANAGED_TITLE_ENV = "PI_SUBAGENT_MANAGED_TITLE";
 export type ManagedChildPolicy = "inherit" | "managed";
 
+const INTERACTIVE_TITLE_MAX_LENGTH = 96;
+const INTERACTIVE_TITLE_LIFECYCLE_STATES = ["queued", "ready", "running", "waiting", "returning", "failed"] as const;
+type InteractiveTitleLifecycleState = typeof INTERACTIVE_TITLE_LIFECYCLE_STATES[number];
+const INTERACTIVE_TITLE_MAX_SUFFIX_LENGTH = Math.max(...INTERACTIVE_TITLE_LIFECYCLE_STATES.map((state) => ` · ${state}`.length));
+const INTERACTIVE_TITLE_MAX_BASE_LENGTH = INTERACTIVE_TITLE_MAX_LENGTH - INTERACTIVE_TITLE_MAX_SUFFIX_LENGTH;
+
+function normalizeInteractiveTitleBase(value: unknown): string {
+  const safe = String(value ?? "").replace(/[^\x20-\x7e]/g, " ").replace(/\s+/g, " ").trim() || "unknown";
+  return safe.slice(0, INTERACTIVE_TITLE_MAX_BASE_LENGTH).trimEnd() || "unknown";
+}
+
+function formatInteractiveTitle(base: string, state: InteractiveTitleLifecycleState): string {
+  return `${normalizeInteractiveTitleBase(base)} · ${state}`;
+}
+
+function isInteractiveTitleMatchingBase(title: string, base: string): boolean {
+  const normalizedBase = normalizeInteractiveTitleBase(base);
+  return INTERACTIVE_TITLE_LIFECYCLE_STATES.some((state) => title === formatInteractiveTitle(normalizedBase, state));
+}
+
 const CHILD_CMUX_PROFILE_ENV = Object.freeze({
   PI_CMUX_PROFILE: "subagent-child-v1",
   PI_CMUX_NOTIFY_LEVEL: "disabled",
@@ -885,7 +905,7 @@ export async function inspectInteractiveRunForUx(runId: string): Promise<(Intera
   const run = activeInteractiveRuns.get(runId);
   if (!run) return null;
   const pane = await run.backend.inspect(run.handle).catch(() => undefined);
-  const titleState = !pane?.title ? "unavailable" : pane.title === run.surfaceTitle ? "matching" : "changed";
+  const titleState = !pane?.title ? "unavailable" : isInteractiveTitleMatchingBase(pane.title, run.surfaceTitle) ? "matching" : "changed";
   return Object.freeze({ ...interactiveSnapshot(run), ...(pane ? { exists: pane.exists, ...(pane.exited === undefined ? {} : { exited: pane.exited }) } : {}), title: run.surfaceTitle, titleState, focusSupported: run.focusSupported, promoteSupported: Boolean(run.paths) });
 }
 
@@ -1241,7 +1261,7 @@ export function registerCommittedInteractiveRun(
   Object.assign(active, {
     runId: run.runId, backend: run.backend, handle: run.handle, ...(run.paths ? { paths: run.paths } : {}),
     agent: sanitizeInteractivePreview(run.agent, 96) ?? "unknown", depth: Number.isSafeInteger(run.depth) && (run.depth ?? -1) >= 0 ? run.depth! : 0,
-    surfaceTitle: sanitizeInteractivePreview(`subagent:${run.agent ?? "unknown"}:${run.runId.slice(0, 8)}`, 96) ?? "subagent",
+    surfaceTitle: buildChildRuntimeTitle(run.agent ?? "unknown", run.runId, run.depth),
     focusSupported: run.focusSupported ?? typeof run.backend.focus === "function", generation: run.generation,
     completionMode: run.completionMode ?? "one-shot", ownership: "managed", startedAt: now, updatedAt: now, operation: Promise.resolve(),
     ...(run.treePermitLease ? { treePermitLease: run.treePermitLease } : {}),
@@ -3464,11 +3484,13 @@ export async function prepareInheritedApiKeyAgentDir(
   }
 }
 
-function buildChildRuntimeTitle(agentName: string, runId: string | undefined): string {
+function buildChildRuntimeTitle(agentName: string, runId: string | undefined, childDepth = 0): string {
   const runPrefix = (runId ?? "inline").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8) || "run";
-  const suffix = `:${runPrefix}`;
-  const agent = String(agentName).replace(/[^\x20-\x7e]/g, " ").replace(/\s+/g, " ").trim() || "unknown";
-  return `subagent:${agent.slice(0, 96 - "subagent:".length - suffix.length).trimEnd() || "unknown"}${suffix}`;
+  const depth = Number.isSafeInteger(childDepth) && childDepth >= 0 ? childDepth : 0;
+  const suffix = ` [depth=${depth};run=${runPrefix}]`;
+  const agent = normalizeInteractiveTitleBase(agentName);
+  const maxAgentLength = Math.max(1, INTERACTIVE_TITLE_MAX_BASE_LENGTH - suffix.length);
+  return `${agent.slice(0, maxAgentLength).trimEnd() || "unknown"}${suffix}`;
 }
 
 export function buildChildProcessEnv(opts: {
@@ -3561,7 +3583,7 @@ export function buildChildProcessEnv(opts: {
   Object.assign(env, opts.runProtocolEnv ?? {}, opts.phase0LiveProofEnv ?? {}, opts.treePermitEnv ?? {});
   // Only an explicit, validated run value crosses the child boundary.
   env[SUBAGENT_COMPLETION_MODE_ENV] = opts.completionMode === "handoff" ? "handoff" : "one-shot";
-  env[SUBAGENT_MANAGED_TITLE_ENV] = buildChildRuntimeTitle(opts.agentName, opts.runProtocolEnv?.[SUBAGENT_RUN_ID_ENV]);
+  env[SUBAGENT_MANAGED_TITLE_ENV] = buildChildRuntimeTitle(opts.agentName, opts.runProtocolEnv?.[SUBAGENT_RUN_ID_ENV], opts.parentDepth + 1);
   // Parent pi-cmux policy is not a child bootstrap authority. Remove every
   // inherited PI_CMUX_* value, then add only the reviewed child profile when
   // pi-cmux itself is inherited. Managed children do not load pi-cmux.
@@ -5011,6 +5033,10 @@ export function buildInteractivePaneWrapperScript(options: {
       .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
       .map(([key, value]) => `export ${key}=${shellQuote(value)}`),
     `cd ${shellQuote(options.effectiveCwd)} || exit 1`,
+    // The wrapper owns only the pre-Pi queued state. Emit it after the
+    // effective private environment and cwd are installed, but before a tree
+    // permit can stop this process; child-bridge owns later lifecycle states.
+    ...(options.surfaceTitle ? [`printf '\\033]2;%s\\007' ${shellQuote(formatInteractiveTitle(options.surfaceTitle, "queued"))}`] : []),
     ...(options.treePermitBootstrapPath ? [
       "umask 077",
       `_pi_permit_tmp=${shellQuote(`${options.treePermitBootstrapPath}.tmp`)}.$$`,
@@ -5023,7 +5049,6 @@ export function buildInteractivePaneWrapperScript(options: {
       `/bin/rm -f ${shellQuote(options.treePermitBootstrapPath)}`,
       "unset _pi_permit_tmp _pi_permit_watchdog",
     ] : []),
-    ...(options.surfaceTitle ? [`printf '\\033]2;%s\\007' ${shellQuote(sanitizeInteractivePreview(options.surfaceTitle, 96) ?? "subagent")}`] : []),
     buildShellCommand(options.childCommand),
     "",
   ].join("\n");
@@ -5665,7 +5690,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         effectiveCwd, childCommand: [command, ...prefixArgs, ...piArgs], exportedEnv: {}, secretEnvPath: runPaths.secretEnvPath,
         wrapperStatusPath: runPaths.wrapperStatusPath,
         cleanupDirs: inheritedApiKeyAgentDir ? [inheritedApiKeyAgentDir] : undefined,
-        surfaceTitle: `subagent:${result.agent}:${runId.slice(0, 8)}`,
+        surfaceTitle: childEnv[SUBAGENT_MANAGED_TITLE_ENV],
         treePermitBootstrapPath: options.treePermitLease ? path.join(runPaths.runDir, "tree-permit-bootstrap.json") : undefined,
       }));
       if (!canStartInteractiveRun(options.interactiveShutdownGeneration)) {

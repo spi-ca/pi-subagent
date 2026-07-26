@@ -2,16 +2,16 @@
 
 > **상태:** generic presence producer 구현됨
 
-root `pi-subagent`는 process-local `pi.events`에 `pi-presence:update:v1`을 발행하고, `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비할 수 있다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
+root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`을 발행하는 **producer**를 구현했고, `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비하는 별도 package다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
 
-`pi-cmux-presence`는 별도 패키지이며, surface별 sidebar·log·사용자 command를 제공하는 [`pi-cmux`](./pi-cmux-integration.md)와도 다르다. 이 문서는 `pi-subagent`가 복제해 구현한 wire DTO와 producer 경계를 설명한다. presence consumer의 canonical 입력 계약은 `pi-cmux-presence` 저장소의 `docs/event-contract.md`가 소유한다.
+`pi-cmux-presence`는 surface별 sidebar·log·사용자 command를 제공하는 [`pi-cmux`](./pi-cmux-integration.md)와도 다르며, 두 optional package는 함께 설치·로드될 수 있다. `pi-cmux`는 generic presence event consumer가 아니고, 어느 package도 다른 쪽의 설치 조건, lifecycle authority 또는 내부 API가 아니다. 이 문서는 `pi-subagent`가 복제해 구현한 wire DTO와 producer 경계를 설명한다. presence consumer의 canonical 입력 계약은 별도 `pi-cmux-presence` 저장소의 `docs/event-contract.md`가 소유한다.
 
 ## 1. 역할과 경계
 
 | 구성 요소 | 역할 | 현재 경계 |
 | --- | --- | --- |
 | `pi-subagent` root parent | subagent 실행 상태를 generic presence update로 투영하는 producer | root depth `0` session에서만 발행한다. `pi-cmux-presence`를 import하거나 의존하지 않는다. |
-| `pi-cmux-presence` | update를 검증해 cmux 상태 UI로 반영할 수 있는 선택 consumer | consumer/UI일 뿐이며 `pi-subagent` 실행에 필요하지 않다. |
+| `pi-cmux-presence` | update를 검증해 cmux 상태 UI로 반영할 수 있는 선택 consumer | consumer/UI일 뿐이며 `pi-subagent` 실행에 필요하지 않고 `pi-cmux`와도 강결합하지 않는다. |
 | `pi-subagent` dashboard publisher | 기존 dashboard/aggregate/detached public event | presence와 별개 contract다. 자동 변환하지 않는다. |
 | `pi-cmux` | 별도 surface UX extension | presence consumer의 소유자나 설치 조건이 아니다. |
 
@@ -50,8 +50,8 @@ presence producer는 root parent(depth `0`)의 `session_start`에서 session ID�
 - `active`는 invocation의 `running`/`cancelling` 수와 scheduler active 수 중 큰 값에 active interactive run 수를 더한다. scheduler 작업을 이중 합산하지 않는다.
 - `queued`는 scheduler queue 수다.
 - `completed`/`failed`/`cancelled`는 session 안에서 처음 본 terminal invocation ID만 누적한다. UX recent history가 pruning되어도 계속 유지한다. ID 기억은 4,096개, 각 presence count는 1,000,000으로 상한을 둔다. ID 기억이 포화되면 재전송으로 과대계산하지 않도록 새 terminal count를 동결한다.
-- active 또는 queued가 있으면 state는 `running`이다. 그렇지 않으면 가장 최근 terminal outcome에 따라 `success`/`error`/`cancelled`, terminal이 없으면 `idle`이다.
-- 새 terminal update만 `completed → success`, `failed → error`, `cancelled → info` attention을 낸다. 그 밖의 정상 update와 모든 replay는 `none`이다.
+- `active > 0`이면 state는 `running`이다. `active === 0`이고 `queued > 0`인 **queued-only** 상태는 `waiting`이다. 둘 다 없으면 가장 최근 terminal outcome에 따라 `success`/`error`/`cancelled`, terminal이 없으면 `idle`이다.
+- attention은 새 **background** terminal에만 붙는다. background `failed → error`, background `completed → success`; background `cancelled`은 `none`이다. foreground terminal은 성공·실패·취소 모두 `none`이고, 그 밖의 정상 update와 모든 replay도 `none`이다.
 
 progress는 추측한 작업량이 아니라 structured tool details와 invocation의 알려진 work count에서만 얻는다. 단일 호출은 active 동안 `0/1`을 내고 terminal update에서는 progress를 생략하며, 병렬 호출은 `details.results` 길이를 total로, `exitCode !== -1` result 수를 completed로 사용한다. 체인은 `chainStageCount`를 total로, `chainCompletedCount`·`chainSkippedCount`·`chainFailedCount`·`chainCompletedWithErrorsCount` 합계를 completed로 사용하며 total을 넘지 않게 제한한다. 여러 active invocation의 determinate progress는 합산해 `Subagents completed/total`로 표시한다.
 
@@ -63,9 +63,19 @@ presence는 observer 출력이다. update/ready listener, consumer socket 또는
 
 기존 `pi-subagent:dashboard:v1`, `pi-subagent:aggregate-completed:v1`, `pi-subagent:detached:v1`은 계속 독립 contract다. dashboard/aggregate/detached를 presence update로 변환하지 않고, detached promotion을 terminal completion으로 취급하지 않는다. 이 채널은 동일한 dashboard publisher의 shared session/generation/sequence fence를 유지한다. presence는 producer-own session/generation/sequence fence를 사용한다.
 
-## 6. 검증 범위
+## 6. 별도 consumer 작업 범위
 
-`pi-subagent`에서 다음 focused test는 strict update/ready parsing, session/generation fence, attention 없는 replay, passive consumer hint, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
+여기까지는 이 repository의 `pi-subagent` producer 구현과 검증 범위다. 다음 consumer 정책은 구현됐다고 주장하지 않으며, 별도의 `pi-cmux-presence` 작업 세션에서 consumer가 소유해야 한다.
+
+- transport queue coalescing과 구분되는 semantic terminal burst 집계 및 subagent 완료를 parent Pi의 ready-to-review 시점과 병합하는 정책
+- 현재 attention별 즉시 notification/flash를 `error` 우선, 성공 저소음 같은 severity 정책으로 조정하는 configuration
+- 사용자가 해당 surface에 focus한 경우의 성공 표시 억제와 focus를 확인할 수 없을 때의 보수적 fallback
+
+이 consumer 작업은 `pi-subagent`의 event DTO·producer lifecycle·result collection·cleanup authority를 바꾸지 않아야 한다.
+
+## 7. 검증 범위
+
+`pi-subagent`에서 다음 focused test는 strict update/ready parsing, session/generation fence, attention 없는 replay, queued-only `waiting`, background-only attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts

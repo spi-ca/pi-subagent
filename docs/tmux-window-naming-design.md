@@ -7,7 +7,7 @@
 `tmux-pane`의 `auto` 배치가 만드는 child window를 목록에서 빠르게 구분하되, 실행 중인 Pi의 상태는 pane/Pi title에서만 동적으로 보여 준다.
 
 - tmux **window 이름**은 child 수명 동안 안정적인 짧은 식별자여야 한다.
-- Pi **pane title**은 `ready`, `running`, `waiting`, `returning`, `failed` 같은 lifecycle 상태를 반영할 수 있어야 한다.
+- Pi **pane title**은 `queued`, `ready`, `running`, `waiting`, `returning`, `failed` lifecycle 상태를 반영할 수 있어야 한다.
 - task, prompt, cwd, 경로, 결과, credential은 어느 이름에도 포함하지 않는다.
 - 이름은 UX/진단 정보일 뿐 allocation, completion, ownership, cleanup authority가 아니다.
 
@@ -17,19 +17,19 @@
 
 ### 2.1 cmux/tmux의 공통 managed title
 
-`src/runtime/runner.ts`의 `buildChildRuntimeTitle()`은 agent 이름과 run ID 앞 8자를 조합해 `PI_SUBAGENT_MANAGED_TITLE`에 넣는다. interactive wrapper는 같은 파일의 `buildInteractivePaneWrapperScript()`에서 OSC 2로 초기 title을 설정한다.
+`src/runtime/runner.ts`의 `buildChildRuntimeTitle()`은 agent 이름, child depth와 run ID 앞 8자를 조합해 `PI_SUBAGENT_MANAGED_TITLE`에 넣는다. interactive wrapper는 effective environment와 cwd를 설치한 뒤 tree permit `STOP` 전에 OSC 2로 초기 queued title을 설정한다.
 
 ```text
-subagent:<agent>:<run-prefix>
+<agent> [depth=<n>;run=<run-prefix>] · queued
 ```
 
-`src/runtime/child-bridge.ts`는 `resolveRuntimeTitle()`로 이 환경 변수를 printable ASCII 1–96자로 다시 검증한다. UI가 있을 때 `session_start`, `agent_start`, `agent_end`, terminal 처리에서 Pi `ctx.ui.setTitle()`을 호출하며 다음 suffix를 붙인다.
+`src/runtime/child-bridge.ts`는 suffix 공간을 예약한 printable-ASCII base를 다시 검증한다. UI가 있을 때 Pi `ctx.ui.setTitle()`을 호출하며 다음 suffix를 붙인다.
 
 ```text
  · ready | running | waiting | returning | failed
 ```
 
-따라서 현재 child Pi pane title은 lifecycle에 따라 변할 수 있다. `src/runtime/runner.ts`의 active interactive registry는 별도로 `surfaceTitle`을 만들고, `inspectInteractiveRunForUx()`에서 observed title과 정확히 비교해 `matching`, `changed`, `unavailable`을 계산한다. 이 expected value와 bridge가 쓰는 suffix title은 동일한 lifecycle contract로 모델링되어 있지 않다.
+따라서 현재 child Pi pane title은 lifecycle에 따라 변할 수 있다. `src/runtime/runner.ts`의 active interactive registry는 같은 base를 보존하고, `inspectInteractiveRunForUx()`은 `queued`, `ready`, `running`, `waiting`, `returning`, `failed` 중 정확한 suffix가 붙은 observed title만 `matching`으로 계산한다. bare base나 다른 suffix는 `changed`, 조회 실패나 빈 title은 `unavailable`이다.
 
 ### 2.2 tmux `auto` window 이름
 
@@ -128,7 +128,7 @@ runner inspection + index.ts /subagents
 - base label helper를 호출해 `PI_SUBAGENT_MANAGED_TITLE`, wrapper `surfaceTitle`, active registry의 expected base title을 같은 값으로 만든다.
 - layout-aware tmux intent에 canonical `windowLabel`을 넣는다. 이 필드는 run identity나 allocation authority를 대체하지 않는 diagnostic field지만 loose optional field로 다루지 않는다. 현재 production runner는 항상 기록하고 broker는 canonical 형식을 strict하게 검증해야 한다.
 - 이전 label-less artifact의 reaper/진단 호환성을 유지할 별도 legacy parser branch를 둔다. 새 production launch가 label 누락을 `subagent:broker`로 fallback하는 것은 허용하지 않는다.
-- `inspectInteractiveRunForUx()`은 observed title이 base label 또는 base label + 허용 lifecycle suffix인 경우 managed title로 인식하도록 변경한다. 다른 title은 현재처럼 `changed`, 조회 실패/빈 title은 `unavailable`로 둔다.
+- `inspectInteractiveRunForUx()`은 observed title이 base label + 허용 lifecycle suffix인 경우에만 managed title로 인식한다. bare base와 다른 title은 `changed`, 조회 실패/빈 title은 `unavailable`로 둔다.
 
 ### 5.2 `src/runtime/run-protocol.ts`와 `src/runtime/tmux-control-protocol.ts`
 
@@ -193,7 +193,7 @@ user가 이후 이름을 바꾸면 runner/bridge가 원래 window label을 복�
   - 가장 긴 lifecycle suffix에서도 전체 run prefix와 96자 bound가 함께 보존됨
 - `test/runtime/child-bridge.test.ts`
   - canonical base label만 acceptance
-  - `ready → running → waiting → returning/failed` suffix와 96자 bound
+  - `queued → ready → running → waiting → returning/failed` suffix와 96자 bound
   - UI 부재 및 invalid title은 fail-soft
 - `test/runtime/runner-interactive.test.ts`
   - active registry의 expected base title과 suffix-aware `matching|changed|unavailable`

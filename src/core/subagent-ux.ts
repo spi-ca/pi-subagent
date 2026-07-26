@@ -124,6 +124,21 @@ function freezeSnapshot(record: MutableSubagentUxRecord): SubagentUxSnapshot {
   return Object.freeze(snapshot);
 }
 
+const STATUS_PRESENTATION: Readonly<Record<SubagentUxStatus, { readonly icon: string; readonly label: string; readonly attention: number }>> = Object.freeze({
+  failed: { icon: "✕", label: "failed", attention: 0 },
+  cancelling: { icon: "◌", label: "cancelling", attention: 1 },
+  running: { icon: "●", label: "running", attention: 2 },
+  completed: { icon: "✓", label: "completed", attention: 3 },
+  cancelled: { icon: "–", label: "cancelled", attention: 4 },
+});
+
+/** Presentation-only attention order; lifecycle state remains authoritative elsewhere. */
+function compareAttentionFirst(left: Pick<SubagentUxSnapshot, "id" | "status" | "startedAt">, right: Pick<SubagentUxSnapshot, "id" | "status" | "startedAt">): number {
+  return STATUS_PRESENTATION[left.status].attention - STATUS_PRESENTATION[right.status].attention
+    || left.startedAt - right.startedAt
+    || left.id.localeCompare(right.id);
+}
+
 function compareOldestFirst(left: MutableSubagentUxRecord, right: MutableSubagentUxRecord): number {
   return left.startedAt - right.startedAt || left.id.localeCompare(right.id);
 }
@@ -208,9 +223,9 @@ export class SubagentUxRegistry {
 
   list(): readonly SubagentUxSnapshot[] {
     return Object.freeze([
-      ...Array.from(this.active.values()).sort(compareOldestFirst).map(freezeSnapshot),
-      ...Array.from(this.recent.values()).sort(compareNewestFirst).map(freezeSnapshot),
-    ]);
+      ...Array.from(this.active.values()),
+      ...Array.from(this.recent.values()),
+    ].sort(compareAttentionFirst).map(freezeSnapshot));
   }
 
   snapshot(): SubagentUxRegistrySnapshot {
@@ -332,19 +347,35 @@ function validCommandId(id: string): boolean {
   return !UNSAFE_ID_CHARACTERS.test(id);
 }
 
-export function formatSubagentUxCompactStatus(job: SubagentUxSnapshot): string {
-  return `${displayId(job.id)} [${job.status}] ${job.kind} ${sanitizeSubagentAgentLabel(job.agent)}`;
+export function formatSubagentUxStatus(status: SubagentUxStatus): string {
+  const presentation = STATUS_PRESENTATION[status];
+  return `${presentation.icon} ${presentation.label}`;
 }
 
-export function formatSubagentUxFooter(snapshot: SubagentUxRegistrySnapshot): string | undefined {
-  const running = snapshot.active.filter((job) => job.status === "running" || job.status === "cancelling").length;
-  const completed = snapshot.recent.filter((job) => job.status === "completed").length;
-  const failed = snapshot.recent.filter((job) => job.status === "failed" || job.status === "cancelled").length;
-  return running + completed + failed === 0 ? undefined : `subagents: ●${running} ✓${completed} ✕${failed}`;
+/** Success/cancellation are already visible through tool results, steer, and status. */
+export function subagentUxTerminalNotification(status: SubagentUxStatus): "warning" | null {
+  return status === "failed" ? "warning" : null;
+}
+
+export function formatSubagentUxCompactStatus(job: SubagentUxSnapshot): string {
+  return `${displayId(job.id)} [${formatSubagentUxStatus(job.status)}] ${job.kind} ${sanitizeSubagentAgentLabel(job.agent)}`;
+}
+
+/**
+ * `schedulerQueued` is the scheduler's aggregate queue count, not an
+ * invocation-specific position. It is deliberately passed at render time so
+ * the presentation registry never becomes lifecycle or scheduler authority.
+ */
+export function formatSubagentUxFooter(snapshot: SubagentUxRegistrySnapshot, schedulerQueued = 0): string | undefined {
+  if (!Number.isSafeInteger(schedulerQueued) || schedulerQueued < 0) throw new Error("Subagent UX schedulerQueued must be a non-negative safe integer.");
+  const jobs = [...snapshot.active, ...snapshot.recent];
+  const counts = (status: SubagentUxStatus) => jobs.filter((job) => job.status === status).length;
+  if (jobs.length === 0 && schedulerQueued === 0) return undefined;
+  return `subagents: ●${counts("running")} ◷${schedulerQueued} ◌${counts("cancelling")} ✓${counts("completed")} ✕${counts("failed")} –${counts("cancelled")}`;
 }
 
 export function formatSubagentUxList(jobs: Iterable<SubagentUxSnapshot>): string {
-  const entries = Array.from(jobs, (job) => {
+  const entries = Array.from(jobs).sort(compareAttentionFirst).map((job) => {
     const completed = job.completedAt === undefined ? "" : `, completed ${job.completedAt}`;
     return `- ${formatSubagentUxCompactStatus(job)}, started ${job.startedAt}${completed}`;
   });
@@ -354,7 +385,7 @@ export function formatSubagentUxList(jobs: Iterable<SubagentUxSnapshot>): string
 export function formatSubagentUxDetail(job: SubagentUxSnapshot): string {
   const lines = [
     `Subagent ${displayId(job.id)}`,
-    `- status: ${job.status}`,
+    `- status: ${formatSubagentUxStatus(job.status)}`,
     `- kind: ${job.kind}`,
     `- agent: ${sanitizeSubagentAgentLabel(job.agent)}`,
     `- startedAt: ${job.startedAt}`,

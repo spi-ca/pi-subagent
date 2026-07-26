@@ -352,7 +352,7 @@ describe("interactive pane runner preparation", () => {
 			exportedEnv: { [SUBAGENT_RUN_ID_ENV]: "run-id" },
 			wrapperStatusPath: "/tmp/run/wrapper-status",
 			cleanupDirs: ["/tmp/run/auth overlay"],
-			surfaceTitle: "subagent:worker:12345678",
+			surfaceTitle: "worker [depth=1;run=12345678]",
 		});
 		assert.match(script, /pi.*--session/);
 		assert.equal(script.includes("pane-renderer"), false);
@@ -363,7 +363,7 @@ describe("interactive pane runner preparation", () => {
 		assert.match(script, /unset NODE_OPTIONS NODE_PATH BUN_OPTIONS/);
 		assert.match(script, /trap finish_subagent_runtime EXIT/);
 		assert.match(script, /\/bin\/rm -rf '\/tmp\/run\/auth overlay'/);
-		assert.match(script, /printf '\\033\]2;%s\\007' 'subagent:worker:12345678'/);
+		assert.match(script, /printf '\\033\]2;%s\\007' 'worker \[depth=1;run=12345678\] · queued'/);
 	});
 
 	test("stops the interactive wrapper before Pi startup until tree permit continuation", async () => {
@@ -373,13 +373,16 @@ describe("interactive pane runner preparation", () => {
 			const gatePath = path.join(root, "tree-permit-bootstrap.json");
 			const markerPath = path.join(root, "child-ran");
 			const wrapperPath = path.join(root, "wrapper.sh");
-			await fs.promises.writeFile(wrapperPath, buildInteractivePaneWrapperScript({
+			const script = buildInteractivePaneWrapperScript({
 				effectiveCwd: root,
 				childCommand: ["/usr/bin/touch", markerPath],
 				exportedEnv: {},
 				wrapperStatusPath: path.join(root, "status"),
+				surfaceTitle: "worker [depth=1;run=permit]",
 				treePermitBootstrapPath: gatePath,
-			}), { mode: 0o700 });
+			});
+			assert.ok(script.indexOf("worker [depth=1;run=permit] · queued") < script.indexOf('command kill -STOP "$$"'));
+			await fs.promises.writeFile(wrapperPath, script, { mode: 0o700 });
 			const child = spawn("/bin/bash", [wrapperPath], { stdio: "ignore" });
 			for (let attempt = 0; attempt < 200 && !fs.existsSync(gatePath); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 			assert.equal(fs.existsSync(markerPath), false, "child command cannot run before permit bind");
@@ -795,15 +798,23 @@ describe("interactive pane runner preparation", () => {
 		await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`, { mode: 0o600 });
 		const childStartedAt = getCurrentProcessStartedAt(); assert.ok(childStartedAt);
 		await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 1, phase: "idle", updatedAt: Date.now(), childPid: process.pid, childStartedAt })}\n`, { mode: 0o600 });
-		let focused = 0; let released = 0; let pauseInspect = false; let inspectEntered!: () => void; let resumeInspect!: () => void;
+		let focused = 0; let released = 0; let pauseInspect = false; let paneTitle = "child"; let inspectEntered!: () => void; let resumeInspect!: () => void;
 		const inspectStarted = new Promise<void>((resolve) => { inspectEntered = resolve; });
 		const inspectResume = new Promise<void>((resolve) => { resumeInspect = resolve; });
-		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { if (pauseInspect) { inspectEntered(); await inspectResume; } return { exists: true, title: "child" }; }, interrupt: async () => true, close: async () => true, focus: async () => { focused += 1; return true; } };
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { if (pauseInspect) { inspectEntered(); await inspectResume; } return { exists: true, title: paneTitle }; }, interrupt: async () => true, close: async () => true, focus: async () => { focused += 1; return true; } };
 		try {
 			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, agent: "worker", depth: 2, completionMode: "handoff", generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
 			assert.equal(await focusInteractiveRun(runId), true); assert.equal(focused, 1);
 			const inspected = await inspectInteractiveRunForUx(runId);
-			assert.match(inspected?.title ?? "", /^subagent:worker:/); assert.equal(inspected?.titleState, "changed");
+			assert.equal(inspected?.title, "worker [depth=2;run=ux-promo]"); assert.equal(inspected?.titleState, "changed");
+			for (const state of ["queued", "ready", "running", "waiting", "returning", "failed"]) {
+				paneTitle = `${inspected!.title} · ${state}`;
+				assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "matching");
+			}
+			paneTitle = inspected!.title!;
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed", "a bare base is not a managed lifecycle title");
+			paneTitle = `${inspected!.title} · completed`;
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed", "only exact lifecycle suffixes match");
 			assert.equal(listInteractiveRunUxSnapshots()[0]?.depth, 2);
 			assert.equal(await keepInteractiveRun(runId), true);
 			assert.equal(await releaseRegisteredInteractiveRun(runId), false); assert.equal(released, 0);

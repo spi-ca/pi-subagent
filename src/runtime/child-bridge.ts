@@ -92,9 +92,16 @@ interface LastAssistantStatus {
 }
 
 const SUBAGENT_MANAGED_TITLE_ENV = "PI_SUBAGENT_MANAGED_TITLE";
+const RUNTIME_TITLE_LIFECYCLE_STATES = ["queued", "ready", "running", "waiting", "returning", "failed"] as const;
+type RuntimeTitleLifecycleState = typeof RUNTIME_TITLE_LIFECYCLE_STATES[number];
+const RUNTIME_TITLE_MAX_LENGTH = 96;
+const RUNTIME_TITLE_MAX_BASE_LENGTH = RUNTIME_TITLE_MAX_LENGTH
+	- Math.max(...RUNTIME_TITLE_LIFECYCLE_STATES.map((state) => ` · ${state}`.length));
 function resolveRuntimeTitle(env: NodeJS.ProcessEnv): string | null {
 	const title = env[SUBAGENT_MANAGED_TITLE_ENV];
-	return title && /^[\x20-\x7e]{1,96}$/.test(title) ? title : null;
+	// The wrapper and bridge must retain one exact base rather than independently
+	// truncating it for lifecycle suffixes.
+	return title && new RegExp(`^[\\x20-\\x7e]{1,${RUNTIME_TITLE_MAX_BASE_LENGTH}}$`).test(title) ? title : null;
 }
 
 type MessageEndRegistrar = (
@@ -441,10 +448,9 @@ export function registerChildBridge(
 		return;
 	}
 
-	const setRuntimeTitle = (ctx: ExtensionContext, state: "ready" | "running" | "waiting" | "returning" | "failed") => {
+	const setRuntimeTitle = (ctx: ExtensionContext, state: Exclude<RuntimeTitleLifecycleState, "queued">) => {
 		if (!runtimeTitle || !ctx.hasUI) return;
-		const suffix = ` · ${state}`;
-		ctx.ui.setTitle(`${runtimeTitle.slice(0, 96 - suffix.length).trimEnd()}${suffix}`);
+		ctx.ui.setTitle(`${runtimeTitle} · ${state}`);
 	};
 
 	let sequence = 0;

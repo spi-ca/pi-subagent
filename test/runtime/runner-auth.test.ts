@@ -265,14 +265,14 @@ describe("subagent auth propagation", () => {
     };
     assert.deepEqual(parentEnv, before);
     for (const [key, value] of Object.entries(profile)) assert.equal(inherited[key], value);
-    assert.match(inherited.PI_SUBAGENT_MANAGED_TITLE!, /^subagent:[\x20-\x7e]+$/);
-    assert.ok(inherited.PI_SUBAGENT_MANAGED_TITLE!.length <= 96);
+    assert.match(inherited.PI_SUBAGENT_MANAGED_TITLE!, /^worker -x+ \[depth=1;run=run-pref\]$/);
+    assert.ok(inherited.PI_SUBAGENT_MANAGED_TITLE!.length <= 84, "the base reserves room for every lifecycle suffix");
     assert.equal(inherited.PI_SUBAGENT_MANAGED_TITLE!.includes("\x1b"), false);
     assert.equal(inherited.PI_CMUX_UNRELATED, undefined);
 
     const privateEnvironment = buildPrivateChildEnvironmentScript(inherited);
     for (const [key, value] of Object.entries(profile)) assert.match(privateEnvironment, new RegExp(`^export ${key}='${value}'$`, "m"));
-    assert.match(privateEnvironment, /^export PI_SUBAGENT_MANAGED_TITLE='subagent:/m);
+    assert.match(privateEnvironment, /^export PI_SUBAGENT_MANAGED_TITLE='worker -x+ \[depth=1;run=run-pref\]'$/m);
     assert.equal(privateEnvironment.includes("PI_CMUX_UNRELATED="), false);
 
     const managed = buildChildProcessEnv({

@@ -7,6 +7,7 @@ import {
   formatSubagentUxFooter,
   formatSubagentUxList,
   parseSubagentsCommand,
+  subagentUxTerminalNotification,
 } from "../../src/core/subagent-ux";
 
 describe("SubagentUxRegistry", () => {
@@ -80,6 +81,34 @@ describe("SubagentUxRegistry", () => {
     assert.equal(registry.cancel("full-id-one").changed, false);
   });
 
+  test("orders attention-first while retaining authoritative snapshot status", () => {
+    let now = 0;
+    let id = 0;
+    const registry = new SubagentUxRegistry({ now: () => ++now, createId: () => `job-${++id}` });
+    const running = registry.start({ agent: "running", kind: "foreground" });
+    const cancelling = registry.start({ agent: "cancelling", kind: "foreground" });
+    registry.cancel(cancelling.id);
+    const completed = registry.start({ agent: "completed", kind: "background" });
+    registry.complete(completed.id);
+    const failed = registry.start({ agent: "failed", kind: "background" });
+    registry.fail(failed.id);
+    const cancelled = registry.start({ agent: "cancelled", kind: "background" });
+    registry.cancelled(cancelled.id);
+
+    assert.deepEqual(registry.list().map((job) => [job.id, job.status]), [
+      [failed.id, "failed"],
+      [cancelling.id, "cancelling"],
+      [running.id, "running"],
+      [completed.id, "completed"],
+      [cancelled.id, "cancelled"],
+    ]);
+    const list = formatSubagentUxList([cancelled, completed, running, cancelling, failed].map((job) => registry.get(job.id)!));
+    assert.ok(list.indexOf(failed.id) < list.indexOf(cancelling.id));
+    assert.ok(list.indexOf(cancelling.id) < list.indexOf(running.id));
+    assert.ok(list.indexOf(running.id) < list.indexOf(completed.id));
+    assert.ok(list.indexOf(completed.id) < list.indexOf(cancelled.id));
+  });
+
   test("bounds recent history, emits immutable observer state, and fences a reset generation", () => {
     let now = 0;
     let id = 0;
@@ -133,11 +162,20 @@ describe("subagents command and status formatting", () => {
     const detail = formatSubagentUxDetail(job);
 
     for (const text of [compact, list, detail]) assert.doesNotMatch(text, /\x1b|\r|[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
-    assert.match(compact, /job-1 \[running\] foreground agent/);
+    assert.match(compact, /job-1 \[● running\] foreground agent/);
     assert.match(list, /^- /);
     assert.match(detail, /^Subagent job-1/m);
+    assert.match(detail, /status: ● running/);
     assert.equal(formatSubagentUxList([]), "No subagents.");
-    assert.equal(formatSubagentUxFooter({ generation: 0, active: [job], recent: [] }), "subagents: ●1 ✓0 ✕0");
+    assert.equal(
+      formatSubagentUxFooter({ generation: 0, active: [job], recent: [] }, 3),
+      "subagents: ●1 ◷3 ◌0 ✓0 ✕0 –0",
+    );
     assert.equal(formatSubagentUxFooter({ generation: 0, active: [], recent: [] }), undefined);
+    assert.throws(() => formatSubagentUxFooter({ generation: 0, active: [], recent: [] }, -1), /schedulerQueued/);
+    assert.equal(subagentUxTerminalNotification("failed"), "warning");
+    for (const status of ["running", "cancelling", "completed", "cancelled"] as const) {
+      assert.equal(subagentUxTerminalNotification(status), null);
+    }
   });
 });

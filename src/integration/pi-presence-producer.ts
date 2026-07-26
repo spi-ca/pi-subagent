@@ -126,6 +126,11 @@ export interface PiSubagentPresenceProducerOptions {
 }
 
 type TerminalStatus = Extract<SubagentUxSnapshot["status"], "completed" | "failed" | "cancelled">;
+type TerminalSnapshot = SubagentUxSnapshot & { readonly status: TerminalStatus };
+interface NewTerminalObservation {
+  readonly state: TerminalStatus | null;
+  readonly attention: PresenceAttention;
+}
 
 /** Root-session, observer-only producer. It has no execution or cleanup authority. */
 export class PiSubagentPresenceProducer {
@@ -143,6 +148,7 @@ export class PiSubagentPresenceProducer {
   private lastTerminal: TerminalStatus | null = null;
   private unsubscribeReady: (() => void) | null = null;
   private cmuxStatusConsumerSeen = false;
+  private replaying = false;
 
   constructor(options: PiSubagentPresenceProducerOptions) {
     this.emit = options.emit;
@@ -163,6 +169,7 @@ export class PiSubagentPresenceProducer {
     this.terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
     this.lastTerminal = null;
     this.cmuxStatusConsumerSeen = false;
+    this.replaying = false;
     try { this.unsubscribeReady = this.on?.(PI_PRESENCE_READY_EVENT, (payload) => this.handleReady(payload)) ?? null; } catch { this.unsubscribeReady = null; }
     return true;
   }
@@ -173,6 +180,7 @@ export class PiSubagentPresenceProducer {
     this.sessionId = null;
     this.generation = null;
     this.current = null;
+    this.replaying = false;
     this.terminalIds.clear();
   }
 
@@ -181,8 +189,8 @@ export class PiSubagentPresenceProducer {
     const newTerminal = this.rememberTerminals(snapshot.recent);
     const event = this.makeUpdate(snapshot, newTerminal, false);
     if (!event) return false;
-    this.current = event;
-    this.emitSafely(event);
+    this.current = freezePresenceUpdate(event);
+    this.emitSafely(this.current);
     return true;
   }
 
@@ -194,14 +202,15 @@ export class PiSubagentPresenceProducer {
       this.cmuxStatusConsumerSeen = true;
       try { this.onCmuxStatusConsumer?.(); } catch { /* UI routing is non-authoritative. */ }
     }
-    if (!this.current) return;
-    const replay: PiPresenceUpdate = { ...this.current, sequence: this.nextSequence(), attention: "none" };
-    if (!parsePiPresenceUpdate(replay)) return;
-    this.current = replay;
-    this.emitSafely(replay);
+    if (!this.current || this.replaying) return;
+    const parsed = parsePiPresenceUpdate({ ...this.current, sequence: this.nextSequence(), attention: "none" });
+    if (!parsed) return;
+    this.current = freezePresenceUpdate(parsed);
+    this.replaying = true;
+    try { this.emitSafely(this.current); } finally { this.replaying = false; }
   }
 
-  private makeUpdate(snapshot: SubagentUxRegistrySnapshot, newTerminal: TerminalStatus | null, replay: boolean): PiPresenceUpdate | null {
+  private makeUpdate(snapshot: SubagentUxRegistrySnapshot, newTerminals: NewTerminalObservation, replay: boolean): PiPresenceUpdate | null {
     if (this.sessionId === null || this.generation === null) return null;
     const scheduler = this.schedulerCounts();
     const interactive = this.interactiveCount();
@@ -215,10 +224,9 @@ export class PiSubagentPresenceProducer {
     const determinate = snapshot.active.filter((item) => item.progress !== undefined);
     const progressTotal = determinate.reduce((total, item) => clamp(total + (item.progress?.total ?? 0)), 0);
     const progressCompleted = determinate.reduce((total, item) => clamp(total + (item.progress?.completed ?? 0)), 0);
-    const activity = active > 0 || queued > 0;
-    const terminal = newTerminal ?? this.lastTerminal;
-    const state: PresenceState = activity ? "running" : terminal === "failed" ? "error" : terminal === "completed" ? "success" : terminal === "cancelled" ? "cancelled" : "idle";
-    const attention: PresenceAttention = replay ? "none" : newTerminal === "failed" ? "error" : newTerminal === "completed" ? "success" : newTerminal === "cancelled" ? "info" : "none";
+    const terminal = newTerminals.state ?? this.lastTerminal;
+    const state: PresenceState = active > 0 ? "running" : queued > 0 ? "waiting" : terminal === "failed" ? "error" : terminal === "completed" ? "success" : terminal === "cancelled" ? "cancelled" : "idle";
+    const attention: PresenceAttention = replay ? "none" : newTerminals.attention;
     const event: PiPresenceUpdate = {
       version: 1, sessionId: this.sessionId, generation: this.generation, sequence: this.nextSequence(), source: PI_SUBAGENT_PRESENCE_SOURCE, state,
       counts: { active, completed, failed, queued, cancelled, total: clamp(active + queued + completed + failed + cancelled) },
@@ -228,18 +236,24 @@ export class PiSubagentPresenceProducer {
     return parsePiPresenceUpdate(event);
   }
 
-  private rememberTerminals(recent: readonly SubagentUxSnapshot[]): TerminalStatus | null {
-    let newest: TerminalStatus | null = null;
+  private rememberTerminals(recent: readonly SubagentUxSnapshot[]): NewTerminalObservation {
+    let newest: TerminalSnapshot | null = null;
+    let attention: PresenceAttention = "none";
     for (const item of recent) {
-      if (item.status !== "completed" && item.status !== "failed" && item.status !== "cancelled" || this.terminalIds.has(item.id)) continue;
+      if (!isTerminalSnapshot(item) || this.terminalIds.has(item.id)) continue;
       // Once identifier memory saturates, freeze counts rather than risking replay overcount.
       if (this.terminalIds.size >= MAX_REMEMBERED_TERMINALS) continue;
       this.terminalIds.add(item.id);
       if (this.terminalCounts[item.status] < MAX_PRESENCE_COUNT) this.terminalCounts[item.status] += 1;
-      newest = item.status;
+      if (!newest || isNewerTerminal(item, newest)) newest = item;
+      if (item.kind === "background") {
+        if (item.status === "failed") attention = "error";
+        else if (item.status === "completed" && attention !== "error") attention = "success";
+      }
     }
-    if (newest) this.lastTerminal = newest;
-    return newest;
+    const state = newest?.status ?? null;
+    if (state) this.lastTerminal = state;
+    return { state, attention };
   }
 
   private schedulerCounts(): { active: number; queued: number } {
@@ -250,6 +264,23 @@ export class PiSubagentPresenceProducer {
   private emitSafely(event: PiPresenceUpdate): void { try { this.emit(PI_PRESENCE_UPDATE_EVENT, event); } catch { /* Event observers are never lifecycle authority. */ } }
 }
 
+function isTerminalSnapshot(item: SubagentUxSnapshot): item is TerminalSnapshot {
+  return item.status === "completed" || item.status === "failed" || item.status === "cancelled";
+}
+function isNewerTerminal(candidate: TerminalSnapshot, current: TerminalSnapshot): boolean {
+  const candidateAt = candidate.completedAt ?? candidate.updatedAt;
+  const currentAt = current.completedAt ?? current.updatedAt;
+  return candidateAt > currentAt || candidateAt === currentAt && candidate.id > current.id;
+}
+function freezePresenceUpdate(event: PiPresenceUpdate): PiPresenceUpdate {
+  return Object.freeze({
+    ...event,
+    source: Object.freeze({ ...event.source }),
+    counts: Object.freeze({ ...event.counts }),
+    ...(event.progress ? { progress: Object.freeze({ ...event.progress }) } : {}),
+    ...(event.usage ? { usage: Object.freeze({ ...event.usage }) } : {}),
+  });
+}
 function generationNumber(value: unknown): value is number { return generation(value); }
 function safeCount(value: unknown): number { return count(value) ? value : 0; }
 function clamp(value: number): number { return Number.isSafeInteger(value) && value > 0 ? Math.min(value, MAX_PRESENCE_COUNT) : 0; }

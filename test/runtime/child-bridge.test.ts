@@ -369,7 +369,7 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("updates the UI title through child lifecycle transitions without accepting malformed titles", async () => {
-		const title = "subagent:worker:run-title";
+		const title = "worker [depth=1;run=runtitle]";
 		const completed = await setupBridge("run-title-completed", { title, hasUI: true });
 		await completed.emit("session_start");
 		await completed.emit("agent_start");
@@ -394,6 +394,10 @@ describe("child lifecycle bridge", () => {
 		const malformed = await setupBridge("run-title-malformed", { title: `${title}\x1b`, hasUI: true });
 		await malformed.emit("session_start");
 		assert.deepEqual(malformed.titles, []);
+
+		const noSuffixRoom = await setupBridge("run-title-too-long", { title: "x".repeat(85), hasUI: true });
+		await noSuffixRoom.emit("session_start");
+		assert.deepEqual(noSuffixRoom.titles, []);
 	});
 
 	test("keeps handoff turns idle until an explicit return command publishes V3 completion", async () => {

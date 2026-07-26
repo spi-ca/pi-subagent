@@ -1,8 +1,8 @@
 # 다중 subagent interactive pane layout 설계
 
-> 상태: 구현 완료. `auto`는 기본 정책이며 strict V2 layout schema, backend primitive, detached broker, process-global coordinator, runner/config propagation, nested self-extension bootstrap과 테스트가 완료됐다. 2026-07-20 cmux와 tmux `auto` live layout smoke는 모두 **PASS**했다. tmux 증거는 제한된 3 top-level + parent/2 nested scenario이며, 기존 tmux crash/reaper acceptance **PASS**는 이 layout 검증과 별개다.
->
-> 이 문서는 여러 interactive subagent가 동시에 실행될 때 parent Pi의 화면이 반복 split으로 지나치게 좁아지는 문제를 해결하기 위한 구현 기준이다. 실행 protocol, completion, lease와 reaper 자체는 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 따르고, `pi-cmux`와의 역할 분리는 [`pi-subagent`와 `pi-cmux` 연동 가이드](./pi-cmux-integration.md)를 따른다.
+> **상태:** 구현 완료. `auto`는 기본 정책이며 strict V2 layout schema, backend primitive, detached broker, process-global coordinator, runner/config propagation, nested self-extension bootstrap과 테스트가 완료됐다. 2026-07-20 cmux와 tmux `auto` live layout smoke는 모두 **PASS**했다. tmux 증거는 제한된 3 top-level + parent/2 nested scenario이며, 기존 tmux crash/reaper acceptance **PASS**는 이 layout 검증과 별개다.
+
+이 문서는 여러 interactive subagent가 동시에 실행될 때 parent Pi의 화면이 반복 split으로 지나치게 좁아지는 문제를 해결하기 위한 구현 기준이다. 실행 protocol, completion, lease와 reaper 자체는 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 따르고, `pi-cmux`와의 역할 분리는 [`pi-subagent`와 `pi-cmux` 연동 가이드](./pi-cmux-integration.md)를 따른다.
 
 ## 1. 결정 요약
 

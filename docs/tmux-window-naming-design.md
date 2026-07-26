@@ -1,6 +1,6 @@
 # tmux window 이름과 Pi pane title 정책 제안
 
-> 상태: **제안 — 미구현.** 이 문서는 현재 runtime을 근거로 한 설계/구현 계획이다. 아래 정책, 코드 변경, 테스트, live 검증은 아직 완료되었다고 주장하지 않는다.
+> **상태:** 제안 — 미구현. 이 문서는 현재 runtime을 근거로 한 설계/구현 계획이다. 아래 정책, 코드 변경, 테스트, live 검증은 아직 완료되었다고 주장하지 않는다. 2026-07-26 기준 `src/runtime/pane-launch-broker.mjs`는 여전히 고정 `-n subagent:broker` label을 사용하고, `src/runtime/tmux.ts`의 `buildTmuxDiagnosticTitle()`/`buildTmuxNewWindowArgs()`와 `src/runtime/runner.ts`의 `buildChildRuntimeTitle()`은 서로 다른 sanitization 규칙을 가진 별도 helper로 남아 있으며, `windowLabel` field는 `src/runtime/run-protocol.ts`/`src/runtime/tmux-control-protocol.ts`의 launch intent에 존재하지 않는다. 아래 §2는 이 미구현 상태의 근거를 기술하고, §3 이후는 여전히 제안이다.
 
 ## 1. 목표
 

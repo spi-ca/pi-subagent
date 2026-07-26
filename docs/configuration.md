@@ -44,7 +44,7 @@ CLI > 환경 변수 > 신뢰된 프로젝트 파일 > 전역 파일 > 내장 기
 
 파일이 없으면 warning 없이 건너뜁니다. 파일에 없는 키는 다음 낮은 우선순위로 내려갑니다. 읽을 수 없거나 안전하지 않은 파일, malformed JSON, JSON object가 아닌 루트, 알 수 없는 키, 또는 잘못된 값은 warning을 내고 해당 파일 또는 키를 무시해 낮은 우선순위를 사용합니다. 파일은 최대 65536바이트의 regular file이어야 하고 final symlink를 허용하지 않으며, open 전후 file identity가 달라지면 거부합니다. 신뢰된 프로젝트 설정은 `.pi`를 canonicalize한 뒤 canonical `ctx.cwd` 안에 남아 있어야 하므로 프로젝트 밖을 가리키는 symlink `.pi`는 읽지 않습니다.
 
-`pi-subagent.schema.json`은 패키지 루트의 JSON Schema이며 배포 파일에 포함됩니다. 선택적인 문자열 `$schema` 키는 에디터가 이 로컬 schema 파일을 연결하는 데 쓸 수 있지만, 확장은 이를 해석하거나 schema URL을 요청하지 않습니다. 전체 JSON 예시와 키별 0 의미는 [README의 `pi-subagent.json` 설정](../README.md#pi-subagentjson-설정)을 참고하세요.
+`pi-subagent.schema.json`은 패키지 루트의 JSON Schema이며 배포 파일에 포함됩니다. 선택적인 문자열 `$schema` 키는 에디터가 이 로컬 schema 파일을 연결하는 데 쓸 수 있지만, 확장은 이를 해석하거나 schema URL을 요청하지 않습니다. 전체 JSON 예시와 키별 0 의미는 [호출 및 백그라운드 한계](#호출-및-백그라운드-한계)를 참고하세요.
 
 구성 파일은 `session_start`에서 읽으므로 `/reload`, 새 세션, `/resume`, `/fork`에서 다시 적용됩니다. 이 갱신은 현재 Pi process의 process-local scheduler에 적용됩니다. Linux/macOS에서 이미 생성·adopt한 durable tree permit authority의 `maxActive`는 root Pi process 수명 동안 고정되므로, 같은 tree의 nested child는 reload 뒤에도 authority가 정한 cap을 채택합니다. Linux/macOS의 tree-wide cap을 바꾸려면 새 root Pi process에서 새 tree를 시작해야 합니다. Windows는 durable tree authority를 만들지 않고 process-local scheduling으로 fallback하므로 `maxActive` reload도 현재 process의 scheduler에만 적용됩니다. CLI 인수 변경은 Pi를 재시작해야 합니다. 이 파일은 `subagent` 도구의 `agent`/`task`, `tasks`, `chain`, `action` 호출 형태나 선택 `background` 필드를 추가·변경하지 않습니다.
 
@@ -152,7 +152,7 @@ pi --subagent-max-depth 3 --no-subagent-prevent-cycles
 
 managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이나 활성 Pi built-in override를 보존할 수 없으면 조용히 좁히지 않고 launch 전에 오류로 끝냅니다. 이름이 같은 inherited `subagent` 도구는 nested delegation authority를 이 패키지 하나로 고정하기 위해 의도적으로 이 패키지의 구현으로 대체합니다. CLI API-key용 private agent-dir overlay도 managed에서는 agents/skills/prompts/themes와 data 설정만 bounded snapshot으로 복제하고 extension/package cache는 상속하지 않습니다. 설정하지 않거나 빈 값이면 `inherit`이고, 값 앞뒤 공백은 제거한 뒤 `inherit` 또는 `managed`만 허용하며 nested child에 그대로 전달됩니다. 이 정책은 terminal/backend가 아니라 child extension registry를 제어하므로 inline, cmux, tmux child에 동일하게 적용됩니다.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1` producer를 만들며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](pi-cmux-presence-integration.md)을 참고하세요.
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1` producer를 만들며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## Completion mode
 
@@ -204,14 +204,14 @@ PI_SUBAGENT_PANE_LAYOUT must be exactly "auto" or "split" (received ...).
 
 | 값 | cmux | tmux |
 | --- | --- | --- |
-| `auto` (기본) | root sibling은 새 오른쪽 shared pane 하나의 surface를 공유한다. nested descendant는 정확한 source pane에 surface로 쌓인다. | child마다 parent와 같은 session의 detached window 하나를 만든다. |
-| `split` | child마다 source surface 오른쪽에 split한다. | child마다 source pane 오른쪽에 split한다. |
+| `auto` (기본) | root sibling은 새 오른쪽 shared pane 하나의 surface를 공유합니다. nested descendant는 정확한 source pane에 surface로 쌓입니다. | child마다 parent와 같은 session의 detached window 하나를 만듭니다. |
+| `split` | child마다 source surface 오른쪽에 split합니다. | child마다 source pane 오른쪽에 split합니다. |
 
 ![Interactive layout coordination](./diagram/interactive-layout-coordination.png)
 
 _2x PNG · [SVG](./diagram/interactive-layout-coordination.svg) · [Mermaid source](./diagram/interactive-layout-coordination.mmd)_
 
-`auto`의 cmux는 source root별 process-global coordinator가 foreground/background launch를 직렬화한다. detached V2 broker만 pre-commit allocation과 durable `allocation.json` publish를 수행하며, coordinator는 commit 뒤 strict layout record와 정확히 일치하는 allocation만 adopt/release한다. 종료·취소·reaper는 shared pane, tmux window 또는 session container를 넓게 닫지 않고 child의 정확한 surface/pane만 대상으로 한다.
+`auto`의 cmux는 source root별 process-global coordinator가 foreground/background launch를 직렬화합니다. detached V2 broker만 pre-commit allocation과 durable `allocation.json` publish를 수행하며, coordinator는 commit 뒤 strict layout record와 정확히 일치하는 allocation만 adopt/release합니다. 종료·취소·reaper는 shared pane, tmux window 또는 session container를 넓게 닫지 않고 child의 정확한 surface/pane만 대상으로 합니다.
 
 ### cmux pane
 
@@ -228,7 +228,7 @@ cmux를 감지했지만 socket owner/mode/inode, authorization, API/app version 
 
 #### Managed child의 OS 신뢰 경계
 
-managed child의 출력·지시는 항상 untrusted로 취급하지만, child 프로세스는 부모와 같은 UID의 협력 peer이며 hostile sandbox 경계가 아닙니다. `0700`/`0600`, no-symlink, no-replace publication은 다른 UID, 경로 경쟁·교체와 실수로 인한 교체를 막는 장치이지 악의적인 same-UID 코드의 관찰·변조를 막지 않습니다. 이 경계는 public `detached-ownership.json` promotion marker와 reaper 판단에도 그대로 적용됩니다. hostile child를 견뎌야 하면 별도 UID 또는 mandatory MAC sandbox와 좁은 IPC를 사용하세요. 그것이 불가능하면 managed mode와 durable promotion을 사용하지 마세요. 구현 artifact의 상세는 [cmux/tmux 설계](cmux-pi-tui-design.md#82-저장-위치-권한-artifact)를 참고하세요.
+managed child의 출력·지시는 항상 untrusted로 취급하지만, child 프로세스는 부모와 같은 UID의 협력 peer이며 hostile sandbox 경계가 아닙니다. `0700`/`0600`, no-symlink, no-replace publication은 다른 UID, 경로 경쟁·교체와 실수로 인한 교체를 막는 장치이지 악의적인 same-UID 코드의 관찰·변조를 막지 않습니다. 이 경계는 public `detached-ownership.json` promotion marker와 reaper 판단에도 그대로 적용됩니다. hostile child를 견뎌야 하면 별도 UID 또는 mandatory MAC sandbox와 좁은 IPC를 사용하세요. 그것이 불가능하면 managed mode와 durable promotion을 사용하지 마세요. 구현 artifact의 상세는 [cmux/tmux 설계](./cmux-pi-tui-design.md#82-저장-위치-권한-artifact)를 참고하세요.
 
 버전 정책은 stable Pi `>=0.80.10`, cmux `>=0.64.20`, tmux `>=3.7b`입니다. 기존 `--version`, control handshake/identify, tmux gate probe 결과만 재사용하므로 추가 probe command나 handshake를 만들지 않습니다. cmux control record와 gated tmux V3 `transport-gate.json`에는 minimum 문자열 대신 실제 감지 버전을 기록하고(V2 safe path는 minimum을 검사하지만 별도 version artifact를 남기지 않음), executable·socket·server·app identity generation이 바뀌면 캐시된 판정도 재사용하지 않습니다. 버전 문턱과 별개로 API family, capability, fixture, parser와 output 계약은 strict하게 유지합니다.
 
@@ -278,7 +278,7 @@ runtime, broker entrypoint 또는 backend를 찾을 수 없거나 실행할 수 
 - `Interactive pane mode requires an available broker runtime, broker entrypoint, and backend executable.`: runtime은 `PATH`의 `bun`/`node`, tmux mode는 `tmux` executable을 확인하세요. cmux mode에서는 app control socket과 stable `0.64.20` 이상 app bundle gate를 확인하세요. Pi/cmux/tmux 모두 prerelease와 malformed version은 지원하지 않습니다. symlink와 shebang shim은 지원됩니다.
 - cmux/tmux 환경이 감지되었는데 실행이 실패함: 안전상 inline으로 자동 fallback하지 않습니다. cmux socket authorization/version 또는 tmux executable과 Pi `0.80.10` 이상을 확인하세요.
 - Windows: interactive backend는 지원하지 않으며 automatic mode는 `inline`입니다.
-- stale diagnostic directory: `possible-unrecorded-allocation` residual risk 또는 target absence 미확인일 수 있습니다. run artifact를 임의 삭제하거나 cmux surface를 이름으로 추측해 종료하지 마세요. live crash/cleanup acceptance 절차와 상태는 [`cmux-pi-tui-design.md`](cmux-pi-tui-design.md#12-acceptance-runbook)를 참고하세요.
+- stale diagnostic directory: `possible-unrecorded-allocation` residual risk 또는 target absence 미확인일 수 있습니다. run artifact를 임의 삭제하거나 cmux surface를 이름으로 추측해 종료하지 마세요. live crash/cleanup acceptance 절차와 상태는 [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md#12-acceptance-runbook)를 참고하세요.
 
 ## 프로젝트 에이전트 신뢰
 

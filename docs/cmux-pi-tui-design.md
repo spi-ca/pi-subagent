@@ -1,10 +1,10 @@
 # cmux/tmux 기반 실제 Pi TUI 설계 및 구현
 
-> 상태: 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. live cmux와 tmux crash/reaper E2E는 2026-07-20 최종 harness로 모두 **PASS**했다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
+> **상태:** 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. live cmux와 tmux crash/reaper E2E는 2026-07-20 최종 harness로 모두 **PASS**했다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
 >
-> interactive pane layout 구현은 완료됐다. 기본 `auto`는 cmux에서 root sibling을 하나의 새 오른쪽 pane 안 surface로 공유하고 nested descendant를 정확한 source pane에 쌓으며, tmux에서는 child별 같은-session detached window를 사용한다. cmux와 tmux `auto` live layout smoke는 2026-07-20에 모두 **PASS**했다. tmux 증거는 제한된 3 top-level + parent/2 nested 범위이며, 기존 tmux crash/reaper acceptance **PASS**와는 별개다.
->
-> 이 문서는 subagent 실행 화면을 legacy Zellij JSONL/FIFO renderer에서 실제 Pi TUI로 전환한 설계와 현재 구현을 기록한다. 파일명은 최초 cmux 설계에서 유래했지만, 현재 구현은 cmux와 tmux를 같은 interactive-pane lifecycle로 지원한다.
+> **Authority:** interactive pane layout 구현도 완료됐다. 배치 정책, coordinator/broker 책임 분리와 live layout smoke 증거는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md)가 authoritative하다.
+
+이 문서는 subagent 실행 화면을 legacy Zellij JSONL/FIFO renderer에서 실제 Pi TUI로 전환한 설계와 현재 구현을 기록한다. 파일명은 최초 cmux 설계에서 유래했지만, 현재 구현은 cmux와 tmux를 같은 interactive-pane lifecycle로 지원한다.
 
 ## 1. 결론
 
@@ -282,7 +282,7 @@ pi
   @<task-file>
 ```
 
-stdout/stderr는 terminal PTY에 직접 붙는다. `|`, `tee`, FIFO, renderer가 없다. tmux server의 오래된 global environment에 의존하지 않도록 parent가 계산한 child environment를 run directory의 private `0600` shell artifact로 전달하고 wrapper가 source 직후 삭제한다. 이 artifact에는 `PROVIDER_API_KEY_ENV_VAR_MAP`의 documented provider key(예: `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`), Azure base/resource/version/deployment map, Cloudflare account/gateway, Bedrock의 AWS profile/access/session/region·default region/ECS container·IRSA/cache·proxy flags, Vertex project/location/application credentials, `PI_CACHE_RETENTION`, `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY`의 대소문자 variant, CA/certificate 변수(`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`)만 allowlist로 담긴다. 이 값들은 broker environment·argv·evidence/log에 넣지 않으며 임의 환경 변수도 전달하지 않는다. 전체 목록은 [configuration](configuration.md#interactive-provider-환경-전달)을 따른다. `TMUX`, `TMUX_PANE`, `CMUX_*`, `PWD` 같은 pane identity/cwd 값은 제외해 새 terminal이 주입한 값을 보존한다.
+stdout/stderr는 terminal PTY에 직접 붙는다. `|`, `tee`, FIFO, renderer가 없다. tmux server의 오래된 global environment에 의존하지 않도록 parent가 계산한 child environment를 run directory의 private `0600` shell artifact로 전달하고 wrapper가 source 직후 삭제한다. 이 artifact에는 `PROVIDER_API_KEY_ENV_VAR_MAP`의 documented provider key(예: `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`), Azure base/resource/version/deployment map, Cloudflare account/gateway, Bedrock의 AWS profile/access/session/region·default region/ECS container·IRSA/cache·proxy flags, Vertex project/location/application credentials, `PI_CACHE_RETENTION`, `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY`의 대소문자 variant, CA/certificate 변수(`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`)만 allowlist로 담긴다. 이 값들은 broker environment·argv·evidence/log에 넣지 않으며 임의 환경 변수도 전달하지 않는다. 전체 목록은 [configuration](./configuration.md#interactive-provider-환경-전달)을 따른다. `TMUX`, `TMUX_PANE`, `CMUX_*`, `PWD` 같은 pane identity/cwd 값은 제외해 새 terminal이 주입한 값을 보존한다.
 
 ### 7.3 fresh child session
 
@@ -339,52 +339,7 @@ Immutable JSON은 정확히 하나의 UTF-8 object와 마지막 `\n`이며, same
 
 모든 parser는 unknown field, cross-run path, run ID/backend mismatch, non-finite timestamp, 잘못된 canonical ID를 거부한다. cmux ID는 canonical UUID, tmux pane ID는 `/^%(?:0|[1-9][0-9]*)$/`여야 한다.
 
-아래는 layout 관련 strict branch만 보인 **축약 excerpt**다. 전체 base field, legacy branch와 모든 parser 조건의 canonical source는 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts)다. 따라서 이 excerpt를 완전한 JSON object 또는 forward-compatible schema로 해석하면 안 된다.
-
-```ts
-type LayoutModeV2 = "auto" | "split";
-type CmuxSourceContainerV2 = {
-  kind: "cmux-source"; workspaceId: string; sourceSurfaceId: string;
-};
-type CmuxPaneContainerV2 = {
-  kind: "cmux-pane"; workspaceId: string; paneId: string;
-};
-type CmuxSourcePaneContainerV2 = {
-  kind: "cmux-source-pane"; workspaceId: string; sourceSurfaceId: string; paneId: string;
-};
-type TmuxSourcePaneContainerV2 = {
-  kind: "tmux-source-pane"; socketPath?: string; serverPid: number;
-  sessionId: string; windowId: string; paneId: string; panePid: number;
-};
-type TmuxSessionContainerV2 = {
-  kind: "tmux-session"; socketPath?: string; serverPid: number;
-  sessionId: string; sourceWindowId: string;
-};
-
-type LayoutPlacementRequestV2 =
-  | { layout: LayoutModeV2; placement: "cmux-split";
-      container: CmuxSourceContainerV2 }
-  | { layout: "auto"; placement: "cmux-new-surface";
-      container: CmuxPaneContainerV2 | CmuxSourcePaneContainerV2 }
-  | { layout: "split"; placement: "tmux-split";
-      container: TmuxSourcePaneContainerV2 }
-  | { layout: "auto"; placement: "tmux-new-window";
-      container: TmuxSessionContainerV2 };
-
-type LayoutAllocationFieldsV2 =
-  | { layout: LayoutModeV2; placement: "cmux-split";
-      container: { kind: "cmux-pane"; workspaceId: string; paneId: string } }
-  | { layout: "auto"; placement: "cmux-new-surface";
-      container: { kind: "cmux-pane"; workspaceId: string; paneId: string } }
-  | { layout: "split"; placement: "tmux-split";
-      container: { kind: "tmux-window"; socketPath?: string; serverPid: number;
-        sessionId: string; windowId: string; paneId: string; panePid: number } }
-  | { layout: "auto"; placement: "tmux-new-window";
-      container: { kind: "tmux-window"; socketPath?: string; serverPid: number;
-        sessionId: string; windowId: string; paneId: string; panePid: number } };
-```
-
-legacy V2 intent/allocation record는 layout key가 **전혀 없는** 별도 exact branch이며 `split` placement로 해석한다. layout-aware intent/allocation은 위 discriminant 전체를 가져야 하고 backend/source/container/target binding을 모두 만족해야 한다. commit path는 this-run `allocation.json` 및 planned `launch.json`의 exact absolute path여야 하고, launch에는 `ownership: "parent-owned"`가 필요하다. `state.json`과 `parent-lease.json`은 V2로 재정의하지 않으며 앞서 설명한 V1 schema/replaceable write를 유지한다.
+legacy V2 intent/allocation record는 layout key가 **전혀 없는** 별도 exact branch이며 `split` placement로 해석한다. layout-aware intent/allocation은 backend/source/container/target binding을 모두 만족하는 strict discriminated union(`LayoutModeV2`, backend별 container type, `LayoutPlacementRequestV2`, `LayoutAllocationFieldsV2`)이어야 한다. 이 union의 정확한 branch와 binding 규칙은 [다중 subagent interactive pane layout 설계 10.1절](./interactive-pane-layout-design.md#101-backward-compatible-strict-v2-layout-schema-migration)이 authoritative하며, 전체 base field·legacy branch·모든 parser 조건의 canonical source는 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts)다. commit path는 this-run `allocation.json` 및 planned `launch.json`의 exact absolute path여야 하고, launch에는 `ownership: "parent-owned"`가 필요하다. `state.json`과 `parent-lease.json`은 V2로 재정의하지 않으며 앞서 설명한 V1 schema/replaceable write를 유지한다.
 
 특히 preflight에서 runtime/backend/entrypoint를 찾지 못하거나 실행할 수 없으면 **artifact-free pre-artifact error**다. parent는 task, prompt, session, lease, `broker-status.json`, intent를 만들거나 broker를 spawn하지 않고 interactive 실행 오류를 반환한다. 따라서 obsolete `runtime-unavailable` status variant는 V2 contract에 없다.
 
@@ -455,13 +410,13 @@ Public cmux API로 allocation response 이전에 생긴 surface를 안전히 red
 
 ## 9. Child bridge, completion, parent lifecycle
 
-`src/runtime/child-bridge.ts`는 protocol 환경 변수가 있을 때만 동작한다. parent는 child session 생성 직후 private `(dev, ino)` identity를 capture한다. child는 `agent_end` 정보를 보관하고, 첫 `agent_settled` 또는 abnormal terminal flow에서 immutable `completion-fence.json`을 publish한 뒤 exact `runId`/nonce의 parent ACK를 기다린다. durable fence publication부터 시작한 하나의 absolute deadline 안에 exact ACK가 없고 exact parent PID/start identity도 dead로 증명되지 않으면, boundary를 capture하지 않고 boundary-less `bridge-error` failure를 publish한다. fence verification과 ACK artifact의 lstat/open/read가 deadline을 넘겨 늦게 끝나도 결과는 무시하며 rejection은 관찰한다. exact dead parent는 ACK bypass를 허용한다. ACK 뒤 정상 완료는 assistant/linked-metadata-chain boundary를 포함한 `CompletionRecordV3`를 create-if-absent로 publish하고 shutdown을 요청한다. abnormal failure의 generic complete JSONL boundary는 parent가 exact `PI_SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY=v1`을 전달한 경우에만 포함하며, 이전 strict parent와의 rolling 조합에서는 boundary-less V3 failure를 publish한다. malformed ACK·UTF-8·duplicate ID·truncation 등으로 boundary를 증명하지 못하면 success를 추정하지 않고 boundary-less `bridge-error` failure를 publish한다. `agent_end`만으로 completion을 만들지 않는다.
+`src/runtime/child-bridge.ts`는 protocol 환경 변수가 있을 때만 동작한다. parent는 child session 생성 직후 private `(dev, ino)` identity를 capture하고, child는 `agent_settled` 또는 abnormal terminal flow에서 completion fence를 publish한 뒤 parent ACK를 거쳐 `CompletionRecordV3`를 publish한다. `agent_end`만으로는 completion을 만들지 않는다.
 
-Bridge, committed parent, startup reaper는 `complete.json`의 경쟁 writer다. 첫 valid immutable completion이 winner이며 나중 writer는 status/error를 바꾸지 않는다. child와 parent terminal 경로만 completion fence/ACK와 generic boundary capture를 result-mutation FIFO에 직렬화한다. parent는 ACK 전에 새 lease scheduling을 멈추고 in-flight parent lease writer를 bounded `stopAndDrain()`으로 끝내 late rename을 배제한다. 같은 FIFO는 incremental tail drain과 `onUpdate` callback도 직렬화하므로 ACK 전 시작된 preview callback은 포함될 수 있지만 ACK 뒤 callback은 child boundary capture에 끼어들 수 없다. global interactive fence는 registry/ownership 확인에만 짧게 쓰며 backend, ACK, filesystem wait와 terminal publication은 run별 FIFO에서 fence 밖으로 수행한다. startup reaper는 parent fence/ACK/FIFO를 사용하지 않는 별도 no-fence 경로이며, parent·broker·child owner의 quiescence 또는 exact-dead proof와 claim을 다시 확인한 뒤에만 generic boundary를 capture하고 observer record를 publish한다. preview는 advisory일 뿐이다. authoritative result와 assistant/tool/summary usage는 parent가 `(dev, ino)`, offset, final entry ID와 SHA-256 prefix를 검증해 boundary까지 새 final result로 replay한 뒤에만 확정한다. offset 뒤 same-inode append는 replay하지 않고, replacement 또는 truncation은 거부한다. boundary-less V3/V2 record는 strict read compatibility로 남지만, **현재 boundary-less V3**은 즉시 final drain·completion-authorized close·permit release를 막고 transcript/recovery authority를 retain한다.
+Bridge, committed parent, startup reaper는 `complete.json`의 경쟁 writer이며 첫 valid immutable completion이 winner다. child와 parent terminal 경로만 이 fence/ACK를 run별 result-mutation FIFO에 직렬화하고, startup reaper는 이 fence/ACK를 사용하지 않는 별도 no-fence 경로에서 parent·broker·child owner의 quiescence 또는 exact-dead proof를 재확인한 뒤에만 observer record를 publish한다. incremental `onUpdate`/preview는 advisory일 뿐이며, authoritative result와 assistant/tool/summary usage는 검증된 final replay에서만 확정된다.
 
-검증 가능한 prefix는 최대 `64 MiB`이며 process-global FIFO reservation은 complete prefix 크기만큼을 합산해 확보한다. verifier가 suffix를 반환하면 parser가 끝날 때까지 lease를 보유한다. 한 line과 누적 entry-ID bytes는 각각 `8 MiB`, entry 수는 `100,000`으로 제한한다. 이는 `64 KiB`만 보유하는 ordinary live-preview tail과 구분되는 verified replay 한도다. Parent abort는 Escape와 bounded grace 뒤 `parent-aborted` observer completion을 시도하고, verified winner를 replay한 뒤 exact close/absence 확인을 bounded하게 기다린다. terminal preparation 또는 verifier/close wait가 timeout·실패하면 fail closed하며 result를 반환하더라도 exact target registry와 recovery metadata를 reaper용으로 retain한다. target absence는 target cleanup/unregister의 근거일 뿐 durable tree-permit settlement authority가 아니다. wrapper exit, pane missing, inspect retry exhaustion도 typed terminal completion을 시도하지만 verified winner 없이 target/permit을 성공적으로 settle했다고 가정하지 않는다. reaper는 immutable terminal record가 있으면 transcript를 retention policy까지 보존한다.
+startup reaper는 observer record를 publish한 뒤에도 legacy boundary-less failure를 포함한 모든 immutable winner의 child session transcript를 즉시 삭제하지 않고 보존하며, `diagnosticRetentionSeconds`(기본 60분) 기준 run-retention 정책이 만료된 뒤에야 별도로 정리를 예약한다(`src/runtime/runner.ts:2383-2391`의 `preserveCompletionSession`/`scheduleRetentionCleanup` 및 `src/runtime/runner.ts:1770-1777`의 기본 retention 상수).
 
-V1 parent lease는 약 2초마다 renew되고 child bridge는 약 12초 stale이면 orphan flow를 시작한다. Commit 전 broker는 lease watch나 long-lived cleanup IPC를 갖지 않는다. Commit 뒤 parent crash 및 stale lease는 durable allocation authority를 가진 startup reaper가 복구한다. monitor가 반환할 때 release하는 process-local scheduler slot은 tree-wide durable permit과 별개다. foreground tree permit scope는 result가 child exit보다 먼저 와도 live child permit을 해제하지 않으며, boundary-less V3도 immediate release를 막는다. unref settlement watcher는 durable child self-release/lease absence 또는 exact child death를 확인할 때만 나중에 parked parent를 resume한다. session shutdown은 active watcher를 취소해 live permit을 풀지 않으며, valid terminal winner 또는 위의 exact settlement가 있을 때만 release/resume한다.
+completion fence/ACK 순서, `CompletionRecordV3` strict schema(성공/child-failure/observer-failure union과 capability 협상), boundary-less failure 처리, prefix replay 한도(`64 MiB`/`8 MiB`/`100,000` entry)와 tree-wide permit·process-local scheduler slot 구분의 authoritative 설명은 [Interactive subagent runtime 성능 개선 설계 6.4절](./interactive-runtime-performance-design.md#64-completionrecordv3-migration과-순서)을 따른다. child bridge memory-only socket heartbeat의 약 12초 stale 판정은 같은 문서 [6.5절](./interactive-runtime-performance-design.md#65-disconnect와-heartbeat)을 따른다. 이와 별개로 child bridge의 parent-lease 감시는 약 2초 주기로 lease를 갱신하고 약 12초 stale threshold로 부모의 비정상 종료를 판정하며, 이 parent-lease 값의 근거는 [설정의 cmux pane](./configuration.md#cmux-pane)과 `src/runtime/run-protocol.ts`의 `DEFAULT_PARENT_LEASE_RENEW_MS`/`DEFAULT_PARENT_LEASE_STALE_MS`다.
 
 ## 10. cmux/tmux production paths
 
@@ -488,7 +443,7 @@ V1 parent lease는 약 2초마다 renew되고 child bridge는 약 12초 stale이
 | allocation-first durable authority와 cancel rollback | ✓ | 부분 — mock backend process에서 exact allocation/rollback 확인, live cancellation 미검증 | — | — |
 | cmux allocation → commit/gate → sanitized respawn | ✓ | 부분 — adapter·verifier 단위, parent full-flow 미검증 | — | — |
 | layout-aware tmux `session_id|window_id|pane_id|pane_pid`, staged gate/fingerprint verifier | ✓ | 부분 — args/schema/mock process 단위, live gate lifecycle 미검증 | — | — |
-| tmux `auto` detached same-session window layout과 exact cleanup | ✓ | 부분 — layout/protocol/adapter 단위 범위 | PASS — 2026-07-20 limited smoke | 3 top-level + parent/2 nested; 상세 evidence는 [`interactive-pane-layout-design.md` 19절](interactive-pane-layout-design.md#19-live-layout-smoke-기록) |
+| tmux `auto` detached same-session window layout과 exact cleanup | ✓ | 부분 — layout/protocol/adapter 단위 범위 | PASS — 2026-07-20 limited smoke | 3 top-level + parent/2 nested; 상세 evidence는 [`interactive-pane-layout-design.md` 19절](./interactive-pane-layout-design.md#19-live-layout-smoke-기록) |
 | V2/V3 dependency matrix, completion fence/replay, reaper transcript retention | ✓ | ✓ — protocol, bridge, tail, runner/reaper 단위 범위 | — | — |
 | artifact-free executable preflight와 minimal bootstrap | ✓ | 부분 — resolver/minimal-env 단위, full invocation의 artifact-free 관찰 미검증 | — | — |
 | deterministic parent `SIGKILL` pre-allocation checkpoint | ✓ — harness-only argv+environment gate 뒤 ready에서 broker SIGSTOP | 부분 — fixture/checkpoint safety guards | cmux/tmux PASS | cmux `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`; tmux `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df` |
@@ -611,4 +566,4 @@ PI_SUBAGENT_PACKAGE_ACCEPTANCE=1 bun run acceptance:package -- --keep
 - lifecycle은 child의 exact surface/pane만 Escape·close/kill한다. cmux shared pane, tmux window/session 또는 caller container를 넓게 닫지 않는다.
 - cmux/tmux backend launch 실패 시 inline으로 자동 fallback하지 않으며 diagnostic retention 시간은 사용자 설정으로 노출하지 않는다.
 
-cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#19-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke는 2026-07-23 tmux와 cmux 모두 **PASS**했다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. `completion: "handoff"`와 public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.
+cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#19-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke는 2026-07-23 tmux와 cmux 모두 **PASS**했다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. `completion: "handoff"`와 public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.

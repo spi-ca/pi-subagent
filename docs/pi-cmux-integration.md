@@ -1,8 +1,8 @@
 # `pi-subagent`와 `pi-cmux` 연동 가이드
 
-> 상태: 현재 동작과 권장 운영 정책
->
-> 이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명한다. **별도 `pi-cmux-presence`에는 root-only generic presence producer가 구현되어 있으며, wire contract·replay·observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고한다.** interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
+> **상태:** 현재 동작과 권장 운영 정책
+
+이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. 별도 `pi-cmux-presence`에는 root-only generic presence producer가 구현되어 있으며, wire contract·replay·observer 경계 같은 세부 계약은 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)에서만 다룬다. interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
 
 `pi-cmux`는 `pi-subagent`의 실행, 결과 반환, 취소와 cleanup에 필요하지 않은 **선택적 workflow UX 확장**이다. child surface별 sidebar와 command/review 작업 흐름이 필요할 때 설치한다. root Pi/subagent 집계의 socket-only status·progress·attention은 별도 `pi-cmux-presence`가 제공할 수 있다.
 
@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며, source는 `pi-subagent`, label은 `Subagents`, kind는 `agent-group`이다. `pi-cmux-presence`가 설치·로드된 경우에만 같은 process에서 선택적으로 소비할 수 있다. presence producer는 cmux CLI 또는 control socket을 열거나 mutate하지 않고, usage/token/cost와 private task/output/path/credential/target을 발행하지 않는다. replay attention은 항상 `none`이고 observer failure는 lifecycle에 영향을 주지 않는다. 정확한 progress·terminal count·managed child 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 따른다.
+root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작하고, `pi-cmux-presence`가 설치·로드된 경우에만 같은 process에서 선택적으로 소비할 수 있다. wire contract, source 식별자, replay attention, progress·terminal count 계산과 observer 경계는 이 문서에서 다루지 않으며 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
 
 ## 5. 권장 운영 정책
 
@@ -239,7 +239,7 @@ PI_SUBAGENT_CMUX_CHILD_POLICY=inherit  # 기존 환경 그대로 상속
 
 `managed`에서는 inherited `pi-cmux`가 로드되지 않으므로 `/cmv`, `/cmh`, review/continue 등 해당 child slash command도 등록되지 않는다. `inherit`에서는 기존 동작을 유지한다. 사용자가 child TUI에서 해당 command를 직접 실행해 만든 surface는 user-owned/unmanaged로 취급한다.
 
-managed는 extension 최소화 정책일 뿐 hostile-child OS sandbox가 아니다. child 출력·지시는 untrusted이지만 child와 parent는 cooperative same-UID peer이며, `0700`/`0600`/no-replace 보호는 다른 UID·race·실수 교체용이다. 따라서 `/subagents promote`의 public durable `detached-ownership.json`도 malicious same-UID code에 대한 ownership proof가 아니다. hostile child가 가능한 환경은 별도 UID 또는 mandatory MAC sandbox와 좁은 IPC를 쓰거나 managed/promotion을 비활성화해야 한다. [설정의 OS 신뢰 경계](configuration.md#managed-child의-os-신뢰-경계)를 따른다.
+managed는 extension 최소화 정책일 뿐 hostile-child OS sandbox가 아니다. child 출력·지시는 untrusted이지만 child와 parent는 cooperative same-UID peer이며, `0700`/`0600`/no-replace 보호는 다른 UID·race·실수 교체용이다. 따라서 `/subagents promote`의 public durable `detached-ownership.json`도 malicious same-UID code에 대한 ownership proof가 아니다. hostile child가 가능한 환경은 별도 UID 또는 mandatory MAC sandbox와 좁은 IPC를 쓰거나 managed/promotion을 비활성화해야 한다. [설정의 OS 신뢰 경계](./configuration.md#managed-child의-os-신뢰-경계)를 따른다.
 
 #### 단일 `/subagents` 관리 command (구현됨)
 
@@ -413,6 +413,7 @@ PI_SUBAGENT_CMUX_CONTROL_PROBE=1 bun run cmux:control-probe
 ## 11. 관련 문서
 
 - [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md): interactive pane protocol, session tail, completion, lease와 reaper
+- [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md): generic presence producer의 wire contract, replay, observer 경계
 - [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md): 구현된 cmux shared-pane/마지막 surface retire 정책과 layout 검증 상태 — cmux와 tmux `auto` live smoke 모두 2026-07-20 **PASS**(tmux는 제한된 smoke 범위)
 - [사용법](./usage.md): subagent 호출과 terminal mode의 사용자 동작
 - [설정](./configuration.md): terminal mode 감지와 관련 설정

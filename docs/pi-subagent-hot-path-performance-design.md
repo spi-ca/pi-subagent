@@ -1,12 +1,10 @@
 # Pi-subagent internal hot-path 성능 개선 설계
 
-> 상태: **Phase 0A hot paths, hardened lease sub-gate, Phase 5 scheduler, Phase 6 exact tail/signature, conservative Phase 7 reaper와 Phase 8 managed-child opt-in profile이 구현됨; managed-child default 전환은 미구현**. 이 문서는 parent/child 내부 hot path의 성능 개선과 multi-agent 사용량 가시성을 다룬다. 현재 동작의 최종 source of truth는 코드와 테스트다.
+> **상태:** Phase 0A hot paths, hardened lease sub-gate, Phase 5 scheduler, Phase 6 exact tail/signature, conservative Phase 7 reaper와 Phase 8 managed-child opt-in profile이 구현됨; managed-child default 전환은 미구현이다. 이 문서는 parent/child 내부 hot path의 성능 개선과 multi-agent 사용량 가시성을 다룬다. 현재 동작의 최종 source of truth는 코드와 테스트다.
 
 > **Authority:** lifecycle Unix socket, `CompletionRecordV3` transport schema·settlement, cmux desktop control socket v2, `tmux -C`, polling 제거, exact-target mutation/recovery/fencing 및 transport Phases 0–4의 canonical register는 [interactive runtime transport 성능 설계](./interactive-runtime-performance-design.md)가 authoritative하다. 이 문서는 아래 internal runtime 항목과 Phase 0A, Phase 2 lease sub-gate, Phases 5–8, 그리고 상세 security/test/benchmark/acceptance/status/order의 authoritative owner다.
 
-## 범위와 authority
-
-이 문서가 authoritative한 internal optimization은 다음과 같다.
+**범위와 authority:** 이 문서가 authoritative한 internal optimization은 다음과 같다.
 
 1. generation-scoped topology read batching
 2. trust-safe session agent-discovery cache

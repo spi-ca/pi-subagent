@@ -24,7 +24,7 @@ bun run ci
 bun pm pack --dry-run
 ```
 
-`bun run ci`는 타입 체크와 테스트를 실행합니다. `bun pm pack --dry-run` 출력에는 `src/runtime/pane-launch-broker.mjs`, `pi-subagent.schema.json`, `pi-subagent.detached-ownership.schema.json`가 포함되어야 합니다. opt-in acceptance는 production과 같은 deterministic runtime/backend resolver를 사용합니다. runtime path는 선택된 실행 명령이고 interpreter path는 native binary 또는 첫 shebang interpreter입니다. interactive preflight는 backend뿐 아니라 broker runtime/interpreter/entrypoint의 realpath·inode·metadata generation을 캡처하고 intent publish 및 broker spawn 직전에 다시 확인합니다. tmux는 canonical socket inode와 server PID start identity도 preflight와 publish 직전에 재검증합니다. env shebang과 Bun/Node를 `exec`하는 shell wrapper도 지원하므로 parent Pi의 `process.execPath`를 provenance로 신뢰하지 않습니다. live cmux/tmux는 명시적 environment gate가 필요합니다. cmux harness는 caller workspace를 disposable로 요구하지 않고, 자체 private workspace를 생성·정리합니다. 기본 push/schedule CI에는 포함하지 않으며 `.github/workflows/live-acceptance.yml`의 `workflow_dispatch`로만 tmux와 명시적 self-hosted cmux job을 실행합니다. 실제 multiplexer가 없는 CI에서는 `test/integration/fake-adapter-runner.e2e.test.ts`가 full `runAgent` completion/cancel/external-close/shutdown/reload를 검증합니다. broker acceptance에는 backend response 수신 뒤 `allocation.json` publish 전 exact STOP/kill window도 포함됩니다. live crash/reaper E2E는 reaper 직전 fixture의 실제 absent/zombie 상태와 해당 exact run ID의 `reaped` 결과를 증거로 요구하며, platform zombie liveness 판정은 parser/reaper 단위 테스트가 별도로 보장합니다. package tarball smoke는 isolated tarball의 pack/install/exact-module-import, strict `subagent` registration, bounded dashboard/aggregate `pi.events` probe와 두 public schema 포함만 확인하는 retained 실행 증거가 있고 full Pi session은 범위 밖입니다. 정적 harness/unit/package 기준은 executable **GO**다. 설계 문서에는 live cmux run `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`과 tmux run `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df`의 **PASS**가 기록되어 있지만, 그 private retained evidence는 저장소에 포함되지 않으며 현재 worktree에서 독립 재실행한 결과로 간주하지 않는다. 상세 checkpoint·evidence·cleanup 규칙은 [`cmux-pi-tui-design.md`의 Acceptance runbook](cmux-pi-tui-design.md#12-acceptance-runbook)을 따른다.
+`bun run ci`는 타입 체크와 테스트를 실행합니다. `bun pm pack --dry-run` 출력에는 `src/runtime/pane-launch-broker.mjs`, `pi-subagent.schema.json`, `pi-subagent.detached-ownership.schema.json`가 포함되어야 합니다. opt-in acceptance는 production과 같은 deterministic runtime/backend resolver를 사용합니다. runtime path는 선택된 실행 명령이고 interpreter path는 native binary 또는 첫 shebang interpreter입니다. interactive preflight는 backend뿐 아니라 broker runtime/interpreter/entrypoint의 realpath·inode·metadata generation을 캡처하고 intent publish 및 broker spawn 직전에 다시 확인합니다. tmux는 canonical socket inode와 server PID start identity도 preflight와 publish 직전에 재검증합니다. env shebang과 Bun/Node를 `exec`하는 shell wrapper도 지원하므로 parent Pi의 `process.execPath`를 provenance로 신뢰하지 않습니다. live cmux/tmux는 명시적 environment gate가 필요합니다. cmux harness는 caller workspace를 disposable로 요구하지 않고, 자체 private workspace를 생성·정리합니다. 기본 push/schedule CI에는 포함하지 않으며 `.github/workflows/live-acceptance.yml`의 `workflow_dispatch`로만 tmux와 명시적 self-hosted cmux job을 실행합니다. 실제 multiplexer가 없는 CI에서는 `test/integration/fake-adapter-runner.e2e.test.ts`가 full `runAgent` completion/cancel/external-close/shutdown/reload를 검증합니다. broker acceptance에는 backend response 수신 뒤 `allocation.json` publish 전 exact STOP/kill window도 포함됩니다. live crash/reaper E2E는 reaper 직전 fixture의 실제 absent/zombie 상태와 해당 exact run ID의 `reaped` 결과를 증거로 요구하며, platform zombie liveness 판정은 parser/reaper 단위 테스트가 별도로 보장합니다. package tarball smoke는 isolated tarball의 pack/install/exact-module-import, strict `subagent` registration, bounded dashboard/aggregate `pi.events` probe와 두 public schema 포함만 확인하는 retained 실행 증거가 있고 full Pi session은 범위 밖입니다. 정적 harness/unit/package 기준은 executable **GO**다. 설계 문서에는 live cmux run `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`과 tmux run `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df`의 **PASS**가 기록되어 있지만, 그 private retained evidence는 저장소에 포함되지 않으며 현재 worktree에서 독립 재실행한 결과로 간주하지 않는다. 상세 checkpoint·evidence·cleanup 규칙은 [`cmux-pi-tui-design.md`의 Acceptance runbook](./cmux-pi-tui-design.md#12-acceptance-runbook)을 따른다.
 
 ```bash
 bun run acceptance:dry-run
@@ -72,7 +72,7 @@ bun run benchmark:phase0:live:verify
 
 record에는 공통으로 `PI_SUBAGENT_PHASE0_LIVE=1`, `PI_SUBAGENT_PHASE0_LIVE_RECORD=1`, `--execute-live` 및 tier별 `--ack-provider-child-runs=15|16`가 필요하다. concurrency에는 `PI_SUBAGENT_PHASE0_LIVE_CMUX16=1`과 `--ack-cmux-active-runs=16`도 필요하다. 기록 대상은 고정된 `test/fixtures/transport-performance-phase0-live-routine.json` 및 `test/fixtures/transport-performance-phase0-live-concurrency.json`뿐이다.
 
-checkpoint schema는 v3이다. routine의 `--max-cells=1..15` completed prefix만 resume할 수 있고, claim 뒤 각 provider cell 전에 terminalize되어 one-use다. concurrency partial resume과 automatic retry는 지원하지 않는다. fixture 유효성은 routine 및 concurrency current-source verifier가 모두 성공할 때만 판정한다. 문서 변경 뒤에는 네 source-bound fixture를 다시 생성한 뒤 이 두 verifier를 실행해야 하며, 그 전의 fixture를 최종 검증 결과로 간주하지 않는다. 세부 계약은 [`interactive-runtime-performance-design.md`](interactive-runtime-performance-design.md#m0-harness-상태)를 따른다.
+checkpoint schema는 v3이다. routine의 `--max-cells=1..15` completed prefix만 resume할 수 있고, claim 뒤 각 provider cell 전에 terminalize되어 one-use다. concurrency partial resume과 automatic retry는 지원하지 않는다. fixture 유효성은 routine 및 concurrency current-source verifier가 모두 성공할 때만 판정한다. 문서 변경 뒤에는 네 source-bound fixture를 다시 생성한 뒤 이 두 verifier를 실행해야 하며, 그 전의 fixture를 최종 검증 결과로 간주하지 않는다. 세부 계약은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md#m0-harness-상태)를 따른다.
 
 ### Generic presence producer 집중 검증
 
@@ -131,10 +131,17 @@ done
 index.ts                    — Pi 패키지 manifest가 참조하는 확장 진입점
 src/core/                   — 에이전트 발견, 신뢰/경로 검사, 스키마, 체인 헬퍼, 이벤트 파싱, 공통 타입
 src/runtime/                — 자식 runner, process-local scheduler와 durable tree permit/source ownership, cmux/tmux adapter, one-shot `pane-launch-broker.mjs`, 공통 interactive-pane backend, child bridge, lifecycle/broker protocol, session tail, inline 경로
+src/integration/            — `pi-cmux`/`pi-cmux-presence` 연동용 duplicated wire contract와 root-only presence producer
 src/ui/                     — subagent 도구 호출과 결과를 위한 TUI 렌더링
 test/core/                  — 발견, 신뢰, 메타데이터, 체인 동작, 공통 타입 단위 테스트
 test/runtime/               — runner, cmux/tmux/backend/bridge/protocol/reaper, 인증 전파, CLI 파싱 테스트
+test/integration/           — presence producer, fake-adapter e2e 같은 통합 테스트
+test/ui/                    — src/ui/ TUI 렌더링 테스트
 test/entrypoint/            — 공개 확장/도구 진입점 계약 테스트
+test/acceptance/            — opt-in live/package acceptance와 성능 벤치마크 harness
+test/fixtures/              — cmux/tmux control 프로토콜과 layout 계약, 성능 baseline/live 등 고정 JSON fixture와 acceptance 전용 parent 헬퍼 스크립트 (`package.json`의 files와 여러 설계 문서가 직접 참조)
+test/helpers/               — cmux control socket 관련 runtime 단위 테스트가 공유하는 fake server 헬퍼
+test/release/               — package pack/release 스모크 테스트
 docs/                       — 주제별 문서
 docs/diagram/               — Mermaid 원본, 흰색 배경 SVG와 2x PNG
 docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
@@ -144,14 +151,15 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 
 ## 개발 설계 문서
 
-- [`cmux-pi-tui-design.md`](cmux-pi-tui-design.md) — legacy Zellij bridge를 제거하고 cmux/tmux 기반 실제 Pi TUI, V2 one-shot broker, session-backed result channel, orphan/recovery 방지와 opt-in acceptance runbook을 기록한 설계와 구현 기준
-- [`pi-cmux-integration.md`](pi-cmux-integration.md) — `pi-subagent`와 `pi-cmux`의 역할 경계 및 운영 정책
-- [`pi-cmux-presence-integration.md`](pi-cmux-presence-integration.md) — root-only generic presence producer, duplicated wire contract, replay/privacy/authority 경계와 focused 검증
-- [`interactive-pane-layout-design.md`](interactive-pane-layout-design.md) — 구현된 `auto`/`split` layout의 설계·정적 테스트 범위와 live 검증 상태. cmux와 tmux `auto` smoke는 2026-07-20에 모두 **PASS**했으며, tmux smoke는 제한된 3 top-level + parent/2 nested 범위다. 기존 tmux crash/reaper **PASS**는 별도 acceptance다.
-- [`interactive-runtime-performance-design.md`](interactive-runtime-performance-design.md) — Linux/macOS transport 설계와 구현 상태. cmux control-socket v2, private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거, optional events hint와 stable-minimum gated `tmux -C`가 구현됐습니다. Windows는 forced-inline입니다.
-- [`pi-subagent-hot-path-performance-design.md`](pi-subagent-hot-path-performance-design.md) — transport 설계 다음에 읽는 companion 문서. Phase 0A cache/preflight/UI/fork·async I/O, hardened lease, Phase 5 scheduler, Phase 6 exact tail/signature와 conservative Phase 7 reaper와 managed-child opt-in profile이 구현됐고 managed-child default 전환은 남아 있습니다.
-- [`pi-081-usage-accounting-design.md`](pi-081-usage-accounting-design.md) — Pi 0.81 foreground assistant/tool/summary usage persistence, interactive verified-final replay와 advisory preview의 구분, provider-backed installed-Pi acceptance, background completion usage 회계의 명시적 비목표
-- [`tmux-window-naming-design.md`](tmux-window-naming-design.md) — tmux child window 이름과 Pi pane title의 역할을 분리하는 **미구현 제안**; 현재 runtime 동작이나 live PASS를 주장하지 않음
+- [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — legacy Zellij bridge를 제거하고 cmux/tmux 기반 실제 Pi TUI, V2 one-shot broker, session-backed result channel, orphan/recovery 방지와 opt-in acceptance runbook을 기록한 설계와 구현 기준
+- [`pi-cmux-integration.md`](./pi-cmux-integration.md) — `pi-subagent`와 `pi-cmux`의 역할 경계 및 운영 정책
+- [`pi-cmux-presence-integration.md`](./pi-cmux-presence-integration.md) — root-only generic presence producer, duplicated wire contract, replay/privacy/authority 경계와 focused 검증
+- [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — 구현된 `auto`/`split` layout의 설계·정적 테스트 범위와 live 검증 상태. cmux와 tmux `auto` smoke는 2026-07-20에 모두 **PASS**했으며, tmux smoke는 제한된 3 top-level + parent/2 nested 범위다. 기존 tmux crash/reaper **PASS**는 별도 acceptance다.
+- [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — Linux/macOS transport 설계와 구현 상태. cmux control-socket v2, private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거, optional events hint와 stable-minimum gated `tmux -C`가 구현됐습니다. Windows는 forced-inline입니다.
+- [`foreground-steer-background-transition-design.md`](./foreground-steer-background-transition-design.md) — 사용자 steer가 queue될 때 foreground invocation을 조건부로 background 전환하는 **미구현 후속 제안**; capacity 부족 시 전환하지 않고 기존 blocking을 유지합니다.
+- [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — transport 설계 다음에 읽는 companion 문서. Phase 0A cache/preflight/UI/fork·async I/O, hardened lease, Phase 5 scheduler, Phase 6 exact tail/signature와 conservative Phase 7 reaper와 managed-child opt-in profile이 구현됐고 managed-child default 전환은 남아 있습니다.
+- [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 foreground assistant/tool/summary usage persistence, interactive verified-final replay와 advisory preview의 구분, provider-backed installed-Pi acceptance, background completion usage 회계의 명시적 비목표
+- [`tmux-window-naming-design.md`](./tmux-window-naming-design.md) — tmux child window 이름과 Pi pane title의 역할을 분리하는 **미구현 제안**; 현재 runtime 동작이나 live PASS를 주장하지 않음
 
 성능 설계에서 정상 run의 cmux backend `inspect()` polling 제거는 **Phase 2** 범위이고, gated `tmux -C` run의 polling 제거는 **Phase 3** 범위입니다. healthy lifecycle 경로의 주기 polling은 제거됐으며, durable completion, 약 2초 parent lease/child lease check, degraded/final exact inspection, startup reaper와 exact-target cleanup은 유지합니다.
 

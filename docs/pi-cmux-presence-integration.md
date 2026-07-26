@@ -1,6 +1,8 @@
 # `pi-subagent`와 `pi-cmux-presence` presence 연동
 
-> **현재 상태: generic presence producer 구현됨.** root `pi-subagent`는 process-local `pi.events`에 `pi-presence:update:v1`을 발행하고, `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비할 수 있다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
+> **상태:** generic presence producer 구현됨
+
+root `pi-subagent`는 process-local `pi.events`에 `pi-presence:update:v1`을 발행하고, `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비할 수 있다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
 
 `pi-cmux-presence`는 별도 패키지이며, surface별 sidebar·log·사용자 command를 제공하는 [`pi-cmux`](./pi-cmux-integration.md)와도 다르다. 이 문서는 `pi-subagent`가 복제해 구현한 wire DTO와 producer 경계를 설명한다. presence consumer의 canonical 입력 계약은 `pi-cmux-presence` 저장소의 `docs/event-contract.md`가 소유한다.
 

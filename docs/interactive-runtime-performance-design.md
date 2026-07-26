@@ -1,8 +1,10 @@
 # Interactive subagent runtime 성능 개선 설계
 
-> 상태: **Phase 0 local baseline과 schema v4 gated-provider live capture가 구현·기록됐다.** `routine-v1`의 15 cells/15 provider children capture는 총 5~6분, `cmux-concurrency-16-v1`의 1 cell/16 provider children capture는 약 8.2분으로 반복 관찰됐다. 이 값은 관찰된 capture 총시간이며 SLA가 아니다. source-bound fixture는 문서 변경을 포함한 source 변경 뒤 다시 생성하고 각 current-source verifier를 통과해야 최종 검증으로 인정한다. 따라서 이 문서 변경 시점의 기존 fixture를 이미 검증된 것으로 주장하지 않는다. Phase 1 cmux control-socket v2, Phase 2 private lifecycle socket·`CompletionRecordV3`·healthy cmux inspect polling 제거, Phase 3 stable-3.7b-minimum gated `tmux -C`·healthy tmux inspect polling 제거, Phase 4 `events.stream` hint는 구현됐다. 현재 호출 계약과 durable lifecycle 안전성을 유지하면서 interactive runtime의 정상 경로 비용을 줄이는 설계와 구현 상태를 함께 기록한다.
-
+> **상태:** Phase 0 local baseline과 schema v4 gated-provider live capture가 구현·기록됐다. `routine-v1`의 15 cells/15 provider children capture는 총 5~6분, `cmux-concurrency-16-v1`의 1 cell/16 provider children capture는 약 8.2분으로 반복 관찰됐다. 이 값은 관찰된 capture 총시간이며 SLA가 아니다. source-bound fixture는 문서 변경을 포함한 source 변경 뒤 다시 생성하고 각 current-source verifier를 통과해야 최종 검증으로 인정한다. 따라서 이 문서 변경 시점의 기존 fixture를 이미 검증된 것으로 주장하지 않는다. Phase 1 cmux control-socket v2, Phase 2 private lifecycle socket·`CompletionRecordV3`·healthy cmux inspect polling 제거, Phase 3 stable-3.7b-minimum gated `tmux -C`·healthy tmux inspect polling 제거, Phase 4 `events.stream` hint는 구현됐다.
+>
 > **Authority:** 이 문서는 lifecycle Unix socket, `CompletionRecordV3` transport schema·settlement, cmux desktop control socket v2, `tmux -C`, polling 제거, exact-target mutation/recovery/fencing, transport Phases 0–4 및 canonical cross-document phase register의 authoritative source다. topology/cache/preflight/lease/UI/fork/I/O/tail/reaper, scheduler 및 managed-child 정책은 [Pi-subagent internal hot-path 성능 개선 설계](./pi-subagent-hot-path-performance-design.md)의 authoritative scope다.
+
+현재 호출 계약과 durable lifecycle 안전성을 유지하면서 interactive runtime의 정상 경로 비용을 줄이는 설계와 구현 상태를 함께 기록한다.
 
 ## 1. 결정 요약
 
@@ -91,7 +93,7 @@ tmux list-panes -a -F ...
 
 최상위 parallel 호출은 기본적으로 최대 50개 task를 받고 호출별 동시성 기본값 16을 적용한다. chain 병렬 단계의 기본 최대 task 수는 8이다. process-local scheduler는 foreground/background queue의 FIFO/round-robin을 유지하고, 별도의 private durable tree authority가 root parent와 모든 nested child의 ACTIVE/RESERVED 합계를 `max-active`(기본 16) 이하로 제한한다. `maxActive`와 호출/백그라운드 한계는 CLI·환경 변수·신뢰된 프로젝트/전역 JSON으로 설정할 수 있다.
 
-nested foreground delegation은 대기 parent lease를 `PARKED_WAIT`로 전환해 descendant에 transfer하므로 cap 1에서도 deadlock을 피한다. background는 parent가 계속 실행되므로 transfer 없이 spare permit을 기다린다. exact PID/start identity로 증명된 dead lease만 crash 뒤 회수하고 unknown identity는 capacity를 retain한다. 자세한 mapping은 [configuration](configuration.md#호출-및-백그라운드-한계)을 따른다.
+nested foreground delegation은 대기 parent lease를 `PARKED_WAIT`로 전환해 descendant에 transfer하므로 cap 1에서도 deadlock을 피한다. background는 parent가 계속 실행되므로 transfer 없이 spare permit을 기다린다. exact PID/start identity로 증명된 dead lease만 crash 뒤 회수하고 unknown identity는 capacity를 retain한다. 자세한 mapping은 [configuration](./configuration.md#호출-및-백그라운드-한계)을 따른다.
 
 ### 3.4 Session state 메모리
 

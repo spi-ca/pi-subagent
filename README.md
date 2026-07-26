@@ -96,6 +96,8 @@ Pi 안에서 `subagent` 도구를 호출합니다.
 
 한 번의 호출에는 네 가지 형태 중 하나만 사용합니다: `agent`/`task`, `tasks`, `chain`, 또는 백그라운드 작업 관리를 위한 `action`/`id?`. 선택적 최상위 `completion`은 실행 호출 형태인 `agent`/`task`, `tasks`, `chain`에만 적용되며 `"one-shot"` 또는 `"handoff"`만 허용하고, 생략하면 `"one-shot"`입니다. `action: "status"`와 `action: "cancel"` 호출에는 `completion`을 지정하지 않습니다. 호출별 `model`은 에이전트 파일의 `model`보다 우선하며, 최상위 `model`은 단일 호출에서만 사용합니다. 병렬 호출은 각 task item에, 체인 호출은 순차 chain step 또는 parallel stage 안의 각 `tasks[]` 항목에 `model`을 넣습니다.
 
+지원하지 않는 입력 필드는 모든 공개 호출 객체에서 거부합니다. 제공하는 `agent`, `task`, `id`, `model`, `cwd`는 공백만으로 이루어지지 않은 문자열이어야 하며, 유효 문자열은 자동으로 `trim`하지 않습니다. 공백뿐인 체인 `label`은 호환을 위해 허용하고 표시할 때 `step-N` 자동 라벨로 대체합니다. 자세한 검증 범위는 [`docs/usage.md`의 입력 검증](docs/usage.md#입력-검증)을 참고하세요.
+
 기존 `agent`/`task`, `tasks`, `chain` 호출은 그대로 블로킹 실행으로 유지됩니다. 단일 모드는 한 실행의 결과 요약을, 병렬/체인은 작업·단계 라벨과 상태/오류 요약을 포함한 모드별 결과 래퍼를 반환합니다. 여기에 선택적 최상위 `background: true`를 추가하면 호출이 즉시 반환되고 완료/실패/취소 알림은 나중에 자동 steer 메시지로 전달됩니다. 백그라운드 작업은 `subagent({ action: "status" })`, `subagent({ action: "status", id })`, `subagent({ action: "cancel" })`, `subagent({ action: "cancel", id })`로 조회/취소할 수 있습니다. `status` 목록은 현재 프로세스 메모리 기준이며, 종료된 작업은 기본적으로 최대 20개/약 1시간 범위에서만 보존됩니다. 호출 크기·동시성·백그라운드 한계는 도구 필드가 아닌 Pi CLI/환경 변수 또는 `pi-subagent.json` 설정입니다. 기본 `subagent` 도구 호출 계약(`agent`/`task`, `tasks`, `chain`, `action`, 선택 `background`, 실행 호출에만 선택 `completion`)은 이 파일 설정으로 바뀌지 않습니다. [설정](docs/configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
 
 ## `pi-subagent.json` 설정
@@ -215,18 +217,13 @@ README는 진입점만 담고, 세부 내용은 주제별 문서로 나눕니다
 | 주제 | 문서 |
 | --- | --- |
 | 설치, 런타임 플래그, 신뢰 모델 | [`docs/configuration.md`](docs/configuration.md) |
-| 도구 호출 형태와 예시 | [`docs/usage.md`](docs/usage.md) |
+| 도구 호출 형태·입력 검증·예시 | [`docs/usage.md`](docs/usage.md) |
 | 에이전트 파일 형식과 통신 모델 | [`docs/agents.md`](docs/agents.md) |
-| 개발 워크플로와 프로젝트 구조 | [`docs/development.md`](docs/development.md) |
-| cmux/tmux 기반 실제 Pi TUI 전환 설계 | [`docs/cmux-pi-tui-design.md`](docs/cmux-pi-tui-design.md) |
-| interactive runtime transport 성능 개선 설계(측정 완료 Phase 0 및 Phase 1–4 구현 상태 포함) | [`docs/interactive-runtime-performance-design.md`](docs/interactive-runtime-performance-design.md) |
-| pi-subagent internal hot-path 성능 개선 설계(구현·검증 상태는 문서의 최신 체크리스트 참조) | [`docs/pi-subagent-hot-path-performance-design.md`](docs/pi-subagent-hot-path-performance-design.md) |
-| 선택적 `pi-cmux` UX의 설치 판단, 기능 비교, 연동·검증과 운영 정책 | [`docs/pi-cmux-integration.md`](docs/pi-cmux-integration.md) |
-| 별도 `pi-cmux-presence`와의 generic presence producer, wire contract, observer 경계 | [`docs/pi-cmux-presence-integration.md`](docs/pi-cmux-presence-integration.md) |
-| interactive pane layout 설계·검증 현황 | [`docs/interactive-pane-layout-design.md`](docs/interactive-pane-layout-design.md) |
-| Pi 0.81 foreground assistant/tool 사용량 영속화와 background completion usage 회계의 명시적 비목표 | [`docs/pi-081-usage-accounting-design.md`](docs/pi-081-usage-accounting-design.md) |
-| tmux child window 이름과 Pi pane title 정책 제안(미구현) | [`docs/tmux-window-naming-design.md`](docs/tmux-window-naming-design.md) |
-| 에이전트용 문서 작성 지침 | [`docs/guidelines/`](docs/guidelines/) |
+| 개발 워크플로, 프로젝트 구조, 설계 문서 목록 | [`docs/development.md`](docs/development.md) |
+
+설계·연동 문서, 다이어그램, 에이전트용 작성 지침을 포함한 `docs/` 전체 목록은
+[`docs/README.md`](docs/README.md)에서 확인하세요. 이 저장소 자체를 편집하는 코딩
+에이전트를 위한 규칙은 [`AGENTS.md`](AGENTS.md)입니다.
 
 ## 로컬 개발
 

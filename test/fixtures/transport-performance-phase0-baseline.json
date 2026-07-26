@@ -2,11 +2,11 @@
   "schemaVersion": 3,
   "phase": "M0",
   "evidenceKind": "local-benchmark-baseline",
-  "capturedAt": "2026-07-25T13:20:42.992Z",
+  "capturedAt": "2026-07-26T06:12:32.828Z",
   "environment": {
-    "sourceRevision": "ee45f6529db216df242d34a579f37aa3cdb93830",
-    "sourceDirty": true,
-    "worktreeDigest": "f0cacdd751ac9128ed8307fdafeebbdcc62372d1a8d3ebbeab85b84c04f16c46",
+    "sourceRevision": "8d8224689a884f7faf10c7c45702d7e622255609",
+    "sourceDirty": false,
+    "worktreeDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "os": "darwin",
     "arch": "arm64",
     "bunVersion": "1.3.14",
@@ -48,11 +48,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 58.085458,
+              "value": 54.183459,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 36.136500000000005,
+              "value": 35.4985,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -64,15 +64,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 9.464,
+              "value": 7.028,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 38600704,
+              "value": 38633472,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.710625,
+              "value": 0.553459,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -97,11 +97,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 28.796750000000003,
+              "value": 27.683707999999996,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 8.959000000000003,
+              "value": 9.041083,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -113,15 +113,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 2.792,
+              "value": 3.268,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 39223296,
+              "value": 39206912,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.609416,
+              "value": 0.574792,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -146,11 +146,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 68.12420800000001,
+              "value": 67.101667,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 49.787875,
+              "value": 49.839042000000006,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -162,15 +162,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 4.555,
+              "value": 3.927,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 39485440,
+              "value": 39550976,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.615833,
+              "value": 0.502208,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -195,11 +195,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 21.708833999999996,
+              "value": 22.428458000000006,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 3.446041999999977,
+              "value": 3.641832999999991,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -211,15 +211,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 1.711,
+              "value": 1.824,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 39583744,
+              "value": 39649280,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.458334,
+              "value": 0.525167,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -244,11 +244,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 20.482249999999993,
+              "value": 20.458499999999987,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 3.428042000000005,
+              "value": 3.3489160000000027,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -260,15 +260,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 1.68,
+              "value": 1.791,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 39698432,
+              "value": 39763968,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.527834,
+              "value": 0.622625,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -293,11 +293,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 53.62387500000003,
+              "value": 53.426334,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 35.44916700000002,
+              "value": 35.084417,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -309,15 +309,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 5.299,
+              "value": 5.513,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 40173568,
+              "value": 40288256,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.611667,
+              "value": 0.5145,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -342,11 +342,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 28.53099999999995,
+              "value": 27.729417000000012,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 9.450999999999965,
+              "value": 9.095124999999996,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -358,15 +358,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 4.927,
+              "value": 4.596,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 40910848,
+              "value": 40943616,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.598,
+              "value": 0.673917,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -391,11 +391,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 68.84699999999998,
+              "value": 69.44575000000003,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 50.22687500000001,
+              "value": 50.229250000000036,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -407,15 +407,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 5.131,
+              "value": 4.848,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 41467904,
+              "value": 41517056,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.66325,
+              "value": 0.487542,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -440,11 +440,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 22.747500000000002,
+              "value": 23.095459000000005,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 3.874916999999982,
+              "value": 4.32120900000001,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -456,15 +456,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 3.558,
+              "value": 3.554,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 41828352,
+              "value": 41926656,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.142292,
+              "value": 0.396083,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -489,11 +489,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 22.07658299999997,
+              "value": 22.03995900000001,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 4.013207999999963,
+              "value": 3.806874999999991,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -505,15 +505,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 3.016,
+              "value": 2.86,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 42188800,
+              "value": 42254336,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.577834,
+              "value": 0.484584,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -538,11 +538,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 55.676625,
+              "value": 57.79583400000001,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 36.393749999999955,
+              "value": 35.13487500000002,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -554,15 +554,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 7.632,
+              "value": 8.162,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 42942464,
+              "value": 43040768,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.697791,
+              "value": 1.134416,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -587,11 +587,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 30.79695799999996,
+              "value": 32.08425,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 9.783624999999972,
+              "value": 8.724959000000013,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -603,15 +603,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 10.193,
+              "value": 8.952,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 45678592,
+              "value": 45891584,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.190834,
+              "value": 0.162292,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -636,11 +636,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 71.32287499999995,
+              "value": 73.52270799999997,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 51.451124999999934,
+              "value": 50.09183299999995,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -652,15 +652,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 8.228,
+              "value": 8.55,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 46645248,
+              "value": 46694400,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 1.076833,
+              "value": 0.809041,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -685,11 +685,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 27.236290999999937,
+              "value": 29.078292000000033,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 4.3868329999999105,
+              "value": 4.628791999999976,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -701,15 +701,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 6.671,
+              "value": 6.962,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 47579136,
+              "value": 47480832,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.68,
+              "value": 0.905792,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -734,11 +734,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 25.465291000000093,
+              "value": 28.73458299999993,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 4.598541000000068,
+              "value": 4.299250000000029,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -750,15 +750,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 5.527,
+              "value": 6.996,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 48234496,
+              "value": 48070656,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 0.886,
+              "value": 1.015708,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -783,11 +783,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 73.58466699999997,
+              "value": 74.63445899999999,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 36.02691699999991,
+              "value": 35.352416999999946,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -799,15 +799,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 12.082,
+              "value": 11.477,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 49446912,
+              "value": 49479680,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 4.358625,
+              "value": 3.135625,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -832,11 +832,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 48.998500000000035,
+              "value": 46.10929199999998,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 9.955916000000002,
+              "value": 10.508791999999971,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -848,15 +848,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 11.215,
+              "value": 11.015,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 50790400,
+              "value": 50741248,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 2.663875,
+              "value": 2.701166,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -881,11 +881,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 90.19016600000009,
+              "value": 93.68295799999999,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 51.36845800000003,
+              "value": 50.830082999999945,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -897,15 +897,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 14.81,
+              "value": 17.652,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 52461568,
+              "value": 52281344,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 3.342708,
+              "value": 3.269791,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -930,11 +930,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 46.975167000000056,
+              "value": 45.01299999999992,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 6.30925000000002,
+              "value": 6.3549580000000105,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -946,15 +946,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 8.51,
+              "value": 8.31,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 53657600,
+              "value": 53460992,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 2.73075,
+              "value": 2.120875,
               "unit": "ms"
             },
             "peakChildCount": {
@@ -979,11 +979,11 @@
           "sample": 1,
           "metrics": {
             "monotonicDurationMs": {
-              "value": 48.52866700000004,
+              "value": 47.86450000000002,
               "unit": "ms"
             },
             "settlementLatencyMs": {
-              "value": 6.100708000000054,
+              "value": 7.092958000000067,
               "unit": "ms"
             },
             "childSpawnCount": {
@@ -995,15 +995,15 @@
               "unit": "count"
             },
             "parentCpuDeltaMs": {
-              "value": 11.459,
+              "value": 9.498,
               "unit": "ms"
             },
             "peakParentRssBytes": {
-              "value": 54919168,
+              "value": 54689792,
               "unit": "bytes"
             },
             "eventLoopDelayMs": {
-              "value": 5.622458,
+              "value": 4.326084,
               "unit": "ms"
             },
             "peakChildCount": {

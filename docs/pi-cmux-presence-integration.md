@@ -51,7 +51,7 @@ presence producer는 root parent(depth `0`)의 `session_start`에서 session ID�
 - `queued`는 scheduler queue 수다.
 - `completed`/`failed`/`cancelled`는 session 안에서 처음 본 terminal invocation ID만 누적한다. UX recent history가 pruning되어도 계속 유지한다. ID 기억은 4,096개, 각 presence count는 1,000,000으로 상한을 둔다. ID 기억이 포화되면 재전송으로 과대계산하지 않도록 새 terminal count를 동결한다.
 - `active > 0`이면 state는 `running`이다. `active === 0`이고 `queued > 0`인 **queued-only** 상태는 `waiting`이다. 둘 다 없으면 가장 최근 terminal outcome에 따라 `success`/`error`/`cancelled`, terminal이 없으면 `idle`이다.
-- attention은 새 **background** terminal에만 붙는다. background `failed → error`, background `completed → success`; background `cancelled`은 `none`이다. foreground terminal은 성공·실패·취소 모두 `none`이고, 그 밖의 정상 update와 모든 replay도 `none`이다.
+- attention은 invocation kind와 관계없이 새 terminal에 붙는다. foreground/background `failed → error`, foreground/background `completed → success`; `cancelled`은 `none`이다. 그 밖의 정상 update와 모든 replay도 `none`이다. consumer는 부모 Pi lifecycle과 terminal attention을 병합해 child 완료를 전체 응답 완료로 조기에 표시하지 않아야 한다.
 
 progress는 추측한 작업량이 아니라 structured tool details와 invocation의 알려진 work count에서만 얻는다. 단일 호출은 active 동안 `0/1`을 내고 terminal update에서는 progress를 생략하며, 병렬 호출은 `details.results` 길이를 total로, `exitCode !== -1` result 수를 completed로 사용한다. 체인은 `chainStageCount`를 total로, `chainCompletedCount`·`chainSkippedCount`·`chainFailedCount`·`chainCompletedWithErrorsCount` 합계를 completed로 사용하며 total을 넘지 않게 제한한다. 여러 active invocation의 determinate progress는 합산해 `Subagents completed/total`로 표시한다.
 
@@ -75,7 +75,7 @@ presence는 observer 출력이다. update/ready listener, consumer socket 또는
 
 ## 7. 검증 범위
 
-`pi-subagent`에서 다음 focused test는 strict update/ready parsing, session/generation fence, attention 없는 replay, queued-only `waiting`, background-only attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
+`pi-subagent`에서 다음 focused test는 strict update/ready parsing, session/generation fence, attention 없는 replay, queued-only `waiting`, foreground/background terminal attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts

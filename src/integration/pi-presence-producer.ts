@@ -246,10 +246,8 @@ export class PiSubagentPresenceProducer {
       this.terminalIds.add(item.id);
       if (this.terminalCounts[item.status] < MAX_PRESENCE_COUNT) this.terminalCounts[item.status] += 1;
       if (!newest || isNewerTerminal(item, newest)) newest = item;
-      if (item.kind === "background") {
-        if (item.status === "failed") attention = "error";
-        else if (item.status === "completed" && attention !== "error") attention = "success";
-      }
+      if (item.status === "failed") attention = "error";
+      else if (item.status === "completed" && attention !== "error") attention = "success";
     }
     const state = newest?.status ?? null;
     if (state) this.lastTerminal = state;

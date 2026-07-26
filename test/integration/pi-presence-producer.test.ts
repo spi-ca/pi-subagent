@@ -99,21 +99,21 @@ describe("pi presence producer wire contract", () => {
     assert.equal(Object.isFrozen(emitted[0].counts), true);
   });
 
-  test("emits background-only attention, selects terminal state by newest completion, and projects queue state", () => {
+  test("emits terminal attention for foreground and background runs, selects terminal state by newest completion, and projects queue state", () => {
     const emitted: any[] = [];
     let scheduler = { active: 0, queued: 0 };
     const producer = createPiSubagentPresenceProducer({
       emit: (_channel, payload) => emitted.push(payload), getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
-    const completed = { id: "completed", status: "completed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 30 };
+    const completed = { id: "completed", status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 30 };
     const failed = { id: "failed", status: "failed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 20, completedAt: 20 };
     producer.publish(snapshot(0, [completed, failed]));
     assert.deepEqual(emitted[0].counts, { active: 0, completed: 1, failed: 1, queued: 0, cancelled: 0, total: 2 });
     assert.equal(emitted[0].state, "success", "newest terminal determines state, independent of snapshot order");
-    assert.equal(emitted[0].attention, "error", "a background failure wins over a simultaneous success");
+    assert.equal(emitted[0].attention, "error", "a failure wins over a simultaneous success across invocation kinds");
 
-    const cancelled = { id: "cancelled", status: "cancelled", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 40, completedAt: 40 };
+    const cancelled = { id: "cancelled", status: "cancelled", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 40, completedAt: 40 };
     producer.publish(snapshot(0, [cancelled]));
     assert.equal(emitted[1].state, "cancelled");
     assert.equal(emitted[1].attention, "none");
@@ -143,7 +143,7 @@ describe("pi presence producer wire contract", () => {
     assert.deepEqual(emitted.map((event) => event.counts.completed), [1, 1]);
     assert.deepEqual(emitted.map((event) => event.counts.failed), [0, 1]);
     assert.deepEqual(emitted.map((event) => event.state), ["success", "error"]);
-    assert.deepEqual(emitted.map((event) => event.attention), ["none", "none"]);
+    assert.deepEqual(emitted.map((event) => event.attention), ["success", "error"]);
 
     const throwing = createPiSubagentPresenceProducer({ emit: () => { throw new Error("listener"); }, getSchedulerCounts: () => { throw new Error("scheduler"); }, getInteractiveActiveCount: () => { throw new Error("interactive"); } });
     throwing.startSession("session-1", 0);

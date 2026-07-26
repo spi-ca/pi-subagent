@@ -21,6 +21,8 @@ export interface ManagedChildPiExecutableGeneration {
   uid: number;
   /** Credentialed live launches require the descriptor-validated native format. */
   nativeExecutable: boolean;
+  /** A separately verified 0700 runtime root may terminate ancestry validation. */
+  privateRoot?: string;
 }
 
 type CanonicalizeCandidate = (candidate: string) => string | null;
@@ -85,11 +87,12 @@ function hasSupportedNativeExecutableMagic(descriptor: number): boolean {
     || magic === 0xcafebabf || magic === 0xbfbafeca; // Mach-O universal 64-bit
 }
 
-function safeGeneration(executable: string, requireNativeExecutable = false): ManagedChildPiExecutableGeneration | null {
+function safeGeneration(executable: string, requireNativeExecutable = false, privateRoot?: string): ManagedChildPiExecutableGeneration | null {
   let descriptor: number | undefined;
   try {
     if (!path.isAbsolute(executable)) return null;
     const canonical = fs.realpathSync(executable);
+    const canonicalPrivateRoot = privateRoot === undefined ? undefined : fs.realpathSync(privateRoot);
     if (!path.isAbsolute(canonical) || path.normalize(canonical) !== canonical) return null;
     const owner = currentUid();
     descriptor = fs.openSync(canonical, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -106,7 +109,12 @@ function safeGeneration(executable: string, requireNativeExecutable = false): Ma
     for (let ancestor = path.dirname(canonical); ; ancestor = path.dirname(ancestor)) {
       const stat = fs.statSync(ancestor);
       if (!stat.isDirectory() || !safeMode(stat.mode) || !isSafeOwner(stat.uid, owner)) return null;
+      if (ancestor === canonicalPrivateRoot) break;
       if (ancestor === path.dirname(ancestor)) break;
+    }
+    if (canonicalPrivateRoot !== undefined) {
+      const relative = path.relative(canonicalPrivateRoot, canonical);
+      if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
     }
     return {
       executable: canonical,
@@ -118,6 +126,7 @@ function safeGeneration(executable: string, requireNativeExecutable = false): Ma
       mode: Number(file.mode),
       uid: Number(file.uid),
       nativeExecutable: requireNativeExecutable,
+      ...(canonicalPrivateRoot === undefined ? {} : { privateRoot: canonicalPrivateRoot }),
     };
   } catch {
     return null;
@@ -131,7 +140,7 @@ function sameGeneration(left: ManagedChildPiExecutableGeneration, right: Managed
     && left.dev === right.dev && left.ino === right.ino && left.size === right.size
     && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
     && left.mode === right.mode && left.uid === right.uid
-    && left.nativeExecutable === right.nativeExecutable;
+    && left.nativeExecutable === right.nativeExecutable && left.privateRoot === right.privateRoot;
 }
 
 /** Captures a canonical safe executable generation; base acceptance may use scripts. */
@@ -142,15 +151,15 @@ export function captureManagedChildPiExecutableGeneration(executable: string): M
 }
 
 /** Captures a canonical safe native generation for a credentialed live child launch. */
-function captureManagedChildLivePiExecutableGeneration(executable: string): ManagedChildPiExecutableGeneration {
-  const generation = safeGeneration(executable, true);
+export function captureManagedChildLivePiExecutableGeneration(executable: string, privateRoot?: string): ManagedChildPiExecutableGeneration {
+  const generation = safeGeneration(executable, true, privateRoot);
   if (!generation) throw new Error("Managed-child live acceptance executable is not a safe canonical native executable.");
   return generation;
 }
 
 /** Fails closed if an executable, native-format, or safe-ancestry property changed. */
 export function revalidateManagedChildPiExecutableGeneration(expected: ManagedChildPiExecutableGeneration): void {
-  const actual = safeGeneration(expected.executable, expected.nativeExecutable);
+  const actual = safeGeneration(expected.executable, expected.nativeExecutable, expected.privateRoot);
   if (!actual || !sameGeneration(actual, expected)) {
     throw new Error("Managed-child acceptance executable generation changed before spawn.");
   }

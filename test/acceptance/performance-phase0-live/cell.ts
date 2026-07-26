@@ -1,69 +1,91 @@
 import * as crypto from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { constants as fsConstants, existsSync } from "node:fs";
+import { constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { MAX_SUBAGENT_ACTIVE } from "../../../src/core/subagent-limits.js";
-import { assertSafeStateRoot, getProcessStartedAt, hasAllocationIntentSourceBinding, prepareRunArtifactPaths, readBrokerArtifact, removeRunArtifacts } from "../../../src/runtime/run-protocol.js";
+import { assertSafeStateRoot, classifyParentProcessIdentity, getProcessStartedAt, hasAllocationIntentSourceBinding, prepareRunArtifactPaths, readBrokerArtifact, removeRunArtifacts, type ProcessIdentityStatus } from "../../../src/runtime/run-protocol.js";
 import { exactArtifactDigest, parseAllocationRecordV3, parseCommittedLaunchRecordV3, parseLaunchIntentV3 } from "../../../src/runtime/tmux-control-protocol.js";
 import { parseTmuxControlTransportGate } from "../../../src/runtime/tmux-control-gate.js";
-import { Phase0LiveProofServer, type Phase0LiveProofTerminalCounts } from "../../../src/runtime/phase0-live-proof.js";
-import { BoundedOutputCapture, CHILD_MODEL, DEFAULT_COMMAND_TIMEOUT_MS, MAX_DIAGNOSTIC_BYTES, MAX_LIVE_STDOUT_BYTES,  SUPPORTED_ACTIVE_RUNS, TRANSPORT_METRICS, type CellDeadline, type CellEvidence, type ChildResources, type Json, type LiveMode, type Metric, type NotApplicable, type Phase0ReleaseWriter, type ProcessIdentity, type RecordJson, type SupportedActiveRun, type TransportCounters, type BoundedCommandOptions, type BoundedCommandResult, type Workload, cleanupPhase0ReleaseWriters, createCellDeadline, exact, phase0CellDeadlineMs, PHASE0_LIVE_SETTLEMENT_MARGIN_MS, record, remainingDeadlineMs, requireRemainingDeadline, runBoundedCommand as run, writePhase0ReleaseToken, safeNumber, safeText } from "./evidence.js";
+import { Phase0LiveProofServer } from "../../../src/runtime/phase0-live-proof.js";
+import { BoundedOutputCapture, CHILD_MODEL, DEFAULT_COMMAND_TIMEOUT_MS, MAX_DIAGNOSTIC_BYTES, MAX_LIVE_STDOUT_BYTES,  SUPPORTED_ACTIVE_RUNS, TRANSPORT_METRICS, type CellDeadline, type CellEvidence, type ChildResources, type Json, type LiveMode, type LivePiExecutable, type Metric, type NotApplicable, type Phase0FailureCategory, type Phase0FailureSummary, type Phase0LiveMilestone, type Phase0ReleaseWriter, type ProcessIdentity, type RecordJson, type SupportedActiveRun, type TransportCounters, type BoundedCommandOptions, type BoundedCommandResult, type Workload, PHASE0_LIVE_MILESTONES, cleanupPhase0ReleaseWriters, createCellDeadline, exact, formatPhase0FailureSummary, phase0CellDeadlineMs, PHASE0_LIVE_SETTLEMENT_MARGIN_MS, record, remainingDeadlineMs, requireRemainingDeadline, Phase0DeadlineExhaustedError, runBoundedCommand as run, writePhase0FailureSummary, writePhase0ReleaseToken, safeNumber, safeText } from "./evidence.js";
+import { revalidateManagedChildPiExecutableGeneration } from "../managed-child-pi-executable.js";
+import { buildStoppedBootstrapArgv } from "../../../src/runtime/runner.js";
 
 /** Moved modules resolve the repository root from this subdirectory. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
-function sanitizedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/** Only ordinary runtime, locale, proxy, and CA inputs may cross the synthetic-parent boundary. */
+const SYNTHETIC_PARENT_BASE_ENV = /^(?:PATH|HOME|LANG|LANGUAGE|TZ|TMPDIR|TEMP|TMP|XDG_RUNTIME_DIR|LC_[A-Z_]+|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)$/;
+const SYNTHETIC_PARENT_TRANSPORT_ENV = /^(?:TMUX|TMUX_PANE|TMUX_BIN|CMUX_BIN|CMUX_BUNDLED_CLI_PATH|CMUX_SOCKET_PATH|CMUX_WORKSPACE_ID|CMUX_SURFACE_ID)$/;
+const SYNTHETIC_PARENT_HARNESS_ENV = new Set(["PI_CODING_AGENT_DIR", "PI_SUBAGENT_RUN_STATE_DIR", "PI_SUBAGENT_CMUX_CHILD_POLICY", "PI_SUBAGENT_MAX_ACTIVE", "PI_SUBAGENT_MAX_CONCURRENCY", "PI_SUBAGENT_MAX_BACKGROUND_JOBS", "PI_SUBAGENT_PHASE0_LIVE", "PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR", "PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY", "PI_SUBAGENT_PHASE0_LIVE_PROOF_SOCKET", "PI_SUBAGENT_PHASE0_LIVE_PROOF_MASTER", "PI_SUBAGENT_PHASE0_LIVE_PROOF_BARRIER_PATHS", "PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_TOKENS", "PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_DEADLINE", "PI_SUBAGENT_PHASE0_LIVE_PROOF_BEHAVIOR", "PI_OFFLINE", "PHASE0_TASK_CHUNKS", "PHASE0_STAGE_ROOT", "PHASE0_STAGE_MILESTONES", "PHASE0_WORKLOAD", "PHASE0_ACTIVE_RUNS", "PHASE0_LAUNCH_COOLDOWN_MS", "PHASE0_ACTION_RELEASE_PATH", "PHASE0_CELL_DEADLINE"]);
+/**
+ * Starts from an explicit caller-provided environment, never process.env.
+ * Ambient Pi/subagent state, loaders, shells, credentials, and multiplexer
+ * state cannot enter unless a listed transport value is explicitly supplied.
+ */
+export function buildSyntheticParentEnv(baseEnv: NodeJS.ProcessEnv, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (/^(?:CMUX_|TMUX$|TMUX_PANE$)/.test(key)) continue;
-    if (!/^(?:NODE_OPTIONS|NODE_PATH|BUN_OPTIONS|LD_|DYLD_|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND)$/i.test(key)
-      && !/^(?:.*(?:API_?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL).*)$/i.test(key) && !key.startsWith("BASH_FUNC_")) env[key] = value;
+  for (const [key, value] of Object.entries(baseEnv)) if (value !== undefined && SYNTHETIC_PARENT_BASE_ENV.test(key)) env[key] = value;
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) continue;
+    if (!SYNTHETIC_PARENT_TRANSPORT_ENV.test(key) && !SYNTHETIC_PARENT_HARNESS_ENV.has(key) && !SYNTHETIC_PARENT_BASE_ENV.test(key)) throw new Error(`synthetic parent override is not allowlisted: ${key}`);
+    env[key] = value;
   }
-  return { ...env, ...overrides };
+  return env;
 }
-function processRows(): Array<{ pid: number; ppid: number; command: string }> {
-  const probe = spawnSync("/bin/ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" });
-  if (probe.status !== 0) return [];
-  const rows: Array<{ pid: number; ppid: number; command: string }> = [];
-  for (const line of probe.stdout.split("\n")) {
+export type Phase0BootstrapProcessRow = Readonly<{ pid: number; ppid: number; command: string }>;
+export const PHASE0_PROCESS_ROWS_TIMEOUT_MS = 100;
+export type Phase0ProcessRowsProbeResult = Readonly<{ status: number | null; stdout?: string | Buffer; error?: Error }>;
+export type Phase0ProcessRowsProbe = (timeoutMs: number) => Phase0ProcessRowsProbeResult;
+/** A failed or timed-out process-table probe provides no topology observation. */
+export function processRows(deadline?: CellDeadline, probe: Phase0ProcessRowsProbe = (timeoutMs) => spawnSync("/bin/ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8", timeout: timeoutMs, killSignal: "SIGKILL" })): Phase0BootstrapProcessRow[] {
+  const timeoutMs = deadline ? Math.min(PHASE0_PROCESS_ROWS_TIMEOUT_MS, Math.max(0, remainingDeadlineMs(deadline))) : PHASE0_PROCESS_ROWS_TIMEOUT_MS;
+  if (timeoutMs <= 0) return [];
+  let result: Phase0ProcessRowsProbeResult;
+  try { result = probe(timeoutMs); } catch { return []; }
+  if (result.status !== 0 || result.error) return [];
+  const rows: Phase0BootstrapProcessRow[] = [];
+  for (const line of String(result.stdout ?? "").split("\n")) {
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
     if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]! });
   }
   return rows;
 }
-function processDescendants(parentPid: number): number[] {
+function processDescendants(parentPid: number, deadline?: CellDeadline): number[] {
   const children = new Map<number, number[]>();
-  for (const row of processRows()) children.set(row.ppid, [...(children.get(row.ppid) ?? []), row.pid]);
+  for (const row of processRows(deadline)) children.set(row.ppid, [...(children.get(row.ppid) ?? []), row.pid]);
   const found: number[] = [];
   const visit = (pid: number): void => { for (const candidate of children.get(pid) ?? []) { found.push(candidate); visit(candidate); } };
   visit(parentPid);
   return found;
 }
-function directChildren(parentPid: number): Array<{ pid: number; startedAt: number }> {
-  return processRows().filter((row) => row.ppid === parentPid && /(?:^|\s|\/)(?:pi|bun)(?:\s|$)/.test(row.command))
+function directChildren(parentPid: number, deadline?: CellDeadline): Array<{ pid: number; startedAt: number }> {
+  return processRows(deadline).filter((row) => row.ppid === parentPid && /(?:^|\s|\/)(?:pi|bun)(?:\s|$)/.test(row.command))
     .map((row) => ({ pid: row.pid, startedAt: getProcessStartedAt(row.pid) }))
     .filter((row): row is { pid: number; startedAt: number } => row.startedAt !== null);
 }
 
-const MAX_PHASE0_FAILURE_DIAGNOSTIC_BYTES = 1024;
+const MAX_PHASE0_LIVE_JSONL_LINE_BYTES = 16 * 1024;
+const MAX_PHASE0_LIVE_DIAGNOSTIC_SNAPSHOT_CHARS = 768;
 export const PHASE0_LIVE_DIAGNOSTIC_ENV = "PI_SUBAGENT_PHASE0_LIVE_DIAGNOSTIC";
 export const PHASE0_TEST_HARNESS_ENV = "PI_SUBAGENT_TEST_HARNESS";
 export const PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS_ENV = "PI_SUBAGENT_PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS";
 export const PHASE0_LIVE_DIAGNOSTIC_STALL_MS_ENV = "PI_SUBAGENT_PHASE0_LIVE_DIAGNOSTIC_STALL_MS";
 const PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS = 15_000;
 const PHASE0_LIVE_DIAGNOSTIC_STALL_MS = 120_000;
-const MAX_PHASE0_LIVE_DIAGNOSTIC_SNAPSHOT_CHARS = 512;
 
 export type Phase0LiveDiagnosticProgressTuple = readonly [
-  parent: "live" | "terminal",
-  descendants: number,
-  readStarts: number,
-  proofs: number,
-  stageExists: boolean,
+  milestone: Phase0LiveMilestone,
+  parentEvents: number,
+  launchRequests: number,
+  backgroundAdmissions: number,
+  descendantHighWater: number,
+  readStartHighWater: number,
+  proofHighWater: number,
+  stagePublished: boolean,
   resourceSampled: boolean,
   peakChildResourceCount: number,
   currentChildResourceCount: number,
@@ -73,152 +95,111 @@ export type Phase0LiveDiagnosticProgressTuple = readonly [
   abortedBeforeReads: number,
 ];
 export type Phase0LiveDiagnosticConfig = Readonly<{ intervalMs: number; stallMs: number }>;
+type Phase0LiveDiagnosticWatchdogOptions = Readonly<{ config: Phase0LiveDiagnosticConfig; startedAt: number; now: () => number; progress: () => Phase0LiveDiagnosticProgressTuple; emit?: (snapshot: string) => void }>;
 
-type Phase0LiveDiagnosticWatchdogOptions = Readonly<{
-  config: Phase0LiveDiagnosticConfig;
-  startedAt: number;
-  now: () => number;
-  progress: () => Phase0LiveDiagnosticProgressTuple;
-  emit?: (snapshot: string) => void;
-}>;
-
-function positiveIntegerEnv(value: string | undefined, fallback: number): number {
-  return value !== undefined && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : fallback;
-}
-
-/** Test timing overrides are deliberately inert outside the explicit harness. */
+function positiveIntegerEnv(value: string | undefined, fallback: number): number { return value !== undefined && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : fallback; }
+/** Test timing overrides are deliberately inert outside the explicit outer harness. */
 export function resolvePhase0LiveDiagnosticConfig(env: NodeJS.ProcessEnv = process.env): Phase0LiveDiagnosticConfig | null {
   if (env[PHASE0_LIVE_DIAGNOSTIC_ENV] !== "1") return null;
   if (env[PHASE0_TEST_HARNESS_ENV] !== "1") return { intervalMs: PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS, stallMs: PHASE0_LIVE_DIAGNOSTIC_STALL_MS };
-  return {
-    intervalMs: positiveIntegerEnv(env[PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS_ENV], PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS),
-    stallMs: positiveIntegerEnv(env[PHASE0_LIVE_DIAGNOSTIC_STALL_MS_ENV], PHASE0_LIVE_DIAGNOSTIC_STALL_MS),
-  };
+  return { intervalMs: positiveIntegerEnv(env[PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS_ENV], PHASE0_LIVE_DIAGNOSTIC_INTERVAL_MS), stallMs: positiveIntegerEnv(env[PHASE0_LIVE_DIAGNOSTIC_STALL_MS_ENV], PHASE0_LIVE_DIAGNOSTIC_STALL_MS) };
 }
-
-function boundedDiagnosticCount(value: number): number {
-  return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1_000_000) : 0;
+function boundedDiagnosticCount(value: number): number { return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1_000_000) : 0; }
+function milestoneIndex(value: Phase0LiveMilestone): number { return PHASE0_LIVE_MILESTONES.indexOf(value); }
+/** Outer-harness tracker: bounded JSONL is parsed incrementally and no raw line, task, or job ID is retained. */
+export class Phase0LiveMilestoneTracker {
+  #partial = Buffer.alloc(0); #discarding = false; #launchIds = new Set<string>();
+  #parentSpawned = false; #parentEvents = 0; #launchRequests = 0; #backgroundAdmissions = 0; #descendantHighWater = 0; #readStartHighWater = 0; #proofHighWater = 0; #stagePublished = false; #latest: Phase0LiveMilestone = "none";
+  #advance(milestone: Phase0LiveMilestone): void { if (milestoneIndex(milestone) > milestoneIndex(this.#latest)) this.#latest = milestone; }
+  parentSpawned(): void { this.#parentSpawned = true; this.#advance("parent-spawned"); }
+  observeDescendants(count: number): void { const bounded = boundedDiagnosticCount(count); if (bounded > this.#descendantHighWater) { this.#descendantHighWater = bounded; this.#advance("descendant-observed"); } }
+  observeReadStarts(count: number): void { const bounded = boundedDiagnosticCount(count); if (bounded > this.#readStartHighWater) { this.#readStartHighWater = bounded; this.#advance("read-start-observed"); } }
+  observeProofs(count: number): void { const bounded = boundedDiagnosticCount(count); if (bounded > this.#proofHighWater) { this.#proofHighWater = bounded; this.#advance("proof-observed"); } }
+  observeStagePublished(present: boolean): void { if (present) this.#stagePublished = true; }
+  observeJsonl(chunk: Uint8Array): void {
+    const input = Buffer.concat([this.#partial, Buffer.from(chunk)]); let cursor = 0;
+    while (cursor < input.length) {
+      const newline = input.indexOf(0x0a, cursor); if (newline < 0) break;
+      const line = input.subarray(cursor, newline); cursor = newline + 1;
+      if (!this.#discarding && line.length <= MAX_PHASE0_LIVE_JSONL_LINE_BYTES) this.#observeLine(line);
+      this.#discarding = false;
+    }
+    const trailing = input.subarray(cursor);
+    if (this.#discarding || trailing.length > MAX_PHASE0_LIVE_JSONL_LINE_BYTES) { this.#partial = Buffer.alloc(0); this.#discarding = true; }
+    else this.#partial = Buffer.from(trailing);
+  }
+  #validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 128 && /^[a-z0-9._:-]+$/i.test(value); }
+  #observeLine(line: Buffer): void {
+    let event: unknown; try { event = JSON.parse(line.toString("utf8")); } catch { return; }
+    if (!record(event) || (event.type !== "tool_execution_start" && event.type !== "tool_execution_end")) return;
+    this.#parentEvents = boundedDiagnosticCount(this.#parentEvents + 1); this.#advance("parent-event-observed");
+    const toolCallId = event.toolCallId;
+    if (event.type === "tool_execution_start" && event.toolName === "subagent" && this.#validId(toolCallId) && record(event.args)
+      && event.args.background === true && Array.isArray(event.args.tasks) && event.args.tasks.length > 0 && event.args.action === undefined) {
+      this.#launchIds.add(toolCallId); this.#launchRequests = boundedDiagnosticCount(this.#launchRequests + 1); this.#advance("subagent-launch-requested");
+    }
+    if (event.type === "tool_execution_end" && event.toolName === "subagent" && this.#validId(toolCallId) && this.#launchIds.delete(toolCallId)
+      && event.isError === false && record(event.result) && record(event.result.details) && this.#validId(event.result.details.jobId)) {
+      this.#backgroundAdmissions = boundedDiagnosticCount(this.#backgroundAdmissions + 1); this.#advance("background-job-admitted");
+    }
+  }
+  progress(resourceSampled: boolean, peakChildResourceCount: number, currentChildResourceCount: number, terminals: Phase0TerminalCounts): Phase0LiveDiagnosticProgressTuple {
+    return [this.#latest, this.#parentEvents, this.#launchRequests, this.#backgroundAdmissions, this.#descendantHighWater, this.#readStartHighWater, this.#proofHighWater, this.#stagePublished, resourceSampled, boundedDiagnosticCount(peakChildResourceCount), boundedDiagnosticCount(currentChildResourceCount), boundedDiagnosticCount(terminals["provider-error"]), boundedDiagnosticCount(terminals["settled-before-read"]), boundedDiagnosticCount(terminals["shutdown-before-read"]), boundedDiagnosticCount(terminals["aborted-before-read"])];
+  }
+  summary(): Phase0FailureSummary["monotonic"] { return { parentSpawned: this.#parentSpawned, parentEventCount: this.#parentEvents, subagentLaunchRequests: this.#launchRequests, backgroundJobAdmissions: this.#backgroundAdmissions, descendantHighWater: this.#descendantHighWater, readStartHighWater: this.#readStartHighWater, proofHighWater: this.#proofHighWater, stagePublished: this.#stagePublished }; }
 }
-
-/** Formats only fixed labels and bounded scalar state; never raw output, paths, or identities. */
+/** Formats fixed labels plus bounded counters. Current resource count is a volatile gauge only. */
 export function formatPhase0LiveDiagnosticSnapshot(elapsedMs: number, progress: Phase0LiveDiagnosticProgressTuple): string {
-  const [parent, descendants, readStarts, proofs, stageExists, resourceSampled, peakChildResourceCount, currentChildResourceCount, providerErrors, settledBeforeReads, shutdownBeforeReads, abortedBeforeReads] = progress;
-  const snapshot = `phase0-live diagnostic elapsedMs=${boundedDiagnosticCount(Math.floor(elapsedMs))} parent=${parent} descendants=${boundedDiagnosticCount(descendants)} readStarts=${boundedDiagnosticCount(readStarts)} proofs=${boundedDiagnosticCount(proofs)} stage=${stageExists ? "present" : "absent"} resourceSampled=${resourceSampled ? "yes" : "no"} childResourcePeak=${boundedDiagnosticCount(peakChildResourceCount)} childResourceCurrent=${boundedDiagnosticCount(currentChildResourceCount)} provider-error=${boundedDiagnosticCount(providerErrors)} settled-before-read=${boundedDiagnosticCount(settledBeforeReads)} shutdown-before-read=${boundedDiagnosticCount(shutdownBeforeReads)} aborted-before-read=${boundedDiagnosticCount(abortedBeforeReads)}`;
+  const [milestone, parentEvents, launches, admissions, descendants, reads, proofs, stage, resourceSampled, peak, current, providerErrors, settled, shutdown, aborted] = progress;
+  const snapshot = `phase0-live diagnostic elapsedMs=${boundedDiagnosticCount(Math.floor(elapsedMs))} milestone=${milestone} parentEvents=${boundedDiagnosticCount(parentEvents)} launches=${boundedDiagnosticCount(launches)} admissions=${boundedDiagnosticCount(admissions)} descendantHighWater=${boundedDiagnosticCount(descendants)} readStartHighWater=${boundedDiagnosticCount(reads)} proofHighWater=${boundedDiagnosticCount(proofs)} stage=${stage ? "published" : "absent"} resourceSampled=${resourceSampled ? "yes" : "no"} childResourcePeak=${boundedDiagnosticCount(peak)} childResourceCurrent=${boundedDiagnosticCount(current)} provider-error=${boundedDiagnosticCount(providerErrors)} settled-before-read=${boundedDiagnosticCount(settled)} shutdown-before-read=${boundedDiagnosticCount(shutdown)} aborted-before-read=${boundedDiagnosticCount(aborted)}`;
   return snapshot.length <= MAX_PHASE0_LIVE_DIAGNOSTIC_SNAPSHOT_CHARS ? snapshot : snapshot.slice(0, MAX_PHASE0_LIVE_DIAGNOSTIC_SNAPSHOT_CHARS);
 }
-
-/** Opt-in watchdog with an explicit tuple so elapsed time alone never counts as progress. */
+/** Only finite work milestones, terminal counts, and true high-water marks reset the stall clock. */
+function hasAuthoritativePhase0LiveProgress(current: Phase0LiveDiagnosticProgressTuple, previous: Phase0LiveDiagnosticProgressTuple): boolean {
+  // parentEvents, generic parent-event milestones, resource-sampled, and current
+  // resource count are display-only gauges: pause/status traffic must not mask a stall.
+  const monotonicNumbers = [2, 3, 4, 5, 6, 9, 11, 12, 13, 14];
+  const authoritativeMilestones: readonly Phase0LiveMilestone[] = ["subagent-launch-requested", "background-job-admitted", "descendant-observed", "read-start-observed", "proof-observed"];
+  const advancedMilestone = authoritativeMilestones.includes(current[0]) && milestoneIndex(current[0]) > milestoneIndex(previous[0]);
+  return advancedMilestone || monotonicNumbers.some((index) => (current[index] as number) > (previous[index] as number)) || (!previous[7] && current[7]);
+}
 export class Phase0LiveDiagnosticWatchdog {
-  #lastProgress: Phase0LiveDiagnosticProgressTuple | null = null;
-  #lastProgressAt = 0;
-  #lastSnapshot = "phase0-live diagnostic unavailable";
+  #lastProgress: Phase0LiveDiagnosticProgressTuple | null = null; #lastProgressAt = 0; #lastSnapshot = "phase0-live diagnostic unavailable";
   constructor(private readonly options: Phase0LiveDiagnosticWatchdogOptions) {}
-  prime(): void {
-    const now = this.options.now();
-    const progress = this.options.progress();
-    this.#lastProgress = progress;
-    this.#lastProgressAt = now;
-    this.#lastSnapshot = formatPhase0LiveDiagnosticSnapshot(now - this.options.startedAt, progress);
-  }
-  tick(): Error | null {
-    if (!this.#lastProgress) this.prime();
-    const now = this.options.now();
-    const progress = this.options.progress();
-    const snapshot = formatPhase0LiveDiagnosticSnapshot(now - this.options.startedAt, progress);
-    this.#lastSnapshot = snapshot;
-    try { this.options.emit?.(snapshot); } catch { /* Diagnostics never alter benchmark control flow. */ }
-    if (!samePhase0LiveDiagnosticProgress(progress, this.#lastProgress!)) {
-      this.#lastProgress = progress;
-      this.#lastProgressAt = now;
-      return null;
-    }
-    if (now - this.#lastProgressAt < this.options.config.stallMs) return null;
-    return new Error(`Phase 0 live diagnostic watchdog stalled; last snapshot: ${this.#lastSnapshot}`);
-  }
+  prime(): void { const now = this.options.now(), progress = this.options.progress(); this.#lastProgress = progress; this.#lastProgressAt = now; this.#lastSnapshot = formatPhase0LiveDiagnosticSnapshot(now - this.options.startedAt, progress); }
+  tick(): Error | null { if (!this.#lastProgress) this.prime(); const now = this.options.now(), progress = this.options.progress(); this.#lastSnapshot = formatPhase0LiveDiagnosticSnapshot(now - this.options.startedAt, progress); try { this.options.emit?.(this.#lastSnapshot); } catch {} if (hasAuthoritativePhase0LiveProgress(progress, this.#lastProgress!)) { this.#lastProgress = progress; this.#lastProgressAt = now; return null; } return now - this.#lastProgressAt < this.options.config.stallMs ? null : new Phase0DeadlineExhaustedError(); }
 }
 
-function samePhase0LiveDiagnosticProgress(left: Phase0LiveDiagnosticProgressTuple, right: Phase0LiveDiagnosticProgressTuple): boolean {
-  return left.every((value, index) => value === right[index]);
-}
-
-export const PHASE0_FAILURE_CATEGORIES = ["spawn-failed", "parent-exit", "parent-signal", "deadline-exhausted", "stdout-overflow", "stderr-overflow", "harness-failure"] as const;
-export type Phase0FailureCategory = (typeof PHASE0_FAILURE_CATEGORIES)[number];
-type Phase0TerminalCounts = Pick<Phase0LiveProofTerminalCounts, "provider-error" | "settled-before-read" | "shutdown-before-read" | "aborted-before-read">;
-
-function phase0TerminalCounts(value: Partial<Phase0TerminalCounts> | undefined): Phase0TerminalCounts {
-  const count = (name: keyof Phase0TerminalCounts): number => boundedDiagnosticCount(Number(value?.[name] ?? 0));
-  return {
-    "provider-error": count("provider-error"),
-    "settled-before-read": count("settled-before-read"),
-    "shutdown-before-read": count("shutdown-before-read"),
-    "aborted-before-read": count("aborted-before-read"),
-  };
-}
-
-function phase0FailureCountsText(value: Partial<Phase0TerminalCounts> | undefined): string {
-  const counts = phase0TerminalCounts(value);
-  return `provider-error=${counts["provider-error"]} settled-before-read=${counts["settled-before-read"]} shutdown-before-read=${counts["shutdown-before-read"]} aborted-before-read=${counts["aborted-before-read"]}`;
-}
-
-class Phase0TerminalFailure extends Error {
-  constructor(readonly category: Extract<Phase0FailureCategory, "spawn-failed" | "parent-exit" | "parent-signal">, counts: Partial<Phase0TerminalCounts>) {
-    super(`Phase 0 provider parent terminal category=${category} ${phase0FailureCountsText(counts)}`);
-  }
-}
-
+type Phase0TerminalCounts = { "provider-error": number; "settled-before-read": number; "shutdown-before-read": number; "aborted-before-read": number };
+function phase0TerminalCounts(value: Partial<Phase0TerminalCounts> | undefined): Phase0TerminalCounts { const count = (name: keyof Phase0TerminalCounts): number => boundedDiagnosticCount(Number(value?.[name] ?? 0)); return { "provider-error": count("provider-error"), "settled-before-read": count("settled-before-read"), "shutdown-before-read": count("shutdown-before-read"), "aborted-before-read": count("aborted-before-read") }; }
+function phase0FailureCountsText(value: Partial<Phase0TerminalCounts> | undefined): string { const counts = phase0TerminalCounts(value); return `provider-error=${counts["provider-error"]} settled-before-read=${counts["settled-before-read"]} shutdown-before-read=${counts["shutdown-before-read"]} aborted-before-read=${counts["aborted-before-read"]}`; }
+class Phase0TerminalFailure extends Error { constructor(readonly category: Extract<Phase0FailureCategory, "spawn-failed" | "parent-exit" | "parent-signal">, counts: Partial<Phase0TerminalCounts>) { super(`Phase 0 provider parent terminal category=${category} ${phase0FailureCountsText(counts)}`); } }
 /** Uses only fixed categories and terminal counters; never provider stderr or spawn error text. */
-export function phase0ChildTerminalFailure(
-  status: { exitCode: number | null; signalCode: NodeJS.Signals | null; error?: unknown },
-  terminalCounts: Partial<Phase0TerminalCounts> = {},
-): Error | null {
-  if (status.error !== undefined) return new Phase0TerminalFailure("spawn-failed", terminalCounts);
-  if (status.signalCode === null && (status.exitCode === null || status.exitCode === 0)) return null;
-  return new Phase0TerminalFailure(status.signalCode ? "parent-signal" : "parent-exit", terminalCounts);
-}
+export function phase0ChildTerminalFailure(status: { exitCode: number | null; signalCode: NodeJS.Signals | null; error?: unknown }, terminalCounts: Partial<Phase0TerminalCounts> = {}): Error | null { if (status.error !== undefined) return new Phase0TerminalFailure("spawn-failed", terminalCounts); if (status.signalCode === null && (status.exitCode === null || status.exitCode === 0)) return null; return new Phase0TerminalFailure(status.signalCode ? "parent-signal" : "parent-exit", terminalCounts); }
 
-export function formatPhase0FailureDiagnostics(category: Phase0FailureCategory, state: {
-  activeRuns: number;
-  parentTerminal: boolean;
-  stageExists: boolean;
-  timedOut: boolean;
-  stdoutOverflow: boolean;
-  stderrOverflow: boolean;
-  stderrBytes: number;
-  terminalCounts: Partial<Phase0TerminalCounts>;
-}): string {
-  if (!(PHASE0_FAILURE_CATEGORIES as readonly string[]).includes(category)) throw new Error("Phase 0 failure diagnostic category is invalid");
-  const counts = phase0TerminalCounts(state.terminalCounts);
-  const diagnostic = {
-    version: 1,
-    category,
-    activeRuns: boundedDiagnosticCount(state.activeRuns),
-    parentTerminal: state.parentTerminal === true,
-    stageExists: state.stageExists === true,
-    timedOut: state.timedOut === true,
-    stdoutOverflow: state.stdoutOverflow === true,
-    stderrOverflow: state.stderrOverflow === true,
-    stderrBytes: boundedDiagnosticCount(state.stderrBytes),
-    providerErrorCount: counts["provider-error"],
-    settledBeforeReadCount: counts["settled-before-read"],
-    shutdownBeforeReadCount: counts["shutdown-before-read"],
-    abortedBeforeReadCount: counts["aborted-before-read"],
-  };
-  const serialized = JSON.stringify(diagnostic);
-  if (Buffer.byteLength(serialized, "utf8") > MAX_PHASE0_FAILURE_DIAGNOSTIC_BYTES) throw new Error("Phase 0 failure diagnostic schema exceeded its byte budget");
-  return serialized;
-}
-
-export async function writePhase0FailureDiagnostics(file: string, category: Phase0FailureCategory, state: Parameters<typeof formatPhase0FailureDiagnostics>[1]): Promise<void> {
-  await fs.writeFile(file, formatPhase0FailureDiagnostics(category, state), { encoding: "utf8", mode: 0o600, flag: "wx" });
-  await fs.chmod(file, 0o600);
-}
-
-function phase0FailureCategory(error: unknown, state: { timedOut: boolean; stdoutOverflow: boolean; stderrOverflow: boolean }): Phase0FailureCategory {
-  if (error instanceof Phase0TerminalFailure) return error.category;
-  if (state.timedOut) return "deadline-exhausted";
+export function phase0FailureCategory(error: unknown, state: { timedOut: boolean; stdoutOverflow: boolean; stderrOverflow: boolean; deadlineExpired?: boolean }): Phase0FailureCategory {
+  // Parent SIGKILL can be an effect of output enforcement or deadline expiry;
+  // preserve the originating harness category before terminal status.
   if (state.stdoutOverflow) return "stdout-overflow";
   if (state.stderrOverflow) return "stderr-overflow";
+  if (state.timedOut || state.deadlineExpired || error instanceof Phase0DeadlineExhaustedError) return "deadline-exhausted";
+  if (error instanceof Phase0TerminalFailure) return error.category;
   return "harness-failure";
+}
+
+/** A no-PID launch has no provider process to observe; wait briefly only for spawn classification. */
+async function classifyNoPidSpawnFailure(child: ChildProcess, deadline: CellDeadline): Promise<Phase0TerminalFailure> {
+  const timeoutMs = Math.min(250, requireRemainingDeadline(deadline, "spawn failure classification"));
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => { if (!settled) { settled = true; clearTimeout(timer); child.off("error", onError); child.off("close", onClose); resolve(); } };
+    const onError = (): void => finish();
+    const onClose = (): void => finish();
+    const timer = setTimeout(finish, timeoutMs);
+    child.once("error", onError);
+    child.once("close", onClose);
+  });
+  return new Phase0TerminalFailure("spawn-failed", {});
 }
 
 function observePhase0ChildTerminalFailure(child: ChildProcess, terminalCounts: () => Phase0TerminalCounts, initialError?: unknown): { promise: Promise<never>; cancel: () => void } {
@@ -246,8 +227,8 @@ async function waitForChildren(child: ChildProcess, expected: number, deadline: 
     const terminalFailure = phase0ChildTerminalFailure({ exitCode: child.exitCode, signalCode: child.signalCode }, terminalCounts());
     if (terminalFailure) throw terminalFailure;
     if (!child.pid || child.exitCode !== null) break;
-    max = Math.max(max, processDescendants(child.pid).length);
-    const identities = directChildren(child.pid);
+    max = Math.max(max, processDescendants(child.pid, deadline).length);
+    const identities = directChildren(child.pid, deadline);
     if (identities.length === expected) return { max, identities };
     if (identities.length > expected) throw new Error(`observed ${identities.length}/${expected} direct child identities before action`);
     await new Promise((resolve) => setTimeout(resolve, Math.min(50, requireRemainingDeadline(deadline, "child observation"))));
@@ -255,9 +236,9 @@ async function waitForChildren(child: ChildProcess, expected: number, deadline: 
   throw new Error(`did not observe ${expected} identity-bound child processes before action`);
 }
 /** Inline has no pane target. Close only the exact direct child identities captured at the barrier. */
-function closeExactDescendants(child: ChildProcess, targets: readonly ProcessIdentity[]): void {
+function closeExactDescendants(child: ChildProcess, targets: readonly ProcessIdentity[], deadline?: CellDeadline): void {
   if (!child.pid) throw new Error("parent PID unavailable for external close");
-  const descendants = new Set(processDescendants(child.pid));
+  const descendants = new Set(processDescendants(child.pid, deadline));
   for (const target of targets) {
     const current = getProcessStartedAt(target.pid);
     if (current === null) continue;
@@ -265,16 +246,105 @@ function closeExactDescendants(child: ChildProcess, targets: readonly ProcessIde
     process.kill(target.pid, "SIGTERM");
   }
 }
-async function terminateExactPhase0Identities(identities: Iterable<ProcessIdentity>, timeoutMs = 5_000): Promise<void> {
+type ExactProcessIdentityClassifier = (identity: ProcessIdentity) => ProcessIdentityStatus;
+const classifyExactProcessIdentity: ExactProcessIdentityClassifier = (identity) => classifyParentProcessIdentity(identity.pid, identity.startedAt);
+
+/** Exact cleanup treats an unprobeable identity as unproven, never absent. */
+export async function terminateExactPhase0Identities(identities: Iterable<ProcessIdentity>, timeoutMs = 5_000, classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity): Promise<void> {
+  // Deduplication preserves caller order for independently authorized identities.
   const unique = [...new Map([...identities].map((identity) => [`${identity.pid}:${identity.startedAt}`, identity])).values()];
+  const pending = new Set<ProcessIdentity>();
+  let failed = false;
   for (const identity of unique) {
-    if (getProcessStartedAt(identity.pid) === identity.startedAt) {
-      try { process.kill(identity.pid, "SIGKILL"); } catch { /* Absence is proven below; a failed signal is not success. */ }
-    }
+    let status: ProcessIdentityStatus;
+    try { status = classify(identity); } catch { failed = true; continue; }
+    if (status === "unknown") { failed = true; continue; }
+    if (status === "dead") continue;
+    pending.add(identity);
+    try { process.kill(identity.pid, "SIGKILL"); } catch { failed = true; }
   }
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline && unique.some((identity) => getProcessStartedAt(identity.pid) === identity.startedAt)) await new Promise((resolve) => setTimeout(resolve, 25));
-  if (unique.some((identity) => getProcessStartedAt(identity.pid) === identity.startedAt)) throw new Error("identity-safe Phase 0 process cleanup was not proven");
+  while (pending.size !== 0) {
+    for (const identity of [...pending]) {
+      let status: ProcessIdentityStatus;
+      try { status = classify(identity); } catch { failed = true; pending.delete(identity); continue; }
+      if (status === "dead") { pending.delete(identity); continue; }
+      if (status === "unknown") { failed = true; pending.delete(identity); }
+    }
+    if (pending.size === 0) break;
+    if (Date.now() >= deadline) { failed = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+  }
+  if (failed) throw new Error("identity-safe Phase 0 process cleanup was not proven");
+}
+/**
+ * Bootstrap authority is intentionally separate from provider-child cleanup.
+ * The watchdog can still target its original parent, so an unknown watchdog
+ * blocks parent signalling. Only its explicit death permits parent cleanup.
+ */
+export type Phase0BootstrapWatchdogBinding = Readonly<{ watchdog: ProcessIdentity; sleepHelper: ProcessIdentity }>;
+
+/**
+ * The watchdog owns its sleep helper's trap/reap path. Terminate the exact
+ * watchdog generation first, then require both bound generations to be dead
+ * before the stopped parent can be touched. No PID or process-group fallback
+ * is permitted here.
+ */
+export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapWatchdogBinding | null, parent: ProcessIdentity | null, classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity): Promise<void> {
+  if (binding === null) {
+    if (parent !== null) throw new Error("bootstrap watchdog identity is unavailable; parent cleanup is unproven");
+    return;
+  }
+  const { watchdog, sleepHelper } = binding;
+  const awaitBoundDead = async (): Promise<boolean> => {
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      let watchdogStatus: ProcessIdentityStatus, helperStatus: ProcessIdentityStatus;
+      try { watchdogStatus = classify(watchdog); helperStatus = classify(sleepHelper); } catch { return false; }
+      if (watchdogStatus === "dead" && helperStatus === "dead") return true;
+      if (watchdogStatus === "unknown" || helperStatus === "unknown" || Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+    }
+  };
+  let watchdogStatus: ProcessIdentityStatus;
+  try { watchdogStatus = classify(watchdog); } catch { throw new Error("bootstrap watchdog cleanup was not proven"); }
+  if (watchdogStatus === "live") {
+    // SIGTERM runs the watchdog's trap, which kills and reaps its /bin/sleep.
+    try { process.kill(watchdog.pid, "SIGTERM"); } catch { throw new Error("bootstrap watchdog cleanup was not proven"); }
+  }
+  if (!await awaitBoundDead()) {
+    // Only the independently exact-bound helper may receive fallback cleanup;
+    // unknown/reused identities are never signal authority.
+    let helperStatus: ProcessIdentityStatus;
+    try { helperStatus = classify(sleepHelper); } catch { throw new Error("bootstrap watchdog/helper cleanup was not proven"); }
+    if (helperStatus === "live") {
+      try { process.kill(sleepHelper.pid, "SIGTERM"); } catch { throw new Error("bootstrap watchdog/helper cleanup was not proven"); }
+    }
+    if (!await awaitBoundDead()) throw new Error("bootstrap watchdog/helper cleanup was not proven");
+  }
+  // This branch is reachable only after explicit dead observations for both
+  // the watchdog and its helper; parent cleanup remains gated on both.
+  if (parent === null) return;
+  let parentStatus: ProcessIdentityStatus;
+  try { parentStatus = classify(parent); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
+  if (parentStatus === "unknown") throw new Error("bootstrap parent cleanup was not proven");
+  if (parentStatus === "dead") return;
+  try { process.kill(parent.pid, "SIGKILL"); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try { parentStatus = classify(parent); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
+    if (parentStatus === "dead") return;
+    if (parentStatus === "unknown" || Date.now() >= deadline) throw new Error("bootstrap parent cleanup was not proven");
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+  }
+}
+/** Runs every independently authorized cleanup step and retains its first failure. */
+export async function attemptPhase0CleanupSteps(steps: readonly (() => Promise<void>)[]): Promise<unknown | null> {
+  let failure: unknown = null;
+  for (const step of steps) {
+    try { await step(); } catch (error) { failure ??= error; }
+  }
+  return failure;
 }
 async function removePhase0BarrierFifos(paths: readonly string[]): Promise<void> {
   for (const fifo of paths) {
@@ -286,9 +356,16 @@ async function removePhase0BarrierFifos(paths: readonly string[]): Promise<void>
   }
 }
 
-export async function prepareAgentDirectory(root: string): Promise<string> {
-  const agentDir = path.join(root, "agent"); await fs.mkdir(path.join(agentDir, "agents"), { recursive: true, mode: 0o700 }); await fs.chmod(agentDir, 0o700);
-  const source = path.join(process.env.PI_CODING_AGENT_DIR?.trim() || path.join(os.homedir(), ".pi", "agent"), "auth.json");
+export async function prepareAgentDirectory(root: string, env: NodeJS.ProcessEnv): Promise<string> {
+  const rootRealpath = await fs.realpath(root), rootStat = await fs.lstat(rootRealpath), uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (rootRealpath !== root || !rootStat.isDirectory() || rootStat.isSymbolicLink() || (rootStat.mode & 0o777) !== 0o700 || (uid !== null && rootStat.uid !== uid)) throw new Error("Phase 0 runtime root is not canonical private 0700");
+  const agentDir = path.join(root, "agent"), existing = await fs.lstat(agentDir).catch(() => null);
+  if (existing !== null) throw new Error("Phase 0 agent directory must not preexist");
+  await fs.mkdir(agentDir, { mode: 0o700 });
+  const created = await fs.lstat(agentDir);
+  if (!created.isDirectory() || created.isSymbolicLink() || (created.mode & 0o777) !== 0o700 || (uid !== null && created.uid !== uid) || await fs.realpath(agentDir) !== agentDir || path.dirname(agentDir) !== rootRealpath) throw new Error("Phase 0 agent directory creation was not proven");
+  await fs.mkdir(path.join(agentDir, "agents"), { mode: 0o700 });
+  const source = path.join(env.PI_CODING_AGENT_DIR?.trim() || path.join(env.HOME?.trim() || "/nonexistent", ".pi", "agent"), "auth.json");
   const sourceHandle = await fs.open(source, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
   let auth: Buffer;
   try {
@@ -712,7 +789,160 @@ export function deriveSettlementFromToolResults(jsonl: string, workload: Workloa
   return "externally-closed";
 }
 
-export async function runParentCell(root: string, agentDir: string, extension: string, piBin: string, activeRuns: number, workload: Workload, transportEnv: NodeJS.ProcessEnv = {}, actionBarrier?: ActionBarrier, enforceDescendantConcurrency = true, deadline: CellDeadline = createCellDeadline(activeRuns)): Promise<Omit<CellEvidence, "mode" | "sourceAndSentinelPreserved">> {
+/** A harness-only failure never exposes the caught error, path, command, or provider output. */
+export class Phase0CellFailure extends Error {
+  /** Internal retention authority; deliberately excluded from the public summary text. */
+  constructor(readonly summary: Phase0FailureSummary, readonly summaryRetentionProven = false) { super(`Phase 0 provider cell failed summary=${formatPhase0FailureSummary(summary)}`); }
+}
+/** Fixed wrapper metadata converts setup/topology failures without exposing raw transport details. */
+export type Phase0CellFailureOrigin = Readonly<{ mode: LiveMode; workload: Workload; activeRuns: number }>;
+/** Pure fallback for wrapper failures before or after a successfully completed parent cell. */
+export function phase0WrapperFallbackSummary(origin: Phase0CellFailureOrigin, cleanupProven: boolean, parentCompleted = false): Phase0FailureSummary {
+  const knownProgress = parentCompleted ? origin.activeRuns : 0;
+  return { version: 1, category: "harness-failure", mode: origin.mode, workload: origin.workload, activeRuns: origin.activeRuns, latestMilestone: parentCompleted ? "proof-observed" : "none",
+    monotonic: { parentSpawned: parentCompleted, parentEventCount: knownProgress, subagentLaunchRequests: knownProgress, backgroundJobAdmissions: knownProgress, descendantHighWater: knownProgress, readStartHighWater: knownProgress, proofHighWater: knownProgress, stagePublished: parentCompleted },
+    terminalCounts: { providerError: 0, settledBeforeRead: 0, shutdownBeforeRead: 0, abortedBeforeRead: 0 }, cleanupProven };
+}
+/**
+ * Wrappers retain detailed cell summaries, but terminalize any raw wrapper or
+ * cleanup failure as a fixed, private, typed summary after final cleanup.
+ */
+export async function finalizePhase0CellFailure(root: string, error: unknown, transportCleanupProven: boolean, origin: Phase0CellFailureOrigin, parentCompleted = false): Promise<Phase0CellFailure | null> {
+  if (error === null || error === undefined) {
+    if (transportCleanupProven) return null;
+    error = new Error("transport cleanup was not proven");
+  }
+  const summary = error instanceof Phase0CellFailure
+    ? { ...error.summary, cleanupProven: error.summary.cleanupProven && transportCleanupProven }
+    : phase0WrapperFallbackSummary(origin, transportCleanupProven, parentCompleted);
+  try { await writePhase0FailureSummary(root, summary); }
+  catch { return new Phase0CellFailure({ ...summary, cleanupProven: false }, false); }
+  return new Phase0CellFailure(summary, true);
+}
+type Phase0BootstrapStoppedState = "stopped" | "running" | "dead" | "unknown";
+function phase0BootstrapStoppedState(pid: number): Phase0BootstrapStoppedState {
+  try {
+    if (process.platform === "linux") {
+      const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const close = raw.lastIndexOf(")"), state = close < 0 ? "" : raw.slice(close + 1).trim().split(/\s+/)[0] ?? "";
+      return /^[Tt]$/.test(state) ? "stopped" : /^[ZXx]$/.test(state) ? "dead" : state ? "running" : "unknown";
+    }
+    if (process.platform === "darwin") {
+      const probe = spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 100 });
+      const state = probe.status === 0 ? probe.stdout.trim()[0] ?? "" : "";
+      return state === "T" || state === "t" ? "stopped" : state === "Z" || state === "X" || state === "z" || state === "x" ? "dead" : state ? "running" : "unknown";
+    }
+  } catch { /* bounded identity gate fails closed */ }
+  return "unknown";
+}
+/** Bounded pre-resume gate: neither a PID nor a stopped observation alone authorizes SIGCONT. */
+async function waitForExactStoppedBootstrap(pid: number, startedAt: number, timeoutMs: number, stoppedState: (pid: number) => Phase0BootstrapStoppedState): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    if (getProcessStartedAt(pid) !== startedAt) return false;
+    if (stoppedState(pid) === "stopped" && getProcessStartedAt(pid) === startedAt) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+  }
+}
+/** Rechecks both immutable identity and stopped state immediately adjacent to SIGCONT. */
+function resumeExactStoppedBootstrap(pid: number, startedAt: number, stoppedState: (pid: number) => Phase0BootstrapStoppedState): boolean {
+  if (getProcessStartedAt(pid) !== startedAt || stoppedState(pid) !== "stopped" || getProcessStartedAt(pid) !== startedAt) return false;
+  try { process.kill(pid, "SIGCONT"); return true; } catch { return false; }
+}
+function exactBootstrapCommand(row: Phase0BootstrapProcessRow, executable: "/bin/sh" | "/bin/sleep"): boolean {
+  return row.command.trim().split(/\s+/, 1)[0] === executable;
+}
+function uniqueDirectChildren(rows: readonly Phase0BootstrapProcessRow[], parentPid: number): Phase0BootstrapProcessRow[] {
+  return [...new Map(rows.filter((row) => row.ppid === parentPid && row.pid > 0 && row.pid !== parentPid).map((row) => [row.pid, row])).values()];
+}
+/**
+ * At the stopped checkpoint, bind the entire watchdog authority chain: the
+ * direct /bin/sh watchdog and its direct /bin/sleep helper. Two equivalent
+ * process-tree snapshots plus PID/start checks make every signal target exact.
+ */
+export async function discoverExactBootstrapWatchdog(
+  parent: ProcessIdentity,
+  timeoutMs: number,
+  rows?: () => readonly Phase0BootstrapProcessRow[],
+  processStartedAt: (pid: number) => number | null = getProcessStartedAt,
+): Promise<Phase0BootstrapWatchdogBinding | null> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  const rowsWithinDeadline = rows ?? (() => processRows({ expiresAt: deadline }));
+  const bindSnapshot = (snapshot: readonly Phase0BootstrapProcessRow[]): { watchdog: Phase0BootstrapProcessRow; sleepHelper: Phase0BootstrapProcessRow } | null => {
+    const watchdogs = uniqueDirectChildren(snapshot, parent.pid);
+    if (watchdogs.length !== 1 || !exactBootstrapCommand(watchdogs[0]!, "/bin/sh")) return null;
+    const helpers = uniqueDirectChildren(snapshot, watchdogs[0]!.pid);
+    if (helpers.length !== 1 || !exactBootstrapCommand(helpers[0]!, "/bin/sleep")) return null;
+    return { watchdog: watchdogs[0]!, sleepHelper: helpers[0]! };
+  };
+  while (true) {
+    if (processStartedAt(parent.pid) !== parent.startedAt) return null;
+    const first = bindSnapshot(rowsWithinDeadline());
+    if (first) {
+      const watchdogStartedAt = processStartedAt(first.watchdog.pid), helperStartedAt = processStartedAt(first.sleepHelper.pid);
+      const second = bindSnapshot(rowsWithinDeadline());
+      if (watchdogStartedAt !== null && helperStartedAt !== null && second
+        && second.watchdog.pid === first.watchdog.pid && second.sleepHelper.pid === first.sleepHelper.pid
+        && processStartedAt(parent.pid) === parent.startedAt
+        && processStartedAt(first.watchdog.pid) === watchdogStartedAt
+        && processStartedAt(first.sleepHelper.pid) === helperStartedAt) {
+        return { watchdog: { pid: first.watchdog.pid, startedAt: watchdogStartedAt }, sleepHelper: { pid: first.sleepHelper.pid, startedAt: helperStartedAt } };
+      }
+    }
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+  }
+}
+/** The post-CONT launch gate requires exact-live parent and exact-dead watchdog/helper identities. */
+export async function awaitExactBootstrapWatchdogDisarm(
+  parent: ProcessIdentity,
+  binding: Phase0BootstrapWatchdogBinding,
+  timeoutMs: number,
+  classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    let parentStatus: ProcessIdentityStatus, watchdogStatus: ProcessIdentityStatus, helperStatus: ProcessIdentityStatus;
+    try { parentStatus = classify(parent); watchdogStatus = classify(binding.watchdog); helperStatus = classify(binding.sleepHelper); } catch { return false; }
+    if (parentStatus !== "live") return false;
+    if (watchdogStatus === "dead" && helperStatus === "dead") return true;
+    // Unknown never proves either authority absent.
+    if (watchdogStatus === "unknown" || helperStatus === "unknown" || Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+  }
+}
+/** On an unbound bootstrap, sever every parent-side retention edge and leave its private watchdog as sole termination authority. */
+function detachUnboundBootstrap(child: ChildProcess): void {
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    if (!stream) continue;
+    stream.on("error", () => undefined);
+    stream.destroy();
+  }
+  child.removeAllListeners("close");
+  child.removeAllListeners("exit");
+  child.unref();
+}
+
+export type Phase0ParentCellTestHooks = {
+  spawnParent?: typeof spawn;
+  /** Test seam for the pre-signal parent identity bind; production uses procfs. */
+  captureParentStartedAt?: (pid: number) => number | null;
+  /** Test-only bounded stopped-state probe; production reads the OS process state. */
+  bootstrapStoppedState?: (pid: number) => Phase0BootstrapStoppedState;
+  /** Test-only bound for stopped bootstrap discovery and its disarm handshake. */
+  bootstrapBindTimeoutMs?: number;
+  /** Test seam after the exact watchdog shell and /bin/sleep helper are bound, before SIGCONT. */
+  afterBootstrapWatchdogBound?: (parent: ProcessIdentity, binding: Phase0BootstrapWatchdogBinding) => void | Promise<void>;
+  /** Test seam immediately after SIGCONT and before the mandatory disarm handshake. */
+  afterBootstrapContinued?: (parent: ProcessIdentity, binding: Phase0BootstrapWatchdogBinding) => void | Promise<void>;
+  /** Test-only exact identity probe; unknown is deliberately cleanup-unproven. */
+  classifyBootstrapIdentity?: ExactProcessIdentityClassifier;
+  afterBootstrapResumed?: (identity: ProcessIdentity) => void | Promise<void>;
+  afterPrimaryFailureCaptured?: () => void | Promise<void>;
+};
+
+export async function runParentCell(root: string, agentDir: string, extension: string, pi: LivePiExecutable, activeRuns: number, workload: Workload, baseEnv: NodeJS.ProcessEnv, transportEnv: NodeJS.ProcessEnv = {}, actionBarrier?: ActionBarrier, enforceDescendantConcurrency = true, deadline: CellDeadline = createCellDeadline(activeRuns), testHooks: Phase0ParentCellTestHooks = {}): Promise<Omit<CellEvidence, "mode" | "sourceAndSentinelPreserved">> {
   const cellRoot = path.join(root, `cell-${crypto.randomUUID()}`), stateRoot = path.join(cellRoot, "state"), barrierRoot = path.join(cellRoot, "barriers"), proofRoot = path.join(cellRoot, "proof-channel"), stageRoot = path.join(cellRoot, "stages"), telemetryRoot = path.join(cellRoot, "transport-telemetry"), actionReleasePath = path.join(cellRoot, "action-release");
   const telemetryCapability = crypto.randomBytes(32).toString("hex");
   let proofServer: Phase0LiveProofServer | null = null;
@@ -720,10 +950,37 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   const milestoneAbort = new AbortController();
   const fifoWriters = new Set<Phase0ReleaseWriter>();
   const exactChildIdentities = new Map<string, ProcessIdentity>();
+  let bootstrapParentIdentity: ProcessIdentity | null = null;
+  let bootstrapWatchdogBinding: Phase0BootstrapWatchdogBinding | null = null;
   let parentIdentity: ProcessIdentity | null = null;
+  const terminateBootstrapAuthority = (classify: ExactProcessIdentityClassifier): Promise<void> =>
+    terminateExactBootstrapAuthority(bootstrapWatchdogBinding, bootstrapWatchdogBinding ? bootstrapParentIdentity ?? parentIdentity : null, classify);
+  const terminateProviderChildIdentities = (classify: ExactProcessIdentityClassifier): Promise<void> => {
+    const bootstrapKeys = new Set([bootstrapWatchdogBinding?.watchdog ?? null, bootstrapWatchdogBinding?.sleepHelper ?? null, bootstrapParentIdentity, parentIdentity]
+      .filter((identity): identity is ProcessIdentity => identity !== null)
+      .map((identity) => `${identity.pid}:${identity.startedAt}`));
+    return terminateExactPhase0Identities([...exactChildIdentities.values()]
+      .filter((identity) => !bootstrapKeys.has(`${identity.pid}:${identity.startedAt}`)), 5_000, classify);
+  };
   let barrierPaths: string[] = [];
   let failureCleanupError: unknown = null;
+  let cellCleanupFailed = false;
+  let timedOut = false, outputOverflow = false, diagnosticsOverflow = false;
+  let primaryFailureCaptured = false;
+  let primaryFailureCategory: Phase0FailureCategory | null = null;
+  const capturePrimaryFailure = async (error: unknown): Promise<void> => {
+    if (primaryFailureCaptured) return;
+    const expiredAtCapture = remainingDeadlineMs(deadline) <= 0;
+    primaryFailureCaptured = true;
+    // Capture precedence before any backend or identity cleanup can cross the deadline.
+    primaryFailureCategory = phase0FailureCategory(error, { timedOut, stdoutOverflow: outputOverflow, stderrOverflow: diagnosticsOverflow, deadlineExpired: expiredAtCapture });
+    await testHooks.afterPrimaryFailureCaptured?.();
+  };
+  let failureSummary: Phase0FailureSummary | null = null;
+  let summaryRetentionProven = false;
+  const milestonesTracker = new Phase0LiveMilestoneTracker();
   try {
+    await fs.mkdir(cellRoot, { recursive: true, mode: 0o700 }); await fs.chmod(cellRoot, 0o700);
     requireRemainingDeadline(deadline, "proof/FIFO setup");
     await fs.mkdir(stateRoot, { recursive: true, mode: 0o700 }); await fs.mkdir(telemetryRoot, { mode: 0o700 });
     const bootstrapPaths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `phase0-bootstrap-${crypto.randomUUID()}` });
@@ -745,34 +1002,76 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   if (taskChunks.some((chunk) => chunk.length !== PHASE0_MAX_TASKS_PER_BACKGROUND_JOB) || taskChunks.length !== activeRuns || taskChunks.flat().length !== activeRuns || milestones.length !== 1 || milestones[0] !== activeRuns || taskChunks.length > PHASE0_MAX_BACKGROUND_JOBS) throw new Error("Phase 0 task chunk plan is not one exact single-task final milestone");
   milestoneMonitor = monitorPhase0ReadStartMilestones(proofServer!, stageRoot, milestones, deadline, milestoneAbort.signal);
   const limits = phase0HarnessLimits(activeRuns);
-  const env = sanitizedEnv({ ...transportEnv, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_RUN_STATE_DIR: stateRoot, PI_SUBAGENT_CMUX_CHILD_POLICY: "managed", PI_SUBAGENT_MAX_ACTIVE: String(limits.treePermitMaxActive), PI_SUBAGENT_MAX_CONCURRENCY: String(limits.localTaskConcurrency), PI_SUBAGENT_MAX_BACKGROUND_JOBS: String(PHASE0_MAX_BACKGROUND_JOBS), PI_SUBAGENT_PHASE0_LIVE: "1", PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR: telemetryRoot, PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY: telemetryCapability, PI_SUBAGENT_PHASE0_LIVE_PROOF_SOCKET: proofServer!.socketPath, PI_SUBAGENT_PHASE0_LIVE_PROOF_MASTER: proofMaster, PI_SUBAGENT_PHASE0_LIVE_PROOF_BARRIER_PATHS: JSON.stringify(barrierPaths), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_TOKENS: JSON.stringify(releaseTokens), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_DEADLINE: String(deadline.expiresAt), PI_SUBAGENT_PHASE0_LIVE_PROOF_BEHAVIOR: workload === "short-response" ? "short" : workload === "long-response" ? "long" : "hold", PI_OFFLINE: "1", PHASE0_TASK_CHUNKS: JSON.stringify(taskChunks), PHASE0_STAGE_ROOT: stageRoot, PHASE0_STAGE_MILESTONES: JSON.stringify(milestones), PHASE0_WORKLOAD: workload, PHASE0_ACTIVE_RUNS: String(activeRuns), PHASE0_LAUNCH_COOLDOWN_MS: String(phase0LaunchCooldownMs(activeRuns)), PHASE0_ACTION_RELEASE_PATH: actionReleasePath, PHASE0_CELL_DEADLINE: String(deadline.expiresAt) });
-  const child = spawn(piBin, ["--mode", "json", "--no-context-files", "--no-extensions", "--extension", path.join(ROOT, "index.ts"), "--extension", extension, "--model", "openai-codex/gpt-5.4-mini", "-p", "Run the Phase 0 provider transport benchmark."], { cwd: ROOT, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
-  let childTerminalError: Error | undefined;
-  // Capture only the fact of a spawn failure. Provider error text is never
-  // retained or exposed by the live harness.
-  child.once("error", (error) => { childTerminalError = error; });
+  const env = buildSyntheticParentEnv(baseEnv, { ...transportEnv, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_RUN_STATE_DIR: stateRoot, PI_SUBAGENT_CMUX_CHILD_POLICY: "managed", PI_SUBAGENT_MAX_ACTIVE: String(limits.treePermitMaxActive), PI_SUBAGENT_MAX_CONCURRENCY: String(limits.localTaskConcurrency), PI_SUBAGENT_MAX_BACKGROUND_JOBS: String(PHASE0_MAX_BACKGROUND_JOBS), PI_SUBAGENT_PHASE0_LIVE: "1", PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR: telemetryRoot, PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY: telemetryCapability, PI_SUBAGENT_PHASE0_LIVE_PROOF_SOCKET: proofServer!.socketPath, PI_SUBAGENT_PHASE0_LIVE_PROOF_MASTER: proofMaster, PI_SUBAGENT_PHASE0_LIVE_PROOF_BARRIER_PATHS: JSON.stringify(barrierPaths), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_TOKENS: JSON.stringify(releaseTokens), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_DEADLINE: String(deadline.expiresAt), PI_SUBAGENT_PHASE0_LIVE_PROOF_BEHAVIOR: workload === "short-response" ? "short" : workload === "long-response" ? "long" : "hold", PI_OFFLINE: "1", PHASE0_TASK_CHUNKS: JSON.stringify(taskChunks), PHASE0_STAGE_ROOT: stageRoot, PHASE0_STAGE_MILESTONES: JSON.stringify(milestones), PHASE0_WORKLOAD: workload, PHASE0_ACTIVE_RUNS: String(activeRuns), PHASE0_LAUNCH_COOLDOWN_MS: String(phase0LaunchCooldownMs(activeRuns)), PHASE0_ACTION_RELEASE_PATH: actionReleasePath, PHASE0_CELL_DEADLINE: String(deadline.expiresAt) });
+  const parentArgs = ["--mode", "json", "--no-context-files", "--no-extensions", "--extension", path.join(ROOT, "index.ts"), "--extension", extension, "--model", "openai-codex/gpt-5.4-mini", "-p", "Run the Phase 0 provider transport benchmark."];
+  const bootstrapArgs = buildStoppedBootstrapArgv(pi.bin, parentArgs);
+  // The staged native generation fence is the final operation before the credentialed stopped bootstrap spawn.
+  revalidateManagedChildPiExecutableGeneration(pi.generation);
+  const child = (testHooks.spawnParent ?? spawn)("/bin/sh", bootstrapArgs, { cwd: ROOT, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
   const stdout = new BoundedOutputCapture(MAX_LIVE_STDOUT_BYTES);
-  let stderrBytes = 0, timedOut = false, outputOverflow = false, diagnosticsOverflow = false, jsonl = "";
-  const startedAt = child.pid ? getProcessStartedAt(child.pid) : null, start = performance.now(), delay = monitorEventLoopDelay({ resolution: 10 });
-  if (child.pid && startedAt !== null) parentIdentity = { pid: child.pid, startedAt };
+  let stderrBytes = 0, jsonl = "";
+  let startedAt: number | null = null;
+  const kill = (): void => { try { if (child.pid && startedAt !== null && getProcessStartedAt(child.pid) === startedAt) process.kill(child.pid, "SIGKILL"); } catch {} };
+  // Start bounded drains before attempting identity acquisition: even an
+  // unbound or failed bootstrap must not block the harness on inherited pipes.
+  child.stdout.on("data", (chunk: Buffer) => { milestonesTracker.observeJsonl(chunk); if (!stdout.append(chunk)) { outputOverflow = true; kill(); } });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes = Math.min(MAX_DIAGNOSTIC_BYTES + 1, stderrBytes + chunk.length);
+    if (stderrBytes > MAX_DIAGNOSTIC_BYTES) { diagnosticsOverflow = true; kill(); }
+  });
+  let childTerminalError: Error | undefined;
+  // Capture only the fact of a spawn failure. Provider error text is never retained or exposed.
+  child.once("error", (error) => { childTerminalError = error; });
+  if (!child.pid) throw await classifyNoPidSpawnFailure(child, deadline);
+  const start = performance.now(), delay = monitorEventLoopDelay({ resolution: 10 });
+  startedAt = testHooks.captureParentStartedAt ? testHooks.captureParentStartedAt(child.pid) : getProcessStartedAt(child.pid);
+  if (startedAt === null) {
+    // Never signal an unbound PID. The stopped bootstrap's private watchdog
+    // will self-kill; detached pipes/process handles cannot retain this cell.
+    detachUnboundBootstrap(child); cellCleanupFailed = true;
+    throw new Error("could not bind benchmark stopped bootstrap; cleanup is unproven and terminal");
+  }
+  bootstrapParentIdentity = { pid: child.pid, startedAt };
+  const bootstrapTimeoutMs = Math.min(requireRemainingDeadline(deadline, "stopped bootstrap watchdog bind"), Math.max(1, Math.min(1_000, testHooks.bootstrapBindTimeoutMs ?? 500)));
+  const stopped = await waitForExactStoppedBootstrap(child.pid, startedAt, bootstrapTimeoutMs, testHooks.bootstrapStoppedState ?? phase0BootstrapStoppedState);
+  if (!stopped) {
+    // Without a watchdog identity, killing even the exact stopped parent could
+    // leave a surviving watchdog able to strike a recycled parent PID.
+    detachUnboundBootstrap(child); cellCleanupFailed = true;
+    throw new Error("could not prove benchmark stopped bootstrap checkpoint");
+  }
+  bootstrapWatchdogBinding = await discoverExactBootstrapWatchdog(bootstrapParentIdentity, bootstrapTimeoutMs);
+  if (!bootstrapWatchdogBinding) {
+    // Preserve the stopped parent/watchdog/helper chain for the bootstrap's own
+    // self-kill path; no PID is cleanup authority without the complete bind.
+    detachUnboundBootstrap(child); cellCleanupFailed = true;
+    throw new Error("could not bind the benchmark bootstrap watchdog/helper chain");
+  }
+  await testHooks.afterBootstrapWatchdogBound?.(bootstrapParentIdentity, bootstrapWatchdogBinding);
+  if (!resumeExactStoppedBootstrap(child.pid, startedAt, testHooks.bootstrapStoppedState ?? phase0BootstrapStoppedState)) {
+    cellCleanupFailed = true;
+    throw new Error("could not resume exact benchmark stopped bootstrap");
+  }
+  await testHooks.afterBootstrapContinued?.(bootstrapParentIdentity, bootstrapWatchdogBinding);
+  if (!await awaitExactBootstrapWatchdogDisarm(bootstrapParentIdentity, bootstrapWatchdogBinding, bootstrapTimeoutMs, testHooks.classifyBootstrapIdentity ?? classifyExactProcessIdentity)) {
+    // The outer exact cleanup pass terminates the watchdog and proves it absent
+    // before it may touch the bound parent identity.
+    cellCleanupFailed = true;
+    throw new Error("benchmark bootstrap watchdog disarm/exec handshake failed");
+  }
+  parentIdentity = bootstrapParentIdentity; milestonesTracker.parentSpawned();
+  await testHooks.afterBootstrapResumed?.(parentIdentity);
   const observedIdentities = new Map<number, number>(); let peakDescendants: ProcessIdentity[] = [], verifiedProviderIdentities: ProcessIdentity[] = [];
   const childCpuSamples = new Map<string, { initialCpuMs: number; latestCpuMs: number }>();
   let childResourceSamplingSupported = false, verifiedProviderResourcesSampled = false;
   let peakChildResourceCount = 0, currentChildResourceCount = 0;
   let peakAggregateCpuMs: Metric = "unavailable", peakAggregateChildRssKiB: Metric = "unavailable", peakIndividualChildRssKiB: Metric = "unavailable";
   let peakRssKiB: Metric = "unavailable"; const initialParent = child.pid ? parentSample(child.pid) : null; let lastParentSample: ParentSample | null = initialParent, finalParent: ParentSample | null = null;
-  if (process.platform !== "win32" && startedAt === null) throw new Error("could not bind benchmark parent identity; cleanup is unproven and terminal");
   delay.enable();
-  const kill = (): void => { try { if (child.pid && startedAt !== null && getProcessStartedAt(child.pid) === startedAt) process.kill(child.pid, "SIGKILL"); } catch {} };
-  child.stdout.on("data", (chunk: Buffer) => { if (!stdout.append(chunk)) { outputOverflow = true; kill(); } });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderrBytes = Math.min(MAX_DIAGNOSTIC_BYTES + 1, stderrBytes + chunk.length);
-    if (stderrBytes > MAX_DIAGNOSTIC_BYTES) { diagnosticsOverflow = true; kill(); }
-  });
   const sampleProcesses = (requiredIdentities: ProcessIdentity[] = []): void => {
     if (!child.pid) return;
     const currentByIdentity = new Map<string, ProcessIdentity>();
-    for (const pid of processDescendants(child.pid)) {
+    for (const pid of processDescendants(child.pid, deadline)) {
       const startedAt = getProcessStartedAt(pid); if (startedAt !== null) currentByIdentity.set(`${pid}:${startedAt}`, { pid, startedAt });
     }
     // Provider proof identities are sampled explicitly, even if a transport's process
@@ -780,6 +1079,10 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     for (const identity of requiredIdentities) if (getProcessStartedAt(identity.pid) === identity.startedAt) currentByIdentity.set(`${identity.pid}:${identity.startedAt}`, identity);
     const current = [...currentByIdentity.values()];
     if (current.length > peakDescendants.length) peakDescendants = current;
+    milestonesTracker.observeDescendants(current.length);
+    milestonesTracker.observeReadStarts(proofServer?.readStartCount() ?? 0);
+    milestonesTracker.observeProofs(proofServer?.proofCount() ?? 0);
+    milestonesTracker.observeStagePublished(existsSync(phase0StageFile(stageRoot, activeRuns)));
     for (const identity of current) { observedIdentities.set(identity.pid, identity.startedAt); exactChildIdentities.set(`${identity.pid}:${identity.startedAt}`, identity); }
     const resources = childResourceSamples(current.map((identity) => identity.pid));
     currentChildResourceCount = resources === null ? 0 : resources.size;
@@ -806,7 +1109,8 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     const parent = parentSample(child.pid); if (parent) { lastParentSample = parent; peakRssKiB = peakRssKiB === "unavailable" ? parent.rssKiB : Math.max(peakRssKiB, parent.rssKiB); }
   };
   const sampler = setInterval(sampleProcesses, 25); sampleProcesses();
-  const diagnosticConfig = resolvePhase0LiveDiagnosticConfig(env);
+  // Diagnostic gates are read from the authoritative outer environment and are absent from child env.
+  const diagnosticConfig = resolvePhase0LiveDiagnosticConfig(baseEnv);
   let diagnosticTimer: ReturnType<typeof setInterval> | null = null;
   let rejectDiagnosticFailure: ((error: Error) => void) | null = null;
   const diagnosticFailure = diagnosticConfig
@@ -818,20 +1122,10 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     now: Date.now,
     progress: () => {
       const terminals = proofServer!.terminalCounts();
-      return [
-        child.exitCode === null && child.signalCode === null ? "live" : "terminal",
-        child.pid ? processDescendants(child.pid).length : 0,
-        proofServer!.readStartCount(),
-        proofServer!.proofCount(),
-        existsSync(phase0StageFile(stageRoot, activeRuns)),
-        childCpuSamples.size > 0,
-        peakChildResourceCount,
-        currentChildResourceCount,
-        terminals["provider-error"],
-        terminals["settled-before-read"],
-        terminals["shutdown-before-read"],
-        terminals["aborted-before-read"],
-      ];
+      milestonesTracker.observeReadStarts(proofServer!.readStartCount());
+      milestonesTracker.observeProofs(proofServer!.proofCount());
+      milestonesTracker.observeStagePublished(existsSync(phase0StageFile(stageRoot, activeRuns)));
+      return milestonesTracker.progress(childCpuSamples.size > 0, peakChildResourceCount, currentChildResourceCount, terminals);
     },
     emit: (snapshot) => { process.stderr.write(`${snapshot}\n`); },
   }) : null;
@@ -861,7 +1155,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
           ? (signal) => actionBarrier(child, activeRuns, deadline, signal)
           : async (_signal) => {
               const observed = await waitForChildren(child, activeRuns, deadline, () => proofServer!.terminalCounts(), _signal);
-              return { observedProcesses: observed.max, identities: observed.identities, backendTargets: undefined, closeAll: async () => closeExactDescendants(child, observed.identities) };
+              return { observedProcesses: observed.max, identities: observed.identities, backendTargets: undefined, closeAll: async () => closeExactDescendants(child, observed.identities, deadline) };
             },
         barrierGuard,
       );
@@ -917,6 +1211,8 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     residualDescendantCount = [...observedIdentities].filter(([pid, identity]) => getProcessStartedAt(pid) === identity).length;
     if (residualDescendantCount !== 0) throw new Error("identity-bound child process cleanup was not proven");
   } catch (error) {
+    // Freeze category precedence before any backend or identity cleanup can run.
+    await capturePrimaryFailure(error);
     // A failed barrier may leave detached managed children outside the parent.
     // Backend cleanup is permitted only through the exact authority the barrier
     // returned; any unknown or failed cleanup remains terminal.
@@ -924,34 +1220,29 @@ export async function runParentCell(root: string, agentDir: string, extension: s
       try { await actionReady.closeAll(); }
       catch (cleanupError) { failureCleanupError = cleanupError; }
     }
-    const category = phase0FailureCategory(error, { timedOut, stdoutOverflow: outputOverflow, stderrOverflow: diagnosticsOverflow });
-    await writePhase0FailureDiagnostics(path.join(cellRoot, "failure-diagnostics.log"), category, {
-      activeRuns,
-      parentTerminal: child.exitCode !== null || child.signalCode !== null,
-      stageExists: existsSync(phase0StageFile(stageRoot, activeRuns)),
-      timedOut,
-      stdoutOverflow: outputOverflow,
-      stderrOverflow: diagnosticsOverflow,
-      stderrBytes,
-      terminalCounts: proofServer!.terminalCounts(),
-    }).catch(() => undefined);
-    if (failureCleanupError) throw new Error("Phase 0 backend cleanup was not proven; terminal failure", { cause: failureCleanupError });
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout); if (diagnosticTimer) clearInterval(diagnosticTimer); clearInterval(sampler); finalParent = child.pid ? parentSample(child.pid) ?? lastParentSample : lastParentSample; delay.disable();
     milestoneAbort.abort();
     await milestoneMonitor?.catch(() => undefined);
     let cleanupFailure: unknown = failureCleanupError;
-    try {
-      // Signal only exact PID/start identities, then require that each identity
-      // is absent. No process group or unbound PID is ever cleanup authority.
-      await terminateExactPhase0Identities([...(parentIdentity ? [parentIdentity] : []), ...exactChildIdentities.values()]);
-      await cleanupPhase0ReleaseWriters(fifoWriters);
-      if (fifoWriters.size !== 0) throw new Error("private Phase 0 FIFO writers remain tracked after cleanup");
-      await removePhase0BarrierFifos(barrierPaths);
-    } catch (error) { cleanupFailure ??= error; }
-    await proofServer?.close();
-    if (cleanupFailure) throw new Error("Phase 0 parent-cell cleanup was not proven; terminal failure", { cause: cleanupFailure });
+    // Each category is independently authorized; a failed identity probe must
+    // not skip FIFO-writer or barrier cleanup.
+    const classify = testHooks.classifyBootstrapIdentity ?? classifyExactProcessIdentity;
+    const attemptedCleanupFailure = await attemptPhase0CleanupSteps([
+      async () => terminateBootstrapAuthority(classify),
+      async () => terminateProviderChildIdentities(classify),
+      async () => { await cleanupPhase0ReleaseWriters(fifoWriters); if (fifoWriters.size !== 0) throw new Error("private Phase 0 FIFO writers remain tracked after cleanup"); },
+      async () => removePhase0BarrierFifos(barrierPaths),
+    ]);
+    cleanupFailure ??= attemptedCleanupFailure;
+    try { await proofServer?.close(); } catch (error) { cleanupFailure ??= error; }
+    if (cleanupFailure) {
+      cellCleanupFailed = true;
+      // The outer catch/finally creates the sole sanitized summary after this
+      // and the final idempotent exact cleanup pass have completed.
+      if (!primaryFailureCaptured) throw new Error("Phase 0 parent-cell cleanup was not proven; terminal failure", { cause: cleanupFailure });
+    }
   }
   const observed = observedProviderAndModel(jsonl), delayMs = (nanoseconds: number): Metric => Number.isFinite(nanoseconds) && nanoseconds >= 0 ? nanoseconds / 1_000_000 : "unavailable";
   const cpuDeltaMs: Metric = initialParent && finalParent ? Math.max(0, finalParent.cpuMs - initialParent.cpuMs) : "unavailable";
@@ -964,17 +1255,27 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     parent: { cpuDeltaMs, peakRssKiB }, descendants: { peakCount: peakDescendants.length, peakIdentities: peakDescendants, verifiedProviderIdentities, resources },
     backend: { topologyProbeCount: 0, transportCounters: transportEnv.TMUX ? await aggregateTransportTelemetry(telemetryRoot, telemetryCapability, "tmux") : transportEnv.CMUX_SOCKET_PATH ? await aggregateTransportTelemetry(telemetryRoot, telemetryCapability, "cmux") : inlineTransportCounters() }, verifiedProviderChildren: activeRuns,
     cleanup: { result: "clean", residualDescendantCount, residualBackendTargetCount: 0 }, settlement: deriveSettlementFromToolResults(jsonl, workload, activeRuns), requestedProvider: "openai-codex", requestedModel: CHILD_MODEL, observedProvider: observed.provider, observedModel: observed.model };
+  } catch (error) {
+    await capturePrimaryFailure(error);
   } finally {
     milestoneAbort.abort();
     await milestoneMonitor?.catch(() => undefined);
-    let outerCleanupFailure: unknown = null;
-    try {
-      await terminateExactPhase0Identities([...(parentIdentity ? [parentIdentity] : []), ...exactChildIdentities.values()]);
-      await cleanupPhase0ReleaseWriters(fifoWriters);
-      if (fifoWriters.size !== 0) throw new Error("private Phase 0 FIFO writers remain tracked after outer cleanup");
-      await removePhase0BarrierFifos(barrierPaths);
-    } catch (error) { outerCleanupFailure = error; }
-    await proofServer?.close();
-    if (outerCleanupFailure) throw new Error("Phase 0 outer cleanup was not proven; terminal failure", { cause: outerCleanupFailure });
+    const classify = testHooks.classifyBootstrapIdentity ?? classifyExactProcessIdentity;
+    let outerCleanupFailure = await attemptPhase0CleanupSteps([
+      async () => terminateBootstrapAuthority(classify),
+      async () => terminateProviderChildIdentities(classify),
+      async () => { await cleanupPhase0ReleaseWriters(fifoWriters); if (fifoWriters.size !== 0) throw new Error("private Phase 0 FIFO writers remain tracked after outer cleanup"); },
+      async () => removePhase0BarrierFifos(barrierPaths),
+    ]);
+    try { await proofServer?.close(); } catch (error) { outerCleanupFailure ??= error; }
+    if (outerCleanupFailure) await capturePrimaryFailure(outerCleanupFailure);
+    if (primaryFailureCaptured && !failureSummary) {
+      const terminals = phase0TerminalCounts(proofServer?.terminalCounts());
+      failureSummary = { version: 1, category: primaryFailureCategory!, mode: transportEnv.TMUX ? "tmux" : transportEnv.CMUX_SOCKET_PATH ? "cmux" : "inline", workload, activeRuns, latestMilestone: milestonesTracker.progress(false, 0, 0, terminals)[0], monotonic: milestonesTracker.summary(), terminalCounts: { providerError: terminals["provider-error"], settledBeforeRead: terminals["settled-before-read"], shutdownBeforeRead: terminals["shutdown-before-read"], abortedBeforeRead: terminals["aborted-before-read"] }, cleanupProven: !cellCleanupFailed && outerCleanupFailure === null };
+      try { await writePhase0FailureSummary(root, failureSummary); summaryRetentionProven = true; }
+      catch { /* the sanitized typed failure remains the only outward error */ }
+    }
+    if (failureSummary !== null) throw new Phase0CellFailure(failureSummary, summaryRetentionProven);
   }
+  throw new Error("unreachable Phase 0 cell completion");
 }

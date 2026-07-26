@@ -4,9 +4,10 @@ import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { MINIMUM_CMUX_VERSION, MINIMUM_PI_VERSION, MINIMUM_TMUX_VERSION, isStableSemverAtLeast, isStableTmuxVersionAtLeast, parseCmuxVersionOutput, parsePiVersionOutput, parseTmuxVersionOutput } from "../../../src/runtime/version-policy.mjs";
-import { getProcessStartedAt } from "../../../src/runtime/run-protocol.js";
+import { MINIMUM_CMUX_VERSION, MINIMUM_TMUX_VERSION, isStableSemverAtLeast, isStableTmuxVersionAtLeast, parseCmuxVersionOutput, parsePiVersionOutput, parseTmuxVersionOutput } from "../../../src/runtime/version-policy.mjs";
+import { classifyParentProcessIdentity, getProcessStartedAt, type ProcessIdentityStatus } from "../../../src/runtime/run-protocol.js";
 import { findCanonicalCmuxIdentity } from "../live-harness.js";
+import { MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV, MANAGED_CHILD_LIVE_MINIMUM_PI_VERSION, captureManagedChildLivePiExecutableGeneration, captureManagedChildPiExecutableGeneration, resolveManagedChildLiveAcceptancePiExecutable, revalidateManagedChildPiExecutableGeneration, type ManagedChildPiExecutableGeneration } from "../managed-child-pi-executable.js";
 
 export const LIVE_GATE = "PI_SUBAGENT_PHASE0_LIVE";
 export const LIVE_RECORD_GATE = "PI_SUBAGENT_PHASE0_LIVE_RECORD";
@@ -95,7 +96,11 @@ export type RoutineLiveEvidence = LiveEvidenceBase<typeof ROUTINE_TIER_ID>;
 export type ConcurrencyLiveEvidence = LiveEvidenceBase<typeof CMUX_CONCURRENCY_TIER_ID>;
 export type LiveEvidence = RoutineLiveEvidence | ConcurrencyLiveEvidence;
 export type LiveOptions = { execute: boolean; tier?: LiveTierId; resumeLiveRoot?: string; maxCells?: number; recordFixture?: boolean };
-export type LivePiExecutable = { bin: string; version: string };
+/** Preflight captures each explicitly selected backend executable generation. */
+export type LiveBackendExecutables = { tmux: ManagedChildPiExecutableGeneration; cmux: ManagedChildPiExecutableGeneration };
+export type LivePiGeneration = { bin: string; version: string; generation: ManagedChildPiExecutableGeneration };
+/** Preflight's exact Pi generation must be staged before every credentialed cell spawn. */
+export type LivePiExecutable = LivePiGeneration & LiveBackendExecutables;
 
 export function record(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 export function exact(value: Record<string, unknown>, keys: readonly string[]): boolean { const actual = Object.keys(value).sort(), expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
@@ -136,11 +141,11 @@ export function validateLiveEvidence(value: unknown): value is LiveEvidence {
 }
 export function validateRoutineLiveEvidence(value: unknown): value is RoutineLiveEvidence { return validateLiveEvidence(value) && value.tier === ROUTINE_TIER_ID; }
 export function validateCmuxConcurrencyLiveEvidence(value: unknown): value is ConcurrencyLiveEvidence { return validateLiveEvidence(value) && value.tier === CMUX_CONCURRENCY_TIER_ID; }
-export type LiveCheckpoint = { version: 3; tier: LiveTierId; planId: string; planDigest: string; sourceRevision: "unknown" | string; sourceDirty: boolean; worktreeDigest: string; childRuns: number; cells: CellEvidence[] };
+export type LiveCheckpoint = { version: 4; tier: LiveTierId; planId: string; planDigest: string; piVersion: string; sourceRevision: "unknown" | string; sourceDirty: boolean; worktreeDigest: string; childRuns: number; cells: CellEvidence[] };
 const LIVE_CHECKPOINT_FILE = "phase0-live-checkpoint.json";
 const MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024;
 export function validateLiveCheckpoint(value: unknown): value is LiveCheckpoint {
-  if (!record(value) || !exact(value, ["version", "tier", "planId", "planDigest", "sourceRevision", "sourceDirty", "worktreeDigest", "childRuns", "cells"]) || value.version !== 3 || !LIVE_TIER_IDS.includes(value.tier as LiveTierId) || !isSourceRevision(value.sourceRevision) || typeof value.sourceDirty !== "boolean" || typeof value.worktreeDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.worktreeDigest)) return false;
+  if (!record(value) || !exact(value, ["version", "tier", "planId", "planDigest", "piVersion", "sourceRevision", "sourceDirty", "worktreeDigest", "childRuns", "cells"]) || value.version !== 4 || !LIVE_TIER_IDS.includes(value.tier as LiveTierId) || !isStableSemverAtLeast(value.piVersion, MANAGED_CHILD_LIVE_MINIMUM_PI_VERSION) || !isSourceRevision(value.sourceRevision) || typeof value.sourceDirty !== "boolean" || typeof value.worktreeDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.worktreeDigest)) return false;
   const plan = livePlan(value.tier as LiveTierId);
   if (value.planId !== plan.planId || value.planDigest !== plan.planDigest || value.childRuns !== plan.childRuns || !hasOrderedCells(value.cells, plan, false)) return false;
   return plan.tier !== CMUX_CONCURRENCY_TIER_ID || value.cells.length === 0 || value.cells.length === 1;
@@ -148,6 +153,10 @@ export function validateLiveCheckpoint(value: unknown): value is LiveCheckpoint 
 export function requireCurrentCheckpointSource(checkpoint: LiveCheckpoint, source: { sourceRevision: string; sourceDirty: boolean; worktreeDigest: string }, tier?: LiveTierId): void {
   if (tier !== undefined && checkpoint.tier !== tier) throw new Error("live checkpoint tier does not match the selected tier");
   if (checkpoint.sourceRevision !== source.sourceRevision || checkpoint.sourceDirty !== source.sourceDirty || checkpoint.worktreeDigest !== source.worktreeDigest) throw new Error("live checkpoint source identity does not match the current checkout");
+}
+/** Completed cells are resumable only under the exact preflight Pi version that ran them. */
+export function requireCurrentCheckpointPiVersion(checkpoint: LiveCheckpoint, piVersion: string): void {
+  if (checkpoint.piVersion !== piVersion) throw new Error("live checkpoint Pi version does not match the current preflight");
 }
 export function parseArgs(argv: string[]): LiveOptions {
   if (argv.length === 0) return { execute: false };
@@ -174,31 +183,82 @@ export function requireLiveGate(options: LiveOptions, env: NodeJS.ProcessEnv = p
 export function phase0CellDeadlineMs(activeRuns: number): number { return CELL_TIMEOUT_MS + activeRuns * CELL_TIMEOUT_PER_ACTIVE_RUN_MS; }
 export function createCellDeadline(activeRuns: number): CellDeadline { return { expiresAt: Date.now() + phase0CellDeadlineMs(activeRuns) }; }
 export function remainingDeadlineMs(deadline: CellDeadline): number { return deadline.expiresAt - Date.now(); }
-export function requireRemainingDeadline(deadline: CellDeadline, operation: string): number { const remaining = remainingDeadlineMs(deadline); if (remaining <= 0) throw new Error(`cell deadline exhausted before ${operation}`); return remaining; }
+/** Fixed discriminator for every harness deadline, never a raw operation error. */
+export class Phase0DeadlineExhaustedError extends Error { constructor() { super("Phase 0 harness deadline exhausted."); } }
+export function requireRemainingDeadline(deadline: CellDeadline, _operation: string): number { const remaining = remainingDeadlineMs(deadline); if (remaining <= 0) throw new Phase0DeadlineExhaustedError(); return remaining; }
 export async function preflightLiveBenchmark(): Promise<void> { const runtime = await fs.stat(process.execPath); if (!runtime.isFile()) throw new Error("benchmark runtime is not a regular file"); for (const tier of LIVE_TIER_IDS) if (expectedChildRunCount(tier) !== (tier === ROUTINE_TIER_ID ? 15 : 16)) throw new Error("unexpected tier plan cardinality"); }
+export function resolveLiveBackendExecutable(env: NodeJS.ProcessEnv, name: "TMUX_BIN" | "CMUX_BIN"): ManagedChildPiExecutableGeneration {
+  const requested = env[name]?.trim();
+  if (!requested || !path.isAbsolute(requested)) throw new Error(`live benchmark requires explicit absolute ${name}`);
+  try { return captureManagedChildPiExecutableGeneration(requested); }
+  catch { throw new Error(`live benchmark ${name} is not a canonical safe executable`); }
+}
+
 export async function preflightLivePrerequisites(env: NodeJS.ProcessEnv): Promise<LivePiExecutable> {
   await preflightLiveBenchmark();
   if (process.platform !== "darwin") throw new Error("the endpoint cmux live matrix requires macOS");
-  const pi = await resolveLivePiExecutable(env); if (!pi) throw new Error(`live benchmark requires stable Pi >=${MINIMUM_PI_VERSION}`);
-  const tmuxBin = env.TMUX_BIN || "tmux", tmux = await run(tmuxBin, ["-V"], { env });
+  const pi = await resolveLivePiExecutable(env), tmuxGeneration = resolveLiveBackendExecutable(env, "TMUX_BIN"), cmuxGeneration = resolveLiveBackendExecutable(env, "CMUX_BIN");
+  const tmux = await run(tmuxGeneration.executable, ["-V"], { env });
   const tmuxVersion = tmux.code === 0 ? parseTmuxVersionOutput(tmux.stdout) : null;
   if (!tmuxVersion || !isStableTmuxVersionAtLeast(tmuxVersion, MINIMUM_TMUX_VERSION)) throw new Error(`live benchmark requires stable tmux >=${MINIMUM_TMUX_VERSION}`);
-  const cmuxBin = env.CMUX_BIN || "cmux", cmux = await run(cmuxBin, ["--version"], { env });
+  revalidateManagedChildPiExecutableGeneration(tmuxGeneration);
+  const cmux = await run(cmuxGeneration.executable, ["--version"], { env });
   const cmuxVersion = cmux.code === 0 ? parseCmuxVersionOutput(cmux.stdout) : null;
   if (!cmuxVersion || !isStableSemverAtLeast(cmuxVersion, MINIMUM_CMUX_VERSION)) throw new Error(`live benchmark requires stable cmux >=${MINIMUM_CMUX_VERSION}`);
+  revalidateManagedChildPiExecutableGeneration(cmuxGeneration);
   const workspaceId = env.CMUX_WORKSPACE_ID?.trim(), surfaceId = env.CMUX_SURFACE_ID?.trim();
   if (!workspaceId || !surfaceId || !env.CMUX_SOCKET_PATH) throw new Error("live benchmark requires a canonical cmux caller environment");
-  const tree = await run(cmuxBin, ["--json", "--id-format", "both", "tree", "--workspace", workspaceId], { env });
+  const tree = await run(cmuxGeneration.executable, ["--json", "--id-format", "both", "tree", "--workspace", workspaceId], { env });
+  revalidateManagedChildPiExecutableGeneration(cmuxGeneration);
   if (tree.code !== 0 || !findCanonicalCmuxIdentity(tree.stdout, workspaceId, surfaceId)) throw new Error("live benchmark cmux caller preflight failed");
-  const authPath = path.join(env.PI_CODING_AGENT_DIR?.trim() || path.join(os.homedir(), ".pi", "agent"), "auth.json"), auth = await fs.lstat(authPath).catch(() => null);
+  const authPath = path.join(env.PI_CODING_AGENT_DIR?.trim() || path.join(env.HOME?.trim() || "/nonexistent", ".pi", "agent"), "auth.json"), auth = await fs.lstat(authPath).catch(() => null);
   if (!auth?.isFile() || auth.isSymbolicLink() || auth.size <= 0 || auth.size > 1024 * 1024) throw new Error("live benchmark provider auth source is unavailable or unsafe");
-  return pi;
+  return { ...pi, tmux: tmuxGeneration, cmux: cmuxGeneration };
 }
 export function redactEvidenceValue(value: unknown): Json { if (typeof value === "string") return /(?:api[_-]?key|token|secret|password|authorization|bearer)/i.test(value) ? "[redacted]" : value.slice(0, 128); if (typeof value === "number" || typeof value === "boolean" || value === null) return value; if (Array.isArray(value)) return value.slice(0, 32).map(redactEvidenceValue); if (!record(value)) return "[redacted]"; const output: RecordJson = {}; for (const [key, child] of Object.entries(value)) if (!/(?:api[_-]?key|token|secret|password|credential|authorization|cookie|auth)/i.test(key)) output[key] = redactEvidenceValue(child); return output; }
 export async function createPrivateEvidenceRoot(): Promise<string> { const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-phase0-live-")); await fs.chmod(root, 0o700); return await fs.realpath(root); }
 export async function privateLiveRoot(root: string): Promise<{ dev: number; ino: number }> { if (!path.isAbsolute(root) || path.normalize(root) !== root || !/^pi-subagent-phase0-live-[a-z0-9_-]{6,128}$/i.test(path.basename(root))) throw new Error("live checkpoint root path is invalid"); const temp = await fs.realpath(os.tmpdir()), parent = await fs.realpath(path.dirname(root)).catch(() => null), stat = await fs.lstat(root).catch(() => null), uid = typeof process.getuid === "function" ? process.getuid() : null; if (!stat?.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || (uid !== null && stat.uid !== uid) || parent !== temp || await fs.realpath(root).catch(() => null) !== root) throw new Error("live checkpoint root is not canonical private 0700"); return { dev: stat.dev, ino: stat.ino }; }
 export function sameIdentity(stat: { dev: number; ino: number } | null, expected: { dev: number; ino: number }): boolean { return stat !== null && stat.dev === expected.dev && stat.ino === expected.ino; }
 async function syncDirectory(root: string): Promise<void> { const handle = await fs.open(root, fsConstants.O_RDONLY); try { await handle.sync(); } finally { await handle.close(); } }
+
+const STAGED_NATIVE_PI_DIRECTORY = "staged-native-pi";
+const STAGED_NATIVE_PI_FILE = "pi";
+export type StageLivePiExecutableHooks = { afterSourcePrevalidated?: () => void | Promise<void> };
+/**
+ * Converts the validated Pi pathname into one private per-runtime generation.
+ * The source fence detects replacement before and after the exclusive copy;
+ * same-UID replacement during those individual filesystem operations remains
+ * outside this harness's threat model.
+ */
+export async function stageLivePiExecutable(root: string, pi: LivePiExecutable, hooks: StageLivePiExecutableHooks = {}): Promise<LivePiExecutable> {
+  const rootIdentity = await privateLiveRoot(root), directory = path.join(root, STAGED_NATIVE_PI_DIRECTORY), destination = path.join(directory, STAGED_NATIVE_PI_FILE);
+  let created = false;
+  try {
+    revalidateManagedChildPiExecutableGeneration(pi.generation);
+    await hooks.afterSourcePrevalidated?.();
+    await fs.mkdir(directory, { mode: 0o700 }); created = true;
+    await fs.chmod(directory, 0o700);
+    const directoryStat = await fs.lstat(directory);
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700 || (uid !== null && directoryStat.uid !== uid) || await fs.realpath(directory) !== directory || !sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi directory is unsafe");
+    revalidateManagedChildPiExecutableGeneration(pi.generation);
+    await fs.copyFile(pi.generation.executable, destination, fsConstants.COPYFILE_EXCL);
+    await fs.chmod(destination, 0o700);
+    revalidateManagedChildPiExecutableGeneration(pi.generation);
+    const staged = captureManagedChildLivePiExecutableGeneration(destination, directory);
+    revalidateManagedChildPiExecutableGeneration(staged);
+    const file = await fs.open(destination, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try { await file.sync(); } finally { await file.close(); }
+    await syncDirectory(directory);
+    await syncDirectory(root);
+    if (!sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi root identity changed");
+    revalidateManagedChildPiExecutableGeneration(staged);
+    return { ...pi, bin: staged.executable, generation: staged };
+  } catch (error) {
+    if (created) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw new Error("live Pi staging failed before provider spawn", { cause: error });
+  }
+}
 export async function writeLiveCheckpoint(root: string, checkpoint: LiveCheckpoint): Promise<string> { if (!validateLiveCheckpoint(checkpoint)) throw new Error("refusing to persist an invalid live checkpoint"); const identity = await privateLiveRoot(root), destination = path.join(root, LIVE_CHECKPOINT_FILE), temporary = path.join(root, `.${LIVE_CHECKPOINT_FILE}.${crypto.randomUUID()}.tmp`); const handle = await fs.open(temporary, "wx", 0o600); try { await handle.writeFile(`${JSON.stringify(checkpoint)}\n`); await handle.sync(); } finally { await handle.close(); } if (!sameIdentity(await fs.lstat(root).catch(() => null), identity)) { await fs.rm(temporary, { force: true }); throw new Error("live checkpoint root identity changed before publish"); } try { await fs.rename(temporary, destination); await fs.chmod(destination, 0o600); await syncDirectory(root); } catch (error) { await fs.rm(temporary, { force: true }); throw error; } return destination; }
 export async function loadLiveCheckpoint(root: string): Promise<LiveCheckpoint> { const identity = await privateLiveRoot(root), file = path.join(root, LIVE_CHECKPOINT_FILE), before = await fs.lstat(file).catch(() => null), uid = typeof process.getuid === "function" ? process.getuid() : null; if (!before?.isFile() || before.isSymbolicLink() || (before.mode & 0o777) !== 0o600 || (uid !== null && before.uid !== uid) || before.size <= 0 || before.size > MAX_CHECKPOINT_BYTES) throw new Error("live checkpoint file is unsafe"); const raw = await fs.readFile(file); const after = await fs.lstat(file).catch(() => null); if (!sameIdentity(await fs.lstat(root).catch(() => null), identity) || !sameIdentity(after, before)) throw new Error("live checkpoint path identity changed while reading"); let parsed: unknown; try { parsed = JSON.parse(raw.toString("utf8")); } catch { throw new Error("live checkpoint JSON is malformed"); } if (!validateLiveCheckpoint(parsed)) throw new Error("live checkpoint schema is invalid"); return parsed; }
 /** Atomically moves a resumable root out of its caller-visible name before it can be used again. */
@@ -212,11 +272,15 @@ export async function claimLiveCheckpoint(root: string): Promise<string> {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
       throw new Error("live checkpoint claim failed before provider start", { cause: error });
     }
-    if (!sameIdentity(await fs.lstat(claimed).catch(() => null), identity) || await fs.lstat(root).catch(() => null)) {
-      throw new Error("live checkpoint claim identity was not proven");
+    try {
+      if (!sameIdentity(await fs.lstat(claimed).catch(() => null), identity) || await fs.lstat(root).catch(() => null)) throw new Error("live checkpoint claim identity was not proven");
+      await syncDirectory(parent);
+      return claimed;
+    } catch (error) {
+      // A post-rename proof failure must not leave an unreferenced hidden claim.
+      await fs.rm(claimed, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
     }
-    await syncDirectory(parent);
-    return claimed;
   }
   throw new Error("live checkpoint claim destination could not be reserved");
 }
@@ -232,7 +296,89 @@ export async function terminalizeLiveCheckpoint(root: string): Promise<void> {
   await syncDirectory(root);
   if (await fs.lstat(file).catch(() => null)) throw new Error("live checkpoint terminalization was not durable");
 }
-export async function scrubSensitiveRecoveryArtifacts(root: string): Promise<boolean> { try { const walk = async (directory: string): Promise<void> => { for (const entry of await fs.readdir(directory, { withFileTypes: true })) { const candidate = path.join(directory, entry.name); if (entry.isSymbolicLink() || ["auth.json", "secret-env.sh", "lifecycle-token", "failure-diagnostics.log"].includes(entry.name)) await fs.rm(candidate, { force: true }); else if (entry.isDirectory()) await walk(candidate); } }; await walk(root); return true; } catch { return false; } }
+export const PHASE0_FAILURE_SUMMARY_FILE = "failure-summary.json";
+export const PHASE0_FAILURE_CATEGORIES = ["spawn-failed", "parent-exit", "parent-signal", "deadline-exhausted", "stdout-overflow", "stderr-overflow", "harness-failure"] as const;
+export const PHASE0_LIVE_MILESTONES = ["none", "parent-spawned", "parent-event-observed", "subagent-launch-requested", "background-job-admitted", "descendant-observed", "read-start-observed", "proof-observed"] as const;
+export type Phase0FailureCategory = typeof PHASE0_FAILURE_CATEGORIES[number];
+export type Phase0LiveMilestone = typeof PHASE0_LIVE_MILESTONES[number];
+export type Phase0FailureSummary = {
+  version: 1; category: Phase0FailureCategory; mode: LiveMode; workload: Workload; activeRuns: number; latestMilestone: Phase0LiveMilestone;
+  monotonic: { parentSpawned: boolean; parentEventCount: number; subagentLaunchRequests: number; backgroundJobAdmissions: number; descendantHighWater: number; readStartHighWater: number; proofHighWater: number; stagePublished: boolean };
+  terminalCounts: { providerError: number; settledBeforeRead: number; shutdownBeforeRead: number; abortedBeforeRead: number };
+  cleanupProven: boolean;
+};
+const MAX_PHASE0_FAILURE_SUMMARY_BYTES = 2048;
+function failureSummaryCount(value: unknown): value is number { return Number.isSafeInteger(value) && typeof value === "number" && value >= 0 && value <= 1_000_000; }
+export function validatePhase0FailureSummary(value: unknown): value is Phase0FailureSummary {
+  return record(value) && exact(value, ["version", "category", "mode", "workload", "activeRuns", "latestMilestone", "monotonic", "terminalCounts", "cleanupProven"])
+    && value.version === 1 && PHASE0_FAILURE_CATEGORIES.includes(value.category as Phase0FailureCategory) && LIVE_MODES.includes(value.mode as LiveMode) && WORKLOADS.includes(value.workload as Workload) && SUPPORTED_ACTIVE_RUNS.includes(value.activeRuns as SupportedActiveRun)
+    && PHASE0_LIVE_MILESTONES.includes(value.latestMilestone as Phase0LiveMilestone) && record(value.monotonic) && exact(value.monotonic, ["parentSpawned", "parentEventCount", "subagentLaunchRequests", "backgroundJobAdmissions", "descendantHighWater", "readStartHighWater", "proofHighWater", "stagePublished"])
+    && typeof value.monotonic.parentSpawned === "boolean" && [value.monotonic.parentEventCount, value.monotonic.subagentLaunchRequests, value.monotonic.backgroundJobAdmissions, value.monotonic.descendantHighWater, value.monotonic.readStartHighWater, value.monotonic.proofHighWater].every(failureSummaryCount) && typeof value.monotonic.stagePublished === "boolean"
+    && record(value.terminalCounts) && exact(value.terminalCounts, ["providerError", "settledBeforeRead", "shutdownBeforeRead", "abortedBeforeRead"]) && Object.values(value.terminalCounts).every(failureSummaryCount) && typeof value.cleanupProven === "boolean";
+}
+export function formatPhase0FailureSummary(summary: Phase0FailureSummary): string {
+  if (!validatePhase0FailureSummary(summary)) throw new Error("Phase 0 failure summary schema is invalid");
+  const serialized = JSON.stringify(summary);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_PHASE0_FAILURE_SUMMARY_BYTES) throw new Error("Phase 0 failure summary exceeded its byte budget");
+  return serialized;
+}
+async function privateSummaryDirectory(root: string): Promise<{ dev: number; ino: number }> {
+  return privateLiveRoot(root);
+}
+async function syncFailureSummaryDirectory(root: string): Promise<void> { const handle = await fs.open(root, fsConstants.O_RDONLY); try { await handle.sync(); } finally { await handle.close(); } }
+async function syncVerifiedRecoveryRoot(root: string, expected: { dev: number; ino: number }): Promise<boolean> {
+  const before = await fs.lstat(root).catch(() => null);
+  if (!sameIdentity(before, expected)) return false;
+  const handle = await fs.open(root, fsConstants.O_RDONLY).catch(() => null);
+  if (!handle) return false;
+  try {
+    const opened = await handle.stat();
+    if (!sameIdentity(opened, expected) || !sameIdentity(await fs.lstat(root).catch(() => null), expected)) return false;
+    await handle.sync();
+    return sameIdentity(await fs.lstat(root).catch(() => null), expected);
+  } catch { return false; }
+  finally { await handle.close().catch(() => undefined); }
+}
+/** Writes the fixed, sanitized recovery summary atomically; no caller path is accepted. */
+export async function writePhase0FailureSummary(root: string, summary: Phase0FailureSummary): Promise<string> {
+  const serialized = formatPhase0FailureSummary(summary); await privateSummaryDirectory(root);
+  const destination = path.join(root, PHASE0_FAILURE_SUMMARY_FILE), temporary = path.join(root, `.${PHASE0_FAILURE_SUMMARY_FILE}.${crypto.randomUUID()}.tmp`);
+  const handle = await fs.open(temporary, "wx", 0o600);
+  try { await handle.writeFile(`${serialized}\n`, "utf8"); await handle.sync(); } finally { await handle.close(); }
+  try { await fs.rename(temporary, destination); await fs.chmod(destination, 0o600); await syncFailureSummaryDirectory(root); }
+  catch (error) { await fs.rm(temporary, { force: true }).catch(() => undefined); throw error; }
+  return destination;
+}
+async function validRetainedFailureSummary(file: string): Promise<boolean> {
+  const stat = await fs.lstat(file).catch(() => null), uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (!stat?.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || (uid !== null && stat.uid !== uid) || stat.size <= 0 || stat.size > MAX_PHASE0_FAILURE_SUMMARY_BYTES + 1) return false;
+  let value: unknown; try { value = JSON.parse(await fs.readFile(file, "utf8")); } catch { return false; }
+  return validatePhase0FailureSummary(value) && Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_PHASE0_FAILURE_SUMMARY_BYTES;
+}
+async function validRetainedLiveCheckpoint(file: string): Promise<boolean> {
+  const stat = await fs.lstat(file).catch(() => null), uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (!stat?.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600 || (uid !== null && stat.uid !== uid) || stat.size <= 0 || stat.size > MAX_CHECKPOINT_BYTES) return false;
+  try { return validateLiveCheckpoint(JSON.parse(await fs.readFile(file, "utf8"))); } catch { return false; }
+}
+/** Default-deny recovery: retain only a valid top-level checkpoint and/or summary. */
+export async function scrubSensitiveRecoveryArtifacts(root: string): Promise<boolean> { try {
+  const identity = await privateSummaryDirectory(root);
+  for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+    const candidate = path.join(root, entry.name);
+    if (entry.name === PHASE0_FAILURE_SUMMARY_FILE && await validRetainedFailureSummary(candidate)) continue;
+    if (entry.name === LIVE_CHECKPOINT_FILE && await validRetainedLiveCheckpoint(candidate)) continue;
+    await fs.rm(candidate, { recursive: true, force: true });
+  }
+  // Persist every removal before trusting the retained recovery contract.
+  if (!await syncVerifiedRecoveryRoot(root, identity)) return false;
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  if (!sameIdentity(await fs.lstat(root).catch(() => null), identity) || entries.length === 0) return false;
+  for (const entry of entries) {
+    const candidate = path.join(root, entry.name);
+    if (entry.name === PHASE0_FAILURE_SUMMARY_FILE ? !await validRetainedFailureSummary(candidate) : entry.name === LIVE_CHECKPOINT_FILE ? !await validRetainedLiveCheckpoint(candidate) : true) return false;
+  }
+  return sameIdentity(await fs.lstat(root).catch(() => null), identity);
+} catch { return false; } }
 export async function writePrivateEvidence(root: string, evidence: LiveEvidence): Promise<string> { if (!validateLiveEvidence(evidence)) throw new Error("refusing to persist non-redacted or incomplete live evidence"); const identity = await privateLiveRoot(root), file = path.join(root, "evidence.json"), handle = await fs.open(file, "wx", 0o600); try { await handle.writeFile(`${JSON.stringify(evidence, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); } if (!sameIdentity(await fs.lstat(root).catch(() => null), identity)) { await fs.rm(file, { force: true }); throw new Error("evidence root identity changed before publish"); } await fs.chmod(file, 0o600); await syncDirectory(root); return file; }
 export type BoundedCommandResult = { code: number; stdout: string; stderr: string; timedOut: boolean; outputOverflow: boolean };
 export type BoundedCommandOptions = { cwd?: string; env?: NodeJS.ProcessEnv; deadline?: CellDeadline; timeoutMs?: number; detached?: boolean; onStart?: (child: ChildProcess) => void };
@@ -258,24 +404,28 @@ export { run as runBoundedCommand };
 
 /** A writer is tracked by immutable PID/start identity, never by a reusable PID alone. */
 export type Phase0ReleaseWriter = { child: ChildProcess; identity: ProcessIdentity };
-function writerIsLive(writer: Phase0ReleaseWriter): boolean { return getProcessStartedAt(writer.identity.pid) === writer.identity.startedAt; }
-async function awaitWriterGone(writer: Phase0ReleaseWriter, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (writerIsLive(writer) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-  if (writerIsLive(writer)) throw new Error("Phase 0 private FIFO writer did not terminate");
+export type Phase0ReleaseWriterIdentityClassifier = (identity: ProcessIdentity) => ProcessIdentityStatus;
+const classifyReleaseWriterIdentity: Phase0ReleaseWriterIdentityClassifier = (identity) => classifyParentProcessIdentity(identity.pid, identity.startedAt);
+async function awaitWriterGone(writer: Phase0ReleaseWriter, timeoutMs: number, classify: Phase0ReleaseWriterIdentityClassifier): Promise<void> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    if (classify(writer.identity) === "dead") return;
+    if (Date.now() >= deadline) throw new Error("Phase 0 private FIFO writer cleanup is unproven");
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10, Math.max(1, deadline - Date.now()))));
+  }
 }
-/** Signals only an exact writer generation and waits for process absence before untracking it. */
-export async function terminatePhase0ReleaseWriter(writer: Phase0ReleaseWriter): Promise<void> {
-  if (writerIsLive(writer)) {
+/** Signals only an exact-live writer generation; unknown identity probes are never signal authority. */
+export async function terminatePhase0ReleaseWriter(writer: Phase0ReleaseWriter, timeoutMs = 5_000, classify: Phase0ReleaseWriterIdentityClassifier = classifyReleaseWriterIdentity): Promise<void> {
+  if (classify(writer.identity) === "live") {
     try { process.kill(process.platform === "win32" ? writer.identity.pid : -writer.identity.pid, "SIGKILL"); } catch {}
   }
-  await awaitWriterGone(writer);
+  await awaitWriterGone(writer, timeoutMs, classify);
 }
 /** Outer cleanup is identity-bound and drains every tracked writer. */
-export async function cleanupPhase0ReleaseWriters(writers: Set<Phase0ReleaseWriter>): Promise<void> {
+export async function cleanupPhase0ReleaseWriters(writers: Set<Phase0ReleaseWriter>, options: { timeoutMs?: number; classify?: Phase0ReleaseWriterIdentityClassifier } = {}): Promise<void> {
   const tracked = [...writers];
   const results = await Promise.allSettled(tracked.map(async (writer) => {
-    await terminatePhase0ReleaseWriter(writer);
+    await terminatePhase0ReleaseWriter(writer, options.timeoutMs, options.classify);
     writers.delete(writer);
   }));
   const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -292,16 +442,17 @@ export async function writePhase0ReleaseToken(barrierPath: string, token: string
     const writer: Phase0ReleaseWriter = { child, identity: { pid: child.pid, startedAt } };
     writers.add(writer);
     let settled = false, timingOut = false;
-    const finish = (error?: Error) => {
+    const finish = (error?: Error, cleanupProven = true) => {
       if (settled) return;
-      settled = true; clearTimeout(timer); writers.delete(writer);
+      settled = true; clearTimeout(timer);
+      if (cleanupProven) writers.delete(writer);
       error ? reject(error) : resolve();
     };
     const failAfterTermination = async (error: Error) => {
       if (settled) return;
       timingOut = true;
       try { await terminatePhase0ReleaseWriter(writer); }
-      catch (terminationError) { finish(terminationError instanceof Error ? terminationError : new Error(String(terminationError))); return; }
+      catch (terminationError) { finish(terminationError instanceof Error ? terminationError : new Error(String(terminationError)), false); return; }
       finish(error);
     };
     const timer = setTimeout(() => { void failAfterTermination(new Error("Phase 0 private FIFO writer deadline expired")); }, requireRemainingDeadline(deadline, "private FIFO release"));
@@ -310,25 +461,21 @@ export async function writePhase0ReleaseToken(barrierPath: string, token: string
     child.stdin.end(`${token}\n`);
   });
 }
-/** Finds the first runnable stable Pi in PATH and returns its canonical absolute path. */
-export async function resolveLivePiExecutable(env: NodeJS.ProcessEnv = process.env): Promise<LivePiExecutable | null> {
-  const candidates = new Set<string>();
-  for (const entry of (env.PATH ?? "").split(path.delimiter)) {
-    const candidate = path.resolve(entry || process.cwd(), "pi");
-    let bin: string;
-    try {
-      bin = await fs.realpath(candidate);
-      const stat = await fs.stat(bin);
-      if (!stat.isFile()) continue;
-      await fs.access(bin, fsConstants.X_OK);
-    } catch { continue; }
-    if (candidates.has(bin)) continue;
-    candidates.add(bin);
-    const result = await run(bin, ["--version"], { env });
-    const version = result.code === 0 && !result.timedOut && !result.outputOverflow ? parsePiVersionOutput(result.stdout) : null;
-    if (version && isStableSemverAtLeast(version, MINIMUM_PI_VERSION)) return { bin, version };
+/** Resolves only the operator-selected, descriptor-validated native Pi generation. */
+export async function resolveLivePiExecutable(env: NodeJS.ProcessEnv = process.env): Promise<LivePiGeneration> {
+  const generation = resolveManagedChildLiveAcceptancePiExecutable({
+    executable: env[MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV],
+    minimumVersion: MANAGED_CHILD_LIVE_MINIMUM_PI_VERSION,
+  });
+  // Validate the returned canonical generation independently for evidence while
+  // preserving the resolver's descriptor/native/ancestry generation fence.
+  const result = await run(generation.executable, ["--version"], { env: { PATH: process.platform === "win32" ? env.SystemRoot : "/usr/bin:/bin" } });
+  const version = result.code === 0 && !result.timedOut && !result.outputOverflow ? parsePiVersionOutput(result.stdout) : null;
+  if (!version || !isStableSemverAtLeast(version, MANAGED_CHILD_LIVE_MINIMUM_PI_VERSION)) {
+    throw new Error(`live benchmark requires stable Pi >=${MANAGED_CHILD_LIVE_MINIMUM_PI_VERSION}`);
   }
-  return null;
+  revalidateManagedChildPiExecutableGeneration(generation);
+  return { bin: generation.executable, version, generation };
 }
 
 export class BoundedOutputCapture {

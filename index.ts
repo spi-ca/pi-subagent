@@ -604,7 +604,10 @@ export default function (pi: ExtensionAPI) {
       emit: (channel, payload) => pi.events.emit(channel, payload),
       on: typeof pi.events.on === "function" ? (channel, handler) => pi.events.on(channel, handler) : undefined,
       getSchedulerCounts: () => ({ active: scheduler.activeCount, queued: scheduler.queuedCount }),
-      getInteractiveActiveCount: () => listActiveInteractiveRunIds().length,
+      getInteractiveActiveCount: () => listInteractiveRunUxSnapshots().length,
+      // One in-process snapshot gives presence exact per-run correlation
+      // without making invocation IDs durable or part of the wire DTO.
+      getInteractiveActiveInvocationIds: () => listInteractiveRunUxSnapshots().map((run) => run.invocationId),
     })
     : null;
   // This is the single UX update boundary for invocation progress. It reads
@@ -1349,6 +1352,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           executionSignal: AbortSignal | undefined,
           executionOnUpdate: ((partial: any) => void) | undefined,
           backgroundExecution: boolean,
+          invocationId: string,
         ) => {
           const schedulerKey = `${schedulerHandle.generation}:${schedulerHandle.id}`;
           // Recheck immediately before every foreground call and every
@@ -1423,6 +1427,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               runnableAgents,
               ctx.cwd,
               executionSignal,
+              invocationId,
               executionOnUpdate,
               makeDetails,
               schedulerHandle,
@@ -1445,6 +1450,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               runnableAgents,
               ctx.cwd,
               executionSignal,
+              invocationId,
               executionOnUpdate,
               makeDetails,
               schedulerHandle,
@@ -1470,6 +1476,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               runnableAgents,
               ctx.cwd,
               executionSignal,
+              invocationId,
               executionOnUpdate,
               makeDetails,
               schedulerHandle,
@@ -1563,7 +1570,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           startBackgroundJob(
             pi,
             job,
-            (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true),
+            (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true, job.id),
             limits,
             backgroundSessionFence.capture(),
             backgroundSessionFence,
@@ -1600,7 +1607,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           cancel: () => foregroundController.abort(),
         });
         try {
-          const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false));
+          const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false, uxRun.id));
           updateUxFromPartial(uxRun.id, uxGeneration, result);
           if (foregroundController.signal.aborted) {
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
@@ -1646,6 +1653,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
+    invocationId: string,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
     schedulerHandle: SchedulerHandle,
@@ -1673,6 +1681,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       maxDepth,
       preventCycles,
       signal,
+      invocationId,
       onUpdate,
       makeDetails: makeDetails("single"),
     });
@@ -1718,6 +1727,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
+    invocationId: string,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
     schedulerHandle: SchedulerHandle,
@@ -1867,6 +1877,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               maxDepth,
               preventCycles,
               signal,
+              invocationId,
               onUpdate: (partial) => {
                 if (partial.details?.results[0]) {
                   runningSlots.replace(taskIndex, partial.details.results[0]);
@@ -1964,6 +1975,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         maxDepth,
         preventCycles,
         signal,
+        invocationId,
         onUpdate: (partial) => {
           if (partial.details?.results[0]) {
             runningSlots.replace(0, partial.details.results[0]);
@@ -2041,6 +2053,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
+    invocationId: string,
     onUpdate: ((partial: any) => void) | undefined,
     makeDetails: ReturnType<typeof makeDetailsFactory>,
     schedulerHandle: SchedulerHandle,
@@ -2109,6 +2122,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             maxDepth,
             preventCycles,
             signal,
+            invocationId,
             onUpdate: (partial) => {
               if (partial.details?.results[0]) {
                 resultSlots.replace(index, partial.details.results[0]);

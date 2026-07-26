@@ -803,7 +803,7 @@ describe("interactive pane runner preparation", () => {
 		const inspectResume = new Promise<void>((resolve) => { resumeInspect = resolve; });
 		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { if (pauseInspect) { inspectEntered(); await inspectResume; } return { exists: true, title: paneTitle }; }, interrupt: async () => true, close: async () => true, focus: async () => { focused += 1; return true; } };
 		try {
-			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, agent: "worker", depth: 2, generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
+			assert.equal(registerCommittedInteractiveRun({ runId, invocationId: "foreground-invocation", backend, handle, paths, agent: "worker", depth: 2, generation: getInteractiveShutdownGenerationForTest(), release: async () => { released += 1; return true; } }), true);
 			assert.equal(await focusInteractiveRun(runId), true); assert.equal(focused, 1);
 			const inspected = await inspectInteractiveRunForUx(runId);
 			assert.equal(inspected?.title, "worker [depth=2;run=ux-promo]"); assert.equal(inspected?.titleState, "changed");
@@ -816,6 +816,7 @@ describe("interactive pane runner preparation", () => {
 			paneTitle = `${inspected!.title} · completed`;
 			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed", "only exact lifecycle suffixes match");
 			assert.equal(listInteractiveRunUxSnapshots()[0]?.depth, 2);
+			assert.equal(listInteractiveRunUxSnapshots()[0]?.invocationId, "foreground-invocation");
 			assert.equal(await keepInteractiveRun(runId), true);
 			assert.equal(await releaseRegisteredInteractiveRun(runId), false); assert.equal(released, 0);
 			pauseInspect = true;

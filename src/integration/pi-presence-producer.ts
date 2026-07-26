@@ -120,7 +120,10 @@ export interface PiSubagentPresenceProducerOptions {
   readonly emit: (channel: string, payload: unknown) => void;
   readonly on?: (channel: string, handler: (payload: unknown) => void) => (() => void);
   readonly getSchedulerCounts: () => { readonly active: number; readonly queued: number };
+  /** Total active interactive runs; retained as a compatibility fallback. */
   readonly getInteractiveActiveCount: () => number;
+  /** One atomic process-local snapshot of active interactive-run invocation IDs. Never emitted. */
+  readonly getInteractiveActiveInvocationIds?: () => readonly (string | undefined)[];
   /** Passive UI-routing hint only; it must never affect run lifecycle. */
   readonly onCmuxStatusConsumer?: () => void;
 }
@@ -138,6 +141,7 @@ export class PiSubagentPresenceProducer {
   private readonly on: PiSubagentPresenceProducerOptions["on"];
   private readonly getSchedulerCounts: PiSubagentPresenceProducerOptions["getSchedulerCounts"];
   private readonly getInteractiveActiveCount: PiSubagentPresenceProducerOptions["getInteractiveActiveCount"];
+  private readonly getInteractiveActiveInvocationIds: PiSubagentPresenceProducerOptions["getInteractiveActiveInvocationIds"];
   private readonly onCmuxStatusConsumer: PiSubagentPresenceProducerOptions["onCmuxStatusConsumer"];
   private sessionId: string | null = null;
   private generation: number | null = null;
@@ -155,6 +159,7 @@ export class PiSubagentPresenceProducer {
     this.on = options.on;
     this.getSchedulerCounts = options.getSchedulerCounts;
     this.getInteractiveActiveCount = options.getInteractiveActiveCount;
+    this.getInteractiveActiveInvocationIds = options.getInteractiveActiveInvocationIds;
     this.onCmuxStatusConsumer = options.onCmuxStatusConsumer;
   }
 
@@ -213,10 +218,21 @@ export class PiSubagentPresenceProducer {
   private makeUpdate(snapshot: SubagentUxRegistrySnapshot, newTerminals: NewTerminalObservation, replay: boolean): PiPresenceUpdate | null {
     if (this.sessionId === null || this.generation === null) return null;
     const scheduler = this.schedulerCounts();
-    const interactive = this.interactiveCount();
-    const invocationActive = snapshot.active.filter((item) => item.status === "running" || item.status === "cancelling").length;
-    // Scheduler work belongs to the invocation; use the larger observation instead of double-counting it.
-    const active = clamp(Math.max(invocationActive, scheduler.active) + interactive);
+    const activeInvocationIds = new Set(snapshot.active
+      .filter((item) => item.status === "running" || item.status === "cancelling")
+      .map((item) => item.id));
+    const invocationActive = activeInvocationIds.size;
+    const interactiveInvocationIds = this.interactiveInvocationIds();
+    // The correlated snapshot is process-local only. Without it, retain the
+    // legacy count callback and conservatively treat every interactive run as
+    // unmatched rather than guessing ownership from its lifecycle state.
+    const interactive = interactiveInvocationIds?.length ?? this.interactiveCount();
+    const matchedInteractive = interactiveInvocationIds?.reduce(
+      (matched, invocationId) => matched + (invocationId !== undefined && activeInvocationIds.has(invocationId) ? 1 : 0),
+      0,
+    ) ?? 0;
+    const unmatchedInteractive = interactive - matchedInteractive;
+    const active = clamp(unmatchedInteractive + Math.max(invocationActive, scheduler.active, matchedInteractive));
     const queued = clamp(scheduler.queued);
     const completed = clamp(this.terminalCounts.completed);
     const failed = clamp(this.terminalCounts.failed);
@@ -258,6 +274,12 @@ export class PiSubagentPresenceProducer {
     try { const value = this.getSchedulerCounts(); return { active: safeCount(value?.active), queued: safeCount(value?.queued) }; } catch { return { active: 0, queued: 0 }; }
   }
   private interactiveCount(): number { try { return safeCount(this.getInteractiveActiveCount()); } catch { return 0; } }
+  private interactiveInvocationIds(): readonly (string | undefined)[] | undefined {
+    try {
+      const value = this.getInteractiveActiveInvocationIds?.();
+      return Array.isArray(value) && value.every((id) => id === undefined || typeof id === "string") ? value : undefined;
+    } catch { return undefined; }
+  }
   private nextSequence(): number { this.sequence += 1; return this.sequence; }
   private emitSafely(event: PiPresenceUpdate): void { try { this.emit(PI_PRESENCE_UPDATE_EVENT, event); } catch { /* Event observers are never lifecycle authority. */ } }
 }

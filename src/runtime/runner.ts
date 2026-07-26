@@ -410,6 +410,8 @@ const TREE_PERMIT_DETACH_RETRY_MS = 100;
 export type InteractivePromotionOutcome = "promoted" | "already-promoted" | "ownership-unknown" | "rejected";
 export interface InteractiveRunUxSnapshot {
   runId: string;
+  /** Process-local parent invocation correlation; never persisted or emitted. */
+  invocationId?: string;
   agent: string;
   depth: number;
   backend: "cmux-pane" | "tmux-pane";
@@ -422,6 +424,8 @@ export interface InteractiveRunUxSnapshot {
 
 interface ActiveInteractiveRun {
   runId: string;
+  /** Process-local parent invocation correlation; never persisted or emitted. */
+  invocationId?: string;
   backend: InteractivePaneBackend;
   handle: InteractivePaneHandle;
   paths?: RunArtifactPaths;
@@ -849,6 +853,7 @@ function sanitizeInteractivePreview(value: unknown, maxLength = 256): string | u
 function interactiveSnapshot(run: ActiveInteractiveRun): InteractiveRunUxSnapshot {
   return Object.freeze({
     runId: run.runId,
+    ...(run.invocationId === undefined ? {} : { invocationId: run.invocationId }),
     agent: run.agent,
     depth: run.depth,
     backend: run.backend.mode,
@@ -1249,13 +1254,13 @@ export async function releaseRegisteredInteractiveRun(runId: string, force = fal
 
 /** Register immediately on durable commit, before any one-way launch action. */
 export function registerCommittedInteractiveRun(
-  run: { runId: string; backend: InteractivePaneBackend; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
+  run: { runId: string; invocationId?: string; backend: InteractivePaneBackend; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
 ): boolean {
   const underlyingRelease = run.release ?? (() => closeInteractiveTarget(run.backend, run.handle));
   const now = Date.now();
   const active = {} as ActiveInteractiveRun;
   Object.assign(active, {
-    runId: run.runId, backend: run.backend, handle: run.handle, ...(run.paths ? { paths: run.paths } : {}),
+    runId: run.runId, ...(run.invocationId === undefined ? {} : { invocationId: run.invocationId }), backend: run.backend, handle: run.handle, ...(run.paths ? { paths: run.paths } : {}),
     agent: sanitizeInteractivePreview(run.agent, 96) ?? "unknown", depth: Number.isSafeInteger(run.depth) && (run.depth ?? -1) >= 0 ? run.depth! : 0,
     surfaceTitle: buildChildRuntimeTitle(run.agent ?? "unknown", run.runId, run.depth),
     focusSupported: run.focusSupported ?? typeof run.backend.focus === "function", generation: run.generation,
@@ -3903,6 +3908,8 @@ export interface RunAgentOptions {
   task: string;
   /** Optional chain stage label used for UI display. */
   stageLabel?: string;
+  /** Process-local parent invocation correlation; never persisted or emitted. */
+  invocationId?: string;
   /** Optional override working directory. */
   taskCwd?: string;
   /** Optional per-call model override. */
@@ -3965,6 +3972,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     agentName,
     task,
     stageLabel,
+    invocationId,
     taskCwd,
     model: modelOverride,
     delegationMode,
@@ -4137,6 +4145,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       backend: interactiveBackend,
       result,
       agent,
+      invocationId,
       cwd,
       taskCwd,
       modelOverride,
@@ -4805,6 +4814,8 @@ interface RunAgentInInteractivePaneOptions {
   backend: InteractivePaneBackend;
   result: SingleResult;
   agent: AgentConfig;
+  /** Process-local parent invocation correlation; never persisted or emitted. */
+  invocationId?: string;
   cwd: string;
   taskCwd?: string;
   modelOverride?: string;
@@ -5768,7 +5779,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     // container state and is registered after the same committed binding.
     // Registration is the final exact generation/fence check before any gate.
     if (!registerCommittedInteractiveRun({
-      runId, backend, handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
+      runId, invocationId: options.invocationId, backend, handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
       sessionIdentity, sessionResultStartOffset, applyCompletionWinner, stopLeaseWriterAndDrain,
       publishParentCompletion: async (status, errorCode) => await publishTerminalParentCompletion(runPaths, runId, status, errorCode),
       // Preserve the post-commit observation even if a reset races adoption.

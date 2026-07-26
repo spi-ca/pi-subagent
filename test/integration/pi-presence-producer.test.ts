@@ -130,6 +130,42 @@ describe("pi presence producer wire contract", () => {
     assert.equal(emitted[4].state, "running");
   });
 
+  test("correlates interactive runs to exact active invocation IDs", () => {
+    const cases = [
+      { name: "managed 1/1/1", activeIds: ["origin"], scheduler: 1, interactiveIds: ["origin"], expected: 1 },
+      { name: "transition while the originating invocation remains active", activeIds: ["origin"], scheduler: 0, interactiveIds: ["origin"], expected: 1 },
+      { name: "retained old run plus unrelated inline invocation", activeIds: ["inline"], scheduler: 1, interactiveIds: ["old"], expected: 2 },
+      { name: "two parallel interactive children", activeIds: ["parallel"], scheduler: 2, interactiveIds: ["parallel", "parallel"], expected: 2 },
+      { name: "missing interactive invocation ID is unmatched", activeIds: ["inline"], scheduler: 1, interactiveIds: [undefined], expected: 2 },
+      { name: "terminal interactive invocation ID is unmatched", activeIds: ["inline"], scheduler: 1, interactiveIds: ["terminal"], expected: 2 },
+    ];
+
+    for (const activeCase of cases) {
+      const emitted: any[] = [];
+      const producer = createPiSubagentPresenceProducer({
+        emit: (_channel, payload) => emitted.push(payload),
+        getSchedulerCounts: () => ({ active: activeCase.scheduler, queued: 0 }),
+        getInteractiveActiveCount: () => activeCase.interactiveIds.length,
+        getInteractiveActiveInvocationIds: () => activeCase.interactiveIds,
+      });
+      producer.startSession("session-1", 0);
+      producer.publish(snapshot(0, [], activeCase.activeIds.map((id) => ({ id, status: "running" }))));
+      assert.equal(emitted[0].counts.active, activeCase.expected, activeCase.name);
+    }
+  });
+
+  test("uses the legacy interactive count as an unmatched fallback", () => {
+    const emitted: any[] = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (_channel, payload) => emitted.push(payload),
+      getSchedulerCounts: () => ({ active: 1, queued: 0 }),
+      getInteractiveActiveCount: () => 1,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [{ id: "origin", status: "running" }]));
+    assert.equal(emitted[0].counts.active, 2);
+  });
+
   test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {
     const emitted: any[] = [];
     const producer = createPiSubagentPresenceProducer({

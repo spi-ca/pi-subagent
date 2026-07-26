@@ -47,7 +47,7 @@ presence producer는 root parent(depth `0`)의 `session_start`에서 session ID�
 
 `update`는 session-local UX snapshot과 scheduler/interactive count만 사용한다.
 
-- `active`는 invocation의 `running`/`cancelling` 수와 scheduler active 수 중 큰 값에 active interactive run 수를 더한다. scheduler 작업을 이중 합산하지 않는다.
+- `active`는 process-local interactive run의 optional invocation ID와 현재 UX의 `running`/`cancelling` invocation ID를 **정확히** 대조한다. interactive ID가 현재 active invocation ID와 같으면 matched, ID가 없거나 terminal/없는 invocation ID면 unmatched다. `unmatchedInteractive + max(activeInvocationCount, scheduler.active, matchedInteractive)`로 계산하므로 managed `1/1/1`과 원 invocation이 active인 전환은 `1`, 오래 남은 run과 관련 없는 inline invocation은 `2`, 병렬 interactive child 둘은 `2`가 된다. 이 correlation ID는 runtime 메모리에만 있고 artifact나 presence wire payload에는 저장·발행하지 않는다. legacy count-only callback은 correlation을 제공하지 못하므로 모든 interactive run을 unmatched로 보수 처리한다.
 - `queued`는 scheduler queue 수다.
 - `completed`/`failed`/`cancelled`는 session 안에서 처음 본 terminal invocation ID만 누적한다. UX recent history가 pruning되어도 계속 유지한다. ID 기억은 4,096개, 각 presence count는 1,000,000으로 상한을 둔다. ID 기억이 포화되면 재전송으로 과대계산하지 않도록 새 terminal count를 동결한다.
 - `active > 0`이면 state는 `running`이다. `active === 0`이고 `queued > 0`인 **queued-only** 상태는 `waiting`이다. 둘 다 없으면 가장 최근 terminal outcome에 따라 `success`/`error`/`cancelled`, terminal이 없으면 `idle`이다.

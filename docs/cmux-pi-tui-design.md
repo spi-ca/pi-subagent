@@ -1,6 +1,6 @@
 # cmux/tmux 기반 실제 Pi TUI 설계 및 구현
 
-> **상태:** 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. live cmux와 tmux crash/reaper E2E는 2026-07-20 최종 harness로 모두 **PASS**했다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
+> **상태:** 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. live cmux crash/reaper E2E는 2026-07-20, live tmux crash/reaper E2E는 2026-07-21 각각 별개의 최종 harness run으로 **PASS**했다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
 >
 > **Authority:** interactive pane layout 구현도 완료됐다. 배치 정책, coordinator/broker 책임 분리와 live layout smoke 증거는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md)가 authoritative하다.
 

@@ -998,7 +998,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
       if (created.code !== 0) throw new Error("could not create a private provider barrier FIFO");
       await fs.chmod(barrierPath, 0o600);
     }
-  const tasks = Array.from({ length: activeRuns }, (_, index) => ({ agent: "phase0-live-child", task: workloadTask(workload, index, barrierPaths[index]!), mode: "spawn" }));
+  const tasks = Array.from({ length: activeRuns }, (_, index) => ({ agent: "phase0-live-child", task: workloadTask(workload, index, barrierPaths[index]!) }));
   const taskChunks = phase0TaskChunks(tasks), milestones = phase0StageMilestones(activeRuns);
   if (taskChunks.some((chunk) => chunk.length !== PHASE0_MAX_TASKS_PER_BACKGROUND_JOB) || taskChunks.length !== activeRuns || taskChunks.flat().length !== activeRuns || milestones.length !== 1 || milestones[0] !== activeRuns || taskChunks.length > PHASE0_MAX_BACKGROUND_JOBS) throw new Error("Phase 0 task chunk plan is not one exact single-task final milestone");
   milestoneMonitor = monitorPhase0ReadStartMilestones(proofServer!, stageRoot, milestones, deadline, milestoneAbort.signal);

@@ -11,6 +11,7 @@ import {
   claimLiveCheckpoint, cleanupPhase0ReleaseWriters, formatPhase0FailureSummary, PHASE0_FAILURE_SUMMARY_FILE, resolveLiveBackendExecutable, resolveLivePiExecutable, revalidateStagedLivePiBundle, scrubSensitiveRecoveryArtifacts, stageLivePiExecutable, validatePhase0FailureSummary, writeLiveCheckpoint, writePhase0FailureSummary, type CellEvidence, type LiveEvidence, type LivePiExecutable, type Phase0ReleaseWriter,
 } from "./performance-phase0-live/evidence";
 import { getProcessStartedAt } from "../../src/runtime/run-protocol";
+import { validateSubagentInvocation } from "../../src/core/subagent-config";
 import { MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV, captureManagedChildLivePiExecutableGeneration, captureManagedChildPiExecutableGeneration } from "./managed-child-pi-executable";
 import { Phase0CellFailure, Phase0LiveDiagnosticWatchdog, Phase0LiveMilestoneTracker, attemptPhase0CleanupSteps, awaitExactBootstrapWatchdogDisarm, buildSyntheticParentEnv, discoverExactBootstrapWatchdog, finalizePhase0CellFailure, phase0ChildTerminalFailure, phase0FailureCategory, phase0WrapperFallbackSummary, prepareAgentDirectory, processRows, runParentCell, terminateExactBootstrapAuthority, terminateExactPhase0Identities } from "./performance-phase0-live/cell";
 import { currentLiveSourceIdentity, executeLiveBenchmark, executeLiveSmoke, recordLiveFixture, type LiveBenchmarkTestHooks } from "./performance-phase0-live";
@@ -196,6 +197,29 @@ describe("two-tier gated Phase 0 live harness", () => {
     const env = buildSyntheticParentEnv({ PATH: "/bin", HOME: "/home/test", LANG: "C", HTTPS_PROXY: "https://proxy.invalid", NODE_EXTRA_CA_CERTS: "/tmp/ca.pem", PI_SUBAGENT_SECRET: "leak", SECRET_TOKEN: "leak", NODE_OPTIONS: "--require=bad", BASH_ENV: "/tmp/hook", RANDOM_CANARY: "leak", TMUX: "ambient" }, { TMUX: "explicit", CMUX_SOCKET_PATH: "/tmp/cmux.sock", PI_SUBAGENT_PHASE0_LIVE: "1", PHASE0_ACTIVE_RUNS: "1" });
     assert.deepEqual(env, { PATH: "/bin", HOME: "/home/test", LANG: "C", HTTPS_PROXY: "https://proxy.invalid", NODE_EXTRA_CA_CERTS: "/tmp/ca.pem", TMUX: "explicit", CMUX_SOCKET_PATH: "/tmp/cmux.sock", PI_SUBAGENT_PHASE0_LIVE: "1", PHASE0_ACTIVE_RUNS: "1" });
     assert.throws(() => buildSyntheticParentEnv({}, { ARBITRARY_OVERRIDE: "no" }), /not allowlisted/); assert.throws(() => buildSyntheticParentEnv({}, { PI_SUBAGENT_PHASE0_LIVE_EVIL: "no" }), /not allowlisted/);
+  });
+
+  test("emits schema-compatible background admission tasks without per-task mode", async () => {
+    const root = await createPrivateEvidenceRoot();
+    let taskChunks: unknown, barrierPaths: unknown;
+    try {
+      await assert.rejects(() => runParentCell(root, "/fixture/agent", "/fixture/extension", fixturePi, 1, "short-response", { PATH: process.env.PATH }, {}, undefined, true, { expiresAt: Date.now() + 10_000 }, {
+        skipStagedBundleRevalidation: true,
+        spawnParent: ((_command: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+          taskChunks = JSON.parse(options.env?.PHASE0_TASK_CHUNKS ?? "null");
+          barrierPaths = JSON.parse(options.env?.PI_SUBAGENT_PHASE0_LIVE_PROOF_BARRIER_PATHS ?? "null");
+          throw new Error("captured provider-free admission contract");
+        }) as never,
+      }));
+      assert.ok(Array.isArray(barrierPaths));
+      assert.deepEqual(taskChunks, [[{
+        agent: "phase0-live-child",
+        task: `First call the read tool exactly once with path ${JSON.stringify(barrierPaths[0])}. Follow the continuation instruction returned by that tool.`,
+      }]]);
+      const tasks = (taskChunks as Array<Array<{ agent: string; task: string }>>)[0]!;
+      assert.equal(validateSubagentInvocation({ tasks, background: true }), null);
+      assert.equal(Object.hasOwn(tasks[0]!, "mode"), false);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
   test("tracks only bounded monotonic milestone state and watchdog ignores volatile gauges", () => {

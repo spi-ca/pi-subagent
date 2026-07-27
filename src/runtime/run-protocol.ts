@@ -4,6 +4,7 @@ import { MINIMUM_CMUX_VERSION, isStableSemverAtLeast } from "./version-policy.mj
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isValidTmuxWindowLabel } from "./tmux-window-label.mjs";
 
 export const RUN_PROTOCOL_VERSION = 1 as const;
 /** Version for the detached one-shot launch broker protocol. */
@@ -1065,7 +1066,10 @@ type LaunchIntentV2Base = { version: 2; runId: string; parentRunId?: string; par
 type LegacyCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2 };
 type LegacyTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 };
 type LayoutCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2; control?: CmuxControlTransportV2 } & Extract<LayoutPlacementRequestV2, { placement: "cmux-split" | "cmux-new-surface" }>;
-type LayoutTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 } & Extract<LayoutPlacementRequestV2, { placement: "tmux-split" | "tmux-new-window" }>;
+type LayoutTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 } & (
+	| Extract<LayoutPlacementRequestV2, { placement: "tmux-split" }>
+	| (Extract<LayoutPlacementRequestV2, { placement: "tmux-new-window" }> & { windowLabel: string })
+);
 /** Legacy cmux records without control are diagnostic-only and never production mutation authority. */
 export type LaunchIntentV2 = LegacyCmuxLaunchIntentV2 | LegacyTmuxLaunchIntentV2 | LayoutCmuxLaunchIntentV2 | LayoutTmuxLaunchIntentV2;
 export interface BrokerClaimV2 { version: 2; runId: string; brokerNonce: string; pid: number; brokerStartedAt?: number; claimedAt: number }
@@ -1206,12 +1210,17 @@ function hasValidLayoutAllocation(terminalMode: unknown, layout: unknown, placem
 		&& container.paneId === target.paneId && container.panePid === target.panePid;
 }
 
-export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runDir?: string): LaunchIntentV2 | null {
+export interface LaunchIntentParseOptions {
+	/** Read-only recovery compatibility for pre-label tmux-new-window artifacts. */
+	allowLegacyTmuxWindowLabel?: boolean;
+}
+
+export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runDir?: string, options: LaunchIntentParseOptions = {}): LaunchIntentV2 | null {
 	if (!isRecord(value) || !validRun(value, expectedRunId) || typeof value.parentSessionId !== "string" || !value.parentSessionId || !pid(value.parentPid) || !positive(value.parentStartedAt) || !positive(value.createdAt) || typeof value.childSessionFile !== "string" || !path.isAbsolute(value.childSessionFile)) return null;
 	if (value.parentRunId !== undefined && (typeof value.parentRunId !== "string" || !value.parentRunId)) return null;
 	if (runDir && !containedPath(value.childSessionFile, runDir, "child-session.jsonl")) return null;
 	const legacyIntentKeys = ["version", "runId", "parentRunId", "parentSessionId", "parentPid", "parentStartedAt", "terminalMode", "source", "childSessionFile", "createdAt", "brokerNonce", "runtimePath", "runtimeInterpreterPath", "backendPath", "brokerEntrypoint"];
-	const layoutIntentKeys = [...legacyIntentKeys, "layout", "placement", "container", "control"];
+	const layoutIntentKeys = [...legacyIntentKeys, "layout", "placement", "container", "control", "windowLabel"];
 	const executionPaths = [value.runtimePath, value.runtimeInterpreterPath, value.backendPath, value.brokerEntrypoint];
 	if (typeof value.brokerNonce !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(value.brokerNonce) || !executionPaths.every((field) => typeof field === "string" && field.length > 0 && path.isAbsolute(field))) return null;
 	const sourceIsValid = value.terminalMode === "cmux-pane" ? isCmuxSource(value.source) : value.terminalMode === "tmux-pane" && isTmuxSource(value.source);
@@ -1219,11 +1228,17 @@ export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runD
 	const layoutFieldNames = ["layout", "placement", "container"];
 	const hasAnyLayoutField = layoutFieldNames.some((key) => Object.hasOwn(value, key));
 	if (!hasAnyLayoutField && Object.keys(value).every((key) => legacyIntentKeys.includes(key))) return value as LaunchIntentV2;
-	if (!hasOnlyOptionalKeys(value, layoutIntentKeys.filter((key) => key !== "parentRunId" && key !== "control"), ["parentRunId", "control"])
+	if (!hasOnlyOptionalKeys(value, layoutIntentKeys.filter((key) => key !== "parentRunId" && key !== "control" && key !== "windowLabel"), ["parentRunId", "control", "windowLabel"])
 		|| !layoutFieldNames.every((key) => Object.hasOwn(value, key))) return null;
 	if (value.control !== undefined && (value.terminalMode !== "cmux-pane" || !isCmuxControlTransport(value.control))) return null;
 	const container = parseLayoutContainerV2(value.container);
 	if (!container || !hasValidLayoutIntentPlacement(value.terminalMode, value.layout, value.placement, container)) return null;
+	const isTmuxNewWindow = value.terminalMode === "tmux-pane" && value.placement === "tmux-new-window";
+	if (isTmuxNewWindow) {
+		if (value.windowLabel === undefined) {
+			if (!options.allowLegacyTmuxWindowLabel) return null;
+		} else if (!isValidTmuxWindowLabel(value.windowLabel, value.runId)) return null;
+	} else if (value.windowLabel !== undefined) return null;
 	if (value.terminalMode === "tmux-pane") {
 		const source = value.source as TmuxSourceV2;
 		const generated = hasTmuxGeneration(source) || ("generation" in container && hasTmuxGeneration(container));

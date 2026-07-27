@@ -9,6 +9,7 @@ import { getProcessStartedAt, prepareRunArtifactPaths, readBrokerJson, writePriv
 import { getCmuxControlRequestManager } from "../../src/runtime/cmux-control-adapter.mjs";
 import { fakeCmuxControlServer } from "../helpers/fake-cmux-control-server";
 import { acceptanceAllocationCheckpointPath } from "../acceptance/acceptance-allocation-checkpoint";
+import { buildTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
 import { cleanupAcceptanceCmuxTarget, terminateStoppedPostallocationBroker } from "../acceptance/live-harness";
 
 const tempDirs: string[] = [];
@@ -825,7 +826,7 @@ describe("pane launch broker", () => {
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-layout-window" });
 		const args = await writeTmuxIntent(paths, "tmux-layout-window", backend);
 		const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
-		record.layout = "auto"; record.placement = "tmux-new-window";
+		record.layout = "auto"; record.placement = "tmux-new-window"; record.windowLabel = buildTmuxWindowLabel("agent", "tmux-layout-window");
 		record.container = tmuxSessionContainer(record);
 		await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 		assert.equal(await run(args, process.env, paths.runDir), 0);
@@ -834,9 +835,34 @@ describe("pane launch broker", () => {
 		const commands = await fs.promises.readFile(log, "utf8");
 		assert.match(commands, /#{session_id}\|#{window_id}\|#{pane_id}\|#{pane_pid}/);
 		assert.match(commands, /new-window/);
+		const newWindow = commands.split("\n").find((line) => line.includes("new-window"))!;
+		assert.equal(newWindow.split(" ").filter((arg) => arg === "-n").length, 1);
+		assert.match(newWindow, /-n subagent:agent:tmux-lay/);
 		assert.match(commands, /-t \$1:/);
 		assert.equal(commands.indexOf("list-panes") < commands.indexOf("new-window"), true);
 		assert.doesNotMatch(commands, /kill-window|kill-session/);
+	});
+
+	test("rejects missing, invalid, or run-mismatched tmux window labels before allocation", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-")); tempDirs.push(root);
+		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
+		for (const [runId, label] of [
+			["tmux-label-missing", undefined],
+			["tmux-label-invalid", "subagent:agent:#{pane_id}"],
+			["tmux-label-mismatch", buildTmuxWindowLabel("agent", "other-run")],
+		] as const) {
+			const log = path.join(root, `${runId}.log`), backend = await nativeTmuxMock(root, "/bin/sh", log, "$1|@3|%2|789", 0, "$1|@2|%1|456");
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const args = await writeTmuxIntent(paths, runId, backend);
+			const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
+			record.layout = "auto"; record.placement = "tmux-new-window"; record.container = tmuxSessionContainer(record);
+			if (label === undefined) delete record.windowLabel; else record.windowLabel = label;
+			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
+			assert.equal(await run(args, process.env, paths.runDir), 0);
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "intent-invalid");
+			assert.equal(fs.existsSync(log), false, "invalid labels must not issue a tmux allocation command");
+		}
 	});
 
 	test("rejects a same-window tmux response without commit and rolls back only its exact pane", async () => {
@@ -846,7 +872,7 @@ describe("pane launch broker", () => {
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-same-window" });
 		const args = await writeTmuxIntent(paths, "tmux-same-window", backend);
 		const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
-		record.layout = "auto"; record.placement = "tmux-new-window";
+		record.layout = "auto"; record.placement = "tmux-new-window"; record.windowLabel = buildTmuxWindowLabel("agent", "tmux-same-window");
 		record.container = tmuxSessionContainer(record);
 		await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 		assert.equal(await run(args, process.env, paths.runDir), 0);
@@ -875,7 +901,7 @@ describe("pane launch broker", () => {
 			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
 			const args = await writeTmuxIntent(paths, runId, backend);
 			const record = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
-			record.layout = "auto"; record.placement = "tmux-new-window";
+			record.layout = "auto"; record.placement = "tmux-new-window"; record.windowLabel = buildTmuxWindowLabel("agent", runId);
 			record.container = tmuxSessionContainer(record);
 			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
 			assert.equal(await run(args, process.env, paths.runDir), 0);

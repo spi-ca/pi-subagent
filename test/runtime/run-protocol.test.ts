@@ -53,6 +53,7 @@ import {
 	STATE_ROOT_MARKER_NAME,
 	RUN_DIRECTORY_MARKER_NAME,
 } from "../../src/runtime/run-protocol";
+import { buildTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
 
 const tempDirs: string[] = [];
 const tmuxGeneration = (socketPath: string) => ({ socketPath, socketDev: "1", socketIno: "2", serverStartedAt: 3 });
@@ -406,7 +407,7 @@ describe("run protocol", () => {
 			[{ ...cmuxBase, layout: "auto", placement: "cmux-new-surface", container: { kind: "cmux-pane", workspaceId: cmuxSource.workspaceId, paneId: cmuxTarget.paneId } }, cmuxAllocation("auto", "cmux-new-surface")],
 			[{ ...cmuxBase, layout: "auto", placement: "cmux-new-surface", container: { kind: "cmux-source-pane", ...cmuxSource, paneId: cmuxTarget.paneId } }, cmuxAllocation("auto", "cmux-new-surface")],
 			[{ ...tmuxBase, layout: "split", placement: "tmux-split", container: { kind: "tmux-source-pane", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId: "$1", windowId: "@1", paneId: tmuxSource.sourcePaneId, panePid: tmuxSource.sourcePanePid, generation: tmuxSource.generation } }, tmuxAllocation("tmux-split")],
-			[{ ...tmuxBase, layout: "auto", placement: "tmux-new-window", container: { kind: "tmux-session", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId: "$1", sourceWindowId: "@1", generation: tmuxSource.generation } }, tmuxAllocation("tmux-new-window")],
+			[{ ...tmuxBase, layout: "auto", placement: "tmux-new-window", windowLabel: buildTmuxWindowLabel("agent", "layout"), container: { kind: "tmux-session", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId: "$1", sourceWindowId: "@1", generation: tmuxSource.generation } }, tmuxAllocation("tmux-new-window")],
 		] as const;
 		for (const [intentRecord, allocationRecord] of valid) {
 			const intent = parseLaunchIntentV2(intentRecord, "layout");
@@ -415,6 +416,14 @@ describe("run protocol", () => {
 			assert.ok(allocation, JSON.stringify(allocationRecord));
 			assert.equal(hasAllocationIntentSourceBinding(intent, allocation), true);
 		}
+
+		const strictWindowIntent = valid[5][0];
+		assert.equal(parseLaunchIntentV2({ ...strictWindowIntent, windowLabel: undefined }, "layout"), null);
+		assert.equal(parseLaunchIntentV2({ ...strictWindowIntent, windowLabel: "subagent:agent:other" }, "layout"), null);
+		assert.equal(parseLaunchIntentV2({ ...valid[4][0], windowLabel: buildTmuxWindowLabel("agent", "layout") }, "layout"), null);
+		assert.equal(parseLaunchIntentV2({ ...valid[0][0], windowLabel: buildTmuxWindowLabel("agent", "layout") }, "layout"), null);
+		const { windowLabel: _legacyLabel, ...legacyWindowIntent } = strictWindowIntent;
+		assert.ok(parseLaunchIntentV2(legacyWindowIntent, "layout", undefined, { allowLegacyTmuxWindowLabel: true }));
 
 		const legacyIntent = { ...cmuxBase };
 		const legacyAllocation = { version: 2, runId: "layout", terminalMode: "cmux-pane", target: cmuxTarget, allocatedAt: 1 };
@@ -466,7 +475,7 @@ describe("run protocol", () => {
 		const intent = {
 			version: 2, runId: "binding", parentSessionId: "p", parentPid: 1, parentStartedAt: 1, terminalMode: "tmux-pane",
 			source: { socketPath: "/tmp/tmux", sourcePaneId: "%1", sourcePanePid: 2, serverPid: 3, generation }, childSessionFile: "/tmp/binding/child-session.jsonl", createdAt: 1, brokerNonce: "a".repeat(43), runtimePath: "/usr/bin/node", runtimeInterpreterPath: "/usr/bin/node", backendPath: "/usr/bin/tmux", brokerEntrypoint: "/usr/bin/broker",
-			layout: "auto", placement: "tmux-new-window", container: { kind: "tmux-session", socketPath: "/tmp/tmux", serverPid: 3, sessionId: "$1", sourceWindowId: "@1", generation },
+			layout: "auto", placement: "tmux-new-window", windowLabel: buildTmuxWindowLabel("agent", "binding"), container: { kind: "tmux-session", socketPath: "/tmp/tmux", serverPid: 3, sessionId: "$1", sourceWindowId: "@1", generation },
 		};
 		const allocation = {
 			version: 2, runId: "binding", terminalMode: "tmux-pane", layout: "auto", placement: "tmux-new-window",

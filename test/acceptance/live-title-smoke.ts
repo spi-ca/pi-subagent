@@ -10,6 +10,7 @@ import {
   parseCreatedCmuxSurface,
 } from "../../src/runtime/cmux.js";
 import { buildInteractivePaneWrapperScript } from "../../src/runtime/runner.js";
+import { buildTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
 
 export const LIVE_TITLE_GATE = "PI_SUBAGENT_LIVE_TITLE_SMOKE";
 export type LiveTitleMode = "tmux" | "cmux";
@@ -79,7 +80,10 @@ async function tmuxTitleSmoke(): Promise<Record<string, unknown>> {
   const baseTitle = "title-smoke [depth=1;run=initial]";
   const initialTitle = `${baseTitle} · queued`;
   const dynamicTitle = `${baseTitle} · running`;
+  const stableWindowLabel = buildTmuxWindowLabel("title-smoke", "a14f82c1-live-tail");
+  const userWindowLabel = "user-renamed-title-smoke";
   let targetPane: string | null = null;
+  let targetWindow: string | null = null;
   try {
     const wrapper = await writeWrapper(root, baseTitle, dynamicTitle);
     const created = await run(tmux, ["-S", socket, "new-session", "-d", "-s", session, "-P", "-F", "#{pane_id}", "/bin/sleep", "30"]);
@@ -88,17 +92,36 @@ async function tmuxTitleSmoke(): Promise<Record<string, unknown>> {
     const sentinel = await run(tmux, ["-S", socket, "split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}", "/bin/sleep", "30"]);
     const sentinelPane = sentinel.stdout.trim();
     if (sentinel.code !== 0 || !/^%\d+$/.test(sentinelPane) || sentinelPane === sourcePane) throw new Error("tmux sentinel creation failed");
-    const target = await run(tmux, ["-S", socket, "split-window", "-d", "-t", sourcePane, "-P", "-F", "#{pane_id}", wrapper]);
-    targetPane = target.stdout.trim();
-    if (target.code !== 0 || !/^%\d+$/.test(targetPane) || [sourcePane, sentinelPane].includes(targetPane)) throw new Error("tmux title target creation failed");
+    const target = await run(tmux, [
+      "-S", socket, "new-window", "-d", "-t", `${session}:`, "-n", stableWindowLabel,
+      "-c", root, "-P", "-F", "#{window_id}|#{pane_id}", wrapper,
+    ]);
+    const [createdWindow, createdPane, ...extra] = target.stdout.trim().split("|");
+    targetWindow = createdWindow ?? null;
+    targetPane = createdPane ?? null;
+    if (target.code !== 0 || extra.length > 0 || !/^@\d+$/.test(targetWindow ?? "") || !/^%\d+$/.test(targetPane ?? "")
+      || [sourcePane, sentinelPane].includes(targetPane!)) throw new Error("tmux title target creation failed");
     const title = async () => (await run(tmux, ["-S", socket, "display-message", "-p", "-t", targetPane!, "#{pane_title}"])).stdout.trim();
+    const windowName = async () => (await run(tmux, ["-S", socket, "display-message", "-p", "-t", targetWindow!, "#{window_name}"])).stdout.trim();
     await waitFor(async () => await title() === initialTitle, "tmux queued title");
+    if (await windowName() !== stableWindowLabel) throw new Error("tmux stable window label changed before lifecycle transition");
+    const automaticRename = await run(tmux, ["-S", socket, "show-options", "-w", "-v", "-t", targetWindow, "automatic-rename"]);
+    if (automaticRename.code !== 0 || automaticRename.stdout.trim() !== "off") throw new Error("tmux named window did not disable automatic rename");
+    const renamed = await run(tmux, ["-S", socket, "rename-window", "-t", targetWindow, userWindowLabel]);
+    if (renamed.code !== 0 || await windowName() !== userWindowLabel) throw new Error("tmux user window rename was not applied");
     await fs.promises.writeFile(path.join(root, "release-dynamic-title"), "release\n", { mode: 0o600 });
     await waitFor(async () => await title() === dynamicTitle, "tmux lifecycle title");
+    if (await windowName() !== userWindowLabel) throw new Error("tmux lifecycle title overwrote the user window name");
     const survivors = await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}"]);
     if (!survivors.stdout.split(/\s+/).includes(sourcePane) || !survivors.stdout.split(/\s+/).includes(sentinelPane)) throw new Error("tmux source/sentinel changed during title smoke");
-    await run(tmux, ["-S", socket, "kill-pane", "-t", targetPane]); targetPane = null;
-    return { mode: "tmux", initialTitle, dynamicTitle, sourcePane, sentinelPane, result: "pass" };
+    const killed = await run(tmux, ["-S", socket, "kill-pane", "-t", targetPane]);
+    if (killed.code !== 0) throw new Error(killed.stderr || "tmux title target cleanup failed");
+    const survivorsAfterCleanup = await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}"]);
+    const afterIds = survivorsAfterCleanup.stdout.split(/\s+/);
+    if (survivorsAfterCleanup.code !== 0 || afterIds.includes(targetPane)
+      || !afterIds.includes(sourcePane) || !afterIds.includes(sentinelPane)) throw new Error("tmux source/sentinel changed after title target cleanup");
+    targetPane = null; targetWindow = null;
+    return { mode: "tmux", initialTitle, dynamicTitle, stableWindowLabel, userWindowLabel, automaticRename: "off", sourcePane, sentinelPane, sourceAndSentinelPreservedAfterCleanup: true, result: "pass" };
   } finally {
     if (targetPane) await run(tmux, ["-S", socket, "kill-pane", "-t", targetPane]).catch(() => undefined);
     await run(tmux, ["-S", socket, "kill-server"]).catch(() => undefined);

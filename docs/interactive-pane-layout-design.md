@@ -26,12 +26,12 @@ cmux auto
 
  tmux auto (현재 production window 이름)
 window 0  parent Pi
-window 1  subagent:broker
-window 2  subagent:broker
-window 3  subagent:broker
+window 1  subagent:scout:a14f82c1
+window 2  subagent:reviewer:5d2e09ab
+window 3  subagent:worker:91c6f7e0
 ```
 
-agent/run별 stable tmux window 이름은 아직 구현되지 않았으며 [별도 제안](./tmux-window-naming-design.md)에서 다룬다.
+`tmux-new-window`는 allocation 시 검증된 agent/run별 stable label을 한 번 설정한다. 형식과 protocol·recovery 경계는 [안정적인 tmux window 이름 설계 및 구현](./tmux-window-naming-design.md)을 따른다.
 
 ## 2. 문제 정의
 
@@ -252,11 +252,11 @@ tmux [-S <socket>] list-panes -a -F '#{pane_id}|#{session_id}|#{window_id}|#{pan
 ```text
 tmux [-S <socket>] new-window -d -P \
   -F '#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}' \
-  -t '<session-id>:' -n 'subagent:broker' \
+  -t '<session-id>:' -n 'subagent:<agent-token>:<8-char-run-prefix>' \
   -c <cwd> "<staged broker>"
 ```
 
-위 label은 현재 production 동작이다. 이를 `subagent:<agent>:<run-prefix>`로 바꾸는 구현 방법과 검증 계획은 [tmux window 이름 정책 제안](./tmux-window-naming-design.md)을 따른다.
+현재 production runner는 strict V2/V3 `tmux-new-window` intent에 canonical `windowLabel`을 넣고 broker는 allocation 전에 이를 검증한다. label-less 과거 artifact는 recovery/reaper에서만 읽으며 신규 mutation authority가 아니다. 상세 계약은 [안정적인 tmux window 이름 설계 및 구현](./tmux-window-naming-design.md)을 따른다.
 
 broker는 source socket/server/session 관계와 returned session/window/pane/PID를 검증한 뒤 exact allocation을 durable publish한다. parent는 commit 뒤 request와 matching allocation만 adopt한다. 모든 depth의 nested tmux도 같은 session의 detached window를 요청한다. source/ancestor window를 다시 split하지 않는다.
 
@@ -427,9 +427,9 @@ reviewer [depth=2;run=a14f82c1] · running
 reviewer [depth=2;run=a14f82c1] · returning
 ```
 
-pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또는 관측 실패는 lifecycle 실패로 승격하지 않으며 `/subagents details`는 raw title 대신 managed title과 `matching|changed|unavailable`만 표시한다. gated live smoke는 `queued` title을 먼저 정확히 관측한 뒤 barrier를 해제해 lifecycle title을 검증하도록 갱신됐다. 2026-07-23의 tmux/cmux PASS는 이전 title 형식의 historical evidence이며, 현재 형식의 live 재실행 통과를 이 문서에서 주장하지 않는다.
+pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또는 관측 실패는 lifecycle 실패로 승격하지 않으며 `/subagents details`는 raw title 대신 managed title과 `matching|changed|unavailable`만 표시한다. gated live smoke는 `queued` title을 먼저 정확히 관측한 뒤 barrier를 해제해 lifecycle title을 검증한다. 2026-07-27 isolated tmux smoke는 현재 title 형식의 `queued → running`, stable window label, user rename과 target 정리 뒤 source·sentinel 보존을 **PASS**했다. 이 smoke는 production runner/broker를 우회하므로 production-path live 증거는 아니다. 2026-07-23 cmux PASS는 이전 title 형식의 historical evidence이며 현재 cmux 형식의 재실행 통과는 이 문서에서 주장하지 않는다.
 
-현재 production tmux broker의 **window 이름**은 pane title과 달리 고정 `subagent:broker`다. 이 title 변경은 window 이름 변경을 뜻하지 않는다. agent/run별 stable window 이름으로 정렬하는 변경은 [tmux window 이름과 Pi pane title 정책 제안](./tmux-window-naming-design.md)에 현재 동작, strict protocol 전달, 안전 경계와 검증 계획을 구분해 기록한다.
+현재 production tmux broker는 **window 이름**을 `subagent:<agent-token>:<8-char-run-prefix>`로 allocation 시 한 번 설정한다. pane title의 lifecycle 갱신은 이 이름을 바꾸지 않으며 user rename도 복구하지 않는다. 이름은 cleanup authority가 아니고 exact tmux fingerprint만 기존 lifecycle 판단에 사용한다. strict protocol 전달, legacy recovery와 검증 상태는 [안정적인 tmux window 이름 설계 및 구현](./tmux-window-naming-design.md)에 기록한다.
 
 ### 12.3 어떤 child가 보이는가
 

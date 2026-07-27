@@ -20,6 +20,7 @@ import {
 	parseTmuxEnvironment,
 	type TmuxCommandResult,
 } from "../../src/runtime/tmux";
+import { buildTmuxWindowLabel, isValidTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
 
 function outcome(stdout = "", exitCode = 0, stderr = ""): TmuxCommandResult {
 	return { stdout, stderr, exitCode, aborted: false };
@@ -61,7 +62,18 @@ describe("tmux adapter", () => {
 		assert.equal(parseTmuxSourceTopology("%8|$4|@9|102\n", "%7"), null);
 	});
 
-	test("builds a detached same-session window with direct argv and diagnostic-only title", () => {
+	test("canonicalizes a bounded ASCII tmux window label and rejects injected forms", () => {
+		assert.equal(buildTmuxWindowLabel("", ""), "subagent:agent:run");
+		assert.equal(buildTmuxWindowLabel("review agent!", "abc123456789"), "subagent:review-agent:abc12345");
+		assert.equal(buildTmuxWindowLabel("\u03b1\u0000\u001b[31m\u202E", "\u03b2"), "subagent:agent:run");
+		assert.equal(buildTmuxWindowLabel("x".repeat(99), "r".repeat(99)), `subagent:${"x".repeat(24)}:${"r".repeat(8)}`);
+		for (const label of ["subagent:agent:abc12345\n", "subagent:\u03b1:abc12345", "subagent:agent:#{pane_id}", "subagent:agent:abc123456"]) {
+			assert.equal(isValidTmuxWindowLabel(label, "abc123456789"), false);
+		}
+		assert.equal(isValidTmuxWindowLabel("subagent:agent:abc12345", "abc123456789"), true);
+	});
+
+	test("builds a detached same-session window with direct argv and stable label", () => {
 		const args = buildTmuxNewWindowArgs({
 			sessionId: "$0", socketPath: "/tmp/tmux/default", cwd: "/tmp/project",
 			agentName: "review agent!", runId: "abc123456789-untrusted-task-text",
@@ -69,7 +81,7 @@ describe("tmux adapter", () => {
 		});
 		assert.deepEqual(args, [
 			"-S", "/tmp/tmux/default", "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}",
-			"-t", "$0:", "-n", "subagent:review-agent:abc123456789", "-c", "/tmp/project",
+			"-t", "$0:", "-n", "subagent:review-agent:abc12345", "-c", "/tmp/project",
 			"/usr/bin/env", "node", "/tmp/run/broker.mjs",
 		]);
 		assert.equal(args.join(" ").includes("untrusted-task-text"), false);

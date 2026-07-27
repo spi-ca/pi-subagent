@@ -11,6 +11,7 @@ import {
 	parseCommittedLaunchRecordV3,
 	parseLaunchIntentV3,
 } from "../../src/runtime/tmux-control-protocol";
+import { buildTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
 
 const roots: string[] = [];
 afterEach(async () => { while (roots.length) await fs.promises.rm(roots.pop()!, { recursive: true, force: true }); });
@@ -26,13 +27,16 @@ describe("tmux control V3 artifact chain", () => {
 			version: 3 as const, runId: "v3-run", parentSessionId: "parent", parentPid: 10, parentStartedAt: 11,
 			terminalMode: "tmux-pane" as const, transport: "tmux-control-v1" as const, transportGatePath: paths.transportGatePath, transportGateDigest: gateDigest,
 			source: { socketPath: "/tmp/tmux.sock", sourcePaneId: "%1", sourcePanePid: 12, serverPid: 13, generation },
-			layout: "split" as const, placement: "tmux-split" as const, container: { kind: "tmux-source-pane" as const, socketPath: "/tmp/tmux.sock", serverPid: 13, sessionId: "$1", windowId: "@1", paneId: "%1", panePid: 12, generation },
+			layout: "auto" as const, placement: "tmux-new-window" as const, windowLabel: buildTmuxWindowLabel("agent", "v3-run"), container: { kind: "tmux-session" as const, socketPath: "/tmp/tmux.sock", serverPid: 13, sessionId: "$1", sourceWindowId: "@1", generation },
 			childSessionFile: paths.childSessionPath, createdAt: 14, brokerNonce: "a".repeat(43), runtimePath: process.execPath, runtimeInterpreterPath: process.execPath, backendPath: process.execPath, brokerEntrypoint: process.execPath,
 		};
 		assert.ok(parseLaunchIntentV3(intent, "v3-run", paths.runDir));
+		const { windowLabel: _legacyLabel, ...legacyIntent } = intent;
+		assert.equal(parseLaunchIntentV3(legacyIntent, "v3-run", paths.runDir), null);
+		assert.ok(parseLaunchIntentV3(legacyIntent, "v3-run", paths.runDir, { allowLegacyTmuxWindowLabel: true }));
 		await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`);
 		const intentDigest = await exactArtifactDigest(paths.launchIntentPath); assert.ok(intentDigest);
-		const allocation = { version: 3 as const, runId: "v3-run", terminalMode: "tmux-pane" as const, transport: "tmux-control-v1" as const, intentDigest, layout: "split" as const, placement: "tmux-split" as const, container: { kind: "tmux-window" as const, socketPath: "/tmp/tmux.sock", serverPid: 13, sessionId: "$1", windowId: "@2", paneId: "%2", panePid: 15, generation }, target: { socketPath: "/tmp/tmux.sock", serverPid: 13, paneId: "%2", panePid: 15, generation }, allocatedAt: 16 };
+		const allocation = { version: 3 as const, runId: "v3-run", terminalMode: "tmux-pane" as const, transport: "tmux-control-v1" as const, intentDigest, layout: "auto" as const, placement: "tmux-new-window" as const, container: { kind: "tmux-window" as const, socketPath: "/tmp/tmux.sock", serverPid: 13, sessionId: "$1", windowId: "@2", paneId: "%2", panePid: 15, generation }, target: { socketPath: "/tmp/tmux.sock", serverPid: 13, paneId: "%2", panePid: 15, generation }, allocatedAt: 16 };
 		assert.ok(parseAllocationRecordV3(allocation, "v3-run"));
 		await writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`);
 		const allocationDigest = await exactArtifactDigest(paths.allocationPath); assert.ok(allocationDigest);
@@ -40,6 +44,8 @@ describe("tmux control V3 artifact chain", () => {
 		assert.ok(parseCommittedLaunchRecordV3(launch, "v3-run", paths.runDir));
 		await writePrivateFile(paths.launchPath, `${JSON.stringify(launch)}\n`);
 		assert.equal(await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation, launch }), true);
+		await fs.promises.writeFile(paths.launchIntentPath, `${JSON.stringify({ ...intent, windowLabel: buildTmuxWindowLabel("agent", "changed") })}\n`);
+		assert.equal(await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation, launch }), false);
 		await fs.promises.appendFile(paths.transportGatePath, " ");
 		assert.equal(await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation, launch }), false);
 	});

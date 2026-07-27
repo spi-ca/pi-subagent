@@ -164,7 +164,7 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 - [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — Linux/macOS transport 설계와 구현 상태. cmux control-socket v2, private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거, optional events hint와 stable-minimum gated `tmux -C`가 구현됐습니다. Windows는 forced-inline입니다.
 - [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — transport 설계 다음에 읽는 companion 문서. Phase 0A cache/preflight/UI/fork·async I/O, hardened lease, Phase 5 scheduler, Phase 6 exact tail/signature와 conservative Phase 7 reaper와 managed-child opt-in profile이 구현됐고 managed-child default 전환은 남아 있습니다.
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 foreground assistant/tool/summary usage persistence, interactive verified-final replay와 advisory preview의 구분, provider-backed installed-Pi acceptance, background completion usage 회계의 명시적 비목표
-- [`tmux-window-naming-design.md`](./tmux-window-naming-design.md) — tmux child window 이름과 Pi pane title의 역할을 분리하는 **미구현 제안**; 현재 runtime 동작이나 live PASS를 주장하지 않음
+- [`tmux-window-naming-design.md`](./tmux-window-naming-design.md) — 구현된 stable tmux child window label, strict V2/V3 전달과 legacy recovery 경계; 2026-07-27 isolated title/window smoke는 PASS했지만 production broker 다중 child naming live scenario는 아직 주장하지 않음
 
 성능 설계에서 정상 run의 cmux backend `inspect()` polling 제거는 **Phase 2** 범위이고, gated `tmux -C` run의 polling 제거는 **Phase 3** 범위입니다. healthy lifecycle 경로의 주기 polling은 제거됐으며, durable completion, 약 2초 parent lease/child lease check, degraded/final exact inspection, startup reaper와 exact-target cleanup은 유지합니다.
 

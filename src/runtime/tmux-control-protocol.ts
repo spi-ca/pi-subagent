@@ -19,6 +19,7 @@ import {
 	type DecisionV2,
 	type LaunchGateV2,
 	type LaunchIntentV2,
+	type LaunchIntentParseOptions,
 	type ResidualRiskV2,
 } from "./run-protocol.js";
 
@@ -44,9 +45,9 @@ export type ResidualRiskV3 = Omit<ResidualRiskV2, "version"> & { version: 3 };
 export type BrokerStatusV3 = Omit<BrokerStatusV2, "version"> & { version: 3 };
 export type LaunchGateV3 = Omit<LaunchGateV2, "version"> & { version: 3 };
 
-export function parseLaunchIntentV3(value: unknown, expectedRunId: string, runDir: string): LaunchIntentV3 | null {
+export function parseLaunchIntentV3(value: unknown, expectedRunId: string, runDir: string, options: LaunchIntentParseOptions = {}): LaunchIntentV3 | null {
 	if (!object(value) || value.version !== 3 || value.transport !== TMUX_CONTROL_TRANSPORT || !contained(value.transportGatePath, runDir, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !DIGEST.test(value.transportGateDigest)) return null;
-	const v2 = parseLaunchIntentV2(transformV2(value, ["transport", "transportGatePath", "transportGateDigest"]), expectedRunId, runDir);
+	const v2 = parseLaunchIntentV2(transformV2(value, ["transport", "transportGatePath", "transportGateDigest"]), expectedRunId, runDir, options);
 	return v2?.terminalMode === "tmux-pane" && "layout" in v2 ? value as unknown as LaunchIntentV3 : null;
 }
 export function parseAllocationRecordV3(value: unknown, expectedRunId: string): AllocationRecordV3 | null {
@@ -95,11 +96,18 @@ export async function exactArtifactDigest(filePath: string): Promise<string | nu
 	return (await readBoundArtifact(filePath))?.digest ?? null;
 }
 
-export async function hasValidTmuxControlChain(options: { runDir: string; intent: LaunchIntentV3; allocation?: AllocationRecordV3 | null; launch?: CommittedLaunchRecordV3 | null }): Promise<boolean> {
+export async function hasValidTmuxControlChain(options: {
+	runDir: string;
+	intent: LaunchIntentV3;
+	allocation?: AllocationRecordV3 | null;
+	launch?: CommittedLaunchRecordV3 | null;
+	/** Read-only reaper compatibility; current launch and broker paths must omit it. */
+	allowLegacyTmuxWindowLabel?: boolean;
+}): Promise<boolean> {
 	const gateArtifact = await readBoundArtifact(options.intent.transportGatePath);
 	const intentArtifact = await readBoundArtifact(path.join(options.runDir, "launch-intent.json"));
 	if (!gateArtifact || gateArtifact.digest !== options.intent.transportGateDigest || !intentArtifact) return false;
-	const boundIntent = parseLaunchIntentV3(intentArtifact.value, options.intent.runId, options.runDir);
+	const boundIntent = parseLaunchIntentV3(intentArtifact.value, options.intent.runId, options.runDir, { allowLegacyTmuxWindowLabel: options.allowLegacyTmuxWindowLabel });
 	if (!boundIntent || !isDeepStrictEqual(boundIntent, options.intent)) return false;
 	if (options.allocation) {
 		if (intentArtifact.digest !== options.allocation.intentDigest) return false;

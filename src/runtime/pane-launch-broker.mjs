@@ -15,6 +15,7 @@ import { createCmuxControlCommandRunner, getCmuxControlRequestManager } from "./
 import { TmuxControlClient, createTmuxControlCommandRunner } from "./tmux-control.mjs";
 import { MINIMUM_CMUX_VERSION, MINIMUM_TMUX_VERSION, isStableSemverAtLeast, isStableTmuxVersionAtLeast } from "./version-policy.mjs";
 import { recordPhase0LiveTelemetry } from "./phase0-live-telemetry.mjs";
+import { isValidTmuxWindowLabel } from "./tmux-window-label.mjs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // UUID authority is string-only: RegExp.test() coerces arrays, objects, and
@@ -287,8 +288,10 @@ function intent(value) {
     && (candidate.bootIdentity === undefined || typeof candidate.bootIdentity === "string");
   const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
   const transportKeys = tmuxControlV3 ? ["transport", "transportGatePath", "transportGateDigest"] : [];
-  const expected = hasLayout ? [...baseKeys, ...layoutKeys, ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys];
+  const tmuxNewWindow = value.terminalMode === "tmux-pane" && value.placement === "tmux-new-window";
+  const expected = hasLayout ? [...baseKeys, ...layoutKeys, ...(tmuxNewWindow ? ["windowLabel"] : []), ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys];
   if (!exact(value, expected) || hasLayout && !layoutKeys.every((key) => Object.hasOwn(value, key))
+    || tmuxNewWindow && !isValidTmuxWindowLabel(value.windowLabel, value.runId)
     || value.terminalMode === "cmux-pane" && ((!hasLayout && !legacyCmuxHarness) || requiresControl && !control(value.control))
     || tmuxControlV3 && (value.transport !== "tmux-control-v1" || !artifactPathEquals(value.transportGatePath, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.transportGateDigest))) return null;
   const sourceValid = value.terminalMode === "cmux-pane"
@@ -691,7 +694,7 @@ async function allocateTmux(i) {
   ];
   const launch = ["/usr/bin/env", ...stagedArgs];
   const allocationArgs = layout && i.placement === "tmux-new-window"
-    ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", "subagent:broker", "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
+    ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", i.windowLabel, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
     : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}\t#{pane_pid}", "-t", source.sourcePaneId, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
   const result = await runTmux(allocationArgs);
   // A complete response stays rollback authority even on nonzero. Parse it

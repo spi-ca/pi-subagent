@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { getProcessStartedAt, type TmuxGenerationV2 } from "./run-protocol.js";
+import { buildTmuxWindowLabel } from "./tmux-window-label.mjs";
 import { readFileGeneration } from "./launch-preflight.js";
 
 export const TMUX_PANE_ID_RE = /^%(?:0|[1-9][0-9]*)$/;
@@ -224,12 +225,9 @@ export function buildTmuxSplitArgs(options: {
 	]);
 }
 
+/** @deprecated Compatibility export for callers that previously used diagnostic titles. */
 export function buildTmuxDiagnosticTitle(agentName: string, runId: string): string {
-	const sanitize = (value: string, fallback: string, limit: number) => {
-		const normalized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, limit);
-		return normalized || fallback;
-	};
-	return `subagent:${sanitize(agentName, "agent", 24)}:${sanitize(runId, "run", 12)}`;
+	return buildTmuxWindowLabel(agentName, runId);
 }
 
 function isDirectCommand(command: TmuxDirectCommand): boolean {

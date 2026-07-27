@@ -78,6 +78,7 @@ import {
   readTmuxSourceTopology,
   type TmuxCommandRunner,
 } from "./tmux.js";
+import { buildTmuxWindowLabel } from "./tmux-window-label.mjs";
 import {
   DEFAULT_PARENT_LEASE_STALE_MS,
   RUN_PROTOCOL_VERSION,
@@ -1903,7 +1904,7 @@ export async function reapStaleInteractiveRuns(options: {
         const [intentArtifact, allocationArtifact, decisionArtifact, launchArtifact, gateArtifact, claimArtifact, riskArtifact, completionArtifact, statusArtifact] = v2Artifacts;
         const rawIntent = intentArtifact?.outcome === "valid" ? intentArtifact.value : null;
         const controlV3 = rawIntent?.version === 3;
-        const intent = controlV3 ? parseLaunchIntentV3(rawIntent, entry.name, paths.runDir) : parseLaunchIntentV2(rawIntent, entry.name, paths.runDir);
+        const intent = controlV3 ? parseLaunchIntentV3(rawIntent, entry.name, paths.runDir, { allowLegacyTmuxWindowLabel: true }) : parseLaunchIntentV2(rawIntent, entry.name, paths.runDir, { allowLegacyTmuxWindowLabel: true });
         if (v2Artifacts.some((artifact) => artifact.outcome === "invalid")) {
           classification.deferredInvalid = { runId: entry.name, paths, kind: "malformed", ...(intent?.parentRunId ? { parentRunId: intent.parentRunId } : {}) };
           return classification;
@@ -1938,7 +1939,7 @@ export async function reapStaleInteractiveRuns(options: {
         ];
         const presentButInvalid = artifactValues.some(({ artifact, value }) => artifact?.outcome === "valid" && !value);
         const validChain = !controlV3 || intent?.version === 3
-          && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null });
+          && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null, allowLegacyTmuxWindowLabel: true });
         const inconsistent = !intent
           || (allocation !== null && !hasAllocationIntentSourceBinding(intent as any, allocation as any))
           || (allocation !== null && allocation.terminalMode !== intent.terminalMode)
@@ -2136,7 +2137,7 @@ export async function reapStaleInteractiveRuns(options: {
       : parseLaunchGateV2(await readBrokerJson(paths.launchGatePath), intent.runId, paths.runDir);
     if ((allocation !== null && !hasAllocationIntentSourceBinding(intent as any, allocation as any))
       || !hasValidV2StateDependencies({ allocation: allocation as any, decision: decision as any, launch: launch as any, gate: gate as any })
-      || controlV3 && !(intent.version === 3 && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null }))) {
+      || controlV3 && !(intent.version === 3 && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null, allowLegacyTmuxWindowLabel: true }))) {
       await quarantineV2(intent.runId, paths);
       continue;
     }
@@ -2215,7 +2216,7 @@ export async function reapStaleInteractiveRuns(options: {
         : parseLaunchGateV2(await readBrokerJson(paths.launchGatePath), intent.runId, paths.runDir);
       if (authorityIsInvalid() || (allocation !== null && !hasAllocationIntentSourceBinding(intent as any, allocation as any))
         || !hasValidV2StateDependencies({ allocation: allocation as any, decision: decision as any, launch: launch as any, gate: gate as any })
-        || controlV3 && !(intent.version === 3 && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null }))
+        || controlV3 && !(intent.version === 3 && await hasValidTmuxControlChain({ runDir: paths.runDir, intent, allocation: allocation?.version === 3 ? allocation : null, launch: launch?.version === 3 ? launch : null, allowLegacyTmuxWindowLabel: true }))
         || (risk && allocation)) {
         await quarantineV2(intent.runId, paths);
         continue;
@@ -5630,6 +5631,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         version: tmuxControlV3 ? 3 : 2, runId, parentRunId: process.env[SUBAGENT_RUN_ID_ENV]?.trim() || undefined,
         parentSessionId: options.parentSessionId ?? "unknown", parentPid: process.pid, parentStartedAt, terminalMode: backend.mode, source,
         layout: request.layout, placement: request.placement, container: request.container,
+        ...(backend.mode === "tmux-pane" && request.placement === "tmux-new-window" ? { windowLabel: buildTmuxWindowLabel(result.agent, runId) } : {}),
         ...(backend.mode === "cmux-pane" ? { control: cmuxControlTransport } : tmuxControlV3 ? {
           transport: "tmux-control-v1", transportGatePath: runPaths.transportGatePath, transportGateDigest,
         } : {}),

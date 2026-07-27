@@ -601,7 +601,39 @@ describe("stale interactive run reaper", () => {
 		assert.equal(calls.some((args) => args.includes("kill-window") || args.includes("kill-session")), false);
 	});
 
-	test("reaps a strict V3 tmux chain through one generation-fenced control runner", async () => {
+	test("reaps a pre-label tmux new-window artifact through its exact pane only", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		const paths = await prepareRunArtifactPaths({ rootDir: root, runId: "v2-legacy-window-label" });
+		const base = v2TmuxIntent(paths, "v2-legacy-window-label");
+		const intent = {
+			...base, layout: "auto" as const, placement: "tmux-new-window" as const,
+			container: { kind: "tmux-session" as const, socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", sourceWindowId: "@1", generation: tmuxGeneration },
+		};
+		const allocation = {
+			version: 2, runId: intent.runId, terminalMode: "tmux-pane" as const, layout: "auto" as const, placement: "tmux-new-window" as const,
+			container: { kind: "tmux-window" as const, socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", windowId: "@2", paneId: "%2", panePid: 789, generation: tmuxGeneration },
+			target: { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789, generation: tmuxGeneration }, allocatedAt: 1,
+		};
+		await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`);
+		await writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`);
+		let closed = false; const calls: string[][] = [];
+		const outcome = await reapStaleInteractiveRuns({
+			rootDir: root, now: 100, staleAfterMs: 10, scheduleCleanup: () => undefined,
+			isTmuxGenerationCurrent: () => true,
+			tmuxRun: async (args) => {
+				calls.push(args);
+				if (args.includes("display-message")) return { exitCode: 0, stdout: "123\n", stderr: "", aborted: false };
+				if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1\t0\tsource\t456\n" : "%2\t0\tallocated\t789\n", stderr: "", aborted: false };
+				if (args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")) closed = true;
+				return { exitCode: 0, stdout: "", stderr: "", aborted: false };
+			},
+		});
+		assert.deepEqual(outcome.reaped, [intent.runId]);
+		assert.ok(calls.some((args) => args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")));
+		assert.equal(calls.some((args) => args.includes("kill-window") || args.includes("kill-session")), false);
+	});
+
+	test("reaps a pre-label V3 tmux new-window chain through one generation-fenced control runner", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
 		const runId = "v3-control-tmux-pane";
 		const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
@@ -617,12 +649,17 @@ describe("stale interactive run reaper", () => {
 		};
 		await writePrivateFile(paths.transportGatePath, `${JSON.stringify(transportGate)}\n`);
 		const transportGateDigest = await exactArtifactDigest(paths.transportGatePath); assert.ok(transportGateDigest);
-		const intent = { ...v2TmuxLayoutIntent(paths, runId), version: 3 as const, backendPath: executable, runtimePath: executable, runtimeInterpreterPath: executable, brokerEntrypoint: executable, transport: "tmux-control-v1" as const, transportGatePath: paths.transportGatePath, transportGateDigest };
+		const intent = {
+			...v2TmuxIntent(paths, runId), version: 3 as const, backendPath: executable, runtimePath: executable, runtimeInterpreterPath: executable, brokerEntrypoint: executable,
+			layout: "auto" as const, placement: "tmux-new-window" as const,
+			container: { kind: "tmux-session" as const, socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", sourceWindowId: "@1", generation: tmuxGeneration },
+			transport: "tmux-control-v1" as const, transportGatePath: paths.transportGatePath, transportGateDigest,
+		};
 		await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`);
 		const intentDigest = await exactArtifactDigest(paths.launchIntentPath); assert.ok(intentDigest);
 		const allocation = {
 			version: 3 as const, runId, terminalMode: "tmux-pane" as const, transport: "tmux-control-v1" as const, intentDigest,
-			layout: "split" as const, placement: "tmux-split" as const,
+			layout: "auto" as const, placement: "tmux-new-window" as const,
 			container: { kind: "tmux-window" as const, socketPath: "/tmp/tmux.sock", serverPid: 123, sessionId: "$1", windowId: "@2", paneId: "%2", panePid: 789, generation: tmuxGeneration },
 			target: { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789, generation: tmuxGeneration }, allocatedAt: 5,
 		};
@@ -640,7 +677,7 @@ describe("stale interactive run reaper", () => {
 				return { close: () => { managerClosed = true; }, run: async (args) => {
 					calls.push(args);
 					if (args.includes("display-message")) return { exitCode: 0, stdout: "123\n", stderr: "", aborted: false };
-					if (args.at(-1)?.includes("|")) return { exitCode: 0, stdout: closed ? "%1|$1|@2|456\n" : "%1|$1|@2|456\n%2|$1|@2|789\n", stderr: "", aborted: false };
+					if (args.at(-1)?.includes("|")) return { exitCode: 0, stdout: closed ? "%1|$1|@1|456\n" : "%1|$1|@1|456\n%2|$1|@2|789\n", stderr: "", aborted: false };
 					if (args.at(-1) === "#{pane_id}\t#{pane_pid}") return { exitCode: 0, stdout: closed ? "%1\t456\n" : "%1\t456\n%2\t789\n", stderr: "", aborted: false };
 					if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1\t0\tsource\t456\n" : "%2\t0\tallocated\t789\n", stderr: "", aborted: false };
 					if (args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")) closed = true;

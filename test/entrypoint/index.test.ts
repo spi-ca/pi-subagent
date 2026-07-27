@@ -38,6 +38,18 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
     return { frontmatter, body: match[2] ?? "" };
   },
 }));
+const presenceLifecycleCalls: string[] = [];
+let presenceRemoveCapabilityDetected = false;
+mock.module("../../src/integration/pi-presence-producer", () => ({
+  createPiSubagentPresenceProducer: () => ({
+    startSession: () => { presenceLifecycleCalls.push("start"); return true; },
+    stop: () => undefined,
+    publish: () => { presenceLifecycleCalls.push("publish"); return true; },
+    beginAgentRun: () => presenceLifecycleCalls.push("begin"),
+    settle: () => presenceLifecycleCalls.push("settle"),
+    isPresenceRemoveCapabilityDetected: () => presenceRemoveCapabilityDetected,
+  }),
+}));
 const { default: registerPiSubagent } = await import("../../index");
 
 import {
@@ -109,6 +121,118 @@ describe("production dashboard boundary", () => {
   test("does not execute the cmux CLI from the extension entry point", async () => {
     const source = await fs.readFile(new URL("../../index.ts", import.meta.url), "utf8");
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
+  });
+
+  test("reports passive presence remove capability in doctor output", async () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const commands = new Map<string, { handler: (rawArgs: string, ctx: unknown) => Promise<void> }>();
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH;
+      presenceRemoveCapabilityDetected = false;
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
+        registerTool: () => undefined,
+        on: () => undefined,
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const command = commands.get("subagents");
+      assert.ok(command);
+      const notify = (message: string) => { doctorOutput = message; };
+      let doctorOutput = "";
+      await command.handler("doctor", { ui: { notify } });
+      assert.match(doctorOutput, /presence remove capability: not observed/);
+      presenceRemoveCapabilityDetected = true;
+      await command.handler("doctor", { ui: { notify } });
+      assert.match(doctorOutput, /presence remove capability: detected/);
+    } finally {
+      presenceRemoveCapabilityDetected = false;
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+  });
+
+  test("settles initial root presence only when the session starts idle", async () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH;
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: () => undefined,
+        on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const sessionStart = handlers.get("session_start");
+      assert.ok(sessionStart);
+      const sessionContext = (idle: boolean) => ({
+        cwd: process.cwd(),
+        hasUI: false,
+        isIdle: () => idle,
+        sessionManager: { getSessionId: () => "presence-session", getSessionFile: () => undefined },
+      });
+
+      presenceLifecycleCalls.length = 0;
+      await sessionStart({}, sessionContext(false));
+      assert.ok(presenceLifecycleCalls.includes("start"));
+      assert.equal(presenceLifecycleCalls.includes("settle"), false);
+
+      const idleStart = presenceLifecycleCalls.length;
+      await sessionStart({}, sessionContext(true));
+      const idleCalls = presenceLifecycleCalls.slice(idleStart);
+      assert.equal(idleCalls.filter((call) => call === "settle").length, 1);
+      assert.ok(idleCalls.indexOf("settle") > idleCalls.indexOf("publish"));
+    } finally {
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+  });
+
+  test("wires presence lifecycle only for the root extension", () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const register = (depth: string | undefined) => {
+      if (depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = depth;
+      const handlers = new Map<string, unknown>();
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: () => undefined,
+        on: (event: string, handler: unknown) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      return handlers;
+    };
+    try {
+      const rootHandlers = register(undefined);
+      assert.equal(typeof rootHandlers.get("agent_start"), "function");
+      assert.equal(typeof rootHandlers.get("agent_settled"), "function");
+      const childHandlers = register("1");
+      assert.equal(childHandlers.has("agent_start"), false);
+      assert.equal(childHandlers.has("agent_settled"), false);
+
+      presenceLifecycleCalls.length = 0;
+      const settle = rootHandlers.get("agent_settled") as (event: unknown, ctx: { isIdle: () => boolean }) => void;
+      let idleChecks = 0;
+      settle({}, { isIdle: () => { idleChecks += 1; return false; } });
+      assert.equal(idleChecks, 1);
+      assert.deepEqual(presenceLifecycleCalls, []);
+      settle({}, { isIdle: () => true });
+      assert.deepEqual(presenceLifecycleCalls, ["settle"]);
+    } finally {
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
   });
 });
 

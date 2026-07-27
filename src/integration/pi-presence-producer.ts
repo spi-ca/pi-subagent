@@ -2,6 +2,7 @@ import type { SubagentUxRegistrySnapshot, SubagentUxSnapshot } from "../core/sub
 
 /** Duplicated wire contract: this package intentionally has no pi-cmux-presence dependency. */
 export const PI_PRESENCE_UPDATE_EVENT = "pi-presence:update:v1" as const;
+export const PI_PRESENCE_REMOVE_EVENT = "pi-presence:remove:v1" as const;
 export const PI_PRESENCE_READY_EVENT = "pi-presence:ready:v1" as const;
 export const PI_SUBAGENT_PRESENCE_SOURCE = { id: "pi-subagent", label: "Subagents", kind: "agent-group" } as const;
 
@@ -14,8 +15,10 @@ const MAX_METRIC = 1_000_000_000_000;
 const STATES = new Set(["idle", "waiting", "running", "success", "error", "cancelled"]);
 const ATTENTION = new Set(["none", "info", "success", "error"]);
 const ROOT_KEYS = ["version", "sessionId", "generation", "sequence", "source", "state", "counts", "progress", "usage", "attention"];
+const REMOVE_KEYS = ["version", "sessionId", "generation", "sequence", "source"];
 const READY_KEYS = ["version", "sessionId", "consumer"];
 const SOURCE_KEYS = ["id", "label", "kind"];
+const REMOVE_SOURCE_KEYS = ["id"];
 const COUNT_KEYS = ["active", "completed", "failed", "queued", "cancelled", "total"];
 const PROGRESS_KEYS = ["value", "label"];
 const USAGE_KEYS = ["tokens", "cost", "contextPercent"];
@@ -42,6 +45,13 @@ export interface PiPresenceReady {
   readonly sessionId: string;
   readonly consumer?: { readonly id: string; readonly capabilities: readonly string[] };
 }
+export interface PiPresenceRemove {
+  readonly version: 1;
+  readonly sessionId: string;
+  readonly generation: number;
+  readonly sequence: number;
+  readonly source: { readonly id: string };
+}
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
@@ -51,7 +61,11 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
 }
 function hasOwn(value: Record<string, unknown>, key: string): boolean { return Object.hasOwn(value, key); }
 function safeText(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= MAX_TEXT && !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/u.test(value);
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= MAX_TEXT * 2
+    && [...value].length <= MAX_TEXT
+    && !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/u.test(value);
 }
 function generation(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function sequence(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 1; }
@@ -64,49 +78,102 @@ export function parsePiPresenceUpdate(value: unknown): PiPresenceUpdate | null {
   try {
     if (!plainObject(value) || !hasOnlyKeys(value, ROOT_KEYS)
       || !["version", "sessionId", "generation", "sequence", "source", "state", "counts"].every((key) => hasOwn(value, key))) return null;
-    const source = value.source;
-    const counts = value.counts;
-    if (value.version !== 1 || !safeText(value.sessionId) || !generation(value.generation) || !sequence(value.sequence)
-      || !plainObject(source) || !hasOnlyKeys(source, SOURCE_KEYS) || !SOURCE_KEYS.every((key) => hasOwn(source, key))
-      || !safeText(source.id) || !safeText(source.label) || !safeText(source.kind)
-      || typeof value.state !== "string" || !STATES.has(value.state)
-      || !plainObject(counts) || !hasOnlyKeys(counts, COUNT_KEYS) || !["active", "completed", "failed"].every((key) => hasOwn(counts, key))
-      || !count(counts.active) || !count(counts.completed) || !count(counts.failed)
-      || (counts.queued !== undefined && !count(counts.queued)) || (counts.cancelled !== undefined && !count(counts.cancelled)) || (counts.total !== undefined && !count(counts.total))) return null;
+    const version = value.version;
+    const sessionId = value.sessionId;
+    const eventGeneration = value.generation;
+    const eventSequence = value.sequence;
+    const rawSource = value.source;
+    const state = value.state;
+    const rawCounts = value.counts;
+    const rawProgress = value.progress;
+    const rawUsage = value.usage;
+    const attention = value.attention;
+    if (version !== 1 || !safeText(sessionId) || !generation(eventGeneration) || !sequence(eventSequence)
+      || !plainObject(rawSource) || !hasOnlyKeys(rawSource, SOURCE_KEYS) || !SOURCE_KEYS.every((key) => hasOwn(rawSource, key))
+      || !plainObject(rawCounts) || !hasOnlyKeys(rawCounts, COUNT_KEYS) || !["active", "completed", "failed"].every((key) => hasOwn(rawCounts, key))) return null;
+
+    const sourceId = rawSource.id;
+    const sourceLabel = rawSource.label;
+    const sourceKind = rawSource.kind;
+    const countActive = rawCounts.active;
+    const countCompleted = rawCounts.completed;
+    const countFailed = rawCounts.failed;
+    const countQueued = rawCounts.queued;
+    const countCancelled = rawCounts.cancelled;
+    const countTotal = rawCounts.total;
+    if (!safeText(sourceId) || !safeText(sourceLabel) || !safeText(sourceKind)
+      || typeof state !== "string" || !STATES.has(state)
+      || !count(countActive) || !count(countCompleted) || !count(countFailed)
+      || (countQueued !== undefined && !count(countQueued)) || (countCancelled !== undefined && !count(countCancelled)) || (countTotal !== undefined && !count(countTotal))) return null;
 
     let progress: PiPresenceUpdate["progress"];
-    if (value.progress !== undefined) {
-      const raw = value.progress;
-      if (!plainObject(raw) || !hasOnlyKeys(raw, PROGRESS_KEYS) || !hasOwn(raw, "value") || !metric(raw.value) || raw.value > 1 || (raw.label !== undefined && !safeText(raw.label))) return null;
-      progress = raw.label === undefined ? { value: raw.value } : { value: raw.value, label: raw.label };
+    if (rawProgress !== undefined) {
+      if (!plainObject(rawProgress) || !hasOnlyKeys(rawProgress, PROGRESS_KEYS) || !hasOwn(rawProgress, "value")) return null;
+      const progressValue = rawProgress.value;
+      const progressLabel = rawProgress.label;
+      if (!metric(progressValue) || progressValue > 1 || (progressLabel !== undefined && !safeText(progressLabel))) return null;
+      progress = progressLabel === undefined ? { value: progressValue } : { value: progressValue, label: progressLabel };
     }
     let usage: PiPresenceUsage | undefined;
-    if (value.usage !== undefined) {
-      const raw = value.usage;
-      if (!plainObject(raw) || !hasOnlyKeys(raw, USAGE_KEYS)
-        || (raw.tokens !== undefined && !metric(raw.tokens)) || (raw.cost !== undefined && !metric(raw.cost)) || (raw.contextPercent !== undefined && !percent(raw.contextPercent))) return null;
-      usage = { ...(raw.tokens === undefined ? {} : { tokens: raw.tokens }), ...(raw.cost === undefined ? {} : { cost: raw.cost }), ...(raw.contextPercent === undefined ? {} : { contextPercent: raw.contextPercent }) };
+    if (rawUsage !== undefined) {
+      if (!plainObject(rawUsage) || !hasOnlyKeys(rawUsage, USAGE_KEYS)) return null;
+      const usageTokens = rawUsage.tokens;
+      const usageCost = rawUsage.cost;
+      const usageContextPercent = rawUsage.contextPercent;
+      if ((usageTokens !== undefined && !metric(usageTokens)) || (usageCost !== undefined && !metric(usageCost)) || (usageContextPercent !== undefined && !percent(usageContextPercent))) return null;
+      usage = { ...(usageTokens === undefined ? {} : { tokens: usageTokens }), ...(usageCost === undefined ? {} : { cost: usageCost }), ...(usageContextPercent === undefined ? {} : { contextPercent: usageContextPercent }) };
     }
-    if (value.attention !== undefined && (typeof value.attention !== "string" || !ATTENTION.has(value.attention))) return null;
+    if (attention !== undefined && (typeof attention !== "string" || !ATTENTION.has(attention))) return null;
     return {
-      version: 1, sessionId: value.sessionId, generation: value.generation, sequence: value.sequence,
-      source: { id: source.id, label: source.label, kind: source.kind }, state: value.state as PresenceState,
-      counts: { active: counts.active, completed: counts.completed, failed: counts.failed, ...(counts.queued === undefined ? {} : { queued: counts.queued }), ...(counts.cancelled === undefined ? {} : { cancelled: counts.cancelled }), ...(counts.total === undefined ? {} : { total: counts.total }) },
+      version: 1, sessionId, generation: eventGeneration, sequence: eventSequence,
+      source: { id: sourceId, label: sourceLabel, kind: sourceKind }, state: state as PresenceState,
+      counts: { active: countActive, completed: countCompleted, failed: countFailed, ...(countQueued === undefined ? {} : { queued: countQueued }), ...(countCancelled === undefined ? {} : { cancelled: countCancelled }), ...(countTotal === undefined ? {} : { total: countTotal }) },
       ...(progress === undefined ? {} : { progress }), ...(usage === undefined ? {} : { usage }),
-      ...(value.attention === undefined ? {} : { attention: value.attention as PresenceAttention }),
+      ...(attention === undefined ? {} : { attention: attention as PresenceAttention }),
     };
+  } catch { return null; }
+}
+
+/** Total parser for untrusted process-local removals; proxies and throwing getters are rejected. */
+export function parsePiPresenceRemove(value: unknown): PiPresenceRemove | null {
+  try {
+    if (!plainObject(value) || !hasOnlyKeys(value, REMOVE_KEYS)
+      || !REMOVE_KEYS.every((key) => hasOwn(value, key))) return null;
+    const version = value.version;
+    const sessionId = value.sessionId;
+    const eventGeneration = value.generation;
+    const eventSequence = value.sequence;
+    const rawSource = value.source;
+    if (version !== 1 || !safeText(sessionId) || !generation(eventGeneration) || !sequence(eventSequence)
+      || !plainObject(rawSource) || !hasOnlyKeys(rawSource, REMOVE_SOURCE_KEYS) || !hasOwn(rawSource, "id")) return null;
+    const sourceId = rawSource.id;
+    if (!safeText(sourceId)) return null;
+    return { version: 1, sessionId, generation: eventGeneration, sequence: eventSequence, source: { id: sourceId } };
   } catch { return null; }
 }
 
 /** Ready is a replay request and passive consumer advertisement, never authority. */
 export function parsePiPresenceReady(value: unknown): PiPresenceReady | null {
   try {
-    if (!plainObject(value) || !hasOnlyKeys(value, READY_KEYS) || value.version !== 1 || !safeText(value.sessionId)) return null;
-    if (value.consumer === undefined) return { version: 1, sessionId: value.sessionId };
-    const consumer = value.consumer;
-    if (!plainObject(consumer) || !hasOnlyKeys(consumer, CONSUMER_KEYS) || !hasOwn(consumer, "id") || !hasOwn(consumer, "capabilities")
-      || !safeText(consumer.id) || !Array.isArray(consumer.capabilities) || consumer.capabilities.length > MAX_ARRAY || !consumer.capabilities.every(safeText)) return null;
-    return { version: 1, sessionId: value.sessionId, consumer: { id: consumer.id, capabilities: [...consumer.capabilities] } };
+    if (!plainObject(value) || !hasOnlyKeys(value, READY_KEYS) || !hasOwn(value, "version") || !hasOwn(value, "sessionId")) return null;
+    const version = value.version;
+    const sessionId = value.sessionId;
+    const rawConsumer = value.consumer;
+    if (version !== 1 || !safeText(sessionId)) return null;
+    if (rawConsumer === undefined) return { version: 1, sessionId };
+    if (!plainObject(rawConsumer) || !hasOnlyKeys(rawConsumer, CONSUMER_KEYS) || !hasOwn(rawConsumer, "id") || !hasOwn(rawConsumer, "capabilities")) return null;
+    const consumerId = rawConsumer.id;
+    const rawCapabilities = rawConsumer.capabilities;
+    if (!safeText(consumerId) || !Array.isArray(rawCapabilities)) return null;
+    const capabilityLength = rawCapabilities.length;
+    if (!Number.isSafeInteger(capabilityLength) || capabilityLength < 0 || capabilityLength > MAX_ARRAY) return null;
+    const capabilities: string[] = [];
+    for (let index = 0; index < capabilityLength; index += 1) {
+      const capability = rawCapabilities[index];
+      if (!safeText(capability)) return null;
+      capabilities.push(capability);
+    }
+    return { version: 1, sessionId, consumer: { id: consumerId, capabilities } };
   } catch { return null; }
 }
 
@@ -134,6 +201,11 @@ interface NewTerminalObservation {
   readonly state: TerminalStatus | null;
   readonly attention: PresenceAttention;
 }
+interface ComputedPresenceUpdate {
+  readonly event: PiPresenceUpdate;
+  readonly active: number;
+  readonly queued: number;
+}
 
 /** Root-session, observer-only producer. It has no execution or cleanup authority. */
 export class PiSubagentPresenceProducer {
@@ -152,7 +224,9 @@ export class PiSubagentPresenceProducer {
   private lastTerminal: TerminalStatus | null = null;
   private unsubscribeReady: (() => void) | null = null;
   private cmuxStatusConsumerSeen = false;
+  private presenceRemoveCapabilityDetected = false;
   private replaying = false;
+  private settlementDeferred = false;
 
   constructor(options: PiSubagentPresenceProducerOptions) {
     this.emit = options.emit;
@@ -174,35 +248,66 @@ export class PiSubagentPresenceProducer {
     this.terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
     this.lastTerminal = null;
     this.cmuxStatusConsumerSeen = false;
+    this.presenceRemoveCapabilityDetected = false;
     this.replaying = false;
+    this.settlementDeferred = false;
     try { this.unsubscribeReady = this.on?.(PI_PRESENCE_READY_EVENT, (payload) => this.handleReady(payload)) ?? null; } catch { this.unsubscribeReady = null; }
     return true;
   }
 
   stop(): void {
+    this.removeCurrent();
     try { this.unsubscribeReady?.(); } catch { /* Listener cleanup is observer-only. */ }
     this.unsubscribeReady = null;
     this.sessionId = null;
     this.generation = null;
     this.current = null;
+    this.cmuxStatusConsumerSeen = false;
+    this.presenceRemoveCapabilityDetected = false;
     this.replaying = false;
+    this.settlementDeferred = false;
     this.terminalIds.clear();
   }
 
   publish(snapshot: SubagentUxRegistrySnapshot): boolean {
     if (this.sessionId === null || this.generation === null || snapshot.generation !== this.generation) return false;
     const newTerminal = this.rememberTerminals(snapshot.recent);
-    const event = this.makeUpdate(snapshot, newTerminal, false);
-    if (!event) return false;
-    this.current = freezePresenceUpdate(event);
-    this.emitSafely(this.current);
+    const computed = this.makeUpdate(snapshot, newTerminal, false);
+    if (!computed) return false;
+    this.current = freezePresenceUpdate(computed.event);
+    this.emitSafely(PI_PRESENCE_UPDATE_EVENT, this.current);
+    if (this.settlementDeferred && computed.active === 0 && computed.queued === 0) this.removeCurrent();
     return true;
+  }
+
+  /** Starts a new parent run without resetting the cumulative session state. */
+  beginAgentRun(): void {
+    this.settlementDeferred = false;
+  }
+
+  /** Public for root-only Pi agent_settled wiring and deterministic tests. */
+  settle(): void {
+    if (!this.current) return;
+    const { active = 0, queued = 0 } = this.current.counts;
+    if (active === 0 && queued === 0) {
+      this.removeCurrent();
+      return;
+    }
+    this.settlementDeferred = true;
+  }
+
+  /** Read-only session diagnostic; it never gates producer behavior. */
+  isPresenceRemoveCapabilityDetected(): boolean {
+    return this.presenceRemoveCapabilityDetected;
   }
 
   /** Public for thin entrypoint wiring and deterministic tests. */
   handleReady(payload: unknown): void {
     const ready = parsePiPresenceReady(payload);
     if (!ready || ready.sessionId !== this.sessionId) return;
+    if (!this.presenceRemoveCapabilityDetected && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("presence-remove-v1")) {
+      this.presenceRemoveCapabilityDetected = true;
+    }
     if (!this.cmuxStatusConsumerSeen && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("cmux-status")) {
       this.cmuxStatusConsumerSeen = true;
       try { this.onCmuxStatusConsumer?.(); } catch { /* UI routing is non-authoritative. */ }
@@ -212,10 +317,10 @@ export class PiSubagentPresenceProducer {
     if (!parsed) return;
     this.current = freezePresenceUpdate(parsed);
     this.replaying = true;
-    try { this.emitSafely(this.current); } finally { this.replaying = false; }
+    try { this.emitSafely(PI_PRESENCE_UPDATE_EVENT, this.current); } finally { this.replaying = false; }
   }
 
-  private makeUpdate(snapshot: SubagentUxRegistrySnapshot, newTerminals: NewTerminalObservation, replay: boolean): PiPresenceUpdate | null {
+  private makeUpdate(snapshot: SubagentUxRegistrySnapshot, newTerminals: NewTerminalObservation, replay: boolean): ComputedPresenceUpdate | null {
     if (this.sessionId === null || this.generation === null) return null;
     const scheduler = this.schedulerCounts();
     const activeInvocationIds = new Set(snapshot.active
@@ -242,6 +347,8 @@ export class PiSubagentPresenceProducer {
     const progressCompleted = determinate.reduce((total, item) => clamp(total + (item.progress?.completed ?? 0)), 0);
     const terminal = newTerminals.state ?? this.lastTerminal;
     const state: PresenceState = active > 0 ? "running" : queued > 0 ? "waiting" : terminal === "failed" ? "error" : terminal === "completed" ? "success" : terminal === "cancelled" ? "cancelled" : "idle";
+    const meaningful = active > 0 || queued > 0 || newTerminals.state !== null;
+    if (!this.current && !meaningful) return null;
     const attention: PresenceAttention = replay ? "none" : newTerminals.attention;
     const event: PiPresenceUpdate = {
       version: 1, sessionId: this.sessionId, generation: this.generation, sequence: this.nextSequence(), source: PI_SUBAGENT_PRESENCE_SOURCE, state,
@@ -249,7 +356,8 @@ export class PiSubagentPresenceProducer {
       ...(progressTotal > 0 ? { progress: { value: Math.min(1, progressCompleted / progressTotal), label: `Subagents ${progressCompleted}/${progressTotal}` } } : {}),
       attention,
     };
-    return parsePiPresenceUpdate(event);
+    const parsed = parsePiPresenceUpdate(event);
+    return parsed ? { event: parsed, active, queued } : null;
   }
 
   private rememberTerminals(recent: readonly SubagentUxSnapshot[]): NewTerminalObservation {
@@ -281,7 +389,18 @@ export class PiSubagentPresenceProducer {
     } catch { return undefined; }
   }
   private nextSequence(): number { this.sequence += 1; return this.sequence; }
-  private emitSafely(event: PiPresenceUpdate): void { try { this.emit(PI_PRESENCE_UPDATE_EVENT, event); } catch { /* Event observers are never lifecycle authority. */ } }
+  private removeCurrent(): void {
+    if (!this.current || this.sessionId === null || this.generation === null) return;
+    const remove = parsePiPresenceRemove({
+      version: 1, sessionId: this.sessionId, generation: this.generation, sequence: this.nextSequence(), source: { id: PI_SUBAGENT_PRESENCE_SOURCE.id },
+    });
+    if (!remove) return;
+    // Clear before emission so synchronous ready handlers cannot replay stale state.
+    this.current = null;
+    this.settlementDeferred = false;
+    this.emitSafely(PI_PRESENCE_REMOVE_EVENT, freezePresenceRemove(remove));
+  }
+  private emitSafely(channel: string, event: PiPresenceUpdate | PiPresenceRemove): void { try { this.emit(channel, event); } catch { /* Event observers are never lifecycle authority. */ } }
 }
 
 function isTerminalSnapshot(item: SubagentUxSnapshot): item is TerminalSnapshot {
@@ -300,6 +419,9 @@ function freezePresenceUpdate(event: PiPresenceUpdate): PiPresenceUpdate {
     ...(event.progress ? { progress: Object.freeze({ ...event.progress }) } : {}),
     ...(event.usage ? { usage: Object.freeze({ ...event.usage }) } : {}),
   });
+}
+function freezePresenceRemove(event: PiPresenceRemove): PiPresenceRemove {
+  return Object.freeze({ ...event, source: Object.freeze({ ...event.source }) });
 }
 function generationNumber(value: unknown): value is number { return generation(value); }
 function safeCount(value: unknown): number { return count(value) ? value : 0; }

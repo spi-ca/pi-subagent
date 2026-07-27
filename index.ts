@@ -50,7 +50,7 @@ import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
 import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
-import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
+import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, subscribeInteractiveRunChanges, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
 import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
 import {
@@ -138,6 +138,11 @@ function compareInteractiveRunsForUx(left: InteractiveRunUxSnapshot, right: Inte
 function formatInteractiveOwnershipForUx(ownership: InteractiveRunUxSnapshot["ownership"]): string {
   const presentation = INTERACTIVE_OWNERSHIP_PRESENTATION[ownership];
   return `${presentation.icon} ${presentation.label}`;
+}
+
+/** Detached surfaces are user-owned, so presence must not aggregate their work. */
+function listPresenceInteractiveRunSnapshots(): readonly InteractiveRunUxSnapshot[] {
+  return listInteractiveRunUxSnapshots().filter((run) => run.ownership !== "detached");
 }
 
 function formatSubagentElapsedForUx(elapsedMs: number): string {
@@ -604,10 +609,10 @@ export default function (pi: ExtensionAPI) {
       emit: (channel, payload) => pi.events.emit(channel, payload),
       on: typeof pi.events.on === "function" ? (channel, handler) => pi.events.on(channel, handler) : undefined,
       getSchedulerCounts: () => ({ active: scheduler.activeCount, queued: scheduler.queuedCount }),
-      getInteractiveActiveCount: () => listInteractiveRunUxSnapshots().length,
+      getInteractiveActiveCount: () => listPresenceInteractiveRunSnapshots().length,
       // One in-process snapshot gives presence exact per-run correlation
       // without making invocation IDs durable or part of the wire DTO.
-      getInteractiveActiveInvocationIds: () => listInteractiveRunUxSnapshots().map((run) => run.invocationId),
+      getInteractiveActiveInvocationIds: () => listPresenceInteractiveRunSnapshots().map((run) => run.invocationId),
     })
     : null;
   // This is the single UX update boundary for invocation progress. It reads
@@ -630,6 +635,7 @@ export default function (pi: ExtensionAPI) {
   };
   let unsubscribeUxStatus: (() => void) | null = null;
   let unsubscribeSchedulerStatus: (() => void) | null = null;
+  let unsubscribeInteractiveRunChanges: (() => void) | null = null;
 
   if (currentDepth === 0) {
     pi.registerCommand("subagents", {
@@ -666,6 +672,7 @@ export default function (pi: ExtensionAPI) {
             `scheduler: ${scheduler.activeCount} active, ${scheduler.queuedCount} queued, max ${scheduler.maxActive}`,
             `interactive authority: ${listActiveInteractiveRunIds().length} active`,
             ...reaperDiagnosticUx.formatDoctorStatus(),
+            `presence remove capability: ${presenceProducer?.isPresenceRemoveCapabilityDetected() ? "detected" : "not observed"}`,
             `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
             "control readiness: validated per interactive launch (no doctor probe)",
           ];
@@ -725,6 +732,9 @@ export default function (pi: ExtensionAPI) {
           const activeSnapshot = await inspectInteractiveRunForUx(command.id);
           const detachedAt = Date.now();
           const promoted = activeSnapshot ? await promoteInteractiveRun(command.id, detachedAt) : "rejected";
+          // Promotion may make a deferred settlement quiescent; presence is an
+          // observer, so republishing has no lifecycle authority.
+          presenceProducer?.publish(uxRegistry.snapshot());
           if (promoted === "promoted" && activeSnapshot) dashboardPublisher?.publishDetached({
             runId: activeSnapshot.runId,
             agent: activeSnapshot.agent,
@@ -910,6 +920,8 @@ export default function (pi: ExtensionAPI) {
     unsubscribeUxStatus = null;
     unsubscribeSchedulerStatus?.();
     unsubscribeSchedulerStatus = null;
+    unsubscribeInteractiveRunChanges?.();
+    unsubscribeInteractiveRunChanges = null;
     const uxGeneration = uxRegistry.reset();
     if (currentDepth === 0 && dashboardPublisher) {
       dashboardPublisher.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
@@ -937,7 +949,13 @@ export default function (pi: ExtensionAPI) {
       };
       unsubscribeUxStatus = uxRegistry.subscribe(updateObservers);
       unsubscribeSchedulerStatus = scheduler.subscribe((state) => updateObservers(uxRegistry.snapshot(), state.queued));
+      unsubscribeInteractiveRunChanges = subscribeInteractiveRunChanges(() => {
+        // Presence observes the registry only; lifecycle authority remains in
+        // the runner. This republish lets deferred idle settlement see zero.
+        presenceProducer?.publish(uxRegistry.snapshot());
+      });
       updateObservers(uxRegistry.snapshot());
+      if (ctx.isIdle()) presenceProducer?.settle();
     }
     backgroundJobSettlements.clear();
     sessionShuttingDown = false;
@@ -989,6 +1007,13 @@ export default function (pi: ExtensionAPI) {
     discoveredAgents = discovery.agents;
   });
 
+  if (currentDepth === 0) {
+    pi.on("agent_start", () => { presenceProducer?.beginAgentRun(); });
+    pi.on("agent_settled", (_event, ctx) => {
+      if (ctx.isIdle()) presenceProducer?.settle();
+    });
+  }
+
   pi.on("session_shutdown", async (_event, ctx) => {
     // Invalidate and quarantine before any await/cancellation so a late
     // old-session finalizer cannot repopulate the registry or send a steer.
@@ -1003,6 +1028,8 @@ export default function (pi: ExtensionAPI) {
     unsubscribeUxStatus = null;
     unsubscribeSchedulerStatus?.();
     unsubscribeSchedulerStatus = null;
+    unsubscribeInteractiveRunChanges?.();
+    unsubscribeInteractiveRunChanges = null;
     if (currentDepth === 0) {
       dashboardPublisher?.stop();
       presenceProducer?.stop();

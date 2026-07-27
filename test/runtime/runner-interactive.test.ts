@@ -65,6 +65,7 @@ import {
 	resetInteractiveShutdownForSession,
 	publishInteractiveLaunchGate,
 	shutdownActiveInteractiveRuns,
+	subscribeInteractiveRunChanges,
 } from "../../src/runtime/runner";
 import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
 import type { InteractivePaneBackend } from "../../src/runtime/interactive-pane";
@@ -99,6 +100,44 @@ const agent = {
 };
 
 describe("interactive pane runner preparation", () => {
+	test("notifies interactive registry observers immediately and after successful shutdown removal", async () => {
+		await shutdownActiveInteractiveRuns();
+		await resetInteractiveShutdownForSession();
+		const runId = "interactive-observer-shutdown-removal";
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "w", surfaceId: "observer" } };
+		const backend = {
+			mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle,
+			interrupt: async () => true, close: async () => true, inspect: async () => ({ exists: false }),
+		};
+		const observed: boolean[] = [];
+		const unsubscribeThrowing = subscribeInteractiveRunChanges(() => { throw new Error("observer failure"); });
+		const observer = () => {
+			observed.push(listActiveInteractiveRunIds().includes(runId));
+		};
+		const unsubscribe = subscribeInteractiveRunChanges(observer);
+		const unsubscribeDuplicate = subscribeInteractiveRunChanges(observer);
+		try {
+			assert.deepEqual(observed, [false], "subscription reports the current registry immediately and duplicate registration is a no-op");
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest(), release: async () => true }), true);
+			assert.deepEqual(observed, [false, true], "a registration notifies despite another observer throwing");
+			unsubscribeDuplicate();
+			await shutdownActiveInteractiveRuns();
+			assert.deepEqual(observed, [false, true, false], "disposing a duplicate leaves the original observer active");
+			unsubscribe();
+			await resetInteractiveShutdownForSession();
+			const unsubscribedRunId = `${runId}-unsubscribed`;
+			assert.equal(registerCommittedInteractiveRun({ runId: unsubscribedRunId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.deepEqual(observed, [false, true, false], "unsubscribed observers receive no later changes");
+			unregisterCommittedInteractiveRun(unsubscribedRunId, true);
+		} finally {
+			unsubscribe();
+			unsubscribeDuplicate();
+			unsubscribeThrowing();
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+		}
+	});
+
 	test("resolves pane layout with CLI precedence and rejects invalid values", () => {
 		assert.equal(resolveInteractivePaneLayout(undefined, {}), "auto");
 		assert.equal(resolveInteractivePaneLayout(undefined, { PI_SUBAGENT_PANE_LAYOUT: "split" }), "split");
@@ -904,6 +943,11 @@ describe("interactive pane runner preparation", () => {
 		const handle = { mode: "cmux-pane" as const, native: { workspaceId: allocation.target.workspaceId, surfaceId: allocation.target.surfaceId } };
 		let targetLive = true;
 		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: targetLive }), interrupt: async () => true, close: async () => true };
+		const observedOwnerships: string[] = [];
+		const unsubscribe = subscribeInteractiveRunChanges(() => {
+			const snapshot = listInteractiveRunUxSnapshots().find((entry) => entry.runId === runId);
+			if (snapshot) observedOwnerships.push(snapshot.ownership);
+		});
 		try {
 			const request = {
 				contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174004", runId,
@@ -927,7 +971,9 @@ describe("interactive pane runner preparation", () => {
 			assert.equal(failedDetachAttempts, 3, "a detached monitor must fail closed after its bounded retry budget");
 			await fs.promises.unlink(paths.promotionAckPath);
 			assert.equal(await promoteInteractiveRun(runId), "ownership-unknown", "a detached retry fails closed when its transfer chain is incomplete");
+			assert.deepEqual(observedOwnerships, ["managed", "detached", "ownership-unknown"], "a detached-to-unknown transition notifies presence observers");
 		} finally {
+			unsubscribe();
 			unregisterCommittedInteractiveRun(runId, true);
 			await resetInteractiveShutdownForSession();
 			await removeRunArtifacts(paths).catch(() => undefined);

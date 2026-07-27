@@ -458,6 +458,29 @@ interface ActiveInteractiveRun {
 }
 
 const activeInteractiveRuns = new Map<string, ActiveInteractiveRun>();
+
+/** Process-local notification only; observers receive no registry mutation authority. */
+export type InteractiveRunChangeObserver = () => void;
+const interactiveRunChangeObservers = new Set<InteractiveRunChangeObserver>();
+
+function notifyInteractiveRunChanges(): void {
+  for (const observer of [...interactiveRunChangeObservers]) {
+    try { observer(); } catch { /* Observers are never lifecycle authority. */ }
+  }
+}
+
+/**
+ * Observe process-local interactive registry changes. The observer is invoked
+ * immediately with the current state and after later relevant transitions.
+ * Re-subscribing the same callback is a no-op.
+ */
+export function subscribeInteractiveRunChanges(observer: InteractiveRunChangeObserver): () => void {
+  if (interactiveRunChangeObservers.has(observer)) return () => {};
+  interactiveRunChangeObservers.add(observer);
+  try { observer(); } catch { /* Observers are never lifecycle authority. */ }
+  return () => { interactiveRunChangeObservers.delete(observer); };
+}
+
 const DETACHED_RETIREMENT_DEGRADED_CADENCE_MS = 5_000;
 const detachedRetirementWatchers = new Map<string, { run: ActiveInteractiveRun; timer: ReturnType<typeof setTimeout> | null; cancelled: boolean }>();
 
@@ -512,9 +535,14 @@ function watchDetachedInteractiveRunForRetirement(run: ActiveInteractiveRun): vo
           } catch { /* retry from the retained registry candidate */ }
         }
         if (!removed) return;
+        let retired = false;
         await withInteractiveFenceMutex(() => {
-          if (activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached") activeInteractiveRuns.delete(run.runId);
+          if (activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached") {
+            activeInteractiveRuns.delete(run.runId);
+            retired = true;
+          }
         });
+        if (retired) notifyInteractiveRunChanges();
         cancelDetachedRetirementWatcher(run.runId);
       });
     });
@@ -1045,6 +1073,13 @@ export function applyInteractiveOwnershipUnknownResultForTest(result: SingleResu
 export async function promoteInteractiveRun(runId: string, detachedAt = Date.now()): Promise<InteractivePromotionOutcome> {
   const run = activeInteractiveRuns.get(runId);
   if (!run?.paths || !Number.isSafeInteger(detachedAt) || detachedAt <= 0) return "rejected";
+  let notifyOwnershipUnknown = false;
+  const markOwnershipUnknown = (): InteractivePromotionOutcome => {
+    notifyOwnershipUnknown ||= run.ownership === "detached";
+    run.ownership = "ownership-unknown";
+    run.updatedAt = Date.now();
+    return "ownership-unknown";
+  };
   let queued: Promise<InteractivePromotionOutcome> | undefined;
   await withInteractiveFenceMutex(() => {
     if (activeInteractiveRuns.get(runId) !== run) return;
@@ -1058,14 +1093,10 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     // the sole authority for this idempotent outcome.
     if (run.ownership === "detached") {
       if (!await hasCompleteDetachedOwnershipTransfer(run.paths!, runId)) {
-        run.ownership = "ownership-unknown";
-        run.updatedAt = Date.now();
-        return "ownership-unknown";
+        return markOwnershipUnknown();
       }
       if (!await detachInteractiveTreePermitWithRetry(run.treePermitLease)) {
-        run.ownership = "ownership-unknown";
-        run.updatedAt = Date.now();
-        return "ownership-unknown";
+        return markOwnershipUnknown();
       }
       return "already-promoted";
     }
@@ -1078,7 +1109,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     if (!parsedAllocation) return "rejected";
     const allocationDigest = crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex");
     const existingMarker = await classifyExistingOwnershipMarkers(run.paths!, runId, allocationDigest);
-    if (existingMarker === "unknown") { run.ownership = "ownership-unknown"; run.updatedAt = Date.now(); return "ownership-unknown"; }
+    if (existingMarker === "unknown") return markOwnershipUnknown();
     const child = parseRunState(await readBoundedPrivateJson(run.paths!.statePath), runId);
     const parentStartedAt = getCurrentProcessStartedAt();
     if (!child?.childPid || !child.childStartedAt || parentStartedAt === null) return "rejected";
@@ -1091,11 +1122,6 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       && request.parent.pid === expected.parentPid && request.parent.startedAt === expected.parentStartedAt
       && request.child.pid === expected.childPid && request.child.startedAt === expected.childStartedAt;
     const requestArtifact = await readBrokerArtifact(run.paths!.promotionRequestPath);
-    const markOwnershipUnknown = (): InteractivePromotionOutcome => {
-      run.ownership = "ownership-unknown";
-      run.updatedAt = Date.now();
-      return "ownership-unknown";
-    };
     // The per-run FIFO serializes observer terminal publication. Any existing
     // completion artifact—including malformed/unreadable authority—wins before
     // promotion; never reinterpret it as an absent terminal record.
@@ -1155,6 +1181,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
         run.updatedAt = Date.now();
         return true;
       });
+      if (committed) notifyInteractiveRunChanges();
       return committed ? existingMarker === "matching" ? "already-promoted" : "promoted" : "ownership-unknown";
     } catch {
       // Request/ack publication can have succeeded when I/O reports an error.
@@ -1163,7 +1190,11 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     }
     });
   });
-  return await queued ?? "rejected";
+  const outcome = await queued ?? "rejected";
+  // Presence filtering excludes detached runs but conservatively includes
+  // unknown ownership. Notify after releasing the interactive fence.
+  if (notifyOwnershipUnknown) notifyInteractiveRunChanges();
+  return outcome;
 }
 
 
@@ -1286,6 +1317,7 @@ export function registerCommittedInteractiveRun(
   // failed/unknown release remains shutdown-owned for later retries.
   if (!canStartInteractiveRun(run.generation)) {
     activeInteractiveRuns.set(active.runId, active);
+    notifyInteractiveRunChanges();
     const cleanup = (async () => {
       const drained = await active.stopLeaseWriterAndDrain?.().catch(() => false);
       if (drained === false) return;
@@ -1306,13 +1338,17 @@ export function registerCommittedInteractiveRun(
       const release = releaseActiveInteractiveRunAfterWinner({ runId: active.runId, expectedRun: active, ...(publication ? { completion: publication.completion } : {}), force: true });
       const released = await awaitInteractiveBooleanBounded(release);
       if (!released) finalizeBoundedInteractiveRelease(active.runId, active, release);
-      if (released && activeInteractiveRuns.get(active.runId) === active) activeInteractiveRuns.delete(active.runId);
+      if (released && activeInteractiveRuns.get(active.runId) === active) {
+        activeInteractiveRuns.delete(active.runId);
+        notifyInteractiveRunChanges();
+      }
     })();
     lateFencedInteractiveReleases.add(cleanup);
     void cleanup.finally(() => lateFencedInteractiveReleases.delete(cleanup));
     return false;
   }
   activeInteractiveRuns.set(active.runId, active);
+  notifyInteractiveRunChanges();
   return true;
 }
 
@@ -1322,8 +1358,9 @@ export function unregisterCommittedInteractiveRun(runId: string, targetConfirmed
   // revoked local cleanup authority. Both stay visible until exact absence is
   // separately proven by the caller.
   if (run?.ownership === "managed" || targetConfirmedAbsent) {
-    activeInteractiveRuns.delete(runId);
+    const removed = activeInteractiveRuns.delete(runId);
     cancelDetachedRetirementWatcher(runId);
+    if (removed) notifyInteractiveRunChanges();
   }
 }
 
@@ -1506,12 +1543,15 @@ async function awaitTerminalPublicationBounded<T>(publication: Promise<T>): Prom
 function finalizeBoundedInteractiveRelease(runId: string, expectedRun: ActiveInteractiveRun, release: Promise<boolean>): void {
   void release.then(async (released) => {
     if (!released) return;
+    let removed = false;
     await withInteractiveFenceMutex(() => {
       if (activeInteractiveRuns.get(runId) === expectedRun) {
         activeInteractiveRuns.delete(runId);
         cancelDetachedRetirementWatcher(runId);
+        removed = true;
       }
     });
+    if (removed) notifyInteractiveRunChanges();
   }, () => undefined);
 }
 
@@ -1568,7 +1608,10 @@ export async function shutdownActiveInteractiveRuns(): Promise<void> {
       // Retain malformed completion and unknown releases for later
       // drain/startup recovery. A valid pre-existing child/reaper winner is
       // replayed and released above, just like a parent winner.
-      if (released && activeInteractiveRuns.get(run.runId) === run) activeInteractiveRuns.delete(run.runId);
+      if (released && activeInteractiveRuns.get(run.runId) === run) {
+        activeInteractiveRuns.delete(run.runId);
+        notifyInteractiveRunChanges();
+      }
     }));
     await Promise.all(lateReleases.map(awaitInteractiveCleanupBounded));
   }

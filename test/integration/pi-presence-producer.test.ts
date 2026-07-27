@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import {
   MAX_PRESENCE_COUNT,
   PI_PRESENCE_READY_EVENT,
+  PI_PRESENCE_REMOVE_EVENT,
   PI_PRESENCE_UPDATE_EVENT,
   createPiSubagentPresenceProducer,
   isPiCmuxPresenceCmuxStatusReady,
   parsePiPresenceReady,
+  parsePiPresenceRemove,
   parsePiPresenceUpdate,
 } from "../../src/integration/pi-presence-producer";
 
@@ -16,10 +18,18 @@ const update = {
   counts: { active: 0, completed: 0, failed: 0 },
 } as const;
 const snapshot = (generation = 0, recent: any[] = [], active: any[] = []) => ({ generation, active, recent });
+const running = (id = "running") => ({ id, status: "running" });
+const completed = (id = "completed") => ({ id, status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2 });
 
 describe("pi presence producer wire contract", () => {
   test("strictly parses bounded, private-data-free update and ready DTOs", () => {
     assert.deepEqual(parsePiPresenceUpdate(update), update);
+    const remove = { version: 1, sessionId: "session-1", generation: 0, sequence: 2, source: { id: "pi-subagent" } } as const;
+    assert.deepEqual(parsePiPresenceRemove(remove), remove);
+    assert.equal(parsePiPresenceRemove({ ...remove, state: "idle" }), null);
+    assert.equal(parsePiPresenceRemove({ ...remove, source: { id: "pi-subagent", label: "private" } }), null);
+    assert.equal(parsePiPresenceRemove({ ...remove, sequence: 0 }), null);
+    assert.equal(parsePiPresenceRemove({ ...remove, generation: -1 }), null);
     assert.equal(parsePiPresenceUpdate({ ...update, task: "private" }), null);
     assert.equal(parsePiPresenceUpdate({ ...update, sessionId: "bad\nvalue" }), null);
     assert.equal(parsePiPresenceUpdate({ ...update, source: { ...update.source, label: "\u202Espoof" } }), null);
@@ -34,7 +44,127 @@ describe("pi presence producer wire contract", () => {
 
     const throwing = new Proxy({}, { get() { throw new Error("no getter execution"); } });
     assert.equal(parsePiPresenceUpdate(throwing), null);
+    assert.equal(parsePiPresenceRemove(throwing), null);
     assert.equal(parsePiPresenceReady(throwing), null);
+  });
+
+  test("accepts the canonical astral text boundary and rejects the next code point", () => {
+    const atLimit = "😀".repeat(96);
+    const overLimit = "😀".repeat(97);
+    const remove = { version: 1, sessionId: atLimit, generation: 0, sequence: 1, source: { id: atLimit } } as const;
+    const astralUpdate = { ...update, sessionId: atLimit, source: { id: atLimit, label: atLimit, kind: atLimit } } as const;
+    const ready = { version: 1, sessionId: atLimit, consumer: { id: atLimit, capabilities: [atLimit] } } as const;
+
+    assert.deepEqual(parsePiPresenceRemove(remove), remove);
+    assert.deepEqual(parsePiPresenceUpdate(astralUpdate), astralUpdate);
+    assert.deepEqual(parsePiPresenceReady(ready), ready);
+    assert.equal(parsePiPresenceRemove({ ...remove, sessionId: overLimit }), null);
+    assert.equal(parsePiPresenceUpdate({ ...astralUpdate, source: { ...astralUpdate.source, label: overLimit } }), null);
+    assert.equal(parsePiPresenceReady({ ...ready, consumer: { ...ready.consumer, capabilities: [overLimit] } }), null);
+  });
+
+  test("snapshots each removal field once before constructing its owned DTO", () => {
+    let versionReads = 0;
+    let sessionReads = 0;
+    let generationReads = 0;
+    let sequenceReads = 0;
+    let sourceReads = 0;
+    let sourceIdReads = 0;
+    const source = Object.create(Object.prototype, {
+      id: { enumerable: true, get: () => ++sourceIdReads === 1 ? "pi-subagent" : "changed-source" },
+    });
+    const changing = Object.create(Object.prototype, {
+      version: { enumerable: true, get: () => ++versionReads === 1 ? 1 : 2 },
+      sessionId: { enumerable: true, get: () => ++sessionReads === 1 ? "session-1" : "changed-session" },
+      generation: { enumerable: true, get: () => ++generationReads === 1 ? 0 : 1 },
+      sequence: { enumerable: true, get: () => ++sequenceReads === 1 ? 1 : 2 },
+      source: { enumerable: true, get: () => ++sourceReads === 1 ? source : { id: "changed-source" } },
+    });
+
+    assert.deepEqual(parsePiPresenceRemove(changing), {
+      version: 1, sessionId: "session-1", generation: 0, sequence: 1, source: { id: "pi-subagent" },
+    });
+    assert.deepEqual({ versionReads, sessionReads, generationReads, sequenceReads, sourceReads, sourceIdReads }, {
+      versionReads: 1, sessionReads: 1, generationReads: 1, sequenceReads: 1, sourceReads: 1, sourceIdReads: 1,
+    });
+  });
+
+  test("snapshots every update field once before validation and construction", () => {
+    const reads = new Map<string, number>();
+    const changing = <T>(name: string, initial: T, later: T) => ({
+      enumerable: true,
+      get: () => {
+        const count = (reads.get(name) ?? 0) + 1;
+        reads.set(name, count);
+        return count === 1 ? initial : later;
+      },
+    });
+    const source = Object.create(Object.prototype, {
+      id: changing("source.id", "pi-subagent", "changed-id"),
+      label: changing("source.label", "Subagents", "changed-label"),
+      kind: changing("source.kind", "agent-group", "changed-kind"),
+    });
+    const counts = Object.create(Object.prototype, {
+      active: changing("counts.active", 1, -1), completed: changing("counts.completed", 2, -1), failed: changing("counts.failed", 3, -1),
+      queued: changing("counts.queued", 4, -1), cancelled: changing("counts.cancelled", 5, -1), total: changing("counts.total", 15, -1),
+    });
+    const progress = Object.create(Object.prototype, {
+      value: changing("progress.value", 0.5, 2), label: changing("progress.label", "Half", "changed-label"),
+    });
+    const usage = Object.create(Object.prototype, {
+      tokens: changing("usage.tokens", 10, -1), cost: changing("usage.cost", 0.25, -1), contextPercent: changing("usage.contextPercent", 50, -1),
+    });
+    const changingUpdate = Object.create(Object.prototype, {
+      version: changing("version", 1, 2), sessionId: changing("sessionId", "session-1", "changed-session"),
+      generation: changing("generation", 0, -1), sequence: changing("sequence", 1, 0), source: changing("source", source, null),
+      state: changing("state", "running", "invalid"), counts: changing("counts", counts, null), progress: changing("progress", progress, null),
+      usage: changing("usage", usage, null), attention: changing("attention", "info", "invalid"),
+    });
+
+    assert.deepEqual(parsePiPresenceUpdate(changingUpdate), {
+      version: 1, sessionId: "session-1", generation: 0, sequence: 1,
+      source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" }, state: "running",
+      counts: { active: 1, completed: 2, failed: 3, queued: 4, cancelled: 5, total: 15 },
+      progress: { value: 0.5, label: "Half" }, usage: { tokens: 10, cost: 0.25, contextPercent: 50 }, attention: "info",
+    });
+    assert.deepEqual(Object.fromEntries(reads), Object.fromEntries([
+      "version", "sessionId", "generation", "sequence", "source", "state", "counts", "progress", "usage", "attention",
+      "source.id", "source.label", "source.kind", "counts.active", "counts.completed", "counts.failed", "counts.queued", "counts.cancelled", "counts.total",
+      "progress.value", "progress.label", "usage.tokens", "usage.cost", "usage.contextPercent",
+    ].map((name) => [name, 1])));
+  });
+
+  test("snapshots ready fields and capability entries without iterating untrusted arrays", () => {
+    const reads = new Map<string, number>();
+    const changing = <T>(name: string, initial: T, later: T) => ({
+      enumerable: true,
+      get: () => {
+        const count = (reads.get(name) ?? 0) + 1;
+        reads.set(name, count);
+        return count === 1 ? initial : later;
+      },
+    });
+    const capabilities = new Proxy(["cmux-status"], {
+      get: (target, key, receiver) => {
+        if (key === "length" || key === "0") reads.set(`capabilities.${key}`, (reads.get(`capabilities.${key}`) ?? 0) + 1);
+        if (key === "0" && reads.get("capabilities.0") !== 1) return "changed-capability";
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const consumer = Object.create(Object.prototype, {
+      id: changing("consumer.id", "pi-cmux-presence", "changed-consumer"),
+      capabilities: changing("consumer.capabilities", capabilities, []),
+    });
+    const ready = Object.create(Object.prototype, {
+      version: changing("version", 1, 2), sessionId: changing("sessionId", "session-1", "changed-session"), consumer: changing("consumer", consumer, null),
+    });
+
+    assert.deepEqual(parsePiPresenceReady(ready), {
+      version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] },
+    });
+    assert.deepEqual(Object.fromEntries(reads), {
+      version: 1, sessionId: 1, consumer: 1, "consumer.id": 1, "consumer.capabilities": 1, "capabilities.length": 1, "capabilities.0": 1,
+    });
   });
 
   test("fences session/generation, replays only after a snapshot, and removes attention on replay", () => {
@@ -49,7 +179,7 @@ describe("pi presence producer wire contract", () => {
     listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1" });
     assert.equal(emitted.length, 0);
     assert.equal(producer.publish(snapshot(1)), false);
-    assert.equal(producer.publish(snapshot(2)), true);
+    assert.equal(producer.publish(snapshot(2, [], [running()])), true);
     listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "other" });
     assert.equal(emitted.length, 1);
     listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1" });
@@ -59,6 +189,20 @@ describe("pi presence producer wire contract", () => {
     assert.equal(emitted[1]!.payload.attention, "none");
     producer.stop();
     assert.equal(listeners.size, 0);
+  });
+
+  test("stays lazy while idle and only opens a retained source for meaningful work", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => emitted.push({ channel, payload }),
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    assert.equal(producer.publish(snapshot()), false);
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.equal(emitted.length, 0);
+    assert.equal(producer.publish(snapshot(0, [completed()])), true);
+    assert.equal(emitted[0]!.payload.sequence, 1);
   });
 
   test("advertises the exact cmux consumer only as a one-shot passive routing hint", () => {
@@ -76,6 +220,158 @@ describe("pi presence producer wire contract", () => {
     listeners.get(PI_PRESENCE_READY_EVENT)!(ready);
     listeners.get(PI_PRESENCE_READY_EVENT)!(ready);
     assert.equal(hints, 1);
+  });
+
+  test("detects the passive remove capability only from the valid same-session cmux ready advertisement", () => {
+    const listeners = new Map<string, (value: unknown) => void>();
+    let hints = 0;
+    const producer = createPiSubagentPresenceProducer({
+      emit: () => {}, on: (channel, handler) => { listeners.set(channel, handler); return () => listeners.delete(channel); },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+      onCmuxStatusConsumer: () => { hints += 1; },
+    });
+    const ready = (sessionId: string, id: string, capabilities: unknown) => ({ version: 1, sessionId, consumer: { id, capabilities } });
+
+    producer.startSession("session-1", 0);
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-cmux-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["cmux-status"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: "presence-remove-v1" } });
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
+    assert.equal(hints, 1, "cmux-status retains its one-shot callback behavior");
+
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
+    assert.equal(hints, 1);
+
+    producer.startSession("session-2", 1);
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
+    producer.handleReady(ready("session-2", "pi-cmux-presence", ["presence-remove-v1"]));
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
+    producer.stop();
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
+  });
+
+  test("removes immediately or after deferred quiescence without replaying stale presence", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    let scheduler = { active: 1, queued: 0 };
+    let interactive = 0;
+    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
+    producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => {
+        emitted.push({ channel, payload });
+        if (channel === PI_PRESENCE_REMOVE_EVENT) producer.handleReady({ version: 1, sessionId: "session-1" });
+      },
+      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [running()]));
+    producer.settle();
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT]);
+
+    // Deferred settlement preserves a new active publication and removes only
+    // after the last terminal update observes the already-computed zero aggregate.
+    producer.publish(snapshot(0, [], [running("new-parent")]));
+    scheduler = { active: 0, queued: 0 };
+    producer.publish(snapshot(0, [completed("done")]));
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+    assert.deepEqual(emitted.map((event) => event.payload.sequence), [1, 2, 3, 4]);
+    assert.equal(emitted[2]!.payload.state, "success");
+    assert.deepEqual(emitted[3]!.payload, { version: 1, sessionId: "session-1", generation: 0, sequence: 4, source: { id: "pi-subagent" } });
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.equal(emitted.length, 4, "ready after remove cannot replay");
+
+    scheduler = { active: 1, queued: 0 };
+    producer.publish(snapshot(0, [], [running("next-burst")]));
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.deepEqual(emitted.slice(4).map((event) => event.payload.sequence), [5, 6]);
+    assert.equal(emitted[4]!.payload.counts.completed, 1, "terminal counts remain cumulative within a session");
+  });
+
+  test("scopes deferred settlement to the parent run that settled", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    let scheduler = { active: 1, queued: 0 };
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => emitted.push({ channel, payload }),
+      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [running("old-run")]));
+    producer.settle();
+
+    producer.beginAgentRun();
+    scheduler = { active: 0, queued: 0 };
+    producer.publish(snapshot(0, [completed("old-work-finished")]));
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT]);
+    assert.equal(emitted[1]!.payload.counts.completed, 1, "terminal state remains cumulative across parent runs");
+
+    producer.settle();
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+  });
+
+  test("removes immediately when the retained aggregate is already quiescent", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => emitted.push({ channel, payload }),
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [completed()]));
+    producer.settle();
+    producer.settle();
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+  });
+
+  test("defers settlement for queued or interactive aggregate work and removes exactly once", () => {
+    for (const retained of [
+      { name: "queued", scheduler: { active: 0, queued: 1 }, interactive: 0 },
+      { name: "interactive", scheduler: { active: 0, queued: 0 }, interactive: 1 },
+    ]) {
+      const emitted: Array<{ channel: string; payload: any }> = [];
+      let scheduler = retained.scheduler;
+      let interactive = retained.interactive;
+      const producer = createPiSubagentPresenceProducer({
+        emit: (channel, payload) => emitted.push({ channel, payload }),
+        getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
+      });
+      producer.startSession("session-1", 0);
+      producer.publish(snapshot());
+      producer.settle();
+      assert.equal(emitted.length, 1, retained.name);
+      scheduler = { active: 0, queued: 0 };
+      interactive = 0;
+      producer.publish(snapshot(0, [completed(`done-${retained.name}`)]));
+      producer.settle();
+      producer.stop();
+      producer.stop();
+      assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT], retained.name);
+    }
+  });
+
+  test("removes retained state during reload and ignores observer failures", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => emitted.push({ channel, payload }),
+      getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("old-session", 0);
+    producer.publish(snapshot(0, [], [running()]));
+    producer.startSession("new-session", 1);
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+    assert.equal(emitted[1]!.payload.sessionId, "old-session");
+    producer.publish(snapshot(1, [], [running("new-session-run")]));
+    producer.stop();
+    producer.stop();
+    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+
+    const throwing = createPiSubagentPresenceProducer({
+      emit: () => { throw new Error("observer"); },
+      getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    throwing.startSession("session-1", 0);
+    assert.doesNotThrow(() => { throwing.publish(snapshot(0, [], [running()])); throwing.settle(); throwing.stop(); });
   });
 
   test("keeps cached replay immutable and blocks synchronous ready recursion", () => {

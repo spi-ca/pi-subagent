@@ -10,8 +10,7 @@ import { assertSafeStateRoot, classifyParentProcessIdentity, getProcessStartedAt
 import { exactArtifactDigest, parseAllocationRecordV3, parseCommittedLaunchRecordV3, parseLaunchIntentV3 } from "../../../src/runtime/tmux-control-protocol.js";
 import { parseTmuxControlTransportGate } from "../../../src/runtime/tmux-control-gate.js";
 import { Phase0LiveProofServer } from "../../../src/runtime/phase0-live-proof.js";
-import { BoundedOutputCapture, CHILD_MODEL, DEFAULT_COMMAND_TIMEOUT_MS, MAX_DIAGNOSTIC_BYTES, MAX_LIVE_STDOUT_BYTES,  SUPPORTED_ACTIVE_RUNS, TRANSPORT_METRICS, type CellDeadline, type CellEvidence, type ChildResources, type Json, type LiveMode, type LivePiExecutable, type Metric, type NotApplicable, type Phase0FailureCategory, type Phase0FailureSummary, type Phase0LiveMilestone, type Phase0ReleaseWriter, type ProcessIdentity, type RecordJson, type SupportedActiveRun, type TransportCounters, type BoundedCommandOptions, type BoundedCommandResult, type Workload, PHASE0_LIVE_MILESTONES, cleanupPhase0ReleaseWriters, createCellDeadline, exact, formatPhase0FailureSummary, phase0CellDeadlineMs, PHASE0_LIVE_SETTLEMENT_MARGIN_MS, record, remainingDeadlineMs, requireRemainingDeadline, Phase0DeadlineExhaustedError, runBoundedCommand as run, writePhase0FailureSummary, writePhase0ReleaseToken, safeNumber, safeText } from "./evidence.js";
-import { revalidateManagedChildPiExecutableGeneration } from "../managed-child-pi-executable.js";
+import { BoundedOutputCapture, CHILD_MODEL, DEFAULT_COMMAND_TIMEOUT_MS, MAX_DIAGNOSTIC_BYTES, MAX_LIVE_STDOUT_BYTES,  SUPPORTED_ACTIVE_RUNS, TRANSPORT_METRICS, type CellDeadline, type CellEvidence, type ChildResources, type Json, type LiveMode, type LivePiExecutable, type Metric, type NotApplicable, type Phase0FailureCategory, type Phase0FailureSummary, type Phase0LiveMilestone, type Phase0ReleaseWriter, type ProcessIdentity, type RecordJson, type SupportedActiveRun, type TransportCounters, type BoundedCommandOptions, type BoundedCommandResult, type Workload, PHASE0_LIVE_MILESTONES, cleanupPhase0ReleaseWriters, createCellDeadline, exact, formatPhase0FailureSummary, phase0CellDeadlineMs, PHASE0_LIVE_SETTLEMENT_MARGIN_MS, record, remainingDeadlineMs, requireRemainingDeadline, Phase0DeadlineExhaustedError, revalidateStagedLivePiBundle, runBoundedCommand as run, writePhase0FailureSummary, writePhase0ReleaseToken, safeNumber, safeText } from "./evidence.js";
 import { buildStoppedBootstrapArgv } from "../../../src/runtime/runner.js";
 
 /** Moved modules resolve the repository root from this subdirectory. */
@@ -940,6 +939,8 @@ export type Phase0ParentCellTestHooks = {
   classifyBootstrapIdentity?: ExactProcessIdentityClassifier;
   afterBootstrapResumed?: (identity: ProcessIdentity) => void | Promise<void>;
   afterPrimaryFailureCaptured?: () => void | Promise<void>;
+  /** Test-only: production always requires the staged executable/theme bundle fence. */
+  skipStagedBundleRevalidation?: boolean;
 };
 
 export async function runParentCell(root: string, agentDir: string, extension: string, pi: LivePiExecutable, activeRuns: number, workload: Workload, baseEnv: NodeJS.ProcessEnv, transportEnv: NodeJS.ProcessEnv = {}, actionBarrier?: ActionBarrier, enforceDescendantConcurrency = true, deadline: CellDeadline = createCellDeadline(activeRuns), testHooks: Phase0ParentCellTestHooks = {}): Promise<Omit<CellEvidence, "mode" | "sourceAndSentinelPreserved">> {
@@ -1005,8 +1006,8 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   const env = buildSyntheticParentEnv(baseEnv, { ...transportEnv, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_RUN_STATE_DIR: stateRoot, PI_SUBAGENT_CMUX_CHILD_POLICY: "managed", PI_SUBAGENT_MAX_ACTIVE: String(limits.treePermitMaxActive), PI_SUBAGENT_MAX_CONCURRENCY: String(limits.localTaskConcurrency), PI_SUBAGENT_MAX_BACKGROUND_JOBS: String(PHASE0_MAX_BACKGROUND_JOBS), PI_SUBAGENT_PHASE0_LIVE: "1", PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR: telemetryRoot, PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY: telemetryCapability, PI_SUBAGENT_PHASE0_LIVE_PROOF_SOCKET: proofServer!.socketPath, PI_SUBAGENT_PHASE0_LIVE_PROOF_MASTER: proofMaster, PI_SUBAGENT_PHASE0_LIVE_PROOF_BARRIER_PATHS: JSON.stringify(barrierPaths), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_TOKENS: JSON.stringify(releaseTokens), PI_SUBAGENT_PHASE0_LIVE_PROOF_RELEASE_DEADLINE: String(deadline.expiresAt), PI_SUBAGENT_PHASE0_LIVE_PROOF_BEHAVIOR: workload === "short-response" ? "short" : workload === "long-response" ? "long" : "hold", PI_OFFLINE: "1", PHASE0_TASK_CHUNKS: JSON.stringify(taskChunks), PHASE0_STAGE_ROOT: stageRoot, PHASE0_STAGE_MILESTONES: JSON.stringify(milestones), PHASE0_WORKLOAD: workload, PHASE0_ACTIVE_RUNS: String(activeRuns), PHASE0_LAUNCH_COOLDOWN_MS: String(phase0LaunchCooldownMs(activeRuns)), PHASE0_ACTION_RELEASE_PATH: actionReleasePath, PHASE0_CELL_DEADLINE: String(deadline.expiresAt) });
   const parentArgs = ["--mode", "json", "--no-context-files", "--no-extensions", "--extension", path.join(ROOT, "index.ts"), "--extension", extension, "--model", "openai-codex/gpt-5.4-mini", "-p", "Run the Phase 0 provider transport benchmark."];
   const bootstrapArgs = buildStoppedBootstrapArgv(pi.bin, parentArgs);
-  // The staged native generation fence is the final operation before the credentialed stopped bootstrap spawn.
-  revalidateManagedChildPiExecutableGeneration(pi.generation);
+  // The staged executable and fixed theme bundle fence is the final operation before the credentialed stopped bootstrap spawn.
+  if (!testHooks.skipStagedBundleRevalidation) await revalidateStagedLivePiBundle(pi);
   const child = (testHooks.spawnParent ?? spawn)("/bin/sh", bootstrapArgs, { cwd: ROOT, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
   const stdout = new BoundedOutputCapture(MAX_LIVE_STDOUT_BYTES);
   let stderrBytes = 0, jsonl = "";

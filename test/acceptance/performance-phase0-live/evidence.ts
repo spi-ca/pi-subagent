@@ -100,7 +100,7 @@ export type LiveOptions = { execute: boolean; tier?: LiveTierId; resumeLiveRoot?
 export type LiveBackendExecutables = { tmux: ManagedChildPiExecutableGeneration; cmux: ManagedChildPiExecutableGeneration };
 export type LivePiGeneration = { bin: string; version: string; generation: ManagedChildPiExecutableGeneration };
 /** Preflight's exact Pi generation must be staged before every credentialed cell spawn. */
-export type LivePiExecutable = LivePiGeneration & LiveBackendExecutables;
+export type LivePiExecutable = LivePiGeneration & LiveBackendExecutables & { themeAssets?: StagedLivePiThemeAssets };
 
 export function record(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 export function exact(value: Record<string, unknown>, keys: readonly string[]): boolean { const actual = Object.keys(value).sort(), expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
@@ -223,40 +223,152 @@ async function syncDirectory(root: string): Promise<void> { const handle = await
 
 const STAGED_NATIVE_PI_DIRECTORY = "staged-native-pi";
 const STAGED_NATIVE_PI_FILE = "pi";
-export type StageLivePiExecutableHooks = { afterSourcePrevalidated?: () => void | Promise<void> };
+/** The only executable-adjacent runtime assets staged for a credentialed child. */
+const STAGED_THEME_ASSET_PATHS = ["theme/dark.json", "theme/light.json"] as const;
+const MAX_STAGED_THEME_BYTES = 1024 * 1024;
+type StagedThemeAssetPath = typeof STAGED_THEME_ASSET_PATHS[number];
+type FileIdentity = { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number; mode: number; uid: number };
+export type StagedLivePiThemeAsset = FileIdentity & { relativePath: StagedThemeAssetPath; path: string; directory: string; directoryDev: number; directoryIno: number; digest: string };
+export type StagedLivePiThemeAssets = readonly StagedLivePiThemeAsset[];
+export type StageLivePiExecutableHooks = {
+  afterSourcePrevalidated?: () => void | Promise<void>;
+  afterThemeSourcePrevalidated?: () => void | Promise<void>;
+};
+
+function currentUid(): number | null { return typeof process.getuid === "function" ? process.getuid() : null; }
+function safeOwner(uid: number, owner = currentUid()): boolean { return owner === null || uid === owner || uid === 0; }
+function safeMode(mode: number): boolean { return (mode & 0o022) === 0; }
+function exactFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs && left.mode === right.mode && left.uid === right.uid;
+}
+function fileIdentity(stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number; mode: number; uid: number }): FileIdentity {
+  return { dev: Number(stat.dev), ino: Number(stat.ino), size: Number(stat.size), mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, mode: Number(stat.mode), uid: Number(stat.uid) };
+}
+async function requireSafeDirectoryAncestry(directory: string, privateRoot?: string): Promise<void> {
+  const canonicalRoot = privateRoot === undefined ? undefined : await fs.realpath(privateRoot);
+  for (let current = directory; ; current = path.dirname(current)) {
+    const stat = await fs.lstat(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !safeMode(stat.mode) || !safeOwner(stat.uid)) throw new Error("theme directory ancestry is unsafe");
+    if (current === canonicalRoot || current === path.dirname(current)) break;
+  }
+  if (canonicalRoot !== undefined) {
+    const relative = path.relative(canonicalRoot, directory);
+    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("theme directory escaped private root");
+  }
+}
+/** Descriptor-bound, nonblocking, bounded JSON read; pathname replacement is detected before acceptance. */
+async function readSafeThemeAsset(file: string, privateRoot?: string): Promise<{ identity: FileIdentity; body: Buffer; digest: string }> {
+  const directory = path.dirname(file);
+  await requireSafeDirectoryAncestry(directory, privateRoot);
+  // O_NONBLOCK rejects FIFOs/devices promptly before fstat, so untrusted source paths cannot stall staging.
+  const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const before = fileIdentity(await handle.stat()), pathBefore = await fs.lstat(file);
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !exactFileIdentity(before, fileIdentity(pathBefore)) || !safeMode(before.mode) || !safeOwner(before.uid) || before.size <= 0 || before.size > MAX_STAGED_THEME_BYTES) throw new Error("theme asset is unsafe");
+    const body = Buffer.alloc(before.size), read = await handle.read(body, 0, body.length, 0);
+    const after = fileIdentity(await handle.stat()), pathAfter = await fs.lstat(file);
+    if (read.bytesRead !== body.length || !exactFileIdentity(before, after) || !exactFileIdentity(before, fileIdentity(pathAfter)) || pathAfter.isSymbolicLink()) throw new Error("theme asset changed while reading");
+    const text = body.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(body)) throw new Error("theme asset is not valid UTF-8");
+    try { JSON.parse(text); } catch { throw new Error("theme asset JSON is malformed"); }
+    return { identity: before, body, digest: crypto.createHash("sha256").update(body).digest("hex") };
+  } finally { await handle.close(); }
+}
+function expectedThemeAsset(pi: LivePiExecutable, relativePath: StagedThemeAssetPath): StagedLivePiThemeAsset | null {
+  const assets = pi.themeAssets;
+  if (!assets || assets.length !== STAGED_THEME_ASSET_PATHS.length) return null;
+  const matched = assets.filter((asset) => asset.relativePath === relativePath);
+  return matched.length === 1 ? matched[0]! : null;
+}
+async function removeCreatedStagedDirectory(root: string, rootIdentity: { dev: number; ino: number }, directory: string, directoryIdentity: { dev: number; ino: number } | null): Promise<void> {
+  if (!sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity) || directoryIdentity === null) throw new Error("staged Pi cleanup authority was not proven");
+  const stat = await fs.lstat(directory).catch(() => null);
+  if (stat === null || !sameIdentity(stat, directoryIdentity) || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
+  // Only unlink the fixed allowlist and remove fixed empty directories. Never recurse into an attacker-controlled entry.
+  for (const relativePath of [STAGED_NATIVE_PI_FILE, ...STAGED_THEME_ASSET_PATHS]) {
+    const candidate = path.join(directory, relativePath), entry = await fs.lstat(candidate).catch(() => null);
+    if (entry !== null) {
+      if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
+      await fs.unlink(candidate);
+    }
+  }
+  const theme = path.join(directory, "theme"), themeStat = await fs.lstat(theme).catch(() => null);
+  if (themeStat !== null) {
+    if (!themeStat.isDirectory() || themeStat.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
+    await fs.rmdir(theme);
+  }
+  await fs.rmdir(directory);
+}
+/** Revalidates the staged executable and every exact allowlisted theme asset immediately before a credentialed parent spawn. */
+export async function revalidateStagedLivePiBundle(pi: LivePiExecutable): Promise<void> {
+  revalidateManagedChildPiExecutableGeneration(pi.generation);
+  if (!pi.themeAssets || pi.themeAssets.length !== STAGED_THEME_ASSET_PATHS.length) throw new Error("credentialed live Pi spawn requires staged theme assets");
+  const bundleRoot = path.dirname(pi.generation.executable);
+  for (const relativePath of STAGED_THEME_ASSET_PATHS) {
+    const asset = expectedThemeAsset(pi, relativePath);
+    if (!asset) throw new Error("credentialed live Pi spawn requires each staged theme asset exactly once");
+    const expectedPath = path.join(bundleRoot, relativePath);
+    if (asset.path !== expectedPath || asset.directory !== path.dirname(expectedPath)) throw new Error("staged Pi theme path is invalid");
+    const directory = await fs.lstat(asset.directory).catch(() => null);
+    if (!directory?.isDirectory() || directory.isSymbolicLink() || directory.dev !== asset.directoryDev || directory.ino !== asset.directoryIno || (directory.mode & 0o777) !== 0o700 || !safeOwner(directory.uid)) throw new Error("staged Pi theme directory changed");
+    const current = await readSafeThemeAsset(asset.path, pi.generation.privateRoot);
+    if (!exactFileIdentity(current.identity, asset) || current.digest !== asset.digest) throw new Error("staged Pi theme asset changed");
+  }
+}
 /**
- * Converts the validated Pi pathname into one private per-runtime generation.
- * The source fence detects replacement before and after the exclusive copy;
- * same-UID replacement during those individual filesystem operations remains
- * outside this harness's threat model.
+ * Stages the executable plus only `theme/dark.json` and `theme/light.json`.
+ * No directory tree or other executable-adjacent asset is copied.
  */
 export async function stageLivePiExecutable(root: string, pi: LivePiExecutable, hooks: StageLivePiExecutableHooks = {}): Promise<LivePiExecutable> {
-  const rootIdentity = await privateLiveRoot(root), directory = path.join(root, STAGED_NATIVE_PI_DIRECTORY), destination = path.join(directory, STAGED_NATIVE_PI_FILE);
-  let created = false;
+  const rootIdentity = await privateLiveRoot(root), directory = path.join(root, STAGED_NATIVE_PI_DIRECTORY), destination = path.join(directory, STAGED_NATIVE_PI_FILE), themeDirectory = path.join(directory, "theme");
+  let created = false, directoryIdentity: { dev: number; ino: number } | null = null;
   try {
     revalidateManagedChildPiExecutableGeneration(pi.generation);
-    await hooks.afterSourcePrevalidated?.();
+    const sourceAssets = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => ({ relativePath, asset: await readSafeThemeAsset(path.join(path.dirname(pi.generation.executable), relativePath)) })));
+    await hooks.afterSourcePrevalidated?.(); await hooks.afterThemeSourcePrevalidated?.();
     await fs.mkdir(directory, { mode: 0o700 }); created = true;
     await fs.chmod(directory, 0o700);
     const directoryStat = await fs.lstat(directory);
-    const uid = typeof process.getuid === "function" ? process.getuid() : null;
-    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700 || (uid !== null && directoryStat.uid !== uid) || await fs.realpath(directory) !== directory || !sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi directory is unsafe");
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700 || !safeOwner(directoryStat.uid) || await fs.realpath(directory) !== directory || !sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi directory is unsafe");
+    directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
     revalidateManagedChildPiExecutableGeneration(pi.generation);
     await fs.copyFile(pi.generation.executable, destination, fsConstants.COPYFILE_EXCL);
     await fs.chmod(destination, 0o700);
     revalidateManagedChildPiExecutableGeneration(pi.generation);
     const staged = captureManagedChildLivePiExecutableGeneration(destination, directory);
     revalidateManagedChildPiExecutableGeneration(staged);
-    const file = await fs.open(destination, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-    try { await file.sync(); } finally { await file.close(); }
-    await syncDirectory(directory);
-    await syncDirectory(root);
+    const stagedExecutable = await fs.open(destination, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try { await stagedExecutable.sync(); } finally { await stagedExecutable.close(); }
+    await fs.mkdir(themeDirectory, { mode: 0o700 }); await fs.chmod(themeDirectory, 0o700);
+    const stagedThemeDirectory = await fs.lstat(themeDirectory);
+    if (!stagedThemeDirectory.isDirectory() || stagedThemeDirectory.isSymbolicLink() || (stagedThemeDirectory.mode & 0o777) !== 0o700 || !safeOwner(stagedThemeDirectory.uid)) throw new Error("private staged theme directory is unsafe");
+    for (const { relativePath, asset } of sourceAssets) {
+      const handle = await fs.open(path.join(directory, relativePath), "wx", 0o600);
+      try { await handle.writeFile(asset.body); await handle.sync(); } finally { await handle.close(); }
+    }
+    const sourceAfter = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => ({ relativePath, asset: await readSafeThemeAsset(path.join(path.dirname(pi.generation.executable), relativePath)) })));
+    for (const source of sourceAssets) {
+      const after = sourceAfter.find((entry) => entry.relativePath === source.relativePath)!.asset;
+      if (!exactFileIdentity(source.asset.identity, after.identity) || source.asset.digest !== after.digest) throw new Error("theme source changed while staging");
+    }
+    const themeAssets: StagedLivePiThemeAssets = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => {
+      const asset = await readSafeThemeAsset(path.join(directory, relativePath), directory);
+      const source = sourceAssets.find((entry) => entry.relativePath === relativePath)!.asset;
+      if (asset.digest !== source.digest) throw new Error("staged theme digest mismatch");
+      return { ...asset.identity, relativePath, path: path.join(directory, relativePath), directory: themeDirectory, directoryDev: stagedThemeDirectory.dev, directoryIno: stagedThemeDirectory.ino, digest: asset.digest };
+    }));
+    await syncDirectory(themeDirectory); await syncDirectory(directory); await syncDirectory(root);
     if (!sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi root identity changed");
-    revalidateManagedChildPiExecutableGeneration(staged);
-    return { ...pi, bin: staged.executable, generation: staged };
+    const stagedPi = { ...pi, bin: staged.executable, generation: staged, themeAssets };
+    await revalidateStagedLivePiBundle(stagedPi);
+    return stagedPi;
   } catch (error) {
-    if (created) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
-    throw new Error("live Pi staging failed before provider spawn", { cause: error });
+    let cause = error;
+    if (created) {
+      try { await removeCreatedStagedDirectory(root, rootIdentity, directory, directoryIdentity); }
+      catch (cleanupError) { cause = new Error("staged Pi cleanup was not proven", { cause: cleanupError }); }
+    }
+    throw new Error("live Pi staging failed before provider spawn", { cause });
   }
 }
 export async function writeLiveCheckpoint(root: string, checkpoint: LiveCheckpoint): Promise<string> { if (!validateLiveCheckpoint(checkpoint)) throw new Error("refusing to persist an invalid live checkpoint"); const identity = await privateLiveRoot(root), destination = path.join(root, LIVE_CHECKPOINT_FILE), temporary = path.join(root, `.${LIVE_CHECKPOINT_FILE}.${crypto.randomUUID()}.tmp`); const handle = await fs.open(temporary, "wx", 0o600); try { await handle.writeFile(`${JSON.stringify(checkpoint)}\n`); await handle.sync(); } finally { await handle.close(); } if (!sameIdentity(await fs.lstat(root).catch(() => null), identity)) { await fs.rm(temporary, { force: true }); throw new Error("live checkpoint root identity changed before publish"); } try { await fs.rename(temporary, destination); await fs.chmod(destination, 0o600); await syncDirectory(root); } catch (error) { await fs.rm(temporary, { force: true }); throw error; } return destination; }

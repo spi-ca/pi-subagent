@@ -2,7 +2,7 @@
 
 > **상태:** 현재 동작과 권장 운영 정책
 
-이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. root-only generic presence **producer는 `pi-subagent`에 구현되어** 있고, 별도 `pi-cmux-presence`는 이를 선택적으로 소비하는 package다. wire contract·replay·observer 경계 같은 세부 계약은 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)에서 다룬다. interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
+이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. root-only generic presence **producer는 `pi-subagent`에 구현되어** `pi-presence:update:v1`/`pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1`을 수신하며, 별도 `pi-cmux-presence`는 이를 선택적으로 소비하는 package다. wire contract·replay·철회·observer 경계 같은 세부 계약은 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)에서 다룬다. interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
 
 `pi-cmux`는 `pi-subagent`의 실행, 결과 반환, 취소와 cleanup에 필요하지 않은 **선택적 workflow UX 확장**이다. child surface별 sidebar와 command/review 작업 흐름이 필요할 때 설치한다. root Pi/subagent 집계의 generic status·progress·attention은 `pi-subagent` producer를 설치·로드된 `pi-cmux-presence` consumer가 표시할 수 있다.
 
@@ -12,9 +12,9 @@
 
 | 구성 요소 | 역할 |
 |---|---|
-| `pi-subagent` | subagent 위임, child surface 생성·종료, 결과 수집, 취소, lease와 orphan 정리, root parent dashboard/aggregate/detached event 및 generic `pi-presence:update:v1` publish, Pi TUI status/notification |
+| `pi-subagent` | subagent 위임, child surface 생성·종료, 결과 수집, 취소, lease와 orphan 정리, root parent dashboard/aggregate/detached event 및 generic `pi-presence:update:v1`/`pi-presence:remove:v1` publish, Pi TUI status/notification |
 | 외부 event consumer (선택) | public dashboard/aggregate/detached event를 검증해 필요한 UI를 best-effort로 갱신한다. `pi-subagent`에 포함되지 않는다. |
-| `pi-cmux-presence` (선택) | `pi-subagent`가 같은 Pi process에서 발행한 generic presence update를 소비할 수 있는 별도 observer/UI다. `pi-cmux` package나 lifecycle authority와 연결되지 않는다. |
+| `pi-cmux-presence` (선택) | `pi-subagent`가 같은 Pi process에서 발행한 generic presence update/remove를 소비할 수 있는 별도 observer/UI다. `pi-cmux` package나 lifecycle authority와 연결되지 않는다. |
 | `pi-cmux` (선택) | 각 Pi surface의 sidebar, progress, log, 알림과 사용자 작업 흐름을 제공한다. public event consumer의 소유자나 설치 조건이 아니다. |
 | cmux | PTY, workspace, surface와 split 제공 |
 
@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작한다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
+root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작한다. producer는 idle에서는 열지 않고 active·queued·새 terminal 집계에서 열며, parent `agent_settled`의 quiescent aggregate에서 remove한다. remove는 cancellation·surface cleanup 권한이 아니다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, 철회, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
 
 ## 5. 권장 운영 정책
 

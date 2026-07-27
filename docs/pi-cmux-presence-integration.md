@@ -1,8 +1,8 @@
 # `pi-subagent`와 `pi-cmux-presence` presence 연동
 
-> **상태:** generic presence producer 구현됨
+> **상태:** generic presence lifecycle producer 구현됨
 
-root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`을 발행하는 **producer**를 구현했고, `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비하는 별도 package다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
+root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`과 `pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1`을 수신하는 **producer**를 구현했다. `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비하는 별도 package다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
 
 `pi-cmux-presence`는 surface별 sidebar·log·사용자 command를 제공하는 [`pi-cmux`](./pi-cmux-integration.md)와도 다르며, 두 optional package는 함께 설치·로드될 수 있다. `pi-cmux`는 generic presence event consumer가 아니고, 어느 package도 다른 쪽의 설치 조건, lifecycle authority 또는 내부 API가 아니다. 이 문서는 `pi-subagent`가 복제해 구현한 wire DTO와 producer 경계를 설명한다. presence consumer의 canonical 입력 계약은 별도 `pi-cmux-presence` 저장소의 `docs/event-contract.md`가 소유한다.
 
@@ -10,8 +10,8 @@ root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`을 �
 
 | 구성 요소 | 역할 | 현재 경계 |
 | --- | --- | --- |
-| `pi-subagent` root parent | subagent 실행 상태를 generic presence update로 투영하는 producer | root depth `0` session에서만 발행한다. `pi-cmux-presence`를 import하거나 의존하지 않는다. |
-| `pi-cmux-presence` | update를 검증해 cmux 상태 UI로 반영할 수 있는 선택 consumer | consumer/UI일 뿐이며 `pi-subagent` 실행에 필요하지 않고 `pi-cmux`와도 강결합하지 않는다. |
+| `pi-subagent` root parent | subagent 실행 상태를 generic presence update/remove로 투영하는 producer | root depth `0` session에서만 발행한다. `pi-cmux-presence`를 import하거나 의존하지 않는다. |
+| `pi-cmux-presence` | update/remove를 검증해 cmux retained 상태 UI에 반영·철회할 수 있는 선택 consumer | consumer/UI일 뿐이며 `pi-subagent` 실행에 필요하지 않고 `pi-cmux`와도 강결합하지 않는다. |
 | `pi-subagent` dashboard publisher | 기존 dashboard/aggregate/detached public event | presence와 별개 contract다. 자동 변환하지 않는다. |
 | `pi-cmux` | 별도 surface UX extension | presence consumer의 소유자나 설치 조건이 아니다. |
 
@@ -21,27 +21,28 @@ root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`을 �
 
 | 채널 | 방향 | 의미 |
 | --- | --- | --- |
-| `pi-presence:update:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | 현재 session의 subagent 집계 snapshot |
-| `pi-presence:ready:v1` | 선택 consumer → `pi-subagent` | 현재 snapshot의 replay 요청 및 passive consumer advertisement |
+| `pi-presence:update:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | 열린 현재 session의 subagent 집계 snapshot |
+| `pi-presence:remove:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | source의 retained observer 상태 철회 |
+| `pi-presence:ready:v1` | 선택 consumer → `pi-subagent` | 열린 현재 snapshot의 replay 요청 및 passive consumer advertisement |
 | `pi-subagent:dashboard:v1` | `pi-subagent` → 외부 선택 consumer | 기존 active/dashboard contract |
 | `pi-subagent:aggregate-completed:v1` | `pi-subagent` → 외부 선택 consumer | 기존 terminal invocation 알림 |
 | `pi-subagent:detached:v1` | `pi-subagent` → 외부 선택 consumer | 기존 durable promotion 알림 |
 
-presence producer는 root parent(depth `0`)의 `session_start`에서 session ID와 UX generation으로 시작하고 `session_shutdown`에서 listener를 해제한다. nested child는 producer를 만들지 않는다. 같은 session/generation의 마지막 update가 있을 때만, 동일 session ID의 valid `ready` 요청에 새 `sequence`를 붙여 replay한다. replay의 `attention`은 항상 `"none"`이며, 아직 snapshot이 없거나 session/generation이 다르면 아무 것도 발행하지 않는다.
+presence producer는 root parent(depth `0`)의 `session_start`에서 session ID와 UX generation으로 시작하고 `session_shutdown`에서 listener를 해제한다. nested child는 producer를 만들지 않는다. 초기 빈 idle snapshot은 발행하지 않는 lazy producer이며, active·queued 집계가 생기거나 새 terminal invocation을 관측할 때만 source를 연다. session 전환 뒤 이전 실행의 active aggregate가 남아 새 source가 열리면 idle session-start에서 즉시 deferred settlement로 표시해 aggregate가 quiescent해지는 snapshot에서 철회한다. `update`와 `remove`는 같은 producer-owned generation/단조 증가 sequence fence를 공유한다.
 
-`ready.consumer.id === "pi-cmux-presence"`이고 capabilities에 `"cmux-status"`가 있을 때의 감지는 한 session에 한 번인 passive UI-routing hint일 뿐이다. 실행 policy, child profile, completion 또는 cleanup 권한을 바꾸지 않는다.
+같은 session/generation의 열린 마지막 update가 있을 때만 동일 session ID의 valid `ready` 요청에 새 `sequence`를 붙여 replay한다. replay의 `attention`은 항상 `"none"`이며, 아직 snapshot이 없거나 이미 remove한 source이거나 session/generation이 다르면 아무 것도 발행하지 않는다. `ready.consumer.id === "pi-cmux-presence"`이고 capabilities에 `"cmux-status"`가 있을 때의 감지는 한 session에 한 번인 passive UI-routing hint일 뿐이다. 같은 exact consumer가 `"presence-remove-v1"`을 광고한 ready를 관측했는지는 session 동안 별도로 기억해 `/subagents doctor`의 `presence remove capability` 진단에만 표시한다. session-start handler 순서 때문에 광고를 놓칠 수 있으므로 음성 결과는 `not observed`이지 consumer 부재의 증명이 아니다. 이 감지는 update/remove 발행을 gate하지 않으며 실행 policy, child profile, completion 또는 cleanup 권한을 바꾸지 않는다.
 
 ## 3. 복제한 `v1` wire contract
 
-`src/integration/pi-presence-producer.ts`는 `pi-cmux-presence` dependency 없이 `v1` update/ready parser와 DTO를 복제한다. producer source는 고정된 다음 값이다.
+`src/integration/pi-presence-producer.ts`는 `pi-cmux-presence` dependency 없이 `v1` update/remove/ready parser와 DTO를 복제한다. update source는 다음 고정 값이며 remove source는 이 중 식별자만 사용한다.
 
 ```json
 { "id": "pi-subagent", "label": "Subagents", "kind": "agent-group" }
 ```
 
-`update`에는 `version`, `sessionId`, `generation`, 증가하는 `sequence`, `source`, `state`, `counts`가 필수다. 선택 필드는 `progress`, `usage`, `attention`이다. producer는 `idle`/`waiting`/`running`/`success`/`error`/`cancelled` state와 0–1,000,000 count, 1–96자 안전 문자열만 허용한다. unknown key, control/bidi 문자, 범위 밖 수치, 잘못된 source/ready shape는 거부한다.
+`update`에는 `version`, `sessionId`, `generation`, 증가하는 `sequence`, `source`, `state`, `counts`가 필수다. 선택 필드는 `progress`, `usage`, `attention`이다. `remove`는 정확히 `version`, `sessionId`, `generation`, 증가하는 `sequence`, `source: { id }`만 가지는 strict DTO다. update/remove/ready parser는 plain object와 exact key를 검사하고, untrusted 필드를 한 번 읽어 소유 DTO로 복사하며 getter/proxy 예외를 밖으로 전파하지 않는다. safe text는 1–96 Unicode code points이고 C0/C1 control 및 bidi·방향성 제어 문자를 거부한다. update는 `idle`/`waiting`/`running`/`success`/`error`/`cancelled` state와 0–1,000,000 count를 허용하며, 각 parser는 범위 밖 수치와 잘못된 중첩 shape를 거부한다.
 
-현재 producer는 `usage`를 **발행하지 않는다**. token, cost, context percent를 계산·조회·추정하지 않는다. task, prompt, raw output, cwd/path, credential, raw title, socket/capability 또는 private cmux/tmux target ID도 payload에 넣지 않는다.
+현재 producer는 `usage`를 **발행하지 않는다**. token, cost, context percent를 계산·조회·추정하지 않는다. task, prompt, raw output, cwd/path, credential, raw title, socket/capability 또는 private cmux/tmux target ID도 update/remove payload에 넣지 않는다.
 
 ## 4. 집계와 진행률
 
@@ -55,9 +56,11 @@ presence producer는 root parent(depth `0`)의 `session_start`에서 session ID�
 
 progress는 추측한 작업량이 아니라 structured tool details와 invocation의 알려진 work count에서만 얻는다. 단일 호출은 active 동안 `0/1`을 내고 terminal update에서는 progress를 생략하며, 병렬 호출은 `details.results` 길이를 total로, `exitCode !== -1` result 수를 completed로 사용한다. 체인은 `chainStageCount`를 total로, `chainCompletedCount`·`chainSkippedCount`·`chainFailedCount`·`chainCompletedWithErrorsCount` 합계를 completed로 사용하며 total을 넘지 않게 제한한다. 여러 active invocation의 determinate progress는 합산해 `Subagents completed/total`로 표시한다.
 
+root parent의 idle `agent_settled`에서 aggregate가 이미 quiescent(`active === 0`, `queued === 0`)이면 마지막 terminal update 뒤에 remove를 발행한다. background·queued·interactive work가 남아 있으면 settlement를 보류하고, 뒤 snapshot이 quiescent가 된 뒤에만 remove한다. user ownership으로 승격된 `detached` interactive surface는 aggregate active에서 제외하고 승격 직후 snapshot을 다시 발행해 보류 settlement가 quiescence를 관측할 수 있게 한다. `kept`·`transferring`·`ownership-unknown`은 보수적으로 active에 남긴다. 새 parent `agent_start`는 이전 parent의 보류 settlement를 해제해 새 run을 철회하지 못하게 한다. remove 전에는 terminal update가 먼저 발행되고, remove 직전에 cached current snapshot을 비워 동기 `ready`가 오래된 상태를 replay할 수 없다. 다음 burst는 더 높은 sequence의 update로 다시 열며 terminal count는 session 동안 누적된다. `stop`, session shutdown, reload/새 session 전환도 열린 상태의 best-effort remove를 시도한다.
+
 ## 5. 권한·child profile·기존 event의 분리
 
-presence는 observer 출력이다. update/ready listener, consumer socket 또는 UI 오류는 모두 best-effort로 격리되며 invocation registry, `CompletionRecordV3`, result replay, cancellation, lease, reaper, detached ownership 또는 cleanup 결정을 만들지 않는다. consumer가 완료로 표시해도 결과 수집이나 target close 권한이 생기지 않는다.
+presence는 observer 출력이다. update/remove/ready listener, consumer socket 또는 UI 오류는 모두 best-effort로 격리되며 invocation registry, `CompletionRecordV3`, result replay, cancellation, lease, reaper, detached ownership 또는 cleanup 결정을 만들지 않는다. remove는 observer retained 상태의 철회일 뿐 cancellation이나 cleanup authority가 아니며, consumer가 완료 또는 철회를 표시해도 결과 수집이나 target close 권한이 생기지 않는다.
 
 `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`는 inherited extension을 제외하므로 inherited `pi-cmux-presence`도 child에 로드하지 않는다. `inherit` child의 extension loading은 parent의 generic root producer를 복제하지 않으며, 별도 child presence policy나 `PI_CMUX_PRESENCE_*` 전달은 제공하지 않는다. presence는 JSON/CLI/environment 설정 항목이 아니며, `pi-subagent.json`이나 `subagent` tool schema를 확장하지 않는다.
 
@@ -65,17 +68,13 @@ presence는 observer 출력이다. update/ready listener, consumer socket 또는
 
 ## 6. 별도 consumer 작업 범위
 
-여기까지는 이 repository의 `pi-subagent` producer 구현과 검증 범위다. 다음 consumer 정책은 구현됐다고 주장하지 않으며, 별도의 `pi-cmux-presence` 작업 세션에서 consumer가 소유해야 한다.
+여기까지는 이 repository의 `pi-subagent` producer 구현과 검증 범위다. notification/flash, terminal burst와 parent lifecycle의 병합 같은 consumer 정책은 `pi-cmux-presence`가 소유하며 canonical consumer contract를 따른다. 특히 정확한 `source.id: "pi-subagent"` remove를 수락한 consumer는 누적 terminal baseline과 보류 terminal burst를 초기화하고, 보류된 parent attention이 있으면 producer payload를 복사하지 않는 local parent fallback을 자체 policy·capability gate로 처리한다.
 
-- transport queue coalescing과 구분되는 semantic terminal burst 집계 및 subagent 완료를 parent Pi의 ready-to-review 시점과 병합하는 정책
-- 현재 attention별 즉시 notification/flash를 `error` 우선, 성공 저소음 같은 severity 정책으로 조정하는 configuration
-- 사용자가 해당 surface에 focus한 경우의 성공 표시 억제와 focus를 확인할 수 없을 때의 보수적 fallback
-
-이 consumer 작업은 `pi-subagent`의 event DTO·producer lifecycle·result collection·cleanup authority를 바꾸지 않아야 한다.
+remove를 모르는 이전 consumer는 event를 구독하지 않아 무시하므로 마지막 update를 session teardown까지 retained한 기존 sticky 동작을 유지할 수 있다. 이 호환성 및 consumer의 notification 의미는 `pi-subagent`의 event DTO·producer lifecycle·result collection·cancellation·cleanup authority를 바꾸지 않는다.
 
 ## 7. 검증 범위
 
-`pi-subagent`에서 다음 focused test는 strict update/ready parsing, session/generation fence, attention 없는 replay, queued-only `waiting`, foreground/background terminal attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
+`pi-subagent`에서 다음 focused test는 strict update/remove/ready parsing, shared session/generation/sequence fence, lazy open, attention 없는 replay, `agent_settled` remove 및 queued/interactive deferred withdrawal, stale replay 차단, reload/session teardown withdrawal, queued-only `waiting`, foreground/background terminal attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts
@@ -86,6 +85,6 @@ bun test test/integration/pi-presence-producer.test.ts
 관련 구현 근거:
 
 - `index.ts` — root-only session wiring과 UX/scheduler observer 연결
-- `src/integration/pi-presence-producer.ts` — duplicated `v1` DTO parser와 observer-only producer
-- `test/integration/pi-presence-producer.test.ts` — focused contract test
+- `src/integration/pi-presence-producer.ts` — duplicated `v1` DTO parser와 observer-only update/remove/ready producer
+- `test/integration/pi-presence-producer.test.ts` — remove lifecycle를 포함한 focused contract test
 - [`pi-cmux` 연동 가이드](./pi-cmux-integration.md) — optional `pi-cmux` UX와 legacy dashboard contract

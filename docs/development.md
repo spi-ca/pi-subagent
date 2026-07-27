@@ -80,6 +80,18 @@ provider-live는 caller `PATH`를 탐색해 Pi·tmux·cmux를 찾지 않습니�
 
 checkpoint schema는 v4입니다. routine의 `--max-cells=1..15` completed prefix만 resume할 수 있고, claim 뒤 각 provider cell 전에 terminalize되어 one-use입니다. resume은 recorded Pi version이 현재 preflight Pi version과 정확히 같고 source/tier/plan binding도 모두 일치할 때만 가능합니다. backend version은 evidence나 checkpoint continuity claim에 기록하지 않습니다. concurrency partial resume과 automatic retry는 지원하지 않습니다. live synthetic parent는 명시 allowlist의 PATH/HOME/locale, proxy/CA와 명시 transport/harness 값만 받으며 ambient `PI_SUBAGENT_*`, credential, loader/shell hook, 임의 변수와 multiplexer state를 상속하지 않습니다. 실패 root를 retain할 때에는 raw diagnostic log 대신 top-level private `0600`의 bounded `failure-summary.json` 하나만 scrub 뒤 남을 수 있습니다. scrub은 default-deny이며 valid top-level checkpoint(있다면)와 valid summary 외 모든 파일·directory·symlink를 제거하고, 둘 다 없는 terminal root 또는 malformed summary면 root 전체를 폐기합니다. final summary overwrite가 증명되지 않으면 이전 summary가 남아 있어도 root를 폐기합니다. `cleanupProven`은 cell과 transport cleanup이 모두 증명된 경우에만 true입니다. fixture 유효성은 routine 및 concurrency current-source verifier가 모두 성공할 때만 판정합니다. source/test/docs 변경은 **amend하지 않고** 먼저 commit한 뒤 fixture를 regenerate하고, 그 생성물만 담은 두 번째 fixture-only commit을 만듭니다. fixture-only commit은 이전 effective source revision을 유지합니다. effective revision은 fixture를 제외한 source commit에 도달할 수 있는 Git history가 있어야 조회됩니다. fixture-only HEAD에서 history가 shallow/incomplete하면 fail closed하여 source revision lookup이 실패하며 HEAD를 source revision으로 취급하지 않습니다. CI checkout은 full history여야 합니다. source 변경과 fixture를 섞어 commit하면 effective source revision이 전진하므로, 그 commit 뒤 다시 regenerate하여 fixture-only commit을 새로 만들어야 합니다. 그 전의 fixture를 최종 검증 결과로 간주하지 않습니다. 세부 계약은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md#m0-harness-상태)를 따릅니다.
 
+### Phase 7 reaper local benchmark
+
+Phase 7의 non-mutating schema preflight, current-source fixture 검증과 고정 local baseline 기록은 다음 명령으로 실행합니다.
+
+```bash
+bun run benchmark:phase7:preflight
+bun run benchmark:phase7:verify
+bun run benchmark:phase7:record-local
+```
+
+기본 record는 실제 private 10,000-run filesystem과 100,000-node in-memory graph를 측정합니다. 실제 100,000-run filesystem 측정은 비용이 큰 명시적 opt-in이며 `PI_SUBAGENT_REAPER_BENCH_RUNS=100000 bun run benchmark:phase7:record-local`로만 실행합니다. 이 override 결과를 일반 baseline으로 남기려는 경우가 아니라면 checked-in fixture를 덮어쓰지 마세요.
+
 ### Generic presence producer 집중 검증
 
 root-only presence producer의 wire DTO, session/generation fence, `ready` replay의 `attention: "none"`, cumulative terminal count와 observer failure 격리는 다음 focused test로 확인합니다.
@@ -109,9 +121,9 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 ## 개발 의존성
 
-클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. 개발 의존성은 Pi `0.82.0` 및 호환되는 `typebox` 버전에 정확히 고정되어 있으며, `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
+클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 `^0.82.0`으로 현재 0.82 patch line을 허용하고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
 
-배포 시 호스트 Pi와의 호환성 범위는 별도 peer dependency가 담당합니다. 특히 `@earendil-works/pi-coding-agent`의 production 최소 버전은 `>=0.80.10`으로 유지됩니다.
+Pi 관련 peer dependency는 host 설치를 막지 않도록 `"*"`로 유지합니다. interactive pane 실행에 필요한 Pi `>=0.80.10`은 peer range가 아니라 runtime version policy로 검사합니다.
 
 ## 다이어그램 렌더링
 

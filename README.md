@@ -15,7 +15,7 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 - **실행 환경 자동 선택** — cmux/tmux에서는 실제 child Pi TUI를 열며, 기본 `auto` layout은 cmux의 shared right pane 또는 tmux의 child별 detached window를 사용합니다. `split`은 child별 split 호환 모드입니다.
 - **선택적 managed child profile** — `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`는 inherited extension을 끄고 nested delegation 및 interactive lifecycle에 필요한 extension만 명시적으로 로드합니다.
 - **Parent TUI 관리 UX** — `/subagents` 하나로 상태/preview/상세 진단, exact-ID 취소, negotiated cmux focus, session keep와 durable promote를 제공하고 footer에 compact 집계를 표시합니다.
-- **선택적 generic presence** — root parent는 dependency 없이 `pi-presence:update:v1`을 발행하고, 설치된 `pi-cmux-presence`가 같은 Pi process에서 이를 선택적으로 소비할 수 있습니다. presence는 observer 출력이며 lifecycle authority가 아닙니다.
+- **선택적 generic presence** — root parent는 dependency 없이 `pi-presence:update:v1`/`pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1` 재발행 요청을 수신합니다. 설치된 `pi-cmux-presence`가 같은 Pi process에서 이를 선택적으로 소비할 수 있으며, presence는 observer 출력이고 lifecycle authority가 아닙니다.
 - **런타임 보호 장치** — 최대 위임 깊이와 순환 위임 방지로 재귀 실행 위험을 줄입니다.
 - **프로젝트 에이전트 신뢰 확인** — `.pi/agents`의 프로젝트 로컬 에이전트는 Pi가 현재 프로젝트를 trusted로 판정하거나 exact canonical root가 승인된 세션에서만 사용합니다.
 
@@ -227,7 +227,7 @@ bun install --frozen-lockfile
 bun run ci
 ```
 
-별도 개발용 체크아웃을 사용하는 경우에도 해당 저장소 루트에서 같은 명령을 실행합니다. 타입 체크에 필요한 Pi API 패키지와 `typebox`는 정확히 고정된 개발 의존성으로 설치되므로, 기존 Pi 설치의 형제 `node_modules` 경로가 필요하지 않습니다. 배포 호환성은 peer dependency가 담당하며 `@earendil-works/pi-coding-agent`의 production 최소 버전은 `>=0.80.10`입니다.
+별도 개발용 체크아웃을 사용하는 경우에도 해당 저장소 루트에서 같은 명령을 실행합니다. 타입 체크에 필요한 Pi API 패키지는 `^0.82.0` patch line을 허용하고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. 따라서 기존 Pi 설치의 형제 `node_modules` 경로가 필요하지 않습니다. Pi 관련 peer dependency는 host 설치를 막지 않도록 `"*"`로 유지하며, interactive pane 실행의 runtime 최소 버전은 별도 정책으로 Pi `>=0.80.10`입니다.
 
 ## 출처
 

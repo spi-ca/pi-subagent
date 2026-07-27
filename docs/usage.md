@@ -102,12 +102,14 @@
 - 병렬 단계는 기본적으로 최대 8개 작업을 받고 호출별 동시성 기본값 16에서 실행합니다. Linux/macOS에서는 root parent와 모든 nested child가 공유하는 tree-wide `max-active` `ACTIVE`/`RESERVED` permit 범위도 적용됩니다. Windows는 tree-wide hard cap을 지원하지 않고 process-local scheduling으로 fallback합니다.
 - 최상위 `mode`가 모든 단계와 작업에 적용됩니다.
 - 첫 번째 이후의 각 단계는 이전 단계 요약을 현재 작업 앞에 전달받습니다.
-- 실패한 단계가 있으면 기본적으로 체인을 중단합니다. 단, 해당 단계에 `continueOnError: true`가 있으면 계속 진행합니다.
+- 실패한 단계가 있으면 기본적으로 체인을 중단합니다. 단, 해당 단계에 `continueOnError: true`가 있으면 계속 진행합니다. 이렇게 계속된 오류는 blocking error가 아니므로 뒤의 기본 `on_success` 단계도 실행될 수 있으며, `on_error`와 `on_completed_with_errors`도 각각 누적 상태에 따라 동시에 참일 수 있습니다.
+- `condition`은 상호 배타적인 분기문이 아닙니다. `always`는 누적 상태와 무관하게 실행하고, `on_success`는 blocking error가 없을 때, `on_error`는 앞 단계에서 오류가 하나라도 있었을 때, `on_completed_with_errors`는 앞 단계가 완료+오류 상태를 만든 경우 실행합니다.
 - `background`를 생략하거나 `false`로 두면 체인 완료 뒤 단계 라벨과 완료/실패/완료+오류 요약을 포함한 체인 결과 래퍼를 반환합니다.
 - `background: true`면 호출은 즉시 반환되고, 최종 결과는 나중에 steer 메시지로 도착합니다.
 
 순차 단계 필드:
 
+- `type: "chain"` — 선택적 순차 단계 discriminator. 생략해도 같은 순차 단계입니다.
 - `label` — 선택적 단계 이름. 라벨을 쓰는 경우 중복될 수 없습니다.
 - `agent` — 하위 에이전트 이름
 - `task` — 작업 프롬프트
@@ -176,9 +178,11 @@ root parent Pi에서는 LLM tool schema를 늘리지 않는 단일 slash command
 
 ### 선택적 generic presence
 
-root parent는 같은 Pi process의 선택 consumer를 위해 `pi-presence:update:v1`을 발행합니다. `pi-cmux-presence`를 설치·로드했을 때만 그 package가 이를 소비해 UI를 갱신할 수 있으며, 설치하지 않아도 subagent 결과·취소·lease·reaper·cleanup은 같습니다. producer는 cmux CLI나 control socket을 사용하지 않고 `usage`/token/cost/context-percent, task, prompt, raw output, 경로, credential, raw title과 private target ID를 발행하지 않습니다.
+root parent는 같은 Pi process의 선택 consumer를 위해 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 열린 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신합니다. `pi-cmux-presence`를 설치·로드했을 때만 그 package가 이를 소비해 UI를 갱신할 수 있으며, 설치하지 않아도 subagent 결과·취소·lease·reaper·cleanup은 같습니다. producer는 cmux CLI나 control socket을 사용하지 않고 `usage`/token/cost/context-percent, task, prompt, raw output, 경로, credential, raw title과 private target ID를 update/remove에 발행하지 않습니다.
 
-presence progress는 structured details와 호출 형태의 알려진 work count에서만 계산합니다. 단일 호출은 실행 중 `0/1`, 병렬은 `results`의 terminal 수/전체 작업 수, 체인은 terminal·skipped·failed·completed-with-errors stage 수/전체 stage 수를 사용합니다. terminal update에서는 active progress를 생략해 consumer가 progress 슬롯을 정리합니다. terminal count는 UX recent history가 pruning된 뒤에도 session 동안 누적됩니다. consumer의 `pi-presence:ready:v1` 요청에는 마지막 snapshot을 replay할 수 있지만 replay `attention`은 항상 `none`입니다. observer/UI 오류는 실행 상태나 lifecycle authority를 바꾸지 않습니다. wire contract와 child profile 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
+producer는 초기 idle에는 event를 발행하지 않고 active·queued 집계 또는 새 terminal invocation에서 source를 엽니다. update/remove는 session/generation의 단조 증가 sequence fence를 공유합니다. parent의 idle `agent_settled`에서 aggregate가 quiescent이면 마지막 terminal update 뒤 remove하며, background·queued·interactive work가 남으면 quiescent snapshot까지 철회를 보류합니다. user ownership의 `detached` interactive surface는 active 집계에서 제외하지만 `kept`·`transferring`·`ownership-unknown`은 보수적으로 유지합니다. 새 parent `agent_start`는 이전 run의 보류 철회를 해제합니다. remove 전에 cached snapshot을 비우므로 이후 `ready`가 stale state를 replay하지 않으며, 다음 burst는 더 높은 sequence update로 다시 열립니다. terminal count는 UX recent history가 pruning된 뒤에도 session 동안 누적됩니다. `stop`, session shutdown, reload도 열린 상태의 best-effort remove를 시도합니다.
+
+presence progress는 structured details와 호출 형태의 알려진 work count에서만 계산합니다. 단일 호출은 실행 중 `0/1`, 병렬은 `results`의 terminal 수/전체 작업 수, 체인은 terminal·skipped·failed·completed-with-errors stage 수/전체 stage 수를 사용합니다. terminal update에서는 active progress를 생략해 consumer가 progress 슬롯을 정리합니다. consumer의 `pi-presence:ready:v1` 요청에는 열린 마지막 snapshot만 replay할 수 있고 replay `attention`은 항상 `none`입니다. exact `pi-cmux-presence` consumer의 `presence-remove-v1` 광고를 현재 session에서 관측했는지는 `/subagents doctor`에서 진단할 수 있지만 update/remove를 gate하지 않습니다. `not observed`는 session-start 순서상 ready를 놓친 경우도 포함하므로 consumer 부재를 증명하지 않습니다. remove는 observer withdrawal일 뿐 cancellation이나 cleanup authority가 아니며 observer/UI 오류도 실행 상태나 lifecycle authority를 바꾸지 않습니다. remove를 모르는 이전 consumer는 이를 무시해 마지막 update를 기존처럼 retained할 수 있습니다. notification 의미와 exact `pi-subagent` remove 때 terminal baseline·보류 burst 초기화 및 parent fallback은 consumer가 소유합니다. wire contract와 child profile 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 권장 패턴
 

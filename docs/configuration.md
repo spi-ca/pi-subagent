@@ -152,7 +152,9 @@ pi --subagent-max-depth 3 --no-subagent-prevent-cycles
 
 managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이나 활성 Pi built-in override를 보존할 수 없으면 조용히 좁히지 않고 launch 전에 오류로 끝냅니다. 이름이 같은 inherited `subagent` 도구는 nested delegation authority를 이 패키지 하나로 고정하기 위해 의도적으로 이 패키지의 구현으로 대체합니다. CLI API-key용 private agent-dir overlay도 managed에서는 agents/skills/prompts/themes와 data 설정만 bounded snapshot으로 복제하고 extension/package cache는 상속하지 않습니다. 설정하지 않거나 빈 값이면 `inherit`이고, 값 앞뒤 공백은 제거한 뒤 `inherit` 또는 `managed`만 허용하며 nested child에 그대로 전달됩니다. 이 정책은 terminal/backend가 아니라 child extension registry를 제어하므로 inline, cmux, tmux child에 동일하게 적용됩니다.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1` producer를 만들며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
+부모 CLI의 `--api-key` 값은 child argv에 그대로 전달하지 않습니다. 명시한 parent `--provider`, fully-qualified parent model, 또는 허용된 agent model에서 provider를 결정해 provider별 API-key 환경 변수로 매핑하고 private agent-dir overlay를 통해 전달합니다. parent provider와 parent/child model provider가 충돌하거나 provider가 없거나 지원 매핑이 없으면 key 전달을 생략하고 경고하며, 기존 provider별 환경 변수나 다른 auth는 그대로 사용할 수 있습니다. user agent model은 provider hint로 사용할 수 있지만 project agent model은 현재 exact project root가 신뢰된 경우에만 사용합니다. 확실한 상속이 필요하면 지원되는 `--provider` 또는 `provider/model` 형식의 `--model`을 명시하고 서로 일치시키세요.
+
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1`/`pi-presence:remove:v1` producer를 만들고 `pi-presence:ready:v1`을 수신하며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 컨텍스트 모드
 
@@ -319,6 +321,11 @@ Pi의 boolean 프로젝트 신뢰 상태를 broad prefix 신뢰로 사용하지 
 - `PI_OFFLINE` — 하위 에이전트에서 업데이트 확인, 패키지 업데이트 확인, install/update telemetry 같은 Pi 시작 시 네트워크 작업을 건너뛰도록 설정되는 Pi 런타임 플래그
 - `PI_SUBAGENT_RUN_STATE_DIR` — interactive pane run artifact root override. 기본값은 `${TMPDIR}/pi-subagent-runs-<uid>`입니다. root에는 immutable `state-root-marker.json`, 각 run에는 immutable `run-directory-marker.json`이 필요하며 둘 다 owner-only regular `0600` JSON marker입니다. 빈 private root만 초기화할 수 있습니다. marker 없는 기존 nonempty override/default root는 보수적으로 거부·보존하며 reaper가 검사·삭제하지 않습니다.
 - `PI_SUBAGENT_RUN_ID`, `PI_SUBAGENT_RUN_STATE_PATH`, `PI_SUBAGENT_RUN_COMPLETION_PATH`, `PI_SUBAGENT_PARENT_LEASE_PATH`, `PI_SUBAGENT_CHILD_SESSION_PATH`, `PI_SUBAGENT_RUN_OWNERSHIP` — parent와 child bridge 사이의 내부 lifecycle protocol
+- `PI_SUBAGENT_COMPLETION_FENCE_PATH`, `PI_SUBAGENT_COMPLETION_FENCE_ACK_PATH`, `PI_SUBAGENT_COMPLETION_FENCE_NONCE` — parent/child completion boundary를 exact run nonce에 결속하는 transient fence/ACK authority
+- `PI_SUBAGENT_PROMOTION_REQUEST_PATH`, `PI_SUBAGENT_PROMOTION_ACK_PATH` — current child에만 주입하는 immutable ownership-transfer request/ACK 경로; descendant에 상속하지 않음
+- `PI_SUBAGENT_FORK_BOOTSTRAP_PATH` — child bridge가 agent 입력 전에 소비하는 immutable fork descriptor 경로
+- `PI_SUBAGENT_EXPECTED_PARENT_PID`, `PI_SUBAGENT_EXPECTED_PARENT_STARTED_AT` — committed launch intent에 결속된 immutable parent process identity
+- `PI_SUBAGENT_LIFECYCLE_SOCKET_PATH`, `PI_SUBAGENT_LIFECYCLE_TOKEN_PATH` — private lifecycle socket과 transient bootstrap token artifact 경로; token은 첫 연결 전에 소비·삭제
 - `PI_SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY=v1`, `PI_SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY=v1` — 새 parent가 launch마다 exact `v1`만 주입하고 inherited value를 제거하는 parent-issued 내부 non-user capability; 각각 failure boundary와 final-assistant 뒤 linked metadata-tail success boundary를 협상
 - `PI_SUBAGENT_LEASE_STALE_MS`, `PI_SUBAGENT_LEASE_CHECK_MS` — parent lease 만료·검사 간격의 내부 값
 - `PI_SUBAGENT_BROKER_RUNTIME` — V2 broker runtime override. 비어 있지 않으면 해당 executable을 사용하고, 비어 있거나 미설정이면 `PATH`에서 `bun` 후 `node`를 탐색

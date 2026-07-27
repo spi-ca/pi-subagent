@@ -94,13 +94,35 @@ bun run benchmark:phase7:record-local
 
 ### Generic presence producer 집중 검증
 
-root-only presence producer의 wire DTO, session/generation fence, `ready` replay의 `attention: "none"`, cumulative terminal count와 observer failure 격리는 다음 focused test로 확인합니다.
+root-only presence producer의 wire DTO, session/generation fence, frozen start discovery request와 exact self 차단, consumer advertisement의 passive zero-replay, consumer-less request의 one-replay(`attention: "none"`), cumulative terminal count와 observer failure 격리는 다음 focused test로 확인합니다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts
 ```
 
 그 뒤 baseline은 `bun run ci`입니다. 이 non-live 범위는 별도 `pi-cmux-presence` package의 실제 consumer 또는 live cmux E2E 조합을 증명하지 않습니다. producer는 dependency 없이 duplicated wire contract를 유지하고, cmux CLI/socket mutation이나 lifecycle authority를 갖지 않습니다.
+
+### `pi-cmux-presence` 교차 live smoke
+
+아래 smoke는 provider, child Pi, prompt, task/raw output, credential을 만들거나 전송하지 않습니다. `pi-subagent`의 고정 aggregate snapshot과 sibling `pi-cmux-presence`의 **실제** extension consumer를 같은 process-local event bus에 연결하고, 실제 cmux Unix socket/sidebar만 확인합니다. 일반 CI에는 넣지 않습니다.
+
+```bash
+# non-mutating: gate, 파일, cmux 또는 socket을 검사하거나 workspace를 만들지 않음
+bun run acceptance:cmux-presence:dry-run
+
+# cmux 안에서만 명시적으로 실행. script가 mutation/trust gate를 설정하지 않는다.
+# 동적 sibling import는 trusted code 실행이며 sandbox나 credential 격리가 아니다.
+PI_SUBAGENT_LIVE_CMUX_PRESENCE=1 \
+PI_SUBAGENT_CMUX_PRESENCE_TRUST=1 \
+bun run acceptance:cmux-presence
+# sibling checkout이 인접 경로가 아닐 때만 canonical absolute path를 명시한다.
+PI_SUBAGENT_LIVE_CMUX_PRESENCE=1 \
+PI_SUBAGENT_CMUX_PRESENCE_TRUST=1 \
+PI_SUBAGENT_CMUX_PRESENCE_ROOT=/absolute/path/to/pi-cmux-presence \
+bun run acceptance:cmux-presence
+```
+
+live는 canonical caller workspace/surface, harness minimum 이상의 stable cmux, package backend resolver가 찾은 실제 executable, consumer의 owner-only socket 검사를 모두 요구합니다. sibling을 동적으로 import하려면 별도 `PI_SUBAGENT_CMUX_PRESENCE_TRUST=1` 확인, filesystem root부터 checkout까지의 canonical ancestor trust gate(실제 directory·no symlink·현재 uid/root 소유·non-group/world-writable), 정확한 `name: "pi-cmux-presence"`, 그리고 명시 allowlist의 `package.json`·`index.ts`·현재 필요한 `src/*.ts`만 same-handle/no-follow 검증으로 private snapshot에 복사하는 절차가 필요합니다. snapshot manifest SHA-256 summary만 evidence에 남기며 import는 mutable sibling이 아닌 이 private snapshot에서만 수행합니다. 이는 local replacement 위험을 줄이지만 sandbox가 아니므로 trusted sibling code는 여전히 full authority로 개발자 파일과 환경에 접근할 수 있고 credential 격리를 주장하지 않습니다. private `0700` root와 caller와 ID가 겹치지 않는 singleton disposable workspace만 만들며, running의 정확한 `pi-subagent` status key/label과 terminal remove 뒤 key 부재를 `cmux list-status`의 strict parser로 poll합니다. 모든 cmux command는 timeout과 stdout/stderr byte cap을 넘으면 kill되어 unknown failure가 됩니다. native lifecycle/progress/notification/flash/log/feed/meta/auto-title/resume fallback과 consumer profile toggle을 모두 sanitize한 뒤 sidebar만 남기고 정확히 복원합니다. producer stop, consumer `session_shutdown`, key별 environment 복원, socket identity, caller 보존, reconcile된 singleton workspace close proof 중 하나라도 불명확하면 root/evidence를 남기고 실패합니다. fake/synthetic Pi lifecycle·event bus·package loader를 사용하지만 실제 consumer/socket/cmux status를 확인하며, 실제 Pi loader는 범위 밖입니다. 이것은 provider/child 실행이나 일반 Pi session 전체를 검증하지 않습니다.
 
 ### Issue #24 완료: interactive completion boundary 집중 검증
 

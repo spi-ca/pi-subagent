@@ -2,7 +2,7 @@
 
 > **상태:** generic presence lifecycle producer 구현됨
 
-root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`과 `pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1`을 수신하는 **producer**를 구현했다. `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비하는 별도 package다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
+root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`과 `pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1`을 송수신하는 **producer**를 구현했다. `pi-cmux-presence`는 설치·로드되었을 때 이를 선택적으로 소비하는 별도 package다. 두 패키지 사이에는 package dependency, socket/CLI 호출, lifecycle authority 공유가 없다.
 
 `pi-cmux-presence`는 surface별 sidebar·log·사용자 command를 제공하는 [`pi-cmux`](./pi-cmux-integration.md)와도 다르며, 두 optional package는 함께 설치·로드될 수 있다. `pi-cmux`는 generic presence event consumer가 아니고, 어느 package도 다른 쪽의 설치 조건, lifecycle authority 또는 내부 API가 아니다. 이 문서는 `pi-subagent`가 복제해 구현한 wire DTO와 producer 경계를 설명한다. presence consumer의 canonical 입력 계약은 별도 `pi-cmux-presence` 저장소의 `docs/event-contract.md`가 소유한다.
 
@@ -23,14 +23,16 @@ root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`과 `p
 | --- | --- | --- |
 | `pi-presence:update:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | 열린 현재 session의 subagent 집계 snapshot |
 | `pi-presence:remove:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | source의 retained observer 상태 철회 |
-| `pi-presence:ready:v1` | 선택 consumer → `pi-subagent` | 열린 현재 snapshot의 replay 요청 및 passive consumer advertisement |
+| `pi-presence:ready:v1` | producer ↔ 선택 consumer | consumer-less replay 요청과 consumer advertisement/응답 |
 | `pi-subagent:dashboard:v1` | `pi-subagent` → 외부 선택 consumer | 기존 active/dashboard contract |
 | `pi-subagent:aggregate-completed:v1` | `pi-subagent` → 외부 선택 consumer | 기존 terminal invocation 알림 |
 | `pi-subagent:detached:v1` | `pi-subagent` → 외부 선택 consumer | 기존 durable promotion 알림 |
 
 presence producer는 root parent(depth `0`)의 `session_start`에서 session ID와 UX generation으로 시작하고 `session_shutdown`에서 listener를 해제한다. nested child는 producer를 만들지 않는다. 초기 빈 idle snapshot은 발행하지 않는 lazy producer이며, active·queued 집계가 생기거나 새 terminal invocation을 관측할 때만 source를 연다. session 전환 뒤 이전 실행의 active aggregate가 남아 새 source가 열리면 idle session-start에서 즉시 deferred settlement로 표시해 aggregate가 quiescent해지는 snapshot에서 철회한다. `update`와 `remove`는 같은 producer-owned generation/단조 증가 sequence fence를 공유한다.
 
-같은 session/generation의 열린 마지막 update가 있을 때만 동일 session ID의 valid `ready` 요청에 새 `sequence`를 붙여 replay한다. replay의 `attention`은 항상 `"none"`이며, 아직 snapshot이 없거나 이미 remove한 source이거나 session/generation이 다르면 아무 것도 발행하지 않는다. `ready.consumer.id === "pi-cmux-presence"`이고 capabilities에 `"cmux-status"`가 있을 때의 감지는 한 session에 한 번인 passive UI-routing hint일 뿐이다. 같은 exact consumer가 `"presence-remove-v1"`을 광고한 ready를 관측했는지는 session 동안 별도로 기억해 `/subagents doctor`의 `presence remove capability` 진단에만 표시한다. session-start handler 순서 때문에 광고를 놓칠 수 있으므로 음성 결과는 `not observed`이지 consumer 부재의 증명이 아니다. 이 감지는 update/remove 발행을 gate하지 않으며 실행 policy, child profile, completion 또는 cleanup 권한을 바꾸지 않는다.
+`session_start`에서 producer는 먼저 session-scoped `ready` listener를 설치한 뒤, consumer 없이 정확히 `{ "version": 1, "sessionId": "…" }`인 immutable strict `ready` 요청을 한 번 발행한다. 이미 로드된 compliant v1 consumer는 그 요청에 자신의 consumer advertisement로 동기 또는 비동기로 응답할 수 있다. 나중에 시작한 consumer도 먼저 advertisement를 발행한 뒤, **자신의** consumer-less request를 한 번 발행해 현재 producer를 발견·replay시킨다. `pi.events`의 동기 self-delivery에서는 producer가 **자신이 발행한 바로 그 consumer-less request 객체만** 좁게 무시한다. request 도중 도착하는 별도 consumer-bearing 응답은 계속 처리해 capability 진단과 passive routing hint를 갱신하지만 replay는 일으키지 않는다. 이후 외부의 legacy consumer-less `ready` 요청도 계속 현재 상태를 replay한다.
+
+같은 session/generation의 열린 마지막 update가 있을 때만 동일 session ID의 valid **consumer-less** `ready` 요청에 새 `sequence`를 붙여 replay한다. consumer-bearing advertisement는 현재 presence를 replay하지 않는 passive diagnostics/routing traffic이다. replay의 `attention`은 항상 `"none"`이며, 아직 snapshot이 없거나 이미 remove한 source이거나 session/generation이 다르면 아무 것도 발행하지 않는다. `ready.consumer.id === "pi-cmux-presence"`이고 capabilities에 `"cmux-status"`가 있을 때의 감지는 한 session에 한 번인 passive UI-routing hint일 뿐이다. 같은 exact consumer가 `"presence-remove-v1"`을 광고한 ready를 관측했는지는 session 동안 별도로 기억해 `/subagents doctor`의 `presence remove capability` 진단에만 표시한다. `not observed`는 valid consumer response/advertisement를 관측하지 못했다는 뜻이다. compliant v1 responder라면 이 request/response와 나중 consumer의 request로 load-order race를 줄이지만, 이전 consumer는 요청에 응답하지 않을 수 있다. 호환성을 위해 producer는 capability 관측 여부로 update/remove 또는 consumer-less replay를 gate하지 않으며 실행 policy, child profile, completion 또는 cleanup 권한을 바꾸지 않는다.
 
 ## 3. 복제한 `v1` wire contract
 
@@ -74,13 +76,24 @@ remove를 모르는 이전 consumer는 event를 구독하지 않아 무시하므
 
 ## 7. 검증 범위
 
-`pi-subagent`에서 다음 focused test는 strict update/remove/ready parsing, shared session/generation/sequence fence, lazy open, attention 없는 replay, `agent_settled` remove 및 queued/interactive deferred withdrawal, stale replay 차단, reload/session teardown withdrawal, queued-only `waiting`, foreground/background terminal attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
+`pi-subagent`에서 다음 focused test는 strict update/remove/ready parsing, producer-first/consumer-first ready request·response, frozen exact-self request 차단, advertisement의 zero-replay와 consumer-less request의 one-replay, multi-producer duplicate-amplification 차단, shared session/generation/sequence fence, lazy open, attention 없는 replay, `agent_settled` remove 및 queued/interactive deferred withdrawal, stale replay 차단, reload/session teardown withdrawal, queued-only `waiting`, foreground/background terminal attention, pruning 뒤 terminal 누적과 observer failure 격리를 확인한다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts
 ```
 
 `bun run ci`는 type check와 전체 테스트를 실행한다. 이 focused/unit 범위와 baseline CI는 별도 `pi-cmux-presence` package의 소비 구현이나 live cmux E2E 조합을 증명하지 않는다.
+
+별도 opt-in 교차 smoke는 다음처럼 실행한다.
+
+```bash
+bun run acceptance:cmux-presence:dry-run
+PI_SUBAGENT_LIVE_CMUX_PRESENCE=1 \
+PI_SUBAGENT_CMUX_PRESENCE_TRUST=1 \
+bun run acceptance:cmux-presence
+```
+
+script는 live mutation gate나 dynamic-import trust gate를 대신 설정하지 않는다. live는 sibling `pi-cmux-presence`의 실제 entrypoint/consumer와 consumer의 Unix socket 검사를 동적으로 사용하지만 package dependency를 추가하지 않는다. 이 import는 trusted code 실행이므로 `PI_SUBAGENT_CMUX_PRESENCE_TRUST=1`을 별도로 요구한다. filesystem root부터 checkout까지 canonical ancestor가 실제 directory·no symlink·현재 uid/root 소유·non-group/world-writable인지 trust gate로 확인하고, 정확한 package name `pi-cmux-presence` 및 명시 allowlist의 `package.json`·`index.ts`·필요한 모든 `src/*.ts`를 same-handle/no-follow로 검증한 bytes만 private `0700` snapshot에 `0600` 파일로 stage한다. evidence에는 source 내용 없이 deterministic SHA-256 manifest summary만 남기며 mutable sibling path는 import하지 않는다. 이것은 local replacement 위험을 줄이지만 sandbox 또는 credential 격리가 아니며 trusted code는 여전히 full authority로 개발자 파일과 환경에 접근할 수 있다. canonical cmux caller와 caller-disjoint disposable workspace에서 고정 provider-free snapshot의 exact `pi-subagent` running status와 `remove` 뒤 strict `list-status` key 부재만 확인한다. 모든 cmux command는 timeout과 stdout/stderr byte cap을 적용하며 cap/timeout은 unknown failure다. native lifecycle/progress/notification/flash/log/feed/meta/auto-title/resume fallback 및 consumer profile toggle을 sanitize하고 key별로 복원한 뒤 sidebar만 사용한다. fake/synthetic Pi lifecycle, event bus, package loader를 사용하지만 실제 consumer/socket/cmux status를 확인한다. 실제 Pi loader는 범위 밖이다. provider 호출, child Pi, prompt/task/raw output/credential 전송, 일반 Pi session 및 consumer의 전체 notification policy는 범위 밖이다. malformed `list-status`, producer stop, consumer shutdown, environment/socket/caller proof 또는 reconcile된 singleton workspace close proof 실패는 absence/cleanup 성공으로 간주하지 않고 private evidence root를 남긴다. 인접 sibling checkout이 없으면 `PI_SUBAGENT_CMUX_PRESENCE_ROOT=/absolute/path/to/pi-cmux-presence`에 canonical absolute path를 명시한다.
 
 관련 구현 근거:
 

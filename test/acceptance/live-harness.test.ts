@@ -114,9 +114,9 @@ describe("live acceptance harness safety guards", () => {
   test("injected X or unknown states never authorize any fixture lifecycle signal", async () => {
     if (process.platform === "win32") return;
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fixture-state-"));
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
     try {
-      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "injected-state" };
+      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "injected-state" };
       const paths = await prepareRunArtifactPaths({ rootDir: root, runId: identity.runId });
       for (const probe of [() => ({ state: "present" as const, value: "X" }), () => ({ state: "unknown" as const })]) {
         assert.throws(() => safeSignalFixture(identity, "SIGKILL", probe), /refusing to signal/);
@@ -151,7 +151,7 @@ describe("live acceptance harness safety guards", () => {
   test("unknown or mismatched identities never authorize fixture signals or cleanup", async () => {
     if (process.platform === "win32") return;
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fixture-identity-"));
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
     try {
       const paths = await prepareRunArtifactPaths({ rootDir: root, runId: "unknown-identity" });
       const mismatched = { pid: child.pid!, startedAt: -1, expectedCommand: "not-this-child", runId: "unknown-identity" };
@@ -169,8 +169,8 @@ describe("live acceptance harness safety guards", () => {
 
   test("resumes only an identity-bound OS-stopped dedicated process", { timeout: 10_000 }, async () => {
     if (process.platform === "win32") return;
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
-    const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "test" };
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
+    const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "test" };
     try {
       child.kill("SIGSTOP");
       await waitForCondition(() => isIdentityStopped(identity), "resumable child stop");
@@ -184,14 +184,21 @@ describe("live acceptance harness safety guards", () => {
 
   test("awaits an identity-verified fixture SIGKILL termination before broker resume", async () => {
     if (process.platform === "win32") return;
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
-    const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "termination" };
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
+    const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "termination" };
     try {
       safeSignalFixture(identity);
       assert.equal(await awaitOwnedIdentityTermination(identity), true);
     } finally {
       if (child.exitCode === null) child.kill("SIGKILL");
     }
+  });
+
+  test("does not fail the pre-allocation parent termination fence on a transient unknown ps probe", async () => {
+    let probes = 0;
+    const identity = { pid: process.pid, startedAt: getProcessStartedAt(process.pid)!, expectedCommand: "bun", runId: "termination-race" };
+    assert.equal(await awaitOwnedIdentityTermination(identity, () => ++probes === 1 ? { state: "unknown" } : { state: "absent" }), true);
+    assert.equal(probes, 2);
   });
 
   test("accepts stable cmux minimum and higher releases only", () => {
@@ -205,10 +212,13 @@ describe("live acceptance harness safety guards", () => {
     assert.equal(parseRequiredCmuxVersion("cmux 0.64.20 (dev)"), null);
   });
 
-  test("treats failed tmux list-panes probes as unknown, never target absence", () => {
+  test("uses a strict full tmux pane list before proving target absence", () => {
     const pair = { id: "%7", pid: 42 };
-    assert.equal(parseTmuxPanePairProbe({ code: 0, stdout: "%7\t42\n" }, pair), "present");
-    assert.equal(parseTmuxPanePairProbe({ code: 0, stdout: "%8\t43\n" }, pair), "absent");
+    assert.equal(parseTmuxPanePairProbe({ code: 0, stdout: "%7|42\n" }, pair), "present");
+    assert.equal(parseTmuxPanePairProbe({ code: 0, stdout: "%8|43\n" }, pair), "absent");
+    for (const stdout of ["%8|43", "%8|43|extra\n", "%8|43\n%8|44\n", "%8|43\r\n", "%8|43\0\n", "%8|bad\n", "%8\t43\n"]) {
+      assert.equal(parseTmuxPanePairProbe({ code: 0, stdout }, pair), "unknown");
+    }
     assert.equal(parseTmuxPanePairProbe({ code: 1, stdout: "" }, pair), "unknown");
   });
 
@@ -271,9 +281,9 @@ describe("live acceptance harness safety guards", () => {
   test("SIGKILLs only the identity-verified stopped pre-allocation broker", { timeout: 35_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fixture-stopped-"));
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
     try {
-      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "stopped-preallocation" };
+      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "stopped-preallocation" };
       const paths = await prepareRunArtifactPaths({ rootDir: root, runId: identity.runId });
       await fs.promises.writeFile(paths.launchIntentPath, `${JSON.stringify({ runId: identity.runId })}\n`, { mode: 0o600 });
       await fs.promises.writeFile(paths.brokerStatusPath, `${JSON.stringify({ runId: identity.runId, writer: "broker", pid: identity.pid, phase: "ready" })}\n`, { mode: 0o600 });
@@ -310,9 +320,9 @@ describe("live acceptance harness safety guards", () => {
   test("does not signal a non-stopped broker without durable reconciliation", async () => {
     if (process.platform === "win32") return;
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fixture-running-"));
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
     try {
-      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "running-preallocation" };
+      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "running-preallocation" };
       const paths = await prepareRunArtifactPaths({ rootDir: root, runId: identity.runId });
       await fs.promises.writeFile(paths.launchIntentPath, `${JSON.stringify({ runId: identity.runId })}\n`, { mode: 0o600 });
       await fs.promises.writeFile(paths.brokerStatusPath, `${JSON.stringify({ runId: identity.runId, writer: "broker", pid: identity.pid, phase: "ready" })}\n`, { mode: 0o600 });
@@ -327,16 +337,16 @@ describe("live acceptance harness safety guards", () => {
   test("retains root cleanup authority while an identity-verified broker is alive after durable allocation", async () => {
     if (process.platform === "win32") return;
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fixture-reconcile-"));
-    const child = spawn("/bin/sh", ["-c", "exec sleep 30"], { stdio: "ignore" });
+    const child = spawn("/bin/sh", ["-c", "exec /bin/sleep 30"], { stdio: "ignore" });
     try {
-      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "sleep 30", runId: "durable-allocation" };
+      const identity = { pid: child.pid!, startedAt: await waitForStartedAt(child.pid!), expectedCommand: "/bin/sleep 30", runId: "durable-allocation" };
       const paths = await prepareRunArtifactPaths({ rootDir: root, runId: identity.runId });
       await fs.promises.writeFile(paths.allocationPath, `${JSON.stringify({ version: 2, runId: identity.runId, terminalMode: "tmux-pane", target: { paneId: "%1", serverPid: 1, panePid: 2 }, allocatedAt: 1 })}\n`, { mode: 0o600 });
       const reconciliation = await reconcileFixtureBroker({ broker: identity, paths });
       assert.deepEqual(reconciliation, { state: "alive-with-allocation", allocationPublished: true, canFinishCleanup: false });
       assert.doesNotThrow(() => process.kill(identity.pid, 0));
     } finally {
-      if (child.pid) assert.equal(await terminateOwnedIdentity({ pid: child.pid, startedAt: await waitForStartedAt(child.pid), expectedCommand: "sleep 30", runId: "durable-allocation" }), true);
+      if (child.pid) assert.equal(await terminateOwnedIdentity({ pid: child.pid, startedAt: await waitForStartedAt(child.pid), expectedCommand: "/bin/sleep 30", runId: "durable-allocation" }), true);
       await fs.promises.rm(root, { recursive: true, force: true });
     }
   });

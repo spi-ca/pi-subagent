@@ -11,12 +11,15 @@ import {
   claimLiveCheckpoint, cleanupPhase0ReleaseWriters, formatPhase0FailureSummary, PHASE0_FAILURE_SUMMARY_FILE, resolveLiveBackendExecutable, resolveLivePiExecutable, revalidateStagedLivePiBundle, scrubSensitiveRecoveryArtifacts, stageLivePiExecutable, validatePhase0FailureSummary, writeLiveCheckpoint, writePhase0FailureSummary, type CellEvidence, type LiveEvidence, type LivePiExecutable, type Phase0ReleaseWriter,
 } from "./performance-phase0-live/evidence";
 import { getProcessStartedAt } from "../../src/runtime/run-protocol";
+import { inspectTmuxPane } from "../../src/runtime/tmux";
+import { buildTmuxSourcePaneProbeArgs, parseTmuxSourcePaneProbe } from "../../src/runtime/runner";
+import { createTmuxControlTransportGate } from "../../src/runtime/tmux-control-gate";
 import { validateSubagentInvocation } from "../../src/core/subagent-config";
 import { MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV, captureManagedChildLivePiExecutableGeneration, captureManagedChildPiExecutableGeneration } from "./managed-child-pi-executable";
-import { Phase0CellFailure, Phase0LiveDiagnosticWatchdog, Phase0LiveMilestoneTracker, attemptPhase0CleanupSteps, awaitExactBootstrapWatchdogDisarm, buildSyntheticParentEnv, discoverExactBootstrapWatchdog, finalizePhase0CellFailure, phase0ChildTerminalFailure, phase0FailureCategory, phase0WrapperFallbackSummary, prepareAgentDirectory, processRows, runParentCell, terminateExactBootstrapAuthority, terminateExactPhase0Identities } from "./performance-phase0-live/cell";
+import { Phase0BlindStageTerminalObserver, Phase0CellFailure, Phase0LiveDiagnosticWatchdog, Phase0LiveMilestoneTracker, attemptPhase0CleanupSteps, awaitExactBootstrapWatchdogDisarm, awaitPhase0PreReadLifecycle, buildSyntheticParentEnv, discoverExactBootstrapWatchdog, finalizePhase0CellFailure, phase0ChildTerminalFailure, phase0FailureCategory, phase0WrapperFallbackSummary, prepareAgentDirectory, processRows, runParentCell, terminateExactBootstrapAuthority, terminateExactPhase0Identities } from "./performance-phase0-live/cell";
 import { currentLiveSourceIdentity, executeLiveBenchmark, executeLiveSmoke, recordLiveFixture, type LiveBenchmarkTestHooks } from "./performance-phase0-live";
 import { aggregateCmuxCleanupAttempts, CMUX_CLEANUP_DEADLINE_MS, createCmuxCleanupDeadline, withCmuxCleanupDeadline } from "./performance-phase0-live/cmux-fixture";
-import { teardownIdentityBoundTmuxServer } from "./performance-phase0-live/tmux-fixture";
+import { runTmuxCell, teardownIdentityBoundTmuxServer, TMUX_FIXTURE_SAFE_PATH, tmuxFixtureSetupEnv } from "./performance-phase0-live/tmux-fixture";
 
 const fixtureGeneration = { executable: "/fixture/pi", dev: 1, ino: 1, size: 1, mtimeMs: 1, ctimeMs: 1, mode: 0o700, uid: 1, nativeExecutable: true };
 const fixturePi: LivePiExecutable = { bin: "/fixture/pi", version: "0.81.1", generation: fixtureGeneration, tmux: fixtureGeneration, cmux: fixtureGeneration };
@@ -241,6 +244,109 @@ describe("two-tier gated Phase 0 live harness", () => {
     now = 5; noisy.observeJsonl(pauseAndStatus); assert.equal(watchdog.tick(), null);
     now = 10; noisy.observeJsonl(pauseAndStatus); assert.match(watchdog.tick()?.message ?? "", /harness deadline exhausted/);
     assert.equal(noisy.summary().parentEventCount, 8);
+  });
+
+  test("fails a blind stage only for a bounded admitted terminal lifecycle event and retains no correlation data", async () => {
+    const observer = new Phase0BlindStageTerminalObserver(1);
+    const waiting = observer.waitForTerminal().then(() => "resolved", (error: unknown) => error);
+    const event = (value: unknown) => Buffer.from(`${JSON.stringify(value)}\n`);
+    // Malformed, unrelated, unadmitted, error, and nonterminal content cannot
+    // release the guard. The untrusted task/job text is never exposed by it.
+    observer.observeJsonl(Buffer.concat([
+      Buffer.from("{bad}\n"),
+      event({ type: "custom_message", customType: "subagent_result", details: { jobId: "SECRET_JOB", status: "failed", startedAt: 1, completedAt: 2 } }),
+      event({ type: "custom_message", customType: "unrelated", details: { jobId: "SECRET_JOB", status: "failed", startedAt: 1, completedAt: 2 } }),
+      event({ type: "tool_execution_start", toolName: "subagent", toolCallId: "launch", args: { background: true, tasks: [{ task: "SECRET_TASK" }] } }),
+      event({ type: "tool_execution_end", toolName: "subagent", toolCallId: "launch", isError: true, result: { details: { jobId: "SECRET_JOB" } } }),
+    ]));
+    assert.equal(await Promise.race([waiting, new Promise((resolve) => setTimeout(() => resolve("pending"), 10))]), "pending");
+    const launch = event({ type: "tool_execution_start", toolName: "subagent", toolCallId: "launch-accepted", args: { background: true, tasks: [{ task: "SECRET_TASK" }] } });
+    const admission = event({ type: "tool_execution_end", toolName: "subagent", toolCallId: "launch-accepted", isError: false, result: { details: { jobId: "SECRET_JOB" } } });
+    const terminal = event({ type: "custom_message", customType: "subagent_result", details: { jobId: "SECRET_JOB", status: "failed", startedAt: 1, completedAt: 2 }, content: "SECRET_TASK" });
+    // Split chunks exercise the incremental bounded JSONL parser.
+    observer.observeJsonl(launch); observer.observeJsonl(admission.subarray(0, 17)); observer.observeJsonl(Buffer.concat([admission.subarray(17), terminal]));
+    const error = await waiting;
+    assert.ok(error instanceof Error); assert.equal(error.message, "Phase 0 stage wait observed a terminal admitted subagent before authenticated read-start.");
+    assert.equal(error.message.includes("SECRET"), false);
+  });
+
+  test("keeps terminal lifecycle failure armed after topology until authenticated read-start", async () => {
+    let resolveTopology!: (value: "topology-ready") => void;
+    let rejectTerminal!: (error: Error) => void;
+    let abortObserved = false;
+    const topology = new Promise<"topology-ready">((resolve) => { resolveTopology = resolve; });
+    const terminal = new Promise<never>((_resolve, reject) => { rejectTerminal = reject; });
+    const milestone = new Promise<void>(() => undefined);
+    const readStarts = new Promise<readonly []>(() => undefined);
+    const waiting = awaitPhase0PreReadLifecycle(
+      async (signal) => { signal.addEventListener("abort", () => { abortObserved = true; }); return await topology; },
+      milestone,
+      readStarts,
+      terminal,
+      new Promise<never>(() => undefined),
+    );
+    resolveTopology("topology-ready");
+    await Promise.resolve();
+    rejectTerminal(new Error("terminal-after-topology"));
+    await assert.rejects(() => waiting, /terminal-after-topology/);
+    assert.equal(abortObserved, true);
+  });
+
+  test("uses a fixed hook-free tmux fixture setup environment", () => {
+    const setup = tmuxFixtureSetupEnv();
+    assert.deepEqual(setup, { PATH: TMUX_FIXTURE_SAFE_PATH, SHELL: "/bin/sh", HOME: "/tmp", TERM: "xterm-256color" });
+    assert.equal("BASH_ENV" in setup, false);
+    assert.equal("ENV" in setup, false);
+    assert.equal("TMUX" in setup, false);
+  });
+
+  const tmux37aFixtureTest = process.env.PI_SUBAGENT_REAL_TMUX_37A_FIXTURE === "1" ? test : test.skip;
+  tmux37aFixtureTest("gated provider-free tmux 3.7a fixture exercises production probe, gate, snapshot, and exact cleanup", { timeout: 20_000 }, async () => {
+    const requestedTmux = process.env.TMUX_BIN?.trim();
+    assert.ok(requestedTmux && path.isAbsolute(requestedTmux), "TMUX_BIN must explicitly select the 3.7a fixture executable");
+    const root = await createPrivateEvidenceRoot();
+    const tmux = captureManagedChildPiExecutableGeneration(requestedTmux!);
+    const pi: LivePiExecutable = { bin: "/fixture/no-provider", version: "0.81.1", generation: fixtureGeneration, tmux, cmux: fixtureGeneration };
+    const stages: string[] = []; let socketRoot = "";
+    const runTmux = async (args: string[]) => {
+      const result = await runPiStartup(tmux.executable, args, tmuxFixtureSetupEnv());
+      return { exitCode: result.code ?? 1, stdout: result.stdout, stderr: result.stderr };
+    };
+    try {
+      await assert.rejects(
+        () => runTmuxCell(root, "/fixture/no-provider-agent", "/fixture/no-provider-extension", pi, 1, "short-response", {
+          PATH: "/unsafe-caller-path", SHELL: "/unsafe-caller-shell", BASH_ENV: "/unsafe-hook", ENV: "/unsafe-hook", TMUX: "unsafe", TMUX_PANE: "%9",
+        }, {
+          afterBinding: async (stage, state) => {
+            stages.push(stage); socketRoot = state.socketRoot;
+            if (stage === "sentinel") throw new Error("provider-free fixture setup complete");
+            if (stage !== "source") return;
+            const version = await runTmux(["-V"]);
+            assert.equal(version.exitCode, 0); assert.equal(version.stdout.trim(), "tmux 3.7a");
+            const source = state.binding.expectedProcesses?.[0];
+            if (!source) throw new Error("fixture source process identity is unavailable");
+            const sourceProbe = await runTmux(buildTmuxSourcePaneProbeArgs(state.socket));
+            const sourcePaneId = sourceProbe.stdout.trim().split("|")[0];
+            assert.equal(sourceProbe.exitCode, 0); assert.ok(sourcePaneId && /^%[0-9]+$/.test(sourcePaneId));
+            assert.equal(parseTmuxSourcePaneProbe(sourceProbe.stdout, sourcePaneId), source.pid);
+            const gate = await createTmuxControlTransportGate({
+              runId: "tmux-37a-fixture", executable: tmux.executable, socketPath: state.socket,
+              sourcePaneId, serverStartedAt: state.binding.server.startedAt, run: runTmux,
+            });
+            assert.equal(gate.probeResult.detectedTmuxVersion, "3.7a");
+            const snapshot = await inspectTmuxPane({ paneId: sourcePaneId, panePid: source.pid, serverPid: state.binding.server.pid, socketPath: state.socket }, async (args) => {
+              const result = await runTmux(args); return { ...result, aborted: false };
+            });
+            assert.equal(snapshot?.exists, true); assert.equal(snapshot?.panePid, source.pid);
+          },
+        }),
+        (error: unknown) => error instanceof Phase0CellFailure,
+      );
+      assert.deepEqual(stages, ["creation", "source", "sentinel"]);
+      assert.equal(await fs.lstat(socketRoot).catch(() => null), null);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   test("retains only strict private sanitized failure summaries during recovery scrub", async () => {
@@ -574,7 +680,7 @@ describe("two-tier gated Phase 0 live harness", () => {
     ], (pid) => started.get(pid) ?? (pid === 44 ? 104 : null));
     assert.equal(ambiguous, null);
     const malformed = await discoverExactBootstrapWatchdog(parent, 0, () => [
-      { pid: watchdog.pid, ppid: parent.pid, command: "/bin/sh -p -c watchdog" }, { pid: sleepHelper.pid, ppid: watchdog.pid, command: "sleep 30" },
+      { pid: watchdog.pid, ppid: parent.pid, command: "/bin/sh -p -c watchdog" }, { pid: sleepHelper.pid, ppid: watchdog.pid, command: "/wrong/sleep 30" },
     ], (pid) => started.get(pid) ?? null);
     assert.equal(malformed, null);
     const binding = { watchdog, sleepHelper };

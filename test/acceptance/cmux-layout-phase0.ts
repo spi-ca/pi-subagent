@@ -304,7 +304,7 @@ async function live(): Promise<void> {
     if (!disjoint(second, caller)) throw new Error("new-surface overlaps caller identity");
 
     if ((await runCommand(cmux, ["send-key", "--workspace", second.workspaceId, "--surface", second.surfaceId, "escape"], evidence)).code !== 0) throw new Error("send-key capability probe failed");
-    if ((await runCommand(cmux, ["respawn-pane", "--workspace", second.workspaceId, "--surface", second.surfaceId, "--command", "exec sleep 600"], evidence)).code !== 0) throw new Error("harmless second-surface respawn failed");
+    if ((await runCommand(cmux, ["respawn-pane", "--workspace", second.workspaceId, "--surface", second.surfaceId, "--command", "exec /bin/sleep 600"], evidence)).code !== 0) throw new Error("harmless second-surface respawn failed");
 
     if ((await runCommand(cmux, ["close-surface", "--workspace", second.workspaceId, "--surface", second.surfaceId], evidence)).code !== 0) throw new Error("second surface close failed");
     const afterSecond = await readTopology(cmux, evidence);

@@ -50,6 +50,7 @@ function brokerEnvironment(mode: Spec["mode"]): NodeJS.ProcessEnv {
     ? ["CMUX_SOCKET_PATH", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH"]
     : ["TMUX", "TMUX_PANE"];
   for (const key of keys) if (typeof process.env[key] === "string") env[key] = process.env[key];
+  if (mode === "tmux-pane" && path.isAbsolute(spec.backend)) env.TMUX_BIN = spec.backend;
   return env;
 }
 
@@ -121,7 +122,7 @@ const intent = {
   runtimePath: spec.runtime, runtimeInterpreterPath: spec.runtimeInterpreter, backendPath: spec.backend, brokerEntrypoint: spec.brokerEntrypoint,
 };
 await writePrivateFile(paths.childSessionPath, "");
-await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${shellQuote(path.join(paths.runDir, "fixture-child-started"))}\nexec sleep 600\n`);
+await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\n/usr/bin/touch ${shellQuote(path.join(paths.runDir, "fixture-child-started"))}\nexec /bin/sleep 600\n`);
 if (await publishImmutableJson(paths.launchIntentPath, intent) !== "published") throw new Error("fixture intent publish failed");
 const lease = startParentLeaseWriter({ filePath: paths.parentLeasePath, runId, parentStartedAt, intervalMs: 100 });
 await lease.renew();

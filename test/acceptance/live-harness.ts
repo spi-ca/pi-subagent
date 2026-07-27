@@ -252,7 +252,7 @@ async function waitFor<T>(probe: () => Promise<T | null>, label: string, timeout
 }
 
 function parseTabPair(text: string, label: string): PaneIdentity {
-  const [id, pidText, ...extra] = text.trim().split("\t");
+  const [id, pidText, ...extra] = text.trim().split("|");
   const pid = Number(pidText);
   if (!id || extra.length || !/^[1-9][0-9]*$/.test(pidText ?? "") || !Number.isSafeInteger(pid)) throw new Error(`invalid ${label} identity`);
   return { id, pid };
@@ -316,7 +316,7 @@ function minimalBrokerEnv(mode: "tmux-pane" | "cmux-pane", base = process.env): 
   }
   const keys = mode === "cmux-pane"
     ? ["CMUX_SOCKET_PATH", "CMUX_SOCKET_CAPABILITY", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH"]
-    : ["TMUX", "TMUX_PANE"];
+    : ["TMUX", "TMUX_PANE", "TMUX_BIN"];
   for (const key of keys) if (typeof base[key] === "string") env[key] = base[key];
   return env;
 }
@@ -410,8 +410,10 @@ export function verifyFixtureTerminationState(identity: ProcessIdentity, statePr
 export async function awaitOwnedIdentityTermination(identity: ProcessIdentity, stateProbe: ProcessStateProbe = probeProcessState): Promise<boolean> {
   return await waitFor(async () => {
     const state = stateProbe(identity.pid);
-    // An unknown probe is not absence and cannot authorize later teardown.
-    if (state.state === "unknown") return false;
+    // An unknown probe is not absence and cannot authorize later teardown, but
+    // it can be a transient ps/child-reap race immediately after SIGKILL.
+    // Wait for observed absence/zombie rather than resuming the broker early.
+    if (state.state === "unknown") return null;
     if (isTerminalOwnedIdentity(identity, state)) return true;
     return verifyProcessIdentity(identity) ? null : false;
   }, "fixture process termination", 5_000).catch(() => false);
@@ -719,12 +721,23 @@ export function assertFixtureRunReaped(runId: string, result: Pick<Awaited<Retur
 export type TmuxPaneProbe = "present" | "absent" | "unknown";
 
 export function parseTmuxPanePairProbe(result: { code: number; stdout: string }, pair: PaneIdentity): TmuxPaneProbe {
-  if (result.code !== 0) return "unknown";
-  return result.stdout.split(/\r?\n/).includes(`${pair.id}\t${pair.pid}`) ? "present" : "absent";
+  if (result.code !== 0 || !result.stdout.endsWith("\n") || !/^%[0-9]+$/.test(pair.id) || !Number.isSafeInteger(pair.pid) || pair.pid <= 0) return "unknown";
+  const output = result.stdout.slice(0, -1);
+  // Exact complete-list parser: malformed unrelated rows cannot prove target
+  // absence, because cleanup authority must never rely on a partial response.
+  if (output.includes("\r") || output.includes("\0")) return "unknown";
+  const seen = new Set<string>();
+  for (const line of output ? output.split("\n") : []) {
+    const fields = line.split("|");
+    if (fields.length !== 2 || !/^%[0-9]+$/.test(fields[0]!) || !/^[1-9][0-9]*$/.test(fields[1]!) || !Number.isSafeInteger(Number(fields[1])) || seen.has(fields[0]!)) return "unknown";
+    seen.add(fields[0]!);
+    if (fields[0] === pair.id && Number(fields[1]) === pair.pid) return "present";
+  }
+  return "absent";
 }
 
 async function probeTmuxPanePair(tmux: string, socket: string, pair: PaneIdentity): Promise<TmuxPaneProbe> {
-  return parseTmuxPanePairProbe(await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]), pair);
+  return parseTmuxPanePairProbe(await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]), pair);
 }
 
 async function cleanupTmuxTarget(tmux: string, socket: string, target: TmuxTarget, source?: PaneIdentity): Promise<boolean> {
@@ -801,8 +814,8 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
     const runtime = brokerRuntime(), runtimeInterpreter = brokerRuntimeInterpreter(runtime);
     if ((await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-c", root, "exec /bin/sh"])).code !== 0) throw new Error("could not create isolated tmux server");
     serverStarted = true;
-    source = parseTabPair((await run(tmux, ["-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}\t#{pane_pid}"])).stdout, "source pane");
-    const sentinel = parseTabPair((await run(tmux, ["-S", socket, "split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", source.id, "exec sleep 600"])).stdout, "sentinel pane");
+    source = parseTabPair((await run(tmux, ["-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}|#{pane_pid}"])).stdout, "source pane");
+    const sentinel = parseTabPair((await run(tmux, ["-S", socket, "split-window", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-t", source.id, "exec /bin/sleep 600"])).stdout, "sentinel pane");
     if ((await probeTmuxPanePair(tmux, socket, source)) !== "present" || (await probeTmuxPanePair(tmux, socket, sentinel)) !== "present") throw new Error("tmux source or sentinel identity is not stable before acceptance");
     serverPid = Number((await run(tmux, ["-S", socket, "display-message", "-p", "#{pid}"])).stdout.trim());
     if (!Number.isSafeInteger(serverPid) || serverPid <= 0) throw new Error("invalid isolated tmux server PID");
@@ -852,7 +865,7 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
     const canaryScript = path.join(root, "tmux-canary.sh");
     await fs.promises.writeFile(canaryScript, `#!/bin/sh\nif [ "$PI_SUBAGENT_CANARY" = ${shellQuote(canary)} ]; then printf 'preserved\\n' > ${shellQuote(canaryProof)}; fi\nexec /bin/sleep 30\n`, { mode: 0o700 });
     const notification = steadyClient.waitForNotification(2_000);
-    const disposableResult = await steadyRun(["-S", transportGate.canonicalSocketPath, "split-window", "-h", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", source.id, "/usr/bin/env", `PI_SUBAGENT_CANARY=${canary}`, canaryScript]);
+    const disposableResult = await steadyRun(["-S", transportGate.canonicalSocketPath, "split-window", "-h", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-t", source.id, "/usr/bin/env", `PI_SUBAGENT_CANARY=${canary}`, canaryScript]);
     if (disposableResult.exitCode !== 0) throw new Error("tmux control multi-argv canary allocation failed");
     const disposable = parseTabPair(disposableResult.stdout, "tmux control disposable pane");
     if (await notification !== "notification") throw new Error("tmux control mutation did not emit a reconciliation notification");
@@ -886,7 +899,7 @@ async function runTmuxLive(options: HarnessOptions): Promise<void> {
     if (!isTmuxControlTransportGateCurrent(transportGate)) throw new Error("tmux transport gate became stale before restart fence acceptance");
     if ((await run(tmux, ["-S", socket, "kill-server"])).code !== 0) throw new Error("could not stop the isolated tmux server for restart fencing");
     await waitFor(async () => getProcessStartedAt(serverPid!) === null ? {} : null, "old tmux server termination");
-    if ((await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", `${session}-replacement`, "-c", root, "exec sleep 30"])).code !== 0) throw new Error("could not create replacement tmux generation");
+    if ((await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", `${session}-replacement`, "-c", root, "exec /bin/sleep 30"])).code !== 0) throw new Error("could not create replacement tmux generation");
     const replacementServerPid = Number((await run(tmux, ["-S", socket, "display-message", "-p", "#{pid}"])).stdout.trim());
     if (!Number.isSafeInteger(replacementServerPid) || replacementServerPid <= 0 || isTmuxControlTransportGateCurrent(transportGate)) throw new Error("stale tmux transport gate authorized a replacement server generation");
     if ((await run(tmux, ["-S", socket, "kill-server"])).code !== 0) throw new Error("could not stop replacement tmux generation");

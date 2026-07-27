@@ -449,7 +449,7 @@ describe("interactive pane runner preparation", () => {
 			await fs.promises.writeFile(envPath, "export PATH='/usr/bin:/bin'\nexport WRAPPER_TEST='ok'\n", { mode: 0o600 });
 			await fs.promises.writeFile(wrapperPath, buildInteractivePaneWrapperScript({
 				effectiveCwd: path.join(root, "missing"),
-				childCommand: ["sh", "-c", `touch '${markerPath}'`],
+				childCommand: ["sh", "-c", `/usr/bin/touch '${markerPath}'`],
 				exportedEnv: {},
 				secretEnvPath: envPath,
 				wrapperStatusPath: statusPath,
@@ -519,31 +519,43 @@ describe("interactive pane runner preparation", () => {
 		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
 	});
 
-	test("accepts project-local shebang and symlink backend shims selected by PATH", async () => {
+	test("uses nonempty configured backend executables before PATH and fails closed when they are invalid", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-backend-"));
 		try {
 			const bin = path.join(root, "bin"); await fs.promises.mkdir(bin, { mode: 0o700 });
-			const script = path.join(bin, "cmux-script");
-			const backend = path.join(bin, "cmux");
+			const script = path.join(bin, "backend-script");
+			const cmux = path.join(bin, "cmux"), tmux = path.join(bin, "tmux"), configured = path.join(root, "configured-backend");
 			await fs.promises.writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
-			await fs.promises.symlink(script, backend);
+			await fs.promises.symlink(script, cmux); await fs.promises.symlink(script, tmux);
+			await fs.promises.writeFile(configured, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
 			assert.equal(resolveBackendExecutable("cmux-pane", { PATH: bin }), fs.realpathSync(script));
 			assert.equal(resolveBackendExecutable("cmux-pane", { PATH: bin, CMUX_BUNDLED_CLI_PATH: "" }), fs.realpathSync(script));
-			assert.equal(resolveBackendExecutable("cmux-pane", { PATH: bin, CMUX_BUNDLED_CLI_PATH: backend }), fs.realpathSync(script));
-			assert.equal(resolveBackendPath("cmux-pane", backend), fs.realpathSync(script));
+			assert.equal(resolveBackendExecutable("cmux-pane", { PATH: bin, CMUX_BUNDLED_CLI_PATH: configured }), fs.realpathSync(configured));
+			assert.equal(resolveBackendExecutable("tmux-pane", { PATH: bin }), fs.realpathSync(script));
+			assert.equal(resolveBackendExecutable("tmux-pane", { PATH: bin, TMUX_BIN: "" }), fs.realpathSync(script));
+			assert.equal(resolveBackendExecutable("tmux-pane", { PATH: bin, TMUX_BIN: configured }), fs.realpathSync(configured));
+			assert.equal(resolveBackendExecutable("tmux-pane", { PATH: bin, TMUX_BIN: path.join(root, "missing") }), null);
+			assert.equal(resolveBackendPath("tmux-pane", configured), fs.realpathSync(configured));
+			const childCwd = path.join(root, "child-cwd"); await fs.promises.mkdir(childCwd);
+			const shadow = path.join(childCwd, "tmux"); await fs.promises.writeFile(shadow, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+			const canonical = fs.realpathSync(configured);
+			const brokerEnv = buildBrokerEnvironment({ PATH: bin, TMUX_BIN: "./tmux" }, "tmux-pane", canonical);
+			assert.equal(brokerEnv.TMUX_BIN, canonical, "a child-cwd shadow cannot replace the resolved backend");
+			assert.match(buildPrivateChildEnvironmentScript({ PATH: bin, TMUX_BIN: "tmux" }), new RegExp(`export TMUX_BIN='${fs.realpathSync(script)}'`));
 		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("spawns brokers with resolver PATH and only explicit backend identity environment", () => {
-		const env = buildBrokerEnvironment({
-			PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp",
+		const base = {
+			PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TMUX_BIN: "/safe/tmux",
 			CMUX_SOCKET_PATH: "/safe/cmux.sock", CMUX_SOCKET_CAPABILITY: "capability", CMUX_BUNDLED_CLI_PATH: "/safe/cmux",
 			CMUX_WORKSPACE_ID: "workspace", CMUX_SURFACE_ID: "surface",
 			OPENAI_API_KEY: "secret", AWS_BEARER_TOKEN_BEDROCK: "bedrock-secret", RADIUS_API_KEY: "radius-secret",
 			AZURE_OPENAI_BASE_URL: "https://resource.openai.azure.com", CLOUDFLARE_ACCOUNT_ID: "account-id",
 			GOOGLE_APPLICATION_CREDENTIALS: "/private/vertex.json", HTTPS_PROXY: "proxy", BASH_ENV: "/hook", ENV: "/hook",
-		}, "cmux-pane");
-		assert.deepEqual(env, { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TERM: "xterm-256color", CMUX_SOCKET_PATH: "/safe/cmux.sock", CMUX_BUNDLED_CLI_PATH: "/safe/cmux", CMUX_WORKSPACE_ID: "workspace", CMUX_SURFACE_ID: "surface" });
+		};
+		assert.deepEqual(buildBrokerEnvironment(base, "cmux-pane"), { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TERM: "xterm-256color", CMUX_SOCKET_PATH: "/safe/cmux.sock", CMUX_BUNDLED_CLI_PATH: "/safe/cmux", CMUX_WORKSPACE_ID: "workspace", CMUX_SURFACE_ID: "surface" });
+		assert.deepEqual(buildBrokerEnvironment({ ...base, TMUX: "/safe/tmux.sock,1,0", TMUX_PANE: "%1" }, "tmux-pane"), { PATH: "/safe/bin", HOME: "/safe/home", TMPDIR: "/safe/tmp", TERM: "xterm-256color", TMUX: "/safe/tmux.sock,1,0", TMUX_PANE: "%1" });
 	});
 
 	test("passes live telemetry only to the broker boundary, never child environments", () => {
@@ -579,11 +591,11 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(hasCommittedInteractiveLaunchAuthority({ intent, allocation, decision, launch: { ...launch, terminalMode: "cmux-pane" }, gate: null, mode: "cmux-pane" }), true);
 	});
 
-	test("uses a runtime tab delimiter when probing the parent tmux pane", () => {
-		assert.deepEqual(buildTmuxSourcePaneProbeArgs("/tmp/tmux"), ["-S", "/tmp/tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
-		assert.equal(buildTmuxSourcePaneProbeArgs().at(-1)?.includes("\\t"), false);
-		assert.equal(parseTmuxSourcePaneProbe("%2\t123\n%3\t456\n", "%3"), 456);
-		for (const output of ["%3\\t456\n", "%2\t123\n%2\t124\n", "%2\tbad\n%3\t456\n", "%2\t123\textra\n"]) {
+	test("uses a strict printable pipe delimiter when probing the parent tmux pane", () => {
+		assert.deepEqual(buildTmuxSourcePaneProbeArgs("/tmp/tmux"), ["-S", "/tmp/tmux", "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]);
+		assert.equal(buildTmuxSourcePaneProbeArgs().at(-1)?.includes("\t"), false);
+		assert.equal(parseTmuxSourcePaneProbe("%2|123\n%3|456\n", "%3"), 456);
+		for (const output of ["%3\t456\n", "%2|123\n%2|124\n", "%2|bad\n%3|456\n", "%2|123|extra\n"]) {
 			assert.equal(parseTmuxSourcePaneProbe(output, "%3"), null);
 		}
 	});
@@ -637,6 +649,7 @@ describe("interactive pane runner preparation", () => {
 			CMUX_SOCKET_PATH: "/private/cmux.sock",
 			CMUX_SOCKET_CAPABILITY: "private-capability",
 			CMUX_BUNDLED_CLI_PATH: "/Applications/cmux.app/Contents/Resources/bin/cmux",
+			TMUX_BIN: "/opt/tmux/tmux",
 			[SUBAGENT_EXPECTED_PARENT_PID_ENV]: "123",
 			[SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV]: "456",
 			ARBITRARY_CMUX_ENV: "must-not-pass",
@@ -668,6 +681,7 @@ describe("interactive pane runner preparation", () => {
 		assert.match(script, /export CMUX_SOCKET_PATH='\/private\/cmux\.sock'/);
 		assert.equal(script.includes("CMUX_SOCKET_CAPABILITY="), false);
 		assert.match(script, /export CMUX_BUNDLED_CLI_PATH='\/Applications\/cmux\.app\/Contents\/Resources\/bin\/cmux'/);
+		assert.equal(script.includes("TMUX_BIN="), false, "an unresolvable raw TMUX_BIN is never replayed to a child");
 		assert.match(script, new RegExp(`export ${SUBAGENT_EXPECTED_PARENT_PID_ENV}='123'`));
 		assert.match(script, new RegExp(`export ${SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV}='456'`));
 		assert.equal(script.includes("ARBITRARY_CMUX_ENV="), false);
@@ -1299,7 +1313,7 @@ describe("interactive pane runner preparation", () => {
 			const shutdown = shutdownActiveInteractiveRuns();
 			await interruptStarted;
 			// This commit is rejected by the shutdown generation, but its bounded
-			// cleanup must still acquire the global fence and touch only its exact handle.
+			// cleanup must still acquire the global fence and /usr/bin/touch only its exact handle.
 			assert.equal(registerCommittedInteractiveRun({ runId: "hung-interrupt-later", backend: laterBackend, handle: laterHandle, generation: getInteractiveShutdownGenerationForTest(), release: async () => { laterReleased += 1; return true; } }), false);
 			for (let attempt = 0; attempt < 100 && laterReleased === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 			assert.equal(laterInterrupted, 1, "the later run interrupt must not wait on unrelated backend I/O under the global fence");
@@ -1579,7 +1593,7 @@ describe("interactive pane runner preparation", () => {
 			},
 			createClient: async () => ({
 				close() {}, notificationSequence: () => 0, lastNotificationAt: () => null, waitForNotification: async () => "timeout" as const,
-				execute: async (line: string) => line.startsWith("display-message") ? ["100"] : ["%2\t0\tchild\t102"],
+				execute: async (line: string) => line.startsWith("display-message") ? ["100"] : ["%2|0|102"],
 			} as any),
 			revalidate: async () => true,
 		});
@@ -1593,7 +1607,7 @@ describe("interactive pane runner preparation", () => {
 				run: lease.run, backendKey: "ignored-by-pooled-tmux", generation: getInteractiveShutdownGenerationForTest(),
 				tmuxAcceptedTransport: () => lease.acceptedTransport(),
 			});
-			assert.deepEqual(snapshot, { exists: true, exited: false, title: "child" });
+			assert.deepEqual(snapshot, { exists: true, exited: false });
 		} finally {
 			lease.release();
 		}

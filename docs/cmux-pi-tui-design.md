@@ -214,7 +214,7 @@ adapter는 `TMUX` 문자열의 **오른쪽 끝 두** comma-delimited field(`,<se
 
 ```text
 tmux [-S <socket>] split-window \
-  -h -d -P -F '#{pane_id}\t#{pane_pid}' \
+  -h -d -P -F '#{pane_id}|#{pane_pid}' \
   -t <source-pane-id> \
   -c <cwd> \
   "exec '<wrapper-path>'"
@@ -226,7 +226,7 @@ tmux [-S <socket>] split-window \
 
 - `-h`: 현재 pane 오른쪽에 split
 - `-d`: 새 pane으로 focus를 이동하지 않음
-- `-P -F '#{pane_id}\t#{pane_pid}'`: legacy/direct adapter의 stable pane ID, **literal tab**, pane PID를 stdout으로 반환
+- `-P -F '#{pane_id}|#{pane_pid}'`: legacy/direct adapter의 stable pane ID, strict printable `|`, pane PID를 stdout으로 반환; parser는 exact field count로 delimiter injection을 거부
 - `-t`: 현재 `TMUX_PANE`을 정확한 split 기준으로 사용
 - `-c`: child 작업 디렉터리 지정
 
@@ -238,7 +238,7 @@ Production layout-aware V2 broker는 `tmux-split`의 `split-window`과 `tmux-new
 
 | 동작 | command |
 |---|---|
-| 조회 | `tmux list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_title}\t#{pane_pid}'` |
+| 조회 | `tmux list-panes -a -F '#{pane_id}|#{pane_dead}|#{pane_title}|#{pane_pid}'` |
 | 정상 중단 요청 | `tmux send-keys -t <pane-id> Escape` |
 | 강제 종료 | `tmux kill-pane -t <pane-id>` |
 
@@ -353,9 +353,9 @@ Runtime resolver 순서는 다음과 같다.
 2. 그 외 `PATH`의 `bun`.
 3. 그 다음 `PATH`의 `node`.
 
-cmux production lifecycle은 identified app의 authenticated control socket v2를 직접 사용하며 `CMUX_BUNDLED_CLI_PATH` 또는 `PATH`의 cmux CLI를 resolve하거나 fallback하지 않는다. tmux만 `PATH`의 `tmux`를 사용한다. 빈 설정값은 미설정과 같아서 fallback을 유지한다. resolver는 regular file인지와 실행 가능한지만 확인하고 `realpath`로 얻은 canonical absolute path를 intent에 기록한다. symlink, shebang/script, project-local path, user-owned 또는 writable ancestor, macOS application path는 provenance·owner·ancestor·native magic·codesign 정책으로 거부하지 않는다. interactive executable `PATH`는 사용자가 명시적으로 선택한 trust boundary다. broker spawn과 parent lifecycle은 선택한 runtime, concrete interpreter, broker entrypoint 및 해당 backend의 full executable generation을 재검증하며, reaper도 기록된 backend/control authority generation이 달라지면 사용하지 않는다.
+cmux production lifecycle은 identified app의 authenticated control socket v2를 직접 사용하며 `CMUX_BUNDLED_CLI_PATH` 또는 `PATH`의 cmux CLI를 resolve하거나 fallback하지 않는다. tmux는 비어 있지 않은 `TMUX_BIN`을 먼저 사용하고, 비어 있거나 미설정일 때만 `PATH`의 `tmux`를 사용한다. 명시한 경로가 regular executable로 resolve되지 않으면 PATH로 조용히 fallback하지 않는다. 빈 설정값은 미설정과 같아서 fallback을 유지한다. resolver는 regular file인지와 실행 가능한지만 확인하고 `realpath`로 얻은 canonical absolute path를 intent에 기록한다. symlink, shebang/script, project-local path, user-owned 또는 writable ancestor, macOS application path는 provenance·owner·ancestor·native magic·codesign 정책으로 거부하지 않는다. interactive executable `PATH`는 사용자가 명시적으로 선택한 trust boundary다. broker spawn과 parent lifecycle은 선택한 runtime, concrete interpreter, broker entrypoint 및 해당 backend의 full executable generation을 재검증하며, reaper도 기록된 backend/control authority generation이 달라지면 사용하지 않는다.
 
-Broker 및 backend command는 resolver가 사용한 명시적 `PATH`, `HOME`, `TMPDIR`, `TERM`과 현재 backend identity에 필요한 `CMUX_*` 또는 `TMUX*`만 가진 최소 환경으로 시작한다. 이 PATH 보존은 선택된 `#!/usr/bin/env bun|node` runtime/backend shim이 같은 interpreter를 찾도록 하기 위한 것이며, `NODE_OPTIONS`, `NODE_PATH`, `BUN_OPTIONS`, shell loader hook과 임의 proxy/auth 환경은 replay하지 않는다. broker의 working directory는 private run directory다. tmux 3.7의 다중 argv `split-window` 형태로 `/usr/bin/env -i ... <broker runtime> <args>`를 직접 exec하므로 사용자가 구성한 `default-shell`은 staged verifier 시작에 전혀 실행되지 않는다. native `env`가 tmux server 환경을 지운 뒤에만 Bun/Node 또는 script interpreter가 시작한다. verifier는 exec로 보존된 자신의 PID가 immutable allocation의 pane PID와 같은지 확인하고 exact socket/server/pane topology를 재검증한 뒤, wrapper에 검증된 `TMUX`/`TMUX_PANE`만 명시적으로 제공한다. wrapper는 private explicit environment를 source한 뒤 삭제하고, 새 pane이 주입한 multiplexer identity/cwd는 덮어쓰지 않는다.
+Broker 및 backend command는 resolver가 사용한 명시적 `PATH`, `HOME`, `TMPDIR`, `TERM`과 현재 backend identity에 필요한 `CMUX_*` 또는 `TMUX*`만 가진 최소 환경으로 시작한다. tmux에서는 raw 또는 relative caller 값이 아니라 resolver가 확정한 canonical absolute `TMUX_BIN`을 broker, staged verifier와 private child/nested bootstrap에 다시 기록한다. 이 PATH 보존은 선택된 `#!/usr/bin/env bun|node` runtime/backend shim이 같은 interpreter를 찾도록 하기 위한 것이며, `NODE_OPTIONS`, `NODE_PATH`, `BUN_OPTIONS`, shell loader hook과 임의 proxy/auth 환경은 replay하지 않는다. broker의 working directory는 private run directory다. tmux 3.7의 다중 argv `split-window` 형태로 `/usr/bin/env -i ... <broker runtime> <args>`를 직접 exec하므로 사용자가 구성한 `default-shell`은 staged verifier 시작에 전혀 실행되지 않는다. native `env`가 tmux server 환경을 지운 뒤에만 Bun/Node 또는 script interpreter가 시작한다. verifier는 exec로 보존된 자신의 PID가 immutable allocation의 pane PID와 같은지 확인하고 exact socket/server/pane topology를 재검증한 뒤, wrapper에 검증된 `TMUX`/`TMUX_PANE`만 명시적으로 제공한다. wrapper는 private explicit environment를 source한 뒤 삭제하고, 새 pane이 주입한 multiplexer identity/cwd는 덮어쓰지 않는다.
 
 Windows에서는 automatic mode가 `inline`이며 명시적 cmux/tmux backend는 unavailable 오류를 반환한다. intent/allocation/broker spawn을 시작하지 않는다.
 
@@ -502,9 +502,10 @@ schema v4 provider-live contract는 `routine-v1`(15 active-1 cells/15 children)�
 
 ### 12.2 Live tmux control V3 (PASS — 2026-07-21)
 
-다른 tmux server나 user pane 안에서 실행할 필요가 없다. harness가 `-f /dev/null` isolated stable-3.7b-minimum server, source pane, 그리고 자체 소유 sentinel pane을 생성한다. source/sentinel의 canonical `(pane_id, pane_pid)` pair를 기록·재검증하고, finally에서 그 isolated server만 종료한다. 현재 harness는 immutable transport gate와 V3 predecessor digest chain, detached broker allocation과 staged verifier, notification-triggered exact snapshot, adversarial multi-argv environment canary, stale reaper close/absence, source·sentinel 보존 및 socket/server restart generation rejection을 검증한다. 350ms steady-state process sampling에서 periodic status command와 recurring short-lived tmux process가 모두 0인지도 실제 counter/process sample로 확인한다.
+다른 tmux server나 user pane 안에서 실행할 필요가 없다. harness가 `-f /dev/null` isolated server, source pane, 그리고 자체 소유 sentinel pane을 생성한다. production gate의 stable minimum은 `>=3.7a`이고, pinned parser fixture 및 2026-07-21 historical exact PASS의 server는 `3.7b`다. 이 둘을 같은 minimum claim으로 취급하지 않는다. source/sentinel의 canonical `(pane_id, pane_pid)` pair를 기록·재검증하고, finally에서 그 isolated server만 종료한다. 현재 harness는 immutable transport gate와 V3 predecessor digest chain, detached broker allocation과 staged verifier, notification-triggered exact snapshot, adversarial multi-argv environment canary, stale reaper close/absence, source·sentinel 보존 및 socket/server restart generation rejection을 검증한다. 350ms steady-state process sampling에서 periodic status command와 recurring short-lived tmux process가 모두 0인지도 실제 counter/process sample로 확인한다.
 
 ```bash
+TMUX_BIN=/absolute/path/to/tmux \
 PI_SUBAGENT_LIVE_TMUX=1 bun run acceptance:tmux -- --keep
 ```
 

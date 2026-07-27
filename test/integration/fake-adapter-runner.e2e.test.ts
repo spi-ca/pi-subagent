@@ -199,18 +199,18 @@ const rows = (separator, format) => {
   const value = current();
   const source = ["%1", "$1", "@1", String(value.sourcePid)];
   const target = value.target && !value.closed ? ["%2", "$1", "@2", String(value.target)] : null;
-  if (format.includes("pane_dead")) return [source, target].filter(Boolean).map((row) => [row[0], "0", row[0] === "%2" ? "fake-target" : "source-sentinel", row[3]].join("\\t")).join("\\n") + "\\n";
+  if (format.includes("pane_dead")) return [source, target].filter(Boolean).map((row) => [row[0], "0", row[0] === "%2" ? "fake-target" : "source-sentinel", row[3]].join("\|")).join("\\n") + "\\n";
   if (format.includes("session_id") && format.startsWith("#{session_id}")) return [source, target].filter(Boolean).map((row) => [row[1], row[2], row[0], row[3]].join("|")).join("\\n") + "\\n";
   if (format.includes("session_id")) return [source, target].filter(Boolean).map((row) => row.join("|")).join("\\n") + "\\n";
   return [source, target].filter(Boolean).map((row) => [row[0], row[3]].join(separator)).join("\\n") + "\\n";
 };
 if (args.includes("-V")) { console.log("tmux 3.7b"); process.exit(0); }
 if (args.includes("display-message")) { console.log(String(current().sourcePid)); process.exit(0); }
-if (args.includes("list-panes")) { const format = args[args.indexOf("-F") + 1] ?? ""; process.stdout.write(rows(format.includes("|") ? "|" : "\\t", format)); process.exit(0); }
+if (args.includes("list-panes")) { const format = args[args.indexOf("-F") + 1] ?? ""; process.stdout.write(rows(format.includes("|") ? "|" : "\|", format)); process.exit(0); }
 if (args.includes("new-window") || args.includes("split-window")) {
   const runDir = args[args.indexOf("--run-dir") + 1];
   if (!runDir) process.exit(2);
-  const child = spawn("/bin/bash", ["-c", "while [ ! -f $1 ]; do sleep 0.01; done; $2 & child=$!; trap 'kill -TERM $child 2>/dev/null; wait $child; exit' TERM INT; wait $child; while :; do sleep 1; done", "fake-tmux-gate", path.join(runDir, "launch.gate"), path.join(runDir, "cmux-wrapper.sh")], { detached: true, stdio: "ignore" });
+  const child = spawn("/bin/bash", ["-c", "while [ ! -f $1 ]; do /bin/sleep 0.01; done; $2 & child=$!; trap 'kill -TERM $child 2>/dev/null; wait $child; exit' TERM INT; wait $child; while :; do /bin/sleep 1; done", "fake-tmux-gate", path.join(runDir, "launch.gate"), path.join(runDir, "cmux-wrapper.sh")], { detached: true, stdio: "ignore" });
   child.unref();
   const value = current(); value.target = child.pid; value.closed = false; value.history = [...(value.history ?? []), child.pid]; save(value);
   console.log("$1|" + (args.includes("split-window") ? "@1" : "@2") + "|%2|" + child.pid); process.exit(0);

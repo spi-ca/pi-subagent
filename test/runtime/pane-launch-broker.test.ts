@@ -75,7 +75,7 @@ async function writeTmuxIntent(paths: Awaited<ReturnType<typeof prepareRunArtifa
 	return [broker, "--run-dir", paths.runDir, "--nonce", nonce, "--runtime", fs.realpathSync(process.execPath), "--runtime-interpreter", fs.realpathSync(process.execPath), "--backend", fs.realpathSync(backend)];
 }
 
-async function nativeTmuxMock(root: string, defaultShell: string, log: string, splitResponse = "%2\\t789", splitExitCode = 0, topologyResponse = "%1|$1|@2|456", topologyExitCode = 0, paneListResponse = "%1\\t456"): Promise<string> {
+async function nativeTmuxMock(root: string, defaultShell: string, log: string, splitResponse = "%2\|789", splitExitCode = 0, topologyResponse = "%1|$1|@2|456", topologyExitCode = 0, paneListResponse = "%1\|456"): Promise<string> {
 	const source = path.join(root, "mock-tmux.c"), binary = path.join(root, `tmux-${path.basename(defaultShell).replace(/[^a-z]/gi, "") || "unsafe"}`);
 	await fs.promises.writeFile(source, `#include <stdio.h>
 #include <string.h>
@@ -916,18 +916,18 @@ describe("pane launch broker", () => {
 	test("durably records then closes exact nonzero tmux allocation without committing", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-")); tempDirs.push(root);
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
-		const log = path.join(root, "tmux.log"), backend = await nativeTmuxMock(root, "/bin/sh", log, "%2\t789", 1);
+		const log = path.join(root, "tmux.log"), backend = await nativeTmuxMock(root, "/bin/sh", log, "%2|789", 1);
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-exact-nonzero" });
 		assert.equal(await run(await writeTmuxIntent(paths, "tmux-exact-nonzero", backend), process.env, paths.runDir), 0);
 		const allocation = await readBrokerJson(paths.allocationPath) as { target?: unknown } | null;
 		assert.deepEqual(allocation?.target, tmuxTarget(await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>), JSON.stringify(await readBrokerJson(paths.brokerStatusPath)));
 		assert.equal(await readBrokerJson(paths.decisionPath), null);
 		assert.equal(await readBrokerJson(paths.launchPath), null);
-		assert.ok(await readBrokerJson(paths.residualRiskPath));
-		assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "possible-unrecorded-allocation");
+		assert.equal(await readBrokerJson(paths.residualRiskPath), null);
+		assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "allocation-failed");
 		const commands = await fs.promises.readFile(log, "utf8");
 		assert.match(commands, /split-window/);
-		assert.match(commands, /list-panes -a -F #\{pane_id\}/);
+		assert.match(commands, /list-panes -a -F #\{pane_id\}\|#\{pane_pid\}/);
 		assert.doesNotMatch(commands, /if-shell|kill-pane|kill-window|kill-session/);
 	});
 
@@ -959,7 +959,7 @@ describe("pane launch broker", () => {
 	test("tmux source-pane aliases fail closed without if-shell or kill-pane mutation", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-")); tempDirs.push(root);
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
-		for (const [runId, response] of [["tmux-source-alias", "%1\\t456"], ["tmux-changed-pid-source-alias", "%1\\t789"], ["tmux-malformed-source-alias", "%1\\tnot-a-pid"]] as const) {
+		for (const [runId, response] of [["tmux-source-alias", "%1\|456"], ["tmux-changed-pid-source-alias", "%1\|789"], ["tmux-malformed-source-alias", "%1\|not-a-pid"]] as const) {
 			const log = path.join(root, `${runId}.log`);
 			const backend = await nativeTmuxMock(root, "/bin/sh", log, response);
 			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
@@ -976,7 +976,7 @@ describe("pane launch broker", () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-")); tempDirs.push(root);
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
 		const log = path.join(root, "tmux.log");
-		const backend = await nativeTmuxMock(root, "/bin/sh", log, "%2\t789", 0, "%1|$1|@2|456\n%2|$1|@2|789");
+		const backend = await nativeTmuxMock(root, "/bin/sh", log, "%2|789", 0, "%1|$1|@2|456\n%2|$1|@2|789");
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-preexisting-pane" });
 		assert.equal(await run(await writeTmuxIntent(paths, "tmux-preexisting-pane", backend), process.env, paths.runDir), 0);
 		assert.equal(await readBrokerJson(paths.allocationPath), null);
@@ -990,7 +990,7 @@ describe("pane launch broker", () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-")); tempDirs.push(root);
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
 		const log = path.join(root, "tmux.log");
-		const backend = await nativeTmuxMock(root, "/bin/sh", log, "%2\t789", 1, "%1|$1|@2|456", 0, "%1\t456\nnot-a-row");
+		const backend = await nativeTmuxMock(root, "/bin/sh", log, "%2|789", 1, "%1|$1|@2|456", 0, "%1|456\nnot-a-row");
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "tmux-malformed-rollback-row" });
 		assert.equal(await run(await writeTmuxIntent(paths, "tmux-malformed-rollback-row", backend), process.env, paths.runDir), 0);
 		assert.deepEqual((await readBrokerJson(paths.allocationPath) as { target?: unknown })?.target, tmuxTarget(await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>));

@@ -1,6 +1,6 @@
 export const MINIMUM_PI_VERSION: "0.80.10";
 export const MINIMUM_CMUX_VERSION: "0.64.20";
-export const MINIMUM_TMUX_VERSION: "3.7b";
+export const MINIMUM_TMUX_VERSION: "3.7a";
 export interface StableSemver { version: string; major: number; minor: number; patch: number }
 export interface StableTmuxVersion { version: string; major: number; minor: number; suffix: string; suffixRank: number }
 export function parseStableSemver(value: unknown): StableSemver | null;

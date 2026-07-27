@@ -17,6 +17,7 @@ import {
 	snapshotTmuxControlMetrics,
 	tmuxCommand,
 } from "../../src/runtime/tmux-control";
+import { MINIMUM_TMUX_VERSION } from "../../src/runtime/version-policy.mjs";
 import {
 	closePhase0LiveTelemetryForTest,
 	PHASE0_LIVE_TELEMETRY_CAPABILITY_ENV,
@@ -51,6 +52,8 @@ async function startControlledClient(options: { commandTimeoutMs?: number; onDis
 describe("tmux 3.7b control mode", () => {
 	test("parses pinned response blocks and outside-block notifications", () => {
 		assert.equal(fixture.contract, "tmux-control-v1");
+		assert.equal(fixture.minimumVersion, MINIMUM_TMUX_VERSION);
+		assert.equal(fixture.capturedVersion, "3.7b");
 		assert.equal(fixture.sourceCommit, "e802909de06012a4df6209d55e86487c56223163");
 		const parser = new TmuxControlParser();
 		let response: unknown;
@@ -108,7 +111,7 @@ describe("tmux 3.7b control mode", () => {
 
 	test("maps direct argv to one encoded control command without shell interpretation", async () => {
 		const lines: string[] = [];
-		const client = { execute: async (line: string) => { lines.push(line); return ["%2\t99"]; } } as unknown as TmuxControlClient;
+		const client = { execute: async (line: string) => { lines.push(line); return ["%2|99"]; } } as unknown as TmuxControlClient;
 		const run = createTmuxControlCommandRunner(client, "/tmp/tmux.sock");
 		const canary = "x; run-shell 'touch /tmp/forbidden' $HOME";
 		const result = await run(["-S", "/tmp/tmux.sock", "split-window", "-d", "--", "/usr/bin/env", "ARG=" + canary]);

@@ -136,7 +136,7 @@ bun test test/runtime/tmux.test.ts test/runtime/run-protocol.test.ts \
 bun run check
 ```
 
-2026-07-27 `PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:tmux`도 isolated tmux server에서 다음을 **PASS**했다. 이 harness는 production runner/broker를 우회하므로 tmux semantics와 공통 helper/wrapper의 live 증거로만 사용한다.
+2026-07-27 `TMUX_BIN=/absolute/path/to/tmux PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:tmux`도 isolated tmux server에서 다음을 **PASS**했다. 이 harness는 production runner/broker를 우회하므로 tmux semantics와 공통 helper/wrapper의 live 증거로만 사용한다.
 
 1. canonical `new-window -n` 이름의 실제 관측
 2. exact window의 effective `automatic-rename=off`

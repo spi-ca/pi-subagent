@@ -143,6 +143,10 @@ const commandEnv = Object.fromEntries([
   ["HOME", process.env.HOME || os.homedir()],
   ["TMPDIR", process.env.TMPDIR || os.tmpdir()],
   ["TERM", process.env.TERM || "xterm-256color"],
+  // Never forward a raw caller TMUX_BIN. The broker's argv already carries
+  // the resolver-selected canonical executable, which is the only child/nested
+  // backend identity permitted through this boundary.
+  ...(path.isAbsolute(backendPath) ? [["TMUX_BIN", backendPath]] : []),
   ...["CMUX_SOCKET_PATH", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_BUNDLED_CLI_PATH", "TMUX", "TMUX_PANE"].flatMap((key) => typeof process.env[key] === "string" ? [[key, process.env[key]]] : []),
   // The isolated test harness may pass a synthetic pane PID to its backend
   // fixture. It is never available to production verifier processes.
@@ -498,13 +502,13 @@ async function rollback(target, intentRecord) {
   if (!tmuxGeneration(target.generation) || !currentTmuxGeneration(target.generation, target.serverPid)) return false;
   const socket = target.socketPath ? ["-S", target.socketPath] : [];
   const runTmux = tmuxCommand ?? (async (args) => await command(backendPath, args));
-  const before = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
+  const before = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]);
   const fingerprint = before.code === 0 ? parseTmuxPanePidList(before.stdout, target.paneId) : null;
   if (fingerprint === false) return true;
   if (fingerprint !== target.panePid) return false;
   const condition = `#{&&:#{==:#{pid},${target.serverPid}},#{==:#{pane_pid},${target.panePid}}}`;
   await runTmux([...socket, "if-shell", "-F", "-t", target.paneId, condition, `kill-pane -t ${target.paneId}`, "display-message -p -l pi-subagent-guard-noop"]);
-  const after = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"]);
+  const after = await runTmux([...socket, "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]);
   return after.code === 0 && parseTmuxPanePidList(after.stdout, target.paneId) === false;
 }
 function parseCanonicalCmuxTopology(stdout) {
@@ -619,7 +623,7 @@ async function safeTmuxShellHome() {
     return shellHome;
   } catch { return null; }
 }
-function parseTmuxPanePidList(stdout, targetPaneId, delimiter = "\t") {
+function parseTmuxPanePidList(stdout, targetPaneId, delimiter = "|") {
   const text = stripFinalLineEnding(stdout); if (text.endsWith("\r") || !PANE.test(targetPaneId)) return null;
   let target = false; const seen = new Set();
   for (const line of text ? text.split("\n") : []) {
@@ -646,7 +650,7 @@ function parseTmuxTopologyFingerprint(stdout, sourcePaneId, sessionFirst = false
   return source ? { panes, source } : null;
 }
 function parseTmuxCreatedPane(stdout, layout, sessionId) {
-  const fields = stripFinalLineEnding(stdout).split(layout ? "|" : "\t");
+  const fields = stripFinalLineEnding(stdout).split("|");
   if (layout) {
     const [createdSessionId, windowId, paneId, panePidText, ...extra] = fields, panePid = parsePid(panePidText);
     return !extra.length && createdSessionId === sessionId && SESSION.test(createdSessionId) && WINDOW.test(windowId) && PANE.test(paneId) && panePid !== null
@@ -686,7 +690,7 @@ async function allocateTmux(i) {
   const paneEnvironment = ["NODE_OPTIONS=", "NODE_PATH=", "BUN_OPTIONS=", "LD_PRELOAD=", "LD_LIBRARY_PATH=", "LD_AUDIT=", "DYLD_INSERT_LIBRARIES=", "DYLD_LIBRARY_PATH=", "DYLD_FRAMEWORK_PATH="];
   const stagedArgs = [
     "-i", `HOME=${shellHome}`, `XDG_CONFIG_HOME=${shellHome}`, `PATH=${commandEnv.PATH}`,
-    `TMPDIR=${commandEnv.TMPDIR}`, `TERM=${commandEnv.TERM}`,
+    `TMPDIR=${commandEnv.TMPDIR}`, `TERM=${commandEnv.TERM}`, `TMUX_BIN=${backendPath}`,
     brokerRuntime, brokerEntrypoint, "--verify-gate", "--run-dir", runDir,
     "--wrapper", p("cmux-wrapper.sh"), "--nonce", expectedNonce,
     "--runtime", brokerRuntime, "--runtime-interpreter", brokerInterpreter,
@@ -695,7 +699,7 @@ async function allocateTmux(i) {
   const launch = ["/usr/bin/env", ...stagedArgs];
   const allocationArgs = layout && i.placement === "tmux-new-window"
     ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", i.windowLabel, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
-    : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}\t#{pane_pid}", "-t", source.sourcePaneId, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
+    : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{pane_pid}", "-t", source.sourcePaneId, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
   const result = await runTmux(allocationArgs);
   // A complete response stays rollback authority even on nonzero. Parse it
   // before status handling; malformed nonzero output never authorizes mutation.

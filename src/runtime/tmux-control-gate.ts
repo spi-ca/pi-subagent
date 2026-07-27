@@ -12,6 +12,8 @@ export class TmuxControlVersionError extends Error {
 	constructor(message: string) { super(message); this.name = "TmuxControlVersionError"; }
 }
 const SESSION = /^\$[0-9]+$/, PANE = /^%[0-9]+$/;
+/** Printable delimiter; IDs and canonical decimal PIDs cannot contain it. */
+const TMUX_FORMAT_DELIMITER = "|";
 
 export interface TmuxControlProbeResult {
 	detectedTmuxVersion: string;
@@ -67,7 +69,7 @@ export function canonicalTmuxProbeBytes(probe: TmuxControlProbeResult): Buffer {
 export function parseTmuxControlProbe(versionStdout: string, identityStdout: string, panesStdout: string): TmuxControlProbeResult | null {
 	const detectedTmuxVersion = parseTmuxVersionOutput(versionStdout);
 	if (!detectedTmuxVersion || !isStableTmuxVersionAtLeast(detectedTmuxVersion, MINIMUM_TMUX_VERSION)) return null;
-	const identity = oneLfLine(identityStdout)?.split("\t");
+	const identity = oneLfLine(identityStdout)?.split(TMUX_FORMAT_DELIMITER);
 	if (!identity || identity.length !== 4) return null;
 	const serverPid = Number(identity[0]), attachedSessionId = identity[1]!, sourcePaneId = identity[2]!, sourcePanePid = Number(identity[3]);
 	if (!positive(serverPid) || !SESSION.test(attachedSessionId) || !PANE.test(sourcePaneId) || !positive(sourcePanePid)) return null;
@@ -77,7 +79,7 @@ export function parseTmuxControlProbe(versionStdout: string, identityStdout: str
 	const paneRows: TmuxControlProbeResult["paneRows"] = [];
 	const pairs = new Set<string>();
 	for (const line of lines) {
-		const fields = line.split("\t"); if (fields.length !== 3) return null;
+		const fields = line.split(TMUX_FORMAT_DELIMITER); if (fields.length !== 3) return null;
 		const [sessionId, paneId, rawPid] = fields; const panePid = Number(rawPid);
 		if (!SESSION.test(sessionId!) || !PANE.test(paneId!) || !positive(panePid)) return null;
 		const pair = `${sessionId}:${paneId}`; if (pairs.has(pair)) return null; pairs.add(pair);
@@ -99,7 +101,7 @@ function parseProbe(value: unknown): TmuxControlProbeResult | null {
 		|| typeof value.detectedTmuxVersion !== "string" || !isStableTmuxVersionAtLeast(value.detectedTmuxVersion, MINIMUM_TMUX_VERSION)
 		|| !positive(value.serverPid) || typeof value.attachedSessionId !== "string" || !SESSION.test(value.attachedSessionId)
 		|| typeof value.sourcePaneId !== "string" || !PANE.test(value.sourcePaneId) || !positive(value.sourcePanePid) || !Array.isArray(value.paneRows)) return null;
-	const rows = value.paneRows; const parsed = parseTmuxControlProbe(`tmux ${value.detectedTmuxVersion}\n`, `${value.serverPid}\t${value.attachedSessionId}\t${value.sourcePaneId}\t${value.sourcePanePid}\n`, `${rows.map((row) => object(row) && exact(row, ["sessionId", "paneId", "panePid"]) ? `${row.sessionId}\t${row.paneId}\t${row.panePid}` : "").join("\n")}\n`);
+	const rows = value.paneRows; const parsed = parseTmuxControlProbe(`tmux ${value.detectedTmuxVersion}\n`, `${value.serverPid}${TMUX_FORMAT_DELIMITER}${value.attachedSessionId}${TMUX_FORMAT_DELIMITER}${value.sourcePaneId}${TMUX_FORMAT_DELIMITER}${value.sourcePanePid}\n`, `${rows.map((row) => object(row) && exact(row, ["sessionId", "paneId", "panePid"]) ? `${row.sessionId}${TMUX_FORMAT_DELIMITER}${row.paneId}${TMUX_FORMAT_DELIMITER}${row.panePid}` : "").join("\n")}\n`);
 	return parsed && JSON.stringify(parsed.paneRows) === JSON.stringify(rows) ? parsed : null;
 }
 
@@ -149,8 +151,8 @@ export async function createTmuxControlTransportGate(options: {
 	if (!executableGeneration || !socket || !PANE.test(options.sourcePaneId) || !positive(options.serverStartedAt)) throw new Error("tmux control gate identity is unavailable");
 	const [version, identity, panes] = await Promise.all([
 		options.run(["-V"]),
-		options.run(["-S", socket.canonicalSocketPath, "display-message", "-p", "-t", options.sourcePaneId, "#{pid}\t#{session_id}\t#{pane_id}\t#{pane_pid}"]),
-		options.run(["-S", socket.canonicalSocketPath, "list-panes", "-a", "-F", "#{session_id}\t#{pane_id}\t#{pane_pid}"]),
+		options.run(["-S", socket.canonicalSocketPath, "display-message", "-p", "-t", options.sourcePaneId, `#{pid}${TMUX_FORMAT_DELIMITER}#{session_id}${TMUX_FORMAT_DELIMITER}#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`]),
+		options.run(["-S", socket.canonicalSocketPath, "list-panes", "-a", "-F", `#{session_id}${TMUX_FORMAT_DELIMITER}#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`]),
 	]);
 	const detectedVersion = version.exitCode === 0 ? parseTmuxVersionOutput(version.stdout) : null;
 	if (!detectedVersion || !isStableTmuxVersionAtLeast(detectedVersion, MINIMUM_TMUX_VERSION)) throw new TmuxControlVersionError(`tmux >= ${MINIMUM_TMUX_VERSION} stable version is required`);

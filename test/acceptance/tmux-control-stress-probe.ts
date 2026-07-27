@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TmuxControlClient, tmuxCommand, type TmuxControlDisconnectDetail } from "../../src/runtime/tmux-control";
+import { captureManagedChildPiExecutableGeneration, revalidateManagedChildPiExecutableGeneration, type ManagedChildPiExecutableGeneration } from "./managed-child-pi-executable";
 
 const gate = "PI_SUBAGENT_TMUX_CONTROL_STRESS_PROBE";
+const tmuxBinEnv = "TMUX_BIN";
 const sessionName = "pi-subagent-control-stress";
 
 if (process.env[gate] !== "1") {
@@ -12,10 +14,19 @@ if (process.env[gate] !== "1") {
 	process.exit(0);
 }
 
+/** The mutating probe never falls back from an explicit executable to PATH. */
+function resolveTmuxBin(): ManagedChildPiExecutableGeneration {
+	const requested = process.env[tmuxBinEnv]?.trim();
+	if (!requested || !path.isAbsolute(requested)) throw new Error("tmux control stress probe requires an explicit absolute TMUX_BIN");
+	return captureManagedChildPiExecutableGeneration(requested);
+}
+
 /** Runs setup/teardown without ever publishing tmux stdout or stderr. */
-async function tmux(args: string[], readStdout = false): Promise<string> {
+async function tmux(generation: ManagedChildPiExecutableGeneration, args: string[], readStdout = false): Promise<string> {
 	return await new Promise((resolve, reject) => {
-		const child = spawn("tmux", args, { stdio: ["ignore", "pipe", "ignore"] });
+		// Revalidate at the last possible point before every direct tmux spawn.
+		revalidateManagedChildPiExecutableGeneration(generation);
+		const child = spawn(generation.executable, args, { stdio: ["ignore", "pipe", "ignore"] });
 		const output: Buffer[] = [];
 		let bytes = 0;
 		child.stdout.on("data", (chunk: Buffer) => {
@@ -33,20 +44,24 @@ async function tmux(args: string[], readStdout = false): Promise<string> {
 
 let root: string | null = null;
 let socketPath: string | null = null;
+let tmuxGeneration: ManagedChildPiExecutableGeneration | null = null;
 let client: TmuxControlClient | null = null;
 let disconnect: TmuxControlDisconnectDetail | null = null;
 try {
+	tmuxGeneration = resolveTmuxBin();
 	root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tmux-control-"));
 	await fs.chmod(root, 0o700);
 	socketPath = path.join(root, "socket");
 	if (Buffer.byteLength(socketPath) >= 100) throw new Error("tmux stress socket path is too long");
 
-	await tmux(["-S", socketPath, "new-session", "-d", "-s", sessionName, "sleep 120"]);
-	const sessionId = (await tmux(["-S", socketPath, "display-message", "-p", "-t", sessionName, "#{session_id}"], true)).trim();
+	await tmux(tmuxGeneration, ["-S", socketPath, "new-session", "-d", "-s", sessionName, "/bin/sleep", "120"]);
+	const sessionId = (await tmux(tmuxGeneration, ["-S", socketPath, "display-message", "-p", "-t", sessionName, "#{session_id}"], true)).trim();
 	if (!/^\$[0-9]+$/.test(sessionId)) throw new Error("tmux stress session identity was invalid");
 
+	// Revalidate independently before opening the long-lived control client.
+	revalidateManagedChildPiExecutableGeneration(tmuxGeneration);
 	client = new TmuxControlClient({
-		executable: "tmux",
+		executable: tmuxGeneration.executable,
 		socketPath,
 		sessionId,
 		onDisconnect: (detail) => { disconnect = detail; },
@@ -56,7 +71,7 @@ try {
 	// Mutations are issued exactly once. A disconnect rejects them as unknown;
 	// this probe intentionally performs no retry or replay.
 	const windows = Promise.all(Array.from({ length: 16 }, async () => {
-		const [windowId] = await client!.execute(tmuxCommand("new-window", ["-d", "-t", sessionId, "-P", "-F", "#{window_id}", "sleep 120"]), { name: "new-window", mutation: true });
+		const [windowId] = await client!.execute(tmuxCommand("new-window", ["-d", "-t", sessionId, "-P", "-F", "#{window_id}", "/bin/sleep", "120"]), { name: "new-window", mutation: true });
 		if (!/^@[0-9]+$/.test(windowId ?? "")) throw new Error("tmux stress window identity was invalid");
 		await client!.execute(tmuxCommand("kill-window", ["-t", windowId!]), { name: "kill-window", mutation: true, reserved: true });
 	}));
@@ -84,6 +99,6 @@ try {
 	console.log(JSON.stringify({ mode: "tmux-control-stress-probe", state: "failed", reason: "tmux-control-stress-failed", disconnect }));
 	process.exitCode = 1;
 } finally {
-	if (socketPath) await tmux(["-S", socketPath, "kill-server"]).catch(() => undefined);
+	if (socketPath && tmuxGeneration) await tmux(tmuxGeneration, ["-S", socketPath, "kill-server"]).catch(() => undefined);
 	if (root) await fs.rm(root, { recursive: true, force: true });
 }

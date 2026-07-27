@@ -592,7 +592,7 @@ describe("stale interactive run reaper", () => {
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: 100, staleAfterMs: 10, scheduleCleanup: () => undefined, isTmuxGenerationCurrent: (generation, serverPid) => generation.socketPath === tmuxGeneration.socketPath && generation.socketDev === tmuxGeneration.socketDev && generation.socketIno === tmuxGeneration.socketIno && generation.serverStartedAt === tmuxGeneration.serverStartedAt && serverPid === 123, tmuxRun: async (args) => {
 			calls.push(args);
 			if (args.includes("display-message")) return { exitCode: 0, stdout: "123\n", stderr: "", aborted: false };
-			if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1\t0\tsource\t456\n" : "%2\t0\tallocated\t789\n", stderr: "", aborted: false };
+			if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1|0|source|456\n" : "%2|0|allocated|789\n", stderr: "", aborted: false };
 			if (args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")) closed = true;
 			return { exitCode: 0, stdout: "", stderr: "", aborted: false };
 		} });
@@ -623,7 +623,7 @@ describe("stale interactive run reaper", () => {
 			tmuxRun: async (args) => {
 				calls.push(args);
 				if (args.includes("display-message")) return { exitCode: 0, stdout: "123\n", stderr: "", aborted: false };
-				if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1\t0\tsource\t456\n" : "%2\t0\tallocated\t789\n", stderr: "", aborted: false };
+				if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1|0|source|456\n" : "%2|0|allocated|789\n", stderr: "", aborted: false };
 				if (args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")) closed = true;
 				return { exitCode: 0, stdout: "", stderr: "", aborted: false };
 			},
@@ -677,9 +677,10 @@ describe("stale interactive run reaper", () => {
 				return { close: () => { managerClosed = true; }, run: async (args) => {
 					calls.push(args);
 					if (args.includes("display-message")) return { exitCode: 0, stdout: "123\n", stderr: "", aborted: false };
+					if (args.at(-1) === "#{pane_id}|#{pane_pid}") return { exitCode: 0, stdout: closed ? "%1|456\n" : "%1|456\n%2|789\n", stderr: "", aborted: false };
+					if (args.at(-1) === "#{pane_id}|#{pane_dead}|#{pane_title}|#{pane_pid}") return { exitCode: 0, stdout: closed ? "%1|0|source|456\n" : "%1|0|source|456\n%2|0|allocated|789\n", stderr: "", aborted: false };
 					if (args.at(-1)?.includes("|")) return { exitCode: 0, stdout: closed ? "%1|$1|@1|456\n" : "%1|$1|@1|456\n%2|$1|@2|789\n", stderr: "", aborted: false };
-					if (args.at(-1) === "#{pane_id}\t#{pane_pid}") return { exitCode: 0, stdout: closed ? "%1\t456\n" : "%1\t456\n%2\t789\n", stderr: "", aborted: false };
-					if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1\t0\tsource\t456\n" : "%2\t0\tallocated\t789\n", stderr: "", aborted: false };
+					if (args.includes("list-panes")) return { exitCode: 0, stdout: closed ? "%1|0|source|456\n" : "%2|0|allocated|789\n", stderr: "", aborted: false };
 					if (args.includes("if-shell") && args.some((arg) => arg === "kill-pane -t %2")) closed = true;
 					return { exitCode: 0, stdout: "", stderr: "", aborted: false };
 				} };
@@ -1149,7 +1150,7 @@ describe("stale interactive run reaper", () => {
 				const stdout = args.includes("display-message")
 					? "123\n"
 					: args.includes("list-panes")
-						? (closed ? "%13\t0\tother\t789\n" : "%12\t0\tsubagent\t456\n")
+						? (closed ? "%13|0|other|789\n" : "%12|0|subagent|456\n")
 						: "";
 				return { exitCode: 0, stdout, stderr: "", aborted: false };
 			},

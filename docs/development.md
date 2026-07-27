@@ -45,11 +45,20 @@ bun run acceptance:managed-child
 # 성공 stdout JSON은 `foregroundUsagePersistence: true`를 포함한다. 이 gate는 input/output/cacheRead/cacheWrite/totalTokens
 # 다섯 base token field의 top-level/nested 일치와 이에 대응하는 get_session_stats token totals, private session JSONL persistence만 검증한다.
 # cost 또는 cacheWrite1h/reasoning 같은 optional usage field는 검증하지 않는다.
-# live tmux/cmux only when deliberately authorized:
+# live tmux/cmux only when deliberately authorized. tmux commands use the
+# explicit canonical executable rather than caller PATH.
+TMUX_BIN=/absolute/path/to/tmux \
 PI_SUBAGENT_LIVE_TMUX=1 bun run acceptance:tmux -- --keep
 PI_SUBAGENT_LIVE_CMUX=1 bun run acceptance:cmux -- --keep
+TMUX_BIN=/absolute/path/to/tmux \
 PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:tmux
 PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:cmux
+# isolated mutating control-client stress probe (no provider call):
+TMUX_BIN=/absolute/path/to/tmux \
+PI_SUBAGENT_TMUX_CONTROL_STRESS_PROBE=1 bun run tmux:control-stress-probe
+# exact-version, provider-free 3.7a production-path fixture:
+TMUX_BIN=/absolute/path/to/tmux-3.7a \
+PI_SUBAGENT_REAL_TMUX_37A_FIXTURE=1 bun test test/acceptance/performance-phase0-live.test.ts
 ```
 
 ### Phase 0 provider-live evidence (명시적 수동 record)

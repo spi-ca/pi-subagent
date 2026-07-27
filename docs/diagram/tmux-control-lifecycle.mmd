@@ -1,6 +1,6 @@
 stateDiagram-v2
   [*] --> Gate: allocation preflight
-  Gate --> V3Authority: stable tmux >= 3.7b<br/>fixture and identity pass
+  Gate --> V3Authority: stable tmux >= 3.7a<br/>fixture and identity pass
   Gate --> FailedClosed: malformed or below-min<br/>stable tmux version
   Gate --> V2SafePath: eligible non-version gate failure<br/>before V3 authority publication
   V3Authority --> Control: publish V3 authority<br/>and lease one tmux -C client

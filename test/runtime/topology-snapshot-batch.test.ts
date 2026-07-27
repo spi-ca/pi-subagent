@@ -76,7 +76,7 @@ describe("TopologySnapshotBatch", () => {
     const tmux = await batch.read({
       generation: 3,
       key: "tmux:exe:socket:99",
-      fetch: async () => ({ server: "99\n", panes: "%1\t0\tone\t100\n%2\t0\ttwo\t200\n" }),
+      fetch: async () => ({ server: "99\n", panes: "%1|0|100\n%2|0|200\n" }),
     });
     assert.equal(tmux.state, "known");
     if (tmux.state === "known") {

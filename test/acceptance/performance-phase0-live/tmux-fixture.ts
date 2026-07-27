@@ -26,6 +26,12 @@ type TmuxTeardownHooks = {
 export type TmuxFixtureTestHooks = {
   afterBinding?: (stage: "creation" | "source" | "sentinel", state: { socket: string; socketRoot: string; binding: TmuxServerBinding }) => void | Promise<void>;
 };
+
+/** Fixture setup never inherits shell startup hooks or the caller's PATH. */
+export const TMUX_FIXTURE_SAFE_PATH = "/usr/bin:/bin";
+export function tmuxFixtureSetupEnv(): NodeJS.ProcessEnv {
+  return { PATH: TMUX_FIXTURE_SAFE_PATH, SHELL: "/bin/sh", HOME: "/tmp", TERM: "xterm-256color" };
+}
 function exactTmuxSocket(stat: Awaited<ReturnType<typeof fs.lstat>> | null, expected: TmuxSocketIdentity): boolean {
   return Boolean(stat?.isSocket() && !stat.isSymbolicLink() && BigInt(stat.dev) === expected.dev && BigInt(stat.ino) === expected.ino);
 }
@@ -41,8 +47,9 @@ function exactPrivateTmuxSocketRoot(stat: Awaited<ReturnType<typeof fs.lstat>> |
 }
 async function tmuxReportedServerPid(tmux: string, socket: string, timeoutMs: number, env: NodeJS.ProcessEnv, runCommand: TmuxTeardownHooks["runCommand"] = rawRun): Promise<number | null> {
   const result = await runCommand(tmux, ["-S", socket, "display-message", "-p", "#{pid}"], { timeoutMs, env });
+  if (result.code !== 0) return null;
   const pid = Number(result.stdout.trim());
-  return result.code === 0 && Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
 }
 /** Captures the minimal authority needed to kill a just-created isolated server. */
 async function bindCreatedTmuxServer(tmux: string, socket: string, socketRoot: string, socketRootIdentity: TmuxSocketRootIdentity, timeoutMs: number, env: NodeJS.ProcessEnv, runCommand: TmuxTeardownHooks["runCommand"] = rawRun): Promise<TmuxServerBinding | null> {
@@ -163,9 +170,10 @@ export async function teardownIdentityBoundTmuxServer(options: {
 /* Transport sources are deliberately isolated. The production extension selects its transport from these exact source environments. */
 export async function runTmuxCell(root: string, agentDir: string, extension: string, pi: LivePiExecutable, activeRuns: number, workload: Workload, env: NodeJS.ProcessEnv, testHooks: TmuxFixtureTestHooks = {}): Promise<Omit<LiveEvidence["matrix"][number], "mode" | "sourceAndSentinelPreserved">> {
   const deadline = createCellDeadline(activeRuns), tmux = pi.tmux.executable, session = `phase0-${crypto.randomUUID()}`;
+  const setupEnv = tmuxFixtureSetupEnv();
   const run = (bin: string, args: string[], options: BoundedCommandOptions): Promise<BoundedCommandResult> => {
     revalidateManagedChildPiExecutableGeneration(pi.tmux);
-    return rawRun(bin, args, options);
+    return rawRun(bin, args, { ...options, env: setupEnv });
   };
   let socketRoot = "", socket = "", tmuxBinding: TmuxServerBinding | null = null, primaryFailure: unknown = null;
   let parentCompleted = false, transportCleanupProven = true, result: Omit<LiveEvidence["matrix"][number], "mode" | "sourceAndSentinelPreserved"> | null = null;
@@ -174,7 +182,7 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     await fs.chmod(socketRoot, 0o700);
     const creationSocketRoot = privateTmuxSocketRoot(await fs.lstat(socketRoot).catch(() => null));
     if (creationSocketRoot === null) throw new Error("isolated tmux socket root identity unavailable");
-    const created = await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "500", "-y", "200", "-s", session, "-c", ROOT, `exec sleep ${TMUX_SOURCE_SENTINEL_LIFETIME_SECONDS}`], { deadline, env });
+    const created = await run(tmux, ["-S", socket, "-f", "/dev/null", "new-session", "-d", "-x", "500", "-y", "200", "-s", session, "-c", ROOT, `exec /bin/sleep ${TMUX_SOURCE_SENTINEL_LIFETIME_SECONDS}`], { deadline, env });
     if (created.code !== 0) {
       // Creation can partially succeed. Bind only two matching observations so
       // cleanup can use the same identity-bound path as every later failure.
@@ -190,20 +198,26 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     tmuxBinding = await bindCreatedTmuxServer(tmux, socket, socketRoot, creationSocketRoot, DEFAULT_COMMAND_TIMEOUT_MS, env, run);
     if (!tmuxBinding) throw new Error("isolated tmux creation binding is unavailable");
     await testHooks.afterBinding?.("creation", { socket, socketRoot, binding: tmuxBinding });
-    const identity = await run(tmux, ["-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}\t#{pid}"], { deadline, env });
-    const identityMatch = identity.stdout.trim().match(/^(%\d+)\t(\d+)$/);
+    // tmux 3.7a normalizes literal tab format output in this command path;
+    // use a fixed non-ambiguous delimiter for the isolated fixture instead.
+    const identity = await run(tmux, ["-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}|#{pid}"], { deadline, env });
+    if (identity.code !== 0) throw new Error("isolated tmux source identity command failed");
+    const identityMatch = identity.stdout.trim().match(/^(%\d+)\|(\d+)$/);
     if (!identityMatch) throw new Error("isolated tmux source unavailable");
     const source = identityMatch[1]!, serverPid = Number(identityMatch[2]);
     const server = await run(tmux, ["-S", socket, "display-message", "-p", "-t", source, "#{pid}"], { deadline, env });
+    if (server.code !== 0) throw new Error("isolated tmux server identity command failed");
     const actualServerPid = Number(server.stdout.trim());
     if (!Number.isSafeInteger(actualServerPid) || actualServerPid <= 0 || serverPid !== actualServerPid || actualServerPid !== tmuxBinding.server.pid || getProcessStartedAt(actualServerPid) !== tmuxBinding.server.startedAt) throw new Error("isolated tmux server PID observations disagree");
     const sourcePanePidResult = await run(tmux, ["-S", socket, "display-message", "-p", "-t", source, "#{pane_pid}"], { deadline, env });
+    if (sourcePanePidResult.code !== 0) throw new Error("isolated tmux source pane identity command failed");
     const sourcePanePid = Number(sourcePanePidResult.stdout.trim()), sourcePaneStartedAt = Number.isSafeInteger(sourcePanePid) && sourcePanePid > 0 ? getProcessStartedAt(sourcePanePid) : null;
     if (sourcePaneStartedAt === null) throw new Error("isolated tmux source fixture identity unavailable");
     tmuxBinding = { ...tmuxBinding, expectedProcesses: [{ pid: sourcePanePid, startedAt: sourcePaneStartedAt }] };
     await testHooks.afterBinding?.("source", { socket, socketRoot, binding: tmuxBinding });
-    const sentinelResult = await run(tmux, ["-S", socket, "split-window", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}", "-t", source, `exec sleep ${TMUX_SOURCE_SENTINEL_LIFETIME_SECONDS}`], { deadline, env });
-    const sentinelMatch = sentinelResult.stdout.trim().match(/^(%\d+)\t([1-9]\d*)$/);
+    const sentinelResult = await run(tmux, ["-S", socket, "split-window", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-t", source, `exec /bin/sleep ${TMUX_SOURCE_SENTINEL_LIFETIME_SECONDS}`], { deadline, env });
+    if (sentinelResult.code !== 0) throw new Error("isolated tmux sentinel command failed");
+    const sentinelMatch = sentinelResult.stdout.trim().match(/^(%\d+)\|([1-9]\d*)$/);
     if (!sentinelMatch || sentinelMatch[1] === source || serverPid <= 0) throw new Error("isolated tmux sentinel unavailable");
     const sentinel = sentinelMatch[1]!, sentinelPid = Number(sentinelMatch[2]!), sentinelStartedAt = getProcessStartedAt(sentinelPid);
     if (sentinelStartedAt === null) throw new Error("isolated tmux sentinel fixture identity unavailable");
@@ -255,7 +269,7 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     // A created namespace without an exact server binding is deliberately
     // retained rather than guessed at; that is not proven cleanup.
     if (tmuxBinding) {
-      try { await teardownIdentityBoundTmuxServer({ tmux, socket, socketRoot, binding: tmuxBinding, env, hooks: { runCommand: run } }); }
+      try { await teardownIdentityBoundTmuxServer({ tmux, socket, socketRoot, binding: tmuxBinding, env: setupEnv, hooks: { runCommand: run } }); }
       catch { transportCleanupProven = false; }
     } else if (socketRoot) transportCleanupProven = false;
     const finalized = await finalizePhase0CellFailure(root, primaryFailure, transportCleanupProven, { mode: "tmux", workload, activeRuns }, parentCompleted);

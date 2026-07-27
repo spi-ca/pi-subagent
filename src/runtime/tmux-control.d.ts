@@ -42,7 +42,7 @@ export type TmuxParsedControlItem = {
 } | {
     kind: "output";
 };
-/** Stateful strict parser for tmux 3.7b control-mode output. */
+/** Stateful strict parser for the tmux control-mode format pinned to the 3.7b baseline. */
 export declare class TmuxControlParser {
     private block;
     consume(line: string): TmuxParsedControlItem | null;

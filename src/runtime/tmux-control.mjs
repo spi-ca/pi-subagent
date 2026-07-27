@@ -96,7 +96,7 @@ function disconnectReason(error) {
 function protocolFailure(category, message) {
     return new TmuxControlError("TMUX_PROTOCOL", message, category);
 }
-/** Stateful strict parser for tmux 3.7b control-mode output. */
+/** Stateful strict parser for the tmux control-mode format pinned to the 3.7b baseline. */
 export class TmuxControlParser {
     block = null;
     consume(line) {

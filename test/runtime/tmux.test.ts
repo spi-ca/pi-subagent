@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	buildGuardedTmuxPaneCommandArgs,
 	buildTmuxNewWindowArgs,
+	buildTmuxPaneSnapshotArgs,
 	buildTmuxSourceTopologyArgs,
 	buildTmuxSplitArgs,
 	closeTmuxPane,
@@ -16,6 +17,8 @@ import {
 	parseCreatedTmuxPane,
 	parseCreatedTmuxWindow,
 	parsePositivePid,
+	parseTmuxPaneSnapshots,
+	readTmuxPaneTitle,
 	parseTmuxSourceTopology,
 	parseTmuxEnvironment,
 	type TmuxCommandResult,
@@ -43,7 +46,7 @@ describe("tmux adapter", () => {
 			cwd: "/tmp/project",
 			wrapperPath: "/tmp/run/wrapper.sh",
 		}), [
-			"-S", "/tmp/tmux/default", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}\t#{pane_pid}",
+			"-S", "/tmp/tmux/default", "split-window", "-h", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}",
 			"-t", "%1", "-c", "/tmp/project", "exec '/tmp/run/wrapper.sh'",
 		]);
 	});
@@ -56,7 +59,7 @@ describe("tmux adapter", () => {
 			paneId: "%7", sessionId: "$0", windowId: "@0",
 		});
 		for (const output of [
-			"%7|$00|@9|101\n", "%7|$4|@00|101\n", "%7|$4|@9|extra\n", "%7\t$4\t@9|101\n",
+			"%7|$00|@9|101\n", "%7|$4|@00|101\n", "%7|$4|@9|extra\n", "%7\t$4\t@9\t101\n",
 			"%7|$4|@9|101\n%7|$4|@10|102\n", "%7|$4|@9|101\nmalformed\n", "%7|$4|@9|0101\n",
 		]) assert.equal(parseTmuxSourceTopology(output, "%7"), null);
 		assert.equal(parseTmuxSourceTopology("%8|$4|@9|102\n", "%7"), null);
@@ -102,12 +105,27 @@ describe("tmux adapter", () => {
 	});
 
 	test("parses only stable tmux pane ids and canonical PIDs", () => {
-		assert.equal(parseCreatedTmuxPane("%12\t212\n"), "%12");
+		assert.equal(parseCreatedTmuxPane("%12|212\n"), "%12");
 		assert.equal(parseCreatedTmuxPane("%12\n"), null);
-		assert.equal(parseCreatedTmuxPane("%12\t212 \n"), null);
+		assert.equal(parseCreatedTmuxPane("%12|212 \n"), null);
 		assert.equal(parseCreatedTmuxPane("pane 12"), null);
 		assert.equal(parsePositivePid("212"), 212);
 		for (const malformed of ["0212", "212x", "212 ", "+212", "0"]) assert.equal(parsePositivePid(malformed), null);
+	});
+
+	test("keeps arbitrary titles out of authoritative snapshots", async () => {
+		assert.deepEqual(buildTmuxPaneSnapshotArgs("/tmp/tmux"), ["-S", "/tmp/tmux", "list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}|#{pane_pid}"]);
+		assert.equal(buildTmuxPaneSnapshotArgs().at(-1)?.includes("pane_title"), false);
+		assert.equal(parseTmuxPaneSnapshots("%1|0|101\n")?.get("%1")?.panePid, 101);
+		for (const title of ["carriage\rreturn", "nul\0title"]) {
+			const snapshot = parseTmuxPaneSnapshots("%1|0|101\n");
+			assert.equal(snapshot?.get("%1")?.panePid, 101);
+			assert.equal(await readTmuxPaneTitle("%1", "/tmp/tmux", async () => outcome(`${title}\n`)), undefined);
+		}
+		assert.equal(parseTmuxPaneSnapshots("%1|0|101\n")?.get("%1")?.panePid, 101);
+		assert.equal(await readTmuxPaneTitle("%1", "/tmp/tmux", async () => outcome("pipe|title\n")), "pipe|title");
+		assert.equal(parseTmuxPaneSnapshots("%1|0|101|extra\n"), null);
+		assert.equal(parseTmuxPaneSnapshots("%1\t0\t101\n"), null);
 	});
 
 	test("refuses to split when the inherited tmux server was replaced", async () => {
@@ -162,7 +180,7 @@ describe("tmux adapter", () => {
 				calls.push(args);
 				if (args.includes("display-message")) return outcome("123\n");
 				if (args.includes("new-window")) return outcome("$4|@9|%12|212\n");
-				if (args.includes("list-panes")) return outcome("%13\t0\tunrelated\t313\n%12\t0\tallocated\t212\n");
+				if (args.includes("list-panes")) return outcome("%13|0|313\n%12|0|212\n");
 				return outcome();
 			},
 		}), /simulated publication failure/);
@@ -178,8 +196,8 @@ describe("tmux adapter", () => {
 			const run = async (args: string[]) => {
 				calls.push(args);
 				if (args.includes("display-message")) return outcome("123\n");
-				if (args.includes(window ? "new-window" : "split-window")) return outcome(window ? "$4|@9|%12|212\n" : "%12\t212\n", 1, "tmux reported failure");
-				if (args.includes("list-panes")) return outcome("%12\t0\tallocated\t212\n");
+				if (args.includes(window ? "new-window" : "split-window")) return outcome(window ? "$4|@9|%12|212\n" : "%12|212\n", 1, "tmux reported failure");
+				if (args.includes("list-panes")) return outcome("%12|0|212\n");
 				return outcome();
 			};
 			const create = window ? createTmuxWindow({ sessionId: "$4", serverPid: 123, cwd: "/tmp/project", agentName: "worker", runId: "run", command: ["true"], onAllocated: async (handle) => { published.push(handle); }, run }) : createTmuxPane({ sourcePaneId: "%1", serverPid: 123, cwd: "/tmp/project", wrapperPath: "/tmp/run/wrapper.sh", onAllocated: async (handle) => { published.push(handle); }, run });
@@ -206,7 +224,7 @@ describe("tmux adapter", () => {
 				calls.push(args);
 				if (args.includes("display-message")) return outcome("123\n");
 				if (args.includes("new-window")) return outcome("$4|@9|%12|212\n");
-				return outcome("%12\t0\tallocated\t999\n");
+				return outcome("%12|0|999\n");
 			},
 		}), /publication failed/);
 		assert.equal(calls.some((args) => args.includes("if-shell")), false);
@@ -228,8 +246,8 @@ describe("tmux adapter", () => {
 			run: async (args) => {
 				calls.push(args);
 				if (args.includes("display-message")) return outcome("123\n");
-				if (args.includes("split-window")) return outcome("%12\t212\n");
-				if (args.includes("list-panes")) return outcome("%13\t0\tunrelated\t313\n%12\t0\tstaged\t212\n");
+				if (args.includes("split-window")) return outcome("%12|212\n");
+				if (args.includes("list-panes")) return outcome("%13|0|313\n%12|0|212\n");
 				return outcome();
 			},
 		}), /simulated parent crash/);
@@ -253,8 +271,8 @@ describe("tmux adapter", () => {
 		const calls: string[][] = [];
 		const run = async (args: string[]) => {
 			calls.push(args);
-			if (args.includes("split-window")) return outcome("%12\t212\n");
-			if (args.includes("list-panes")) return outcome("%11\t0\tother\t201\n%12\t0\tsubagent\t212\n");
+			if (args.includes("split-window")) return outcome("%12|212\n");
+			if (args.includes("list-panes")) return outcome("%11|0|201\n%12|0|212\n");
 			if (args.includes("display-message")) return outcome("123\n");
 			return outcome();
 		};
@@ -267,7 +285,7 @@ describe("tmux adapter", () => {
 			run,
 		});
 		assert.deepEqual(handle, { paneId: "%12", socketPath: "/tmp/tmux/default", serverPid: 123, panePid: 212 });
-		assert.deepEqual(await inspectTmuxPane(handle, run), { exists: true, dead: false, title: "subagent", panePid: 212 });
+		assert.deepEqual(await inspectTmuxPane(handle, run), { exists: true, dead: false, panePid: 212 });
 		assert.equal(await matchesTmuxPaneFingerprint(handle, run), true);
 		assert.equal(await interruptTmuxPane(handle, run), true);
 		assert.equal(await closeTmuxPane(handle, run), true);
@@ -280,11 +298,11 @@ describe("tmux adapter", () => {
 		const handle = { paneId: "%12", socketPath: "/tmp/tmux/default", serverPid: 123, panePid: 212 };
 		assert.deepEqual(await inspectTmuxPaneFingerprint(handle, async (args) => {
 			if (args.includes("display-message")) return outcome("999\n");
-			return outcome("%12\t0\tother\t212\n");
+			return outcome("%12|0|212\n");
 		}), { exists: false });
 		assert.deepEqual(await inspectTmuxPaneFingerprint(handle, async (args) => {
 			if (args.includes("display-message")) return outcome("123\n");
-			return outcome("%12\t0\tother\t999\n");
+			return outcome("%12|0|999\n");
 		}), { exists: false });
 		assert.equal(await inspectTmuxPaneFingerprint(handle, async () => outcome("", 1)), undefined);
 	});
@@ -292,15 +310,15 @@ describe("tmux adapter", () => {
 	test("rejects malformed or duplicate unrelated lifecycle rows rather than proving absence", async () => {
 		const handle = { paneId: "%9", serverPid: 123, panePid: 999 };
 		for (const output of [
-			"%1\t2\tmain\t101\n", "%1\t0\tmain\tbad\n", "%1\t0\tmain\t101\textra\n",
-			"%1\t0\tmain\t101\n%1\t0\tmain\t102\n", "%9\t0\ttarget\tbad\n",
+			"%1|2|101\n", "%1|0|bad\n", "%1|0|101|extra\n",
+			"%1|0|101\n%1|0|102\n", "%9|0|bad\n", "%1|0|101\0\n",
 		]) assert.equal(await inspectTmuxPane(handle, async () => outcome(output)), undefined);
 	});
 
 	test("reports a missing pane only from a fully valid complete list", async () => {
 		const snapshot = await inspectTmuxPane(
 			{ paneId: "%9", serverPid: 123, panePid: 999 },
-			async () => outcome("%1\t0\tmain\t101\n"),
+			async () => outcome("%1|0|101\n"),
 		);
 		assert.deepEqual(snapshot, { exists: false });
 	});

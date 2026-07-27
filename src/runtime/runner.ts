@@ -76,6 +76,7 @@ import {
   parseTmuxPaneSnapshots,
   parseTmuxServerPidOutput,
   readTmuxSourceTopology,
+  TMUX_FORMAT_DELIMITER,
   type TmuxCommandRunner,
 } from "./tmux.js";
 import { buildTmuxWindowLabel } from "./tmux-window-label.mjs";
@@ -398,6 +399,7 @@ const BROKER_COMMIT_TIMEOUT_MS = 30_000;
 const BROKER_RUNTIME_ENV = "PI_SUBAGENT_BROKER_RUNTIME";
 const BROKER_ENTRYPOINT = fileURLToPath(new URL("./pane-launch-broker.mjs", import.meta.url));
 const CMUX_BUNDLED_CLI_PATH_ENV = "CMUX_BUNDLED_CLI_PATH";
+const TMUX_BIN_ENV = "TMUX_BIN";
 const interactivePiVersionChecks = new Map<string, Promise<void>>();
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -2848,6 +2850,8 @@ export function resolveBackendExecutable(mode: "cmux-pane" | "tmux-pane", env: N
     if (configured) return resolveConfiguredExecutable(env, configured);
     return resolvePathExecutable(env, "cmux");
   }
+  const configured = env[TMUX_BIN_ENV]?.trim();
+  if (configured) return resolveConfiguredExecutable(env, configured);
   return resolvePathExecutable(env, "tmux");
 }
 
@@ -2877,7 +2881,7 @@ function createBackendCommandRunner(
       || resolveBackendPath(mode, backendPath) !== backendPath) {
       return { exitCode: 1, stdout: "", stderr: "Backend executable is no longer available after preflight.", aborted: false };
     }
-    const result = await runCommandCapture(backendPath, args, { signal: options.signal, env: buildBrokerEnvironment(process.env, mode) });
+    const result = await runCommandCapture(backendPath, args, { signal: options.signal, env: buildBrokerEnvironment(process.env, mode, backendPath) });
     return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, aborted: result.aborted };
   };
 }
@@ -2978,7 +2982,7 @@ async function inspectActiveInteractiveSnapshot(options: {
   const pane = panes.get(native.paneId);
   if (!pane) return { exists: false };
   return pane.panePid === native.panePid
-    ? { exists: true, exited: pane.dead, title: pane.title }
+    ? { exists: true, exited: pane.dead }
     : { exists: false };
 }
 
@@ -4915,7 +4919,7 @@ const CHILD_BOOTSTRAP_ENV = new Set([
   ...PROXY_AND_CERTIFICATE_ENV,
   // These are restored only from the private 0600 environment script after
   // the wrapper removes inherited state. Dynamic pane identities are not.
-  "CMUX_SOCKET_PATH", CMUX_BUNDLED_CLI_PATH_ENV,
+  "CMUX_SOCKET_PATH", CMUX_BUNDLED_CLI_PATH_ENV, TMUX_BIN_ENV,
   ...Object.keys(CHILD_CMUX_PROFILE_ENV),
   PI_AGENT_DIR_ENV, SUBAGENT_ORIGINAL_AGENT_DIR_ENV, SUBAGENT_INHERITED_API_KEY_ENV, SUBAGENT_MANAGED_TITLE_ENV,
   SUBAGENT_DEPTH_ENV, SUBAGENT_MAX_DEPTH_ENV, SUBAGENT_MAX_ACTIVE_ENV, SUBAGENT_STACK_ENV, SUBAGENT_PREVENT_CYCLES_ENV, SUBAGENT_MANAGED_CHILD_POLICY_ENV,
@@ -4933,7 +4937,7 @@ const CHILD_BOOTSTRAP_ENV = new Set([
 /** Explicit child allowlist; provider auth, proxy, and CA settings stay private. */
 /** Environment authority for the detached broker and every command it runs. */
 export function buildTmuxSourcePaneProbeArgs(socketPath?: string): string[] {
-  return [...(socketPath ? ["-S", socketPath] : []), "list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"];
+  return [...(socketPath ? ["-S", socketPath] : []), "list-panes", "-a", "-F", `#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`];
 }
 
 export function parseTmuxSourcePaneProbe(stdout: string, paneId: string): number | null {
@@ -4997,7 +5001,7 @@ export async function resolveSharedCmuxSourcePreflight(options: {
   throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=1 control=none parser=topology-mutated", 1, "none", "topology-mutated");
 }
 
-export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane" | "tmux-pane"): NodeJS.ProcessEnv {
+export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane" | "tmux-pane", resolvedBackendExecutable?: string): NodeJS.ProcessEnv {
   const minimal: NodeJS.ProcessEnv = {
     // Keep the resolver PATH for env-shebang runtime/backend shims. This is
     // still an explicit allowlisted value, not inherited shell state.
@@ -5014,6 +5018,14 @@ export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane"
     : ["TMUX", "TMUX_PANE"]) {
     if (env[key] !== undefined) minimal[key] = env[key];
   }
+  if (mode === "tmux-pane") {
+    // Do not replay a caller's raw/relative selection into the detached
+    // broker. Every tmux descendant receives the already-resolved identity.
+    const canonical = resolvedBackendExecutable
+      ? resolveBackendPath("tmux-pane", resolvedBackendExecutable)
+      : resolveBackendExecutable("tmux-pane", env);
+    if (canonical && path.isAbsolute(canonical)) minimal[TMUX_BIN_ENV] = canonical;
+  }
   return minimal;
 }
 
@@ -5022,6 +5034,15 @@ export function buildPrivateChildEnvironmentScript(env: NodeJS.ProcessEnv): stri
   for (const [key, value] of Object.entries(env).sort(([left], [right]) => left.localeCompare(right))) {
     if (value === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     if (!CHILD_BOOTSTRAP_ENV.has(key) && !key.startsWith("LC_")) continue;
+    // Child/nested launch must never inherit an unresolved relative TMUX_BIN.
+    // Resolve it against the explicit PATH once, then serialize only its
+    // canonical absolute path through the private bootstrap artifact.
+    if (key === TMUX_BIN_ENV) {
+      const canonical = resolveBackendExecutable("tmux-pane", env);
+      if (!canonical || !path.isAbsolute(canonical)) continue;
+      lines.push(`export ${key}=${shellQuote(canonical)}`);
+      continue;
+    }
     // Multiplexer pane identities remain dynamic and must never be restored.
     // The inherited CLI key uses this same short-lived private 0600 boundary
     // as provider keys; the wrapper unlinks the script immediately after source.
@@ -5719,7 +5740,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         agentName: result.agent, parentDepth: options.parentDepth, parentAgentStack: options.parentAgentStack,
         maxDepth: options.maxDepth, maxActive: options.maxActive, limits: options.limits, preventCycles: options.preventCycles, interactivePaneLayout: options.interactivePaneLayout,
         trustedProjectRoots: options.trustedProjectRoots, deniedProjectRoots: options.deniedProjectRoots,
-        inheritedApiKeyBinding: options.inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv: options.phase0LiveProofEnv, baseEnv: process.env, runProtocolEnv: protocolEnv,
+        inheritedApiKeyBinding: options.inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv: options.phase0LiveProofEnv,
+        baseEnv: backend.mode === "tmux-pane" ? { ...process.env, [TMUX_BIN_ENV]: backendExecutable } : process.env, runProtocolEnv: protocolEnv,
         treePermitEnv: buildTreePermitChildEnv(options.treePermitLease, options.runStateRoot),
       });
       await writePrivateFile(runPaths.secretEnvPath, buildPrivateChildEnvironmentScript(childEnv));
@@ -5736,7 +5758,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         throw new Error("Interactive session shutdown fenced this run before broker allocation.");
       }
       if (options.signal?.aborted) throw new Error("Interactive launch was aborted before broker allocation.");
-      const brokerEnvironment = buildBrokerEnvironment(process.env, backend.mode);
+      const brokerEnvironment = buildBrokerEnvironment(process.env, backend.mode, backendExecutable);
       // The detached broker follows these exact paths. Revalidate every
       // executable/script generation immediately before the irreversible spawn.
       if (!sameExecutableGeneration(backendGeneration, readExecutableGeneration(backendExecutable))

@@ -170,6 +170,60 @@ export class Phase0LiveDiagnosticWatchdog {
 }
 
 type Phase0TerminalCounts = { "provider-error": number; "settled-before-read": number; "shutdown-before-read": number; "aborted-before-read": number };
+
+const PHASE0_BLIND_STAGE_TERMINAL_ERROR = "Phase 0 stage wait observed a terminal admitted subagent before authenticated read-start.";
+/**
+ * Watches only the already-emitted parent JSON lifecycle for one admitted
+ * background job reaching a terminal status while the stage remains blind.
+ * IDs and result content are correlation-only and are never retained in errors.
+ */
+export class Phase0BlindStageTerminalObserver {
+  #partial = Buffer.alloc(0); #discarding = false;
+  #launchCalls = new Set<string>(); #admittedJobs = new Set<string>(); #terminalJobs = new Set<string>();
+  #resolveTerminal!: () => void;
+  #terminal = new Promise<void>((resolve) => { this.#resolveTerminal = resolve; });
+  constructor(private readonly maximumJobs: number) {
+    if (!Number.isSafeInteger(maximumJobs) || maximumJobs < 1 || maximumJobs > PHASE0_MAX_BACKGROUND_JOBS) throw new Error("Phase 0 blind stage observer requires a bounded job count.");
+  }
+  #validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 128 && /^[a-z0-9._:-]+$/i.test(value); }
+  #exact(value: Record<string, unknown>, keys: readonly string[]): boolean { const actual = Object.keys(value).sort(), expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
+  #observeLine(line: Buffer): void {
+    let event: unknown;
+    try { event = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)); } catch { return; }
+    if (!record(event)) return;
+    if (event.type === "custom_message" && event.customType === "subagent_result" && record(event.details) && this.#exact(event.details, ["jobId", "status", "startedAt", "completedAt"])
+      && this.#validId(event.details.jobId) && ["completed", "failed", "cancelled"].includes(event.details.status as string)
+      && Number.isSafeInteger(event.details.startedAt) && (event.details.startedAt as number) > 0 && Number.isSafeInteger(event.details.completedAt) && (event.details.completedAt as number) > 0
+      && this.#admittedJobs.has(event.details.jobId) && !this.#terminalJobs.has(event.details.jobId)) {
+      this.#terminalJobs.add(event.details.jobId);
+      this.#resolveTerminal();
+      return;
+    }
+    if ((event.type !== "tool_execution_start" && event.type !== "tool_execution_end") || event.toolName !== "subagent" || !this.#validId(event.toolCallId)) return;
+    const callId = event.toolCallId;
+    if (event.type === "tool_execution_start") {
+      if (record(event.args) && event.args.background === true && event.args.action === undefined && Array.isArray(event.args.tasks) && event.args.tasks.length === 1 && this.#launchCalls.size < this.maximumJobs) this.#launchCalls.add(callId);
+      return;
+    }
+    if (this.#launchCalls.delete(callId) && event.isError === false && record(event.result) && record(event.result.details) && this.#validId(event.result.details.jobId)
+      && this.#admittedJobs.size < this.maximumJobs && !this.#admittedJobs.has(event.result.details.jobId)) this.#admittedJobs.add(event.result.details.jobId);
+  }
+  observeJsonl(chunk: Uint8Array): void {
+    const input = Buffer.concat([this.#partial, Buffer.from(chunk)]); let cursor = 0;
+    while (cursor < input.length) {
+      const newline = input.indexOf(0x0a, cursor); if (newline < 0) break;
+      const line = input.subarray(cursor, newline); cursor = newline + 1;
+      if (!this.#discarding && line.length <= MAX_PHASE0_LIVE_JSONL_LINE_BYTES) this.#observeLine(line);
+      this.#discarding = false;
+    }
+    const trailing = input.subarray(cursor);
+    if (this.#discarding || trailing.length > MAX_PHASE0_LIVE_JSONL_LINE_BYTES) { this.#partial = Buffer.alloc(0); this.#discarding = true; }
+    else this.#partial = Buffer.from(trailing);
+  }
+  /** Fixed error only: no job ID, task, path, or provider output escapes this boundary. */
+  async waitForTerminal(): Promise<never> { await this.#terminal; throw new Error(PHASE0_BLIND_STAGE_TERMINAL_ERROR); }
+}
+
 function phase0TerminalCounts(value: Partial<Phase0TerminalCounts> | undefined): Phase0TerminalCounts { const count = (name: keyof Phase0TerminalCounts): number => boundedDiagnosticCount(Number(value?.[name] ?? 0)); return { "provider-error": count("provider-error"), "settled-before-read": count("settled-before-read"), "shutdown-before-read": count("shutdown-before-read"), "aborted-before-read": count("aborted-before-read") }; }
 function phase0FailureCountsText(value: Partial<Phase0TerminalCounts> | undefined): string { const counts = phase0TerminalCounts(value); return `provider-error=${counts["provider-error"]} settled-before-read=${counts["settled-before-read"]} shutdown-before-read=${counts["shutdown-before-read"]} aborted-before-read=${counts["aborted-before-read"]}`; }
 class Phase0TerminalFailure extends Error { constructor(readonly category: Extract<Phase0FailureCategory, "spawn-failed" | "parent-exit" | "parent-signal">, counts: Partial<Phase0TerminalCounts>) { super(`Phase 0 provider parent terminal category=${category} ${phase0FailureCountsText(counts)}`); } }
@@ -627,6 +681,27 @@ export async function racePhase0ActionBarrier<T>(
   try { return await Promise.race([actionResult, milestoneFailure]); }
   finally { abort.abort(); }
 }
+/**
+ * The parent/process terminal and admitted-job terminal guards remain live from
+ * topology through the final authenticated descriptor read. They are cancelled
+ * only once the read-start boundary is reached, before any FIFO writer exists.
+ */
+export async function awaitPhase0PreReadLifecycle<T, U>(
+  action: (signal: AbortSignal) => Promise<T>,
+  milestoneMonitor: Promise<void>,
+  readStarts: Promise<U>,
+  terminalFailure: Promise<never>,
+  blindStageTerminal: Promise<never>,
+  diagnosticFailure: Promise<never> | null = null,
+): Promise<{ actionReady: T; readStartIdentities: U }> {
+  const guard = <V>(stage: Promise<V>): Promise<V> => (diagnosticFailure
+    ? Promise.race([stage, terminalFailure, blindStageTerminal, diagnosticFailure])
+    : Promise.race([stage, terminalFailure, blindStageTerminal])) as Promise<V>;
+  const actionReady = await racePhase0ActionBarrier(action, guard(milestoneMonitor));
+  await guard(milestoneMonitor);
+  const readStartIdentities = await guard(readStarts);
+  return { actionReady, readStartIdentities };
+}
 type ParentSample = { cpuMs: number; rssKiB: number };
 function parentSample(pid: number): ParentSample | null {
   const probe = spawnSync("/bin/ps", ["-p", String(pid), "-o", "rss=", "-o", "time="], { encoding: "utf8" });
@@ -980,6 +1055,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   let failureSummary: Phase0FailureSummary | null = null;
   let summaryRetentionProven = false;
   const milestonesTracker = new Phase0LiveMilestoneTracker();
+  const blindStageTerminal = new Phase0BlindStageTerminalObserver(activeRuns);
   try {
     await fs.mkdir(cellRoot, { recursive: true, mode: 0o700 }); await fs.chmod(cellRoot, 0o700);
     requireRemainingDeadline(deadline, "proof/FIFO setup");
@@ -1015,7 +1091,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   const kill = (): void => { try { if (child.pid && startedAt !== null && getProcessStartedAt(child.pid) === startedAt) process.kill(child.pid, "SIGKILL"); } catch {} };
   // Start bounded drains before attempting identity acquisition: even an
   // unbound or failed bootstrap must not block the harness on inherited pipes.
-  child.stdout.on("data", (chunk: Buffer) => { milestonesTracker.observeJsonl(chunk); if (!stdout.append(chunk)) { outputOverflow = true; kill(); } });
+  child.stdout.on("data", (chunk: Buffer) => { milestonesTracker.observeJsonl(chunk); blindStageTerminal.observeJsonl(chunk); if (!stdout.append(chunk)) { outputOverflow = true; kill(); } });
   child.stderr.on("data", (chunk: Buffer) => {
     stderrBytes = Math.min(MAX_DIAGNOSTIC_BYTES + 1, stderrBytes + chunk.length);
     if (stderrBytes > MAX_DIAGNOSTIC_BYTES) { diagnosticsOverflow = true; kill(); }
@@ -1147,27 +1223,31 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   let actionReady: Awaited<ReturnType<ActionBarrier>> | null = null;
   try {
     const terminalFailure = observePhase0ChildTerminalFailure(child, () => proofServer!.terminalCounts(), childTerminalError);
+    let readStartIdentities: ProcessIdentity[];
     try {
-      const barrierGuard = diagnosticFailure
-        ? Promise.race([milestoneMonitor!, terminalFailure.promise, diagnosticFailure])
-        : Promise.race([milestoneMonitor!, terminalFailure.promise]);
-      actionReady = await racePhase0ActionBarrier(
+      // A child sends read-start only after it owns the exact validated FIFO
+      // descriptor. Keep terminal guards through topology, stage publication,
+      // and this authenticated read-start; cancel them only after that boundary.
+      const preRead = await awaitPhase0PreReadLifecycle(
         actionBarrier
           ? (signal) => actionBarrier(child, activeRuns, deadline, signal)
           : async (_signal) => {
               const observed = await waitForChildren(child, activeRuns, deadline, () => proofServer!.terminalCounts(), _signal);
               return { observedProcesses: observed.max, identities: observed.identities, backendTargets: undefined, closeAll: async () => closeExactDescendants(child, observed.identities, deadline) };
             },
-        barrierGuard,
+        milestoneMonitor!,
+        proofServer!.waitForReadStarts(activeRuns, requireRemainingDeadline(deadline, "provider read starts")),
+        terminalFailure.promise,
+        blindStageTerminal.waitForTerminal(),
+        diagnosticFailure,
       );
+      actionReady = preRead.actionReady;
+      readStartIdentities = preRead.readStartIdentities;
     } finally {
       terminalFailure.cancel();
     }
-    // A child sends read-start only after it owns the exact validated FIFO descriptor.
-    // The launch barrier therefore combines exact read-start identities with the
-    // process/backend topology before any FIFO writer is allowed to run.
-    await awaitWithDiagnostic(milestoneMonitor!);
-    const readStartIdentities = await awaitWithDiagnostic(proofServer!.waitForReadStarts(activeRuns, requireRemainingDeadline(deadline, "provider read starts")));
+    // The launch barrier combines exact read-start identities with the process/
+    // backend topology before any FIFO writer is allowed to run.
     if (actionReady.identities && (actionReady.identities.length !== readStartIdentities.length
       || actionReady.identities.some((identity) => !readStartIdentities.some((readStart) => readStart.pid === identity.pid && readStart.startedAt === identity.startedAt)))) {
       throw new Error("provider read-start identities do not match the exact process launch barrier");

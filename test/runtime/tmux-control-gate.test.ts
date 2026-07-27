@@ -29,29 +29,31 @@ async function socketFixture() {
 }
 
 describe("tmux control transport gate", () => {
-	test("strictly parses, sorts, and hashes the pinned read-only probe", () => {
-		const probe = parseTmuxControlProbe("tmux 3.7b\n", "42\t$1\t%2\t99\n", "$2\t%5\t100\n$1\t%2\t99\n");
+	test("accepts stable tmux 3.7a and higher while strictly parsing, sorting, and hashing the read-only probe", () => {
+		const probe = parseTmuxControlProbe("tmux 3.7a\n", "42|$1|%2|99\n", "$2|%5|100\n$1|%2|99\n");
 		assert.ok(probe);
-		assert.equal(probe.detectedTmuxVersion, "3.7b");
-		assert.ok(parseTmuxControlProbe("tmux 3.8\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n"));
-		assert.ok(parseTmuxControlProbe("tmux 4.0\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n"));
+		assert.equal(probe.detectedTmuxVersion, "3.7a");
+		assert.ok(parseTmuxControlProbe("tmux 3.7b\n", "42|$1|%2|99\n", "$1|%2|99\n"));
+		assert.ok(parseTmuxControlProbe("tmux 3.8\n", "42|$1|%2|99\n", "$1|%2|99\n"));
+		assert.ok(parseTmuxControlProbe("tmux 4.0\n", "42|$1|%2|99\n", "$1|%2|99\n"));
 		assert.deepEqual(probe.paneRows, [{ sessionId: "$1", paneId: "%2", panePid: 99 }, { sessionId: "$2", paneId: "%5", panePid: 100 }]);
 		assert.equal(canonicalTmuxProbeBytes(probe).at(-1), 0x0a);
 		for (const malformed of [
-			["tmux 3.7a\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n"],
-			["tmux 3.8-rc1\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n"],
-			["tmux garbage\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n"],
-			["tmux 3.7b\n", "42\t$1\t%2\t99\r\n", "$1\t%2\t99\n"],
-			["tmux 3.7b\n", "42\t$1\t%2\t99\n", "$1\t%2\t99\n$1\t%2\t99\n"],
-			["tmux 3.7b\n", "42\t$1\t%2\t99\n", "$1\t%3\t99\n"],
+			["tmux 3.7\n", "42|$1|%2|99\n", "$1|%2|99\n"],
+			["tmux 3.6z\n", "42|$1|%2|99\n", "$1|%2|99\n"],
+			["tmux 3.8-rc1\n", "42|$1|%2|99\n", "$1|%2|99\n"],
+			["tmux garbage\n", "42|$1|%2|99\n", "$1|%2|99\n"],
+			["tmux 3.7b\n", "42|$1|%2|99\r\n", "$1|%2|99\n"],
+			["tmux 3.7b\n", "42|$1|%2|99\n", "$1|%2|99\n$1|%2|99\n"],
+			["tmux 3.7b\n", "42|$1|%2|99\n", "$1|%3|99\n"],
 		]) assert.equal(parseTmuxControlProbe(...malformed as [string, string, string]), null);
 	});
 
 	test("classifies below-minimum and malformed version output as a fatal version gate error", async () => {
 		const fixture = await socketFixture();
-		for (const versionStdout of ["tmux 3.7a\n", "tmux 3.8-rc1\n", "garbage\n"]) {
+		for (const versionStdout of ["tmux 3.7\n", "tmux 3.6z\n", "tmux 3.8-rc1\n", "garbage\n"]) {
 			let calls = 0;
-			await assert.rejects(() => createTmuxControlTransportGate({ runId: "version", executable: process.execPath, socketPath: fixture.socketPath, sourcePaneId: "%2", serverStartedAt: getProcessStartedAt(process.pid)!, run: async (args) => { calls += 1; return args[0] === "-V" ? { exitCode: 0, stdout: versionStdout } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}\t$1\t%2\t99\n` } : { exitCode: 0, stdout: "$1\t%2\t99\n" }; } }), TmuxControlVersionError);
+			await assert.rejects(() => createTmuxControlTransportGate({ runId: "version", executable: process.execPath, socketPath: fixture.socketPath, sourcePaneId: "%2", serverStartedAt: getProcessStartedAt(process.pid)!, run: async (args) => { calls += 1; return args[0] === "-V" ? { exitCode: 0, stdout: versionStdout } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}|$1|%2|99\n` } : { exitCode: 0, stdout: "$1|%2|99\n" }; } }), TmuxControlVersionError);
 			assert.equal(calls, 3);
 		}
 	});
@@ -63,11 +65,12 @@ describe("tmux control transport gate", () => {
 		const serverStartedAt = getProcessStartedAt(process.pid)!;
 		const gate = await createTmuxControlTransportGate({ runId: "gate-run", executable: process.execPath, socketPath: fixture.socketPath, sourcePaneId: "%2", serverStartedAt, createdAt: 456, run: async (args) => {
 			calls.push(args);
-			if (args[0] === "-V") return { exitCode: 0, stdout: "tmux 3.7b\n" };
-			if (args.includes("display-message")) return { exitCode: 0, stdout: `${process.pid}\t$1\t%2\t99\n` };
-			return { exitCode: 0, stdout: "$1\t%2\t99\n" };
+			if (args[0] === "-V") return { exitCode: 0, stdout: "tmux 3.7a\n" };
+			if (args.includes("display-message")) return { exitCode: 0, stdout: `${process.pid}|$1|%2|99\n` };
+			return { exitCode: 0, stdout: "$1|%2|99\n" };
 		} });
 		assert.equal(gate.fixtureContractId, TMUX_CONTROL_FIXTURE_CONTRACT_ID);
+		assert.equal(gate.probeResult.detectedTmuxVersion, "3.7a");
 		assert.equal(gate.pinnedSourceCommit, TMUX_CONTROL_SOURCE_COMMIT);
 		assert.equal(gate.probeDigest, crypto.createHash("sha256").update(canonicalTmuxProbeBytes(gate.probeResult)).digest("hex"));
 		assert.deepEqual((await publishTmuxControlTransportGate(paths.transportGatePath, gate)).probeResult, gate.probeResult);
@@ -77,7 +80,7 @@ describe("tmux control transport gate", () => {
 	test("invalidates executable replacement even when inode, size, and mtime are preserved", async () => {
 		const fixture = await socketFixture(); const executable = path.join(fixture.root, "tmux");
 		await fs.promises.writeFile(executable, "aaaa", { mode: 0o700 }); const before = await fs.promises.stat(executable);
-		const gate = await createTmuxControlTransportGate({ runId: "ctime", executable, socketPath: fixture.socketPath, sourcePaneId: "%1", serverStartedAt: getProcessStartedAt(process.pid)!, createdAt: 2, run: async (args) => args[0] === "-V" ? { exitCode: 0, stdout: "tmux 3.7b\n" } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}\t$1\t%1\t8\n` } : { exitCode: 0, stdout: "$1\t%1\t8\n" } });
+		const gate = await createTmuxControlTransportGate({ runId: "ctime", executable, socketPath: fixture.socketPath, sourcePaneId: "%1", serverStartedAt: getProcessStartedAt(process.pid)!, createdAt: 2, run: async (args) => args[0] === "-V" ? { exitCode: 0, stdout: "tmux 3.7b\n" } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}|$1|%1|8\n` } : { exitCode: 0, stdout: "$1|%1|8\n" } });
 		assert.equal(isTmuxControlTransportGateCurrent(gate), true);
 		await new Promise((resolve) => setTimeout(resolve, 2)); await fs.promises.writeFile(executable, "bbbb", { mode: 0o700 }); await fs.promises.utimes(executable, before.atime, before.mtime);
 		assert.equal(isTmuxControlTransportGateCurrent(gate), false);
@@ -85,12 +88,12 @@ describe("tmux control transport gate", () => {
 
 	test("rejects extra fields, digest changes, unsorted rows, and cross-run records", async () => {
 		const fixture = await socketFixture();
-		const gate = await createTmuxControlTransportGate({ runId: "strict", executable: process.execPath, socketPath: fixture.socketPath, sourcePaneId: "%1", serverStartedAt: getProcessStartedAt(process.pid)!, createdAt: 2, run: async (args) => args[0] === "-V" ? { exitCode: 0, stdout: "tmux 3.7b\n" } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}\t$1\t%1\t8\n` } : { exitCode: 0, stdout: "$1\t%1\t8\n$2\t%2\t9\n" } });
+		const gate = await createTmuxControlTransportGate({ runId: "strict", executable: process.execPath, socketPath: fixture.socketPath, sourcePaneId: "%1", serverStartedAt: getProcessStartedAt(process.pid)!, createdAt: 2, run: async (args) => args[0] === "-V" ? { exitCode: 0, stdout: "tmux 3.7b\n" } : args.includes("display-message") ? { exitCode: 0, stdout: `${process.pid}|$1|%1|8\n` } : { exitCode: 0, stdout: "$1|%1|8\n$2|%2|9\n" } });
 		assert.ok(parseTmuxControlTransportGate(gate, "strict"));
 		const higherProbe = { ...gate.probeResult, detectedTmuxVersion: "3.8" };
 		const higherGate = { ...gate, probeResult: higherProbe, probeDigest: crypto.createHash("sha256").update(canonicalTmuxProbeBytes(higherProbe)).digest("hex") };
 		assert.equal(parseTmuxControlTransportGate(higherGate, "strict")?.probeResult.detectedTmuxVersion, "3.8");
-		for (const detectedTmuxVersion of ["3.7a", "3.8-rc1", "garbage"]) {
+		for (const detectedTmuxVersion of ["3.7", "3.6z", "3.8-rc1", "garbage"]) {
 			const probeResult = { ...gate.probeResult, detectedTmuxVersion };
 			assert.equal(parseTmuxControlTransportGate({ ...gate, probeResult, probeDigest: crypto.createHash("sha256").update(canonicalTmuxProbeBytes(probeResult)).digest("hex") }, "strict"), null);
 		}

@@ -3,6 +3,9 @@ import { getProcessStartedAt, type TmuxGenerationV2 } from "./run-protocol.js";
 import { buildTmuxWindowLabel } from "./tmux-window-label.mjs";
 import { readFileGeneration } from "./launch-preflight.js";
 
+/** Printable, strict format separator shared by every tmux machine-readable response. */
+export const TMUX_FORMAT_DELIMITER = "|";
+
 export const TMUX_PANE_ID_RE = /^%(?:0|[1-9][0-9]*)$/;
 /** Layout topology requires non-zero stable container IDs. */
 export const TMUX_SESSION_ID_RE = /^\$(?:0|[1-9][0-9]*)$/;
@@ -103,13 +106,42 @@ export function buildTmuxServerPidArgs(socketPath?: string): string[] {
 export function buildTmuxPaneSnapshotArgs(socketPath?: string): string[] {
 	return withSocket(socketPath, [
 		"list-panes", "-a", "-F",
-		"#{pane_id}\t#{pane_dead}\t#{pane_title}\t#{pane_pid}",
+		`#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_dead}${TMUX_FORMAT_DELIMITER}#{pane_pid}`,
 	]);
+}
+
+/** Pane titles are UX-only and excluded from authoritative snapshots. */
+export function buildTmuxPaneTitleArgs(paneId: string, socketPath?: string): string[] {
+	return TMUX_PANE_ID_RE.test(paneId)
+		? withSocket(socketPath, ["display-message", "-p", "-t", paneId, "#{pane_title}"])
+		: [];
+}
+
+function parseTmuxPaneTitle(stdout: string): string | undefined {
+	const title = withoutFinalLineEnding(stdout);
+	return title.length <= 1024 && !title.includes("\0") && !title.includes("\r") && !title.includes("\n") ? title || undefined : undefined;
+}
+
+/** Fail-soft UX read; its result never participates in lifecycle authority. */
+export async function readTmuxPaneTitle(
+	paneId: string,
+	socketPath: string | undefined,
+	run: TmuxCommandRunner,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	const args = buildTmuxPaneTitleArgs(paneId, socketPath);
+	if (args.length === 0) return undefined;
+	try {
+		const result = await run(args, { signal });
+		return result.exitCode === 0 ? parseTmuxPaneTitle(result.stdout) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Uses a printable separator because locale/client handling can sanitize tabs. */
 export function buildTmuxSourceTopologyArgs(socketPath?: string): string[] {
-	return withSocket(socketPath, ["list-panes", "-a", "-F", "#{pane_id}|#{session_id}|#{window_id}|#{pane_pid}"]);
+	return withSocket(socketPath, ["list-panes", "-a", "-F", `#{pane_id}${TMUX_FORMAT_DELIMITER}#{session_id}${TMUX_FORMAT_DELIMITER}#{window_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`]);
 }
 
 /** Alias that makes the command's read-only purpose explicit to callers. */
@@ -126,7 +158,7 @@ export function parseTmuxPanePidList(stdout: string, targetPaneId: string): numb
 	let target: number | false = false;
 	const seenPaneIds = new Set<string>();
 	for (const line of output ? output.split("\n") : []) {
-		const fields = line.split("\t");
+		const fields = line.split(TMUX_FORMAT_DELIMITER);
 		if (fields.length !== 2) return null;
 		const [paneId, panePidText] = fields;
 		const panePid = parsePositivePid(panePidText!);
@@ -144,7 +176,7 @@ export function parseTmuxSourceTopology(stdout: string, sourcePaneId: string): T
 	let source: TmuxSourceTopology | undefined;
 	const seenPaneIds = new Set<string>();
 	for (const line of output.split("\n")) {
-		const fields = line.split("|");
+		const fields = line.split(TMUX_FORMAT_DELIMITER);
 		if (fields.length !== 4) return null;
 		const [paneId, sessionId, windowId, panePidText] = fields;
 		if (!TMUX_PANE_ID_RE.test(paneId!) || !TMUX_SESSION_ID_RE.test(sessionId!) || !TMUX_WINDOW_ID_RE.test(windowId!)
@@ -216,7 +248,7 @@ export function buildTmuxSplitArgs(options: {
 		"-d",
 		"-P",
 		"-F",
-		"#{pane_id}\t#{pane_pid}",
+		`#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`,
 		"-t",
 		options.sourcePaneId,
 		"-c",
@@ -246,20 +278,20 @@ export function buildTmuxNewWindowArgs(options: {
 		throw new Error("tmux new window requires a canonical session ID and non-empty direct command argv.");
 	}
 	return withSocket(options.socketPath, [
-		"new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}",
+		"new-window", "-d", "-P", "-F", `#{session_id}${TMUX_FORMAT_DELIMITER}#{window_id}${TMUX_FORMAT_DELIMITER}#{pane_id}${TMUX_FORMAT_DELIMITER}#{pane_pid}`,
 		"-t", `${options.sessionId}:`, "-n", buildTmuxDiagnosticTitle(options.agentName, options.runId), "-c", options.cwd,
 		...options.command,
 	]);
 }
 
 export function parseCreatedTmuxPane(stdout: string): string | null {
-	const [paneId, panePid, ...extra] = withoutFinalLineEnding(stdout).split("\t");
+	const [paneId, panePid, ...extra] = withoutFinalLineEnding(stdout).split(TMUX_FORMAT_DELIMITER);
 	if (extra.length > 0 || !paneId || !panePid || !TMUX_PANE_ID_RE.test(paneId)) return null;
 	return parsePositivePid(panePid) === null ? null : paneId;
 }
 
 export function parseCreatedTmuxPaneFingerprint(stdout: string): { paneId: string; panePid: number } | null {
-	const [paneId, panePid, ...extra] = withoutFinalLineEnding(stdout).split("\t");
+	const [paneId, panePid, ...extra] = withoutFinalLineEnding(stdout).split(TMUX_FORMAT_DELIMITER);
 	if (extra.length > 0 || !paneId || !panePid || !TMUX_PANE_ID_RE.test(paneId)) return null;
 	const pid = parsePositivePid(panePid);
 	return pid === null ? null : { paneId, panePid: pid };
@@ -268,7 +300,7 @@ export function parseCreatedTmuxPaneFingerprint(stdout: string): { paneId: strin
 /** The response must prove the requested session and exact pane fingerprint. */
 export function parseCreatedTmuxWindow(stdout: string, requestedSessionId: string): TmuxWindowFingerprint | null {
 	if (!TMUX_SESSION_ID_RE.test(requestedSessionId)) return null;
-	const [sessionId, windowId, paneId, panePidText, ...extra] = withoutFinalLineEnding(stdout).split("|");
+	const [sessionId, windowId, paneId, panePidText, ...extra] = withoutFinalLineEnding(stdout).split(TMUX_FORMAT_DELIMITER);
 	if (extra.length > 0 || !sessionId || !windowId || !paneId || !panePidText
 		|| !TMUX_SESSION_ID_RE.test(sessionId) || !TMUX_WINDOW_ID_RE.test(windowId) || !TMUX_PANE_ID_RE.test(paneId)
 		|| sessionId !== requestedSessionId) return null;
@@ -396,15 +428,15 @@ export async function createTmuxPane(options: {
 
 export function parseTmuxPaneSnapshots(stdout: string): ReadonlyMap<string, TmuxPaneSnapshot> | null {
 	const output = withoutFinalLineEnding(stdout);
-	if (output.endsWith("\r")) return null;
+	if (output.endsWith("\r") || output.includes("\0")) return null;
 	const panes = new Map<string, TmuxPaneSnapshot>();
 	for (const line of output ? output.split("\n") : []) {
-		const fields = line.split("\t");
-		if (fields.length !== 4) return null;
-		const [paneId, dead, title, panePidText] = fields;
+		const fields = line.split(TMUX_FORMAT_DELIMITER);
+		if (fields.length !== 3) return null;
+		const [paneId, dead, panePidText] = fields;
 		const panePid = parsePositivePid(panePidText!);
 		if (!TMUX_PANE_ID_RE.test(paneId!) || (dead !== "0" && dead !== "1") || panePid === null || panes.has(paneId!)) return null;
-		panes.set(paneId!, { exists: true, dead: dead === "1", title: title || undefined, panePid });
+		panes.set(paneId!, { exists: true, dead: dead === "1", panePid });
 	}
 	return panes;
 }
@@ -413,13 +445,19 @@ export async function inspectTmuxPane(
 	handle: TmuxPaneHandle,
 	run: TmuxCommandRunner = runTmuxCommand,
 	signal?: AbortSignal,
+	includeTitle = false,
 ): Promise<TmuxPaneSnapshot | undefined> {
 	if (!TMUX_PANE_ID_RE.test(handle.paneId)) return undefined;
 	const result = await run(buildTmuxPaneSnapshotArgs(handle.socketPath), { signal });
 	if (result.exitCode !== 0) return undefined;
 	const panes = parseTmuxPaneSnapshots(result.stdout);
 	if (!panes) return undefined;
-	return panes.get(handle.paneId) ?? { exists: false };
+	const snapshot = panes.get(handle.paneId);
+	if (!snapshot) return { exists: false };
+	if (!includeTitle) return snapshot;
+	// This post-authority UX request cannot alter missing/dead/PID evidence.
+	const title = await readTmuxPaneTitle(handle.paneId, handle.socketPath, run, signal);
+	return title === undefined ? snapshot : { ...snapshot, title };
 }
 
 export function isTmuxPaneGenerationCurrent(handle: TmuxPaneHandle): boolean {

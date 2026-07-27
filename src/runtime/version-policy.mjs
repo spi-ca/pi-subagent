@@ -1,6 +1,6 @@
 export const MINIMUM_PI_VERSION = "0.80.10";
 export const MINIMUM_CMUX_VERSION = "0.64.20";
-export const MINIMUM_TMUX_VERSION = "3.7b";
+export const MINIMUM_TMUX_VERSION = "3.7a";
 
 const SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 const TMUX = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([a-z]?)$/;

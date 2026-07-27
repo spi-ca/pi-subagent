@@ -1,6 +1,6 @@
 {
   "contract": "tmux-control-v1",
-  "minimumVersion": "3.7b",
+  "minimumVersion": "3.7a",
   "capturedVersion": "3.7b",
   "sourceCommit": "e802909de06012a4df6209d55e86487c56223163",
   "response": [

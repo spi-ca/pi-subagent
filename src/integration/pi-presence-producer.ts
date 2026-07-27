@@ -60,6 +60,51 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
   return Reflect.ownKeys(value).every((key) => typeof key === "string" && allowed.includes(key));
 }
 function hasOwn(value: Record<string, unknown>, key: string): boolean { return Object.hasOwn(value, key); }
+
+/** Snapshot only own data fields so untrusted ready payloads cannot race validation. */
+function snapshotOwnDataFields(
+  value: unknown,
+  allowed: readonly string[],
+  required: readonly string[],
+): Record<string, unknown> | null {
+  if (!plainObject(value)) return null;
+  const keys = Reflect.ownKeys(value);
+  if (!keys.every((key) => typeof key === "string" && allowed.includes(key))
+    || !required.every((key) => keys.includes(key))) return null;
+  const snapshot: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) return null;
+    snapshot[key as string] = descriptor.value;
+  }
+  return snapshot;
+}
+
+/** Copy a dense, bounded capability list without reading indexed accessors. */
+function snapshotCapabilities(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const keys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (!lengthDescriptor || !("value" in lengthDescriptor)
+    || typeof lengthDescriptor.value !== "number"
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < 0
+    || lengthDescriptor.value > MAX_ARRAY) return null;
+  const length = lengthDescriptor.value;
+  if (keys.length !== length + 1
+    || !keys.every((key) => key === "length"
+      || (typeof key === "string"
+        && /^(?:0|[1-9]\d*)$/.test(key)
+        && Number(key) < length))) return null;
+  const capabilities: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !("value" in descriptor) || !safeText(descriptor.value)) return null;
+    capabilities.push(descriptor.value);
+  }
+  return capabilities;
+}
+
 function safeText(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
@@ -155,25 +200,16 @@ export function parsePiPresenceRemove(value: unknown): PiPresenceRemove | null {
 /** Ready is a replay request and passive consumer advertisement, never authority. */
 export function parsePiPresenceReady(value: unknown): PiPresenceReady | null {
   try {
-    if (!plainObject(value) || !hasOnlyKeys(value, READY_KEYS) || !hasOwn(value, "version") || !hasOwn(value, "sessionId")) return null;
-    const version = value.version;
-    const sessionId = value.sessionId;
-    const rawConsumer = value.consumer;
-    if (version !== 1 || !safeText(sessionId)) return null;
-    if (rawConsumer === undefined) return { version: 1, sessionId };
-    if (!plainObject(rawConsumer) || !hasOnlyKeys(rawConsumer, CONSUMER_KEYS) || !hasOwn(rawConsumer, "id") || !hasOwn(rawConsumer, "capabilities")) return null;
-    const consumerId = rawConsumer.id;
-    const rawCapabilities = rawConsumer.capabilities;
-    if (!safeText(consumerId) || !Array.isArray(rawCapabilities)) return null;
-    const capabilityLength = rawCapabilities.length;
-    if (!Number.isSafeInteger(capabilityLength) || capabilityLength < 0 || capabilityLength > MAX_ARRAY) return null;
-    const capabilities: string[] = [];
-    for (let index = 0; index < capabilityLength; index += 1) {
-      const capability = rawCapabilities[index];
-      if (!safeText(capability)) return null;
-      capabilities.push(capability);
-    }
-    return { version: 1, sessionId, consumer: { id: consumerId, capabilities } };
+    const root = snapshotOwnDataFields(value, READY_KEYS, ["version", "sessionId"]);
+    if (!root || root.version !== 1 || !safeText(root.sessionId)) return null;
+    // A discovery request omits consumer entirely; an own undefined value is invalid.
+    if (!hasOwn(root, "consumer")) return { version: 1, sessionId: root.sessionId };
+
+    const consumer = snapshotOwnDataFields(root.consumer, CONSUMER_KEYS, CONSUMER_KEYS);
+    if (!consumer || !safeText(consumer.id)) return null;
+    const capabilities = snapshotCapabilities(consumer.capabilities);
+    if (!capabilities) return null;
+    return { version: 1, sessionId: root.sessionId, consumer: { id: consumer.id, capabilities } };
   } catch { return null; }
 }
 
@@ -226,6 +262,9 @@ export class PiSubagentPresenceProducer {
   private cmuxStatusConsumerSeen = false;
   private presenceRemoveCapabilityDetected = false;
   private replaying = false;
+  /** Exact request identity prevents synchronous self-replay without hiding a consumer response. */
+  private locallyEmittedReadyRequest: PiPresenceReady | null = null;
+  private requestingReady = false;
   private settlementDeferred = false;
 
   constructor(options: PiSubagentPresenceProducerOptions) {
@@ -250,8 +289,11 @@ export class PiSubagentPresenceProducer {
     this.cmuxStatusConsumerSeen = false;
     this.presenceRemoveCapabilityDetected = false;
     this.replaying = false;
+    this.locallyEmittedReadyRequest = null;
+    this.requestingReady = false;
     this.settlementDeferred = false;
     try { this.unsubscribeReady = this.on?.(PI_PRESENCE_READY_EVENT, (payload) => this.handleReady(payload)) ?? null; } catch { this.unsubscribeReady = null; }
+    this.requestReady();
     return true;
   }
 
@@ -265,6 +307,8 @@ export class PiSubagentPresenceProducer {
     this.cmuxStatusConsumerSeen = false;
     this.presenceRemoveCapabilityDetected = false;
     this.replaying = false;
+    this.locallyEmittedReadyRequest = null;
+    this.requestingReady = false;
     this.settlementDeferred = false;
     this.terminalIds.clear();
   }
@@ -303,6 +347,10 @@ export class PiSubagentPresenceProducer {
 
   /** Public for thin entrypoint wiring and deterministic tests. */
   handleReady(payload: unknown): void {
+    // pi.events emits synchronously. Ignore only this exact locally emitted
+    // consumer-less request. A nested consumer advertisement remains visible
+    // for passive diagnostics/routing, but never requests a replay.
+    if (this.requestingReady && payload === this.locallyEmittedReadyRequest) return;
     const ready = parsePiPresenceReady(payload);
     if (!ready || ready.sessionId !== this.sessionId) return;
     if (!this.presenceRemoveCapabilityDetected && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("presence-remove-v1")) {
@@ -312,7 +360,7 @@ export class PiSubagentPresenceProducer {
       this.cmuxStatusConsumerSeen = true;
       try { this.onCmuxStatusConsumer?.(); } catch { /* UI routing is non-authoritative. */ }
     }
-    if (!this.current || this.replaying) return;
+    if (ready.consumer || !this.current || this.replaying) return;
     const parsed = parsePiPresenceUpdate({ ...this.current, sequence: this.nextSequence(), attention: "none" });
     if (!parsed) return;
     this.current = freezePresenceUpdate(parsed);
@@ -389,6 +437,16 @@ export class PiSubagentPresenceProducer {
     } catch { return undefined; }
   }
   private nextSequence(): number { this.sequence += 1; return this.sequence; }
+  private requestReady(): void {
+    if (this.sessionId === null) return;
+    const request: PiPresenceReady = Object.freeze({ version: 1, sessionId: this.sessionId });
+    this.locallyEmittedReadyRequest = request;
+    this.requestingReady = true;
+    try { this.emitSafely(PI_PRESENCE_READY_EVENT, request); } finally {
+      this.requestingReady = false;
+      this.locallyEmittedReadyRequest = null;
+    }
+  }
   private removeCurrent(): void {
     if (!this.current || this.sessionId === null || this.generation === null) return;
     const remove = parsePiPresenceRemove({
@@ -400,7 +458,7 @@ export class PiSubagentPresenceProducer {
     this.settlementDeferred = false;
     this.emitSafely(PI_PRESENCE_REMOVE_EVENT, freezePresenceRemove(remove));
   }
-  private emitSafely(channel: string, event: PiPresenceUpdate | PiPresenceRemove): void { try { this.emit(channel, event); } catch { /* Event observers are never lifecycle authority. */ } }
+  private emitSafely(channel: string, event: PiPresenceUpdate | PiPresenceRemove | PiPresenceReady): void { try { this.emit(channel, event); } catch { /* Event observers are never lifecycle authority. */ } }
 }
 
 function isTerminalSnapshot(item: SubagentUxSnapshot): item is TerminalSnapshot {

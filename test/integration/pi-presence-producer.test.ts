@@ -37,6 +37,12 @@ describe("pi presence producer wire contract", () => {
     assert.equal(parsePiPresenceUpdate({ ...update, progress: { value: 1.1 } }), null);
     assert.equal(parsePiPresenceUpdate({ ...update, usage: { tokens: -1 } }), null);
     assert.deepEqual(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } }), { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } });
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", source: "unexpected" }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: [], private: true } }), null);
+    assert.equal(parsePiPresenceReady({ version: 1 }), null);
+    assert.equal(parsePiPresenceReady({ sessionId: "session-1" }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x" } }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { capabilities: [] } }), null);
     assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: Array(17).fill("x") } }), null);
     assert.equal(isPiCmuxPresenceCmuxStatusReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } }), true);
     assert.equal(isPiCmuxPresenceCmuxStatusReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-progress"] } }), false);
@@ -134,44 +140,195 @@ describe("pi presence producer wire contract", () => {
     ].map((name) => [name, 1])));
   });
 
-  test("snapshots ready fields and capability entries without iterating untrusted arrays", () => {
-    const reads = new Map<string, number>();
-    const changing = <T>(name: string, initial: T, later: T) => ({
-      enumerable: true,
-      get: () => {
-        const count = (reads.get(name) ?? 0) + 1;
-        reads.set(name, count);
-        return count === 1 ? initial : later;
-      },
+  test("strictly snapshots ready DTOs from own data properties", () => {
+    const ready = { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } };
+    const parsed = parsePiPresenceReady(ready);
+    assert.deepEqual(parsed, ready);
+    assert.ok(parsed?.consumer);
+    assert.notEqual(parsed, ready);
+    assert.notEqual(parsed.consumer, ready.consumer);
+    assert.notEqual(parsed.consumer.capabilities, ready.consumer.capabilities);
+
+    const sparseCapabilities = new Array<string>(1);
+    const accessorCapabilities = ["cmux-status"];
+    Object.defineProperty(accessorCapabilities, "0", { enumerable: true, get() { throw new Error("must not read index accessors"); } });
+    const extraCapabilityProperty = ["cmux-status"] as string[] & { private?: string };
+    extraCapabilityProperty.private = "no";
+    const inheritedCapabilities = new Array<string>(1);
+    Object.setPrototypeOf(inheritedCapabilities, { 0: "cmux-status" });
+    const inheritedRoot = Object.create({ version: 1, sessionId: "session-1" });
+    const inheritedConsumer = Object.create({ id: "consumer", capabilities: [] });
+    let rootGetterReads = 0;
+    const changingRoot = { version: 1, sessionId: "session-1" };
+    Object.defineProperty(changingRoot, "consumer", { enumerable: true, get() { rootGetterReads += 1; return { id: "changed", capabilities: [] }; } });
+    let consumerGetterReads = 0;
+    const changingConsumer = { capabilities: [] as string[] };
+    Object.defineProperty(changingConsumer, "id", { enumerable: true, get() { consumerGetterReads += 1; return "changed"; } });
+    const versionAccessor = { sessionId: "session-1" };
+    Object.defineProperty(versionAccessor, "version", { enumerable: true, get() { rootGetterReads += 1; return 1; } });
+    const capabilitiesAccessor = { id: "consumer" };
+    Object.defineProperty(capabilitiesAccessor, "capabilities", { enumerable: true, get() { consumerGetterReads += 1; return []; } });
+
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: undefined }), null, "consumer-less requests must omit consumer");
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: sparseCapabilities } }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: accessorCapabilities } }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: extraCapabilityProperty } }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: inheritedCapabilities } }), null);
+    assert.equal(parsePiPresenceReady(inheritedRoot), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: inheritedConsumer }), null);
+    assert.equal(parsePiPresenceReady(changingRoot), null);
+    assert.equal(parsePiPresenceReady(versionAccessor), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: changingConsumer }), null);
+    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: capabilitiesAccessor }), null);
+    assert.equal(rootGetterReads, 0, "root getters must not run");
+    assert.equal(consumerGetterReads, 0, "consumer getters must not run");
+    assert.equal(parsePiPresenceReady(new Proxy({}, { getPrototypeOf() { throw new Error("proxy rejected"); } })), null);
+  });
+
+  test("actively requests ready without self-replay and accepts a synchronous consumer response", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const listeners = new Map<string, Set<(value: unknown) => void>>();
+    const emit = (channel: string, payload: unknown) => {
+      emitted.push({ channel, payload });
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+    };
+    const on = (channel: string, handler: (value: unknown) => void) => {
+      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
+      handlers.add(handler);
+      listeners.set(channel, handlers);
+      return () => handlers.delete(handler);
+    };
+    // A consumer loaded first responds synchronously to the producer request.
+    on(PI_PRESENCE_READY_EVENT, (payload) => {
+      const ready = parsePiPresenceReady(payload);
+      if (ready && !ready.consumer) emit(PI_PRESENCE_READY_EVENT, {
+        version: 1, sessionId: ready.sessionId,
+        consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status", "presence-remove-v1"] },
+      });
     });
-    const capabilities = new Proxy(["cmux-status"], {
-      get: (target, key, receiver) => {
-        if (key === "length" || key === "0") reads.set(`capabilities.${key}`, (reads.get(`capabilities.${key}`) ?? 0) + 1);
-        if (key === "0" && reads.get("capabilities.0") !== 1) return "changed-capability";
-        return Reflect.get(target, key, receiver);
-      },
-    });
-    const consumer = Object.create(Object.prototype, {
-      id: changing("consumer.id", "pi-cmux-presence", "changed-consumer"),
-      capabilities: changing("consumer.capabilities", capabilities, []),
-    });
-    const ready = Object.create(Object.prototype, {
-      version: changing("version", 1, 2), sessionId: changing("sessionId", "session-1", "changed-session"), consumer: changing("consumer", consumer, null),
+    let hints = 0;
+    const producer = createPiSubagentPresenceProducer({
+      emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+      onCmuxStatusConsumer: () => { hints += 1; },
     });
 
-    assert.deepEqual(parsePiPresenceReady(ready), {
-      version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] },
+    assert.doesNotThrow(() => producer.startSession("session-1", 0));
+    const requests = emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer);
+    assert.deepEqual(requests.map((entry) => entry.payload), [{ version: 1, sessionId: "session-1" }]);
+    assert.equal(Object.isFrozen(requests[0]!.payload), true, "the outgoing discovery request is frozen");
+    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 0, "own request cannot replay");
+    assert.equal(hints, 1, "synchronous advertised response is still processed");
+    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
+  });
+
+  test("treats consumer advertisements as passive and replays only consumer-less requests", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const listeners = new Map<string, Set<(value: unknown) => void>>();
+    const emit = (channel: string, payload: unknown) => {
+      emitted.push({ channel, payload });
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+    };
+    const on = (channel: string, handler: (value: unknown) => void) => {
+      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
+      handlers.add(handler);
+      listeners.set(channel, handlers);
+      return () => handlers.delete(handler);
+    };
+    const producer = createPiSubagentPresenceProducer({ emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 });
+
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [running()]));
+    const updates = () => emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT);
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: [] } });
+    assert.equal(updates().length, 1, "advertisement alone cannot replay cached presence");
+
+    // A later consumer advertises, then sends its own canonical consumer-less
+    // request. Only that request performs the one replay.
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
+    assert.deepEqual(updates().map((entry) => entry.payload.sequence), [1, 2]);
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
+    assert.deepEqual(updates().map((entry) => entry.payload.sequence), [1, 2, 3], "legacy consumer-less requests still replay once");
+
+    const requestsBeforeRestart = emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer).length;
+    producer.startSession("session-2", 1);
+    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer).length, requestsBeforeRestart + 1, "one request per start");
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
+    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 3, "old session ready is fenced after restart");
+    producer.stop();
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-2" });
+    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 3, "stop fences ready replay");
+  });
+
+  test("suppresses an exact self request even when synchronous delivery populates cached presence", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const listeners = new Map<string, Set<(value: unknown) => void>>();
+    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
+    const emit = (channel: string, payload: unknown) => {
+      emitted.push({ channel, payload });
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+    };
+    const on = (channel: string, handler: (value: unknown) => void) => {
+      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
+      handlers.add(handler);
+      listeners.set(channel, handlers);
+      return () => handlers.delete(handler);
+    };
+    // This listener runs before the producer listener and makes current non-null
+    // while the producer's own ready request is still being delivered.
+    on(PI_PRESENCE_READY_EVENT, (payload) => {
+      if (!parsePiPresenceReady(payload)?.consumer) producer.publish(snapshot(0, [], [running()]));
     });
-    assert.deepEqual(Object.fromEntries(reads), {
-      version: 1, sessionId: 1, consumer: 1, "consumer.id": 1, "consumer.capabilities": 1, "capabilities.length": 1, "capabilities.0": 1,
+    producer = createPiSubagentPresenceProducer({ emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 });
+
+    producer.startSession("session-1", 0);
+    const updates = emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT);
+    assert.deepEqual(updates.map((entry) => entry.payload.sequence), [1], "the exact self request cannot replay newly cached presence");
+    assert.equal(Object.isFrozen(emitted.find((entry) => entry.channel === PI_PRESENCE_READY_EVENT)!.payload), true);
+  });
+
+  test("does not amplify a consumer request across multiple producers", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const listeners = new Map<string, Set<(value: unknown) => void>>();
+    const emit = (channel: string, payload: unknown) => {
+      emitted.push({ channel, payload });
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+    };
+    const on = (channel: string, handler: (value: unknown) => void) => {
+      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
+      handlers.add(handler);
+      listeners.set(channel, handlers);
+      return () => handlers.delete(handler);
+    };
+    // Each producer startup receives one consumer advertisement and the
+    // consumer's own consumer-less discovery request. Before either producer
+    // has current presence, neither exchange can emit an update.
+    let startupResponsesRemaining = 2;
+    let emittingOwnRequest = false;
+    on(PI_PRESENCE_READY_EVENT, (payload) => {
+      const ready = parsePiPresenceReady(payload);
+      if (!ready || ready.consumer || emittingOwnRequest || startupResponsesRemaining === 0) return;
+      startupResponsesRemaining -= 1;
+      emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: ready.sessionId, consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } });
+      emittingOwnRequest = true;
+      try { emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: ready.sessionId }); } finally { emittingOwnRequest = false; }
     });
+    const options = { emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 };
+    const first = createPiSubagentPresenceProducer(options);
+    const second = createPiSubagentPresenceProducer(options);
+    first.startSession("session-1", 0);
+    second.startSession("session-1", 0);
+    first.publish(snapshot(0, [], [running("first")]));
+    second.publish(snapshot(0, [], [running("second")]));
+
+    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
+    assert.deepEqual(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).map((entry) => entry.payload.sequence), [1, 1, 2, 2]);
   });
 
   test("fences session/generation, replays only after a snapshot, and removes attention on replay", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     const listeners = new Map<string, (value: unknown) => void>();
     const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => emitted.push({ channel, payload }),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
       on: (channel, handler) => { listeners.set(channel, handler); return () => listeners.delete(channel); },
       getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
@@ -194,7 +351,7 @@ describe("pi presence producer wire contract", () => {
   test("stays lazy while idle and only opens a retained source for meaningful work", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => emitted.push({ channel, payload }),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
       getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
@@ -261,7 +418,7 @@ describe("pi presence producer wire contract", () => {
     let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
     producer = createPiSubagentPresenceProducer({
       emit: (channel, payload) => {
-        emitted.push({ channel, payload });
+        if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload });
         if (channel === PI_PRESENCE_REMOVE_EVENT) producer.handleReady({ version: 1, sessionId: "session-1" });
       },
       getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
@@ -294,7 +451,7 @@ describe("pi presence producer wire contract", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     let scheduler = { active: 1, queued: 0 };
     const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => emitted.push({ channel, payload }),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
       getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
@@ -314,7 +471,7 @@ describe("pi presence producer wire contract", () => {
   test("removes immediately when the retained aggregate is already quiescent", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => emitted.push({ channel, payload }),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
       getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
@@ -333,7 +490,7 @@ describe("pi presence producer wire contract", () => {
       let scheduler = retained.scheduler;
       let interactive = retained.interactive;
       const producer = createPiSubagentPresenceProducer({
-        emit: (channel, payload) => emitted.push({ channel, payload }),
+        emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
         getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
       });
       producer.startSession("session-1", 0);
@@ -353,7 +510,7 @@ describe("pi presence producer wire contract", () => {
   test("removes retained state during reload and ignores observer failures", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => emitted.push({ channel, payload }),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
       getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
     producer.startSession("old-session", 0);
@@ -370,7 +527,7 @@ describe("pi presence producer wire contract", () => {
       emit: () => { throw new Error("observer"); },
       getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
-    throwing.startSession("session-1", 0);
+    assert.doesNotThrow(() => throwing.startSession("session-1", 0), "ready request emission failures are isolated");
     assert.doesNotThrow(() => { throwing.publish(snapshot(0, [], [running()])); throwing.settle(); throwing.stop(); });
   });
 
@@ -378,8 +535,8 @@ describe("pi presence producer wire contract", () => {
     const emitted: any[] = [];
     let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
     producer = createPiSubagentPresenceProducer({
-      emit: (_channel, payload: any) => {
-        emitted.push(payload);
+      emit: (channel, payload: any) => {
+        if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload);
         try { payload.counts.completed = 999; } catch { /* frozen observer payload */ }
         if (payload.sequence === 2) producer.handleReady({ version: 1, sessionId: "session-1" });
       },
@@ -399,7 +556,7 @@ describe("pi presence producer wire contract", () => {
     const emitted: any[] = [];
     let scheduler = { active: 0, queued: 0 };
     const producer = createPiSubagentPresenceProducer({
-      emit: (_channel, payload) => emitted.push(payload), getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); }, getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
     const completed = { id: "completed", status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 30 };
@@ -439,7 +596,7 @@ describe("pi presence producer wire contract", () => {
     for (const activeCase of cases) {
       const emitted: any[] = [];
       const producer = createPiSubagentPresenceProducer({
-        emit: (_channel, payload) => emitted.push(payload),
+        emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); },
         getSchedulerCounts: () => ({ active: activeCase.scheduler, queued: 0 }),
         getInteractiveActiveCount: () => activeCase.interactiveIds.length,
         getInteractiveActiveInvocationIds: () => activeCase.interactiveIds,
@@ -453,7 +610,7 @@ describe("pi presence producer wire contract", () => {
   test("uses the legacy interactive count as an unmatched fallback", () => {
     const emitted: any[] = [];
     const producer = createPiSubagentPresenceProducer({
-      emit: (_channel, payload) => emitted.push(payload),
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); },
       getSchedulerCounts: () => ({ active: 1, queued: 0 }),
       getInteractiveActiveCount: () => 1,
     });
@@ -465,7 +622,7 @@ describe("pi presence producer wire contract", () => {
   test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {
     const emitted: any[] = [];
     const producer = createPiSubagentPresenceProducer({
-      emit: (_channel, payload) => emitted.push(payload), getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); }, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
     });
     producer.startSession("session-1", 0);
     const one = { id: "one", status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2, progress: { completed: 1, total: 1 } };

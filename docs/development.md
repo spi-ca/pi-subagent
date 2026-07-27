@@ -56,7 +56,7 @@ PI_SUBAGENT_LIVE_TITLE_SMOKE=1 bun run title:live:cmux
 # isolated mutating control-client stress probe (no provider call):
 TMUX_BIN=/absolute/path/to/tmux \
 PI_SUBAGENT_TMUX_CONTROL_STRESS_PROBE=1 bun run tmux:control-stress-probe
-# exact-version, provider-free 3.7a production-path fixture:
+# development-only exact tmux 3.7a fixture; gate/probe/snapshot and fixture-owned cleanup only:
 TMUX_BIN=/absolute/path/to/tmux-3.7a \
 PI_SUBAGENT_REAL_TMUX_37A_FIXTURE=1 bun test test/acceptance/performance-phase0-live.test.ts
 ```

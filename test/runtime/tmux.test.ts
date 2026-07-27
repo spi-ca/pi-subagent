@@ -11,6 +11,7 @@ import {
 	createTmuxWindow,
 	inspectTmuxPane,
 	inspectTmuxPaneFingerprint,
+	inspectTmuxPaneFingerprintForUx,
 	interruptTmuxPane,
 	isInsideTmux,
 	matchesTmuxPaneFingerprint,
@@ -126,6 +127,34 @@ describe("tmux adapter", () => {
 		assert.equal(await readTmuxPaneTitle("%1", "/tmp/tmux", async () => outcome("pipe|title\n")), "pipe|title");
 		assert.equal(parseTmuxPaneSnapshots("%1|0|101|extra\n"), null);
 		assert.equal(parseTmuxPaneSnapshots("%1\t0\t101\n"), null);
+	});
+
+	test("reads pane titles only after an exact fingerprint for UX", async () => {
+		const handle = { paneId: "%1", socketPath: "/tmp/tmux", serverPid: 123, panePid: 456 };
+		const calls: string[][] = [];
+		const readablePipeTitle = await inspectTmuxPaneFingerprintForUx(handle, async (args) => {
+			calls.push(args);
+			if (args.at(-1) === "#{pid}") return outcome("123\n");
+			if (args.at(-1) === "#{pane_title}") return outcome("readable|pipe title\n");
+			return outcome("%1|0|456\n");
+		});
+		assert.deepEqual(readablePipeTitle, { exists: true, dead: false, panePid: 456, title: "readable|pipe title" });
+		assert.deepEqual(calls.map((args) => args.at(-1)), ["#{pid}", "#{pane_id}|#{pane_dead}|#{pane_pid}", "#{pane_title}"]);
+		for (const titleResult of [outcome("bad\nvalue\n"), outcome("", 1)]) {
+			const snapshot = await inspectTmuxPaneFingerprintForUx(handle, async (args) => {
+				if (args.at(-1) === "#{pid}") return outcome("123\n");
+				if (args.at(-1) === "#{pane_title}") return titleResult;
+				return outcome("%1|0|456\n");
+			});
+			assert.deepEqual(snapshot, { exists: true, dead: false, panePid: 456 });
+		}
+		let titleRead = false;
+		assert.deepEqual(await inspectTmuxPaneFingerprintForUx(handle, async (args) => {
+			if (args.at(-1) === "#{pid}") return outcome("123\n");
+			if (args.at(-1) === "#{pane_title}") titleRead = true;
+			return outcome("%1|0|999\n");
+		}), { exists: false });
+		assert.equal(titleRead, false, "a failed fingerprint must not read a UX title");
 	});
 
 	test("refuses to split when the inherited tmux server was replaced", async () => {

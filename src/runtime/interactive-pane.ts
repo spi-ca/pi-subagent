@@ -11,6 +11,7 @@ import {
 	closeTmuxPane,
 	createTmuxPane,
 	inspectTmuxPaneFingerprint,
+	inspectTmuxPaneFingerprintForUx,
 	interruptTmuxPane,
 	parseTmuxEnvironment,
 	type TmuxPaneHandle,
@@ -50,7 +51,10 @@ export interface InteractivePaneBackend {
 	readonly mode: InteractivePaneMode;
 	availabilityError(env?: NodeJS.ProcessEnv): string | null;
 	launch(options: InteractivePaneLaunchOptions): Promise<InteractivePaneHandle>;
+	/** Lifecycle authority only; it never reads diagnostic pane titles. */
 	inspect(handle: InteractivePaneHandle): Promise<InteractivePaneSnapshot | undefined>;
+	/** Optional post-fingerprint diagnostic observation for interactive UX only. */
+	inspectForUx?(handle: InteractivePaneHandle): Promise<InteractivePaneSnapshot | undefined>;
 	interrupt(handle: InteractivePaneHandle): Promise<boolean>;
 	close(handle: InteractivePaneHandle): Promise<boolean>;
 	/** Optional exact-target user-requested focus; unsupported backends fail closed. */
@@ -120,6 +124,11 @@ export const tmuxInteractivePaneBackend: InteractivePaneBackend = {
 	async inspect(handle) {
 		if (handle.mode !== "tmux-pane") throw new Error("tmux backend received a non-tmux handle.");
 		const snapshot = await inspectTmuxPaneFingerprint(handle.native);
+		return snapshot && { exists: snapshot.exists, exited: snapshot.dead };
+	},
+	async inspectForUx(handle) {
+		if (handle.mode !== "tmux-pane") throw new Error("tmux backend received a non-tmux handle.");
+		const snapshot = await inspectTmuxPaneFingerprintForUx(handle.native);
 		return snapshot && { exists: snapshot.exists, exited: snapshot.dead, title: snapshot.title };
 	},
 	async interrupt(handle) {

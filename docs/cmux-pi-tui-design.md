@@ -238,11 +238,12 @@ Production layout-aware V2 broker는 `tmux-split`의 `split-window`과 `tmux-new
 
 | 동작 | command |
 |---|---|
-| 조회 | `tmux list-panes -a -F '#{pane_id}|#{pane_dead}|#{pane_title}|#{pane_pid}'` |
+| authoritative 조회 | `tmux list-panes -a -F '#{pane_id}|#{pane_dead}|#{pane_pid}'` |
+| UX title 조회 (fail-soft) | `tmux display-message -p -t <pane-id> '#{pane_title}'` |
 | 정상 중단 요청 | `tmux send-keys -t <pane-id> Escape` |
 | 강제 종료 | `tmux kill-pane -t <pane-id>` |
 
-조회는 terminal screen을 scrape하지 않는다. 전체 pane 목록의 stable ID, `pane_dead`, `pane_pid`를 비교한다. launch 시에는 `display-message -p '#{pid}'`로 inherited `TMUX`의 server PID도 검증한다. interrupt/close는 tmux server의 `if-shell -F -t <pane>` 안에서 server PID와 pane PID 조건을 다시 평가한 뒤 `send-keys`/`kill-pane`을 실행한다. 따라서 server 재시작 뒤 재사용된 `%N`이 무관한 pane을 가리켜도 종료하지 않는다. stable tmux 3.7b control transport에서는 이 guarded `if-shell`의 top-level 응답과 선택된 branch 응답을 모두 기다린다. false branch도 고정 `display-message -p -l pi-subagent-guard-noop`으로 비어 있지 않게 하며, 이 정확한 guarded 구조가 아니면 두 번째 응답을 추측하지 않는다. 두 response block은 하나의 original command deadline과 aggregate line/byte bound를 공유하고, 첫 block만 받은 상태에서는 다음 queued command를 dispatch하지 않는다; block 오류·EOF·timeout은 mutation을 unknown으로 남기며 replay하지 않는다.
+authoritative 조회는 terminal screen을 scrape하거나 title을 포함하지 않고, 전체 pane 목록의 stable ID, `pane_dead`, `pane_pid` 세 필드만 비교한다. UX title은 exact server/pane PID fingerprint가 일치한 뒤에만 별도 fail-soft query로 읽으며, 오류·malformed 결과·사용자 변경은 lifecycle/cleanup authority에 영향을 주지 않는다. launch 시에는 `display-message -p '#{pid}'`로 inherited `TMUX`의 server PID도 검증한다. interrupt/close는 tmux server의 `if-shell -F -t <pane>` 안에서 server PID와 pane PID 조건을 다시 평가한 뒤 `send-keys`/`kill-pane`을 실행한다. 따라서 server 재시작 뒤 재사용된 `%N`이 무관한 pane을 가리켜도 종료하지 않는다. stable tmux 3.7b control transport에서는 이 guarded `if-shell`의 top-level 응답과 선택된 branch 응답을 모두 기다린다. false branch도 고정 `display-message -p -l pi-subagent-guard-noop`으로 비어 있지 않게 하며, 이 정확한 guarded 구조가 아니면 두 번째 응답을 추측하지 않는다. 두 response block은 하나의 original command deadline과 aggregate line/byte bound를 공유하고, 첫 block만 받은 상태에서는 다음 queued command를 dispatch하지 않는다; block 오류·EOF·timeout은 mutation을 unknown으로 남기며 replay하지 않는다.
 
 ### 6.4 cmux와의 의미 차이 제거
 
@@ -502,7 +503,9 @@ schema v4 provider-live contract는 `routine-v1`(15 active-1 cells/15 children)�
 
 ### 12.2 Live tmux control V3 (PASS — 2026-07-21)
 
-다른 tmux server나 user pane 안에서 실행할 필요가 없다. harness가 `-f /dev/null` isolated server, source pane, 그리고 자체 소유 sentinel pane을 생성한다. production gate의 stable minimum은 `>=3.7a`이고, pinned parser fixture 및 2026-07-21 historical exact PASS의 server는 `3.7b`다. 이 둘을 같은 minimum claim으로 취급하지 않는다. source/sentinel의 canonical `(pane_id, pane_pid)` pair를 기록·재검증하고, finally에서 그 isolated server만 종료한다. 현재 harness는 immutable transport gate와 V3 predecessor digest chain, detached broker allocation과 staged verifier, notification-triggered exact snapshot, adversarial multi-argv environment canary, stale reaper close/absence, source·sentinel 보존 및 socket/server restart generation rejection을 검증한다. 350ms steady-state process sampling에서 periodic status command와 recurring short-lived tmux process가 모두 0인지도 실제 counter/process sample로 확인한다.
+다른 tmux server나 user pane 안에서 실행할 필요가 없다. harness가 `-f /dev/null` isolated server, source pane, 그리고 자체 소유 sentinel pane을 생성한다. production gate의 stable minimum은 `>=3.7a`이고, pinned parser fixture 및 2026-07-21 historical exact PASS의 server는 `3.7b`다. 이 둘을 같은 minimum claim으로 취급하지 않는다. 저장소의 exact-version 3.7a fixture 범위는 production gate, read-only probe, direct snapshot, fixture-owned cleanup까지만이다. source/sentinel의 canonical `(pane_id, pane_pid)` pair를 기록·재검증하고, finally에서 그 isolated server만 종료한다. 현재 harness는 immutable transport gate와 V3 predecessor digest chain, detached broker allocation과 staged verifier, notification-triggered exact snapshot, adversarial multi-argv environment canary, stale reaper close/absence, source·sentinel 보존 및 socket/server restart generation rejection을 검증한다. 350ms steady-state process sampling에서 periodic status command와 recurring short-lived tmux process가 모두 0인지도 실제 counter/process sample로 확인한다.
+
+2026-07-27 이 session에서 **exact tmux 3.7a**로 provider 없이 실행한 full `acceptance:tmux`는 V3 allocation, exact target absence, source/sentinel 보존, cleanup을 PASS했고 `tmux:control-stress-probe`도 PASS했다. 이 기록은 retained fixture/evidence가 아닌 해당 날짜·버전의 local observation이며, 3.7b pinned parser baseline 및 historical exact PASS와 혼동하거나 `>=3.7a` 전반의 fixture/live claim으로 확장하지 않는다.
 
 ```bash
 TMUX_BIN=/absolute/path/to/tmux \

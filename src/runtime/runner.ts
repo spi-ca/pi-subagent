@@ -70,6 +70,7 @@ import {
   buildTmuxServerPidArgs,
   closeTmuxPane,
   inspectTmuxPaneFingerprint,
+  inspectTmuxPaneFingerprintForUx,
   interruptTmuxPane,
   parseTmuxPanePidList,
   parseTmuxEnvironment,
@@ -430,6 +431,8 @@ interface ActiveInteractiveRun {
   /** Process-local parent invocation correlation; never persisted or emitted. */
   invocationId?: string;
   backend: InteractivePaneBackend;
+  /** Optional active-only UX transport; never grants lifecycle/cleanup authority. */
+  uxBackend?: () => InteractivePaneBackend | null;
   handle: InteractivePaneHandle;
   paths?: RunArtifactPaths;
   agent: string;
@@ -936,7 +939,15 @@ export function createInteractiveResultMutationQueueForTest(): { run<T>(operatio
 export async function inspectInteractiveRunForUx(runId: string): Promise<(InteractiveRunUxSnapshot & { exists?: boolean; exited?: boolean; title?: string; titleState?: "matching" | "changed" | "unavailable"; focusSupported: boolean; promoteSupported: boolean }) | null> {
   const run = activeInteractiveRuns.get(runId);
   if (!run) return null;
-  const pane = await run.backend.inspect(run.handle).catch(() => undefined);
+  // Active V3 tmux UX reads resolve the currently accepted lease backend at
+  // call time. A pending/disconnected lease deliberately has no fallback to
+  // the backend captured at commit, which could be a short-lived CLI runner.
+  const uxBackend = run.uxBackend ? run.uxBackend() : run.backend;
+  // UX title reads are optional and occur only through the backend's
+  // post-fingerprint diagnostic path; lifecycle callers use inspect() alone.
+  const pane = uxBackend
+    ? await (uxBackend.inspectForUx?.(run.handle) ?? uxBackend.inspect(run.handle)).catch(() => undefined)
+    : undefined;
   const titleState = !pane?.title ? "unavailable" : isInteractiveTitleMatchingBase(pane.title, run.surfaceTitle) ? "matching" : "changed";
   return Object.freeze({ ...interactiveSnapshot(run), ...(pane ? { exists: pane.exists, ...(pane.exited === undefined ? {} : { exited: pane.exited }) } : {}), title: run.surfaceTitle, titleState, focusSupported: run.focusSupported, promoteSupported: Boolean(run.paths) });
 }
@@ -1288,13 +1299,13 @@ export async function releaseRegisteredInteractiveRun(runId: string, force = fal
 
 /** Register immediately on durable commit, before any one-way launch action. */
 export function registerCommittedInteractiveRun(
-  run: { runId: string; invocationId?: string; backend: InteractivePaneBackend; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
+  run: { runId: string; invocationId?: string; backend: InteractivePaneBackend; /** Active-only UX transport resolver; lifecycle and cleanup retain `backend`. */ uxBackend?: () => InteractivePaneBackend | null; handle: InteractivePaneHandle; paths?: RunArtifactPaths; agent?: string; depth?: number; focusSupported?: boolean; release?: () => Promise<boolean>; treePermitLease?: Pick<TreePermitLease, "detachBoundChild">; sessionIdentity?: SessionFileIdentity; sessionResultStartOffset?: number; applyCompletionWinner?: (completion: CompletionRecord) => Promise<boolean>; stopLeaseWriterAndDrain?: () => Promise<boolean | void>; publishParentCompletion?: ActiveInteractiveRun["publishParentCompletion"]; generation: number },
 ): boolean {
   const underlyingRelease = run.release ?? (() => closeInteractiveTarget(run.backend, run.handle));
   const now = Date.now();
   const active = {} as ActiveInteractiveRun;
   Object.assign(active, {
-    runId: run.runId, ...(run.invocationId === undefined ? {} : { invocationId: run.invocationId }), backend: run.backend, handle: run.handle, ...(run.paths ? { paths: run.paths } : {}),
+    runId: run.runId, ...(run.invocationId === undefined ? {} : { invocationId: run.invocationId }), backend: run.backend, ...(run.uxBackend ? { uxBackend: run.uxBackend } : {}), handle: run.handle, ...(run.paths ? { paths: run.paths } : {}),
     agent: sanitizeInteractivePreview(run.agent, 96) ?? "unknown", depth: Number.isSafeInteger(run.depth) && (run.depth ?? -1) >= 0 ? run.depth! : 0,
     surfaceTitle: buildChildRuntimeTitle(run.agent ?? "unknown", run.runId, run.depth),
     focusSupported: run.focusSupported ?? typeof run.backend.focus === "function", generation: run.generation,
@@ -3036,6 +3047,12 @@ function bindInteractiveBackend(
       if (handle.mode !== "tmux-pane" || !hasTmuxGeneration(handle.native)
         || !isTmuxGenerationCurrent(handle.native.generation, handle.native.serverPid)) return undefined;
       const snapshot = await inspectTmuxPaneFingerprint(handle.native, run);
+      return snapshot && { exists: snapshot.exists, exited: snapshot.dead };
+    },
+    inspectForUx: async (handle) => {
+      if (handle.mode !== "tmux-pane" || !hasTmuxGeneration(handle.native)
+        || !isTmuxGenerationCurrent(handle.native.generation, handle.native.serverPid)) return undefined;
+      const snapshot = await inspectTmuxPaneFingerprintForUx(handle.native, run);
       return snapshot && { exists: snapshot.exists, exited: snapshot.dead, title: snapshot.title };
     },
     interrupt: async (handle) => handle.mode === "tmux-pane" && hasTmuxGeneration(handle.native)
@@ -5846,7 +5863,12 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     // container state and is registered after the same committed binding.
     // Registration is the final exact generation/fence check before any gate.
     if (!registerCommittedInteractiveRun({
-      runId, invocationId: options.invocationId, backend, handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
+      runId, invocationId: options.invocationId, backend,
+      // V3 UX must never use the pre-lease CLI binding captured at commit.
+      // The resolver follows each accepted pooled lease rebind/reconnect and
+      // returns unavailable while the lease is still proving a new epoch.
+      ...(tmuxControlEnabled ? { uxBackend: () => tmuxParentLease?.acceptedTransport() ? backend : null } : {}),
+      handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
       sessionIdentity, sessionResultStartOffset, applyCompletionWinner, stopLeaseWriterAndDrain,
       publishParentCompletion: async (status, errorCode) => await publishTerminalParentCompletion(runPaths, runId, status, errorCode),
       // Preserve the post-commit observation even if a reset races adoption.

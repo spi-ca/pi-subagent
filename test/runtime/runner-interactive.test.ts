@@ -68,6 +68,7 @@ import {
 	subscribeInteractiveRunChanges,
 } from "../../src/runtime/runner";
 import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
+import { buildTmuxPaneSnapshotArgs, buildTmuxServerPidArgs, readTmuxPaneTitle } from "../../src/runtime/tmux";
 import type { InteractivePaneBackend } from "../../src/runtime/interactive-pane";
 import { acquireTmuxControlLease, snapshotTmuxControlPoolForTest } from "../../src/runtime/tmux-control-pool";
 import {
@@ -839,6 +840,119 @@ describe("interactive pane runner preparation", () => {
 			await backend.interrupt();
 			assert.equal(await closeInteractiveTarget(backend, handle), true);
 		} finally { unregisterCommittedInteractiveRun(runId); }
+	});
+
+	test("reports readable pipe titles and fail-soft unavailable UX title reads", async () => {
+		await resetInteractiveShutdownForSession();
+		const runId = "ux-tmux-title";
+		const handle = { mode: "tmux-pane" as const, native: { paneId: "%2", socketPath: "/tmp/tmux.sock", serverPid: 123, panePid: 456 } };
+		let titleResult = { stdout: "readable|pipe title\n", exitCode: 0 };
+		let lifecycleInspections = 0;
+		const backend = {
+			mode: "tmux-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => { lifecycleInspections += 1; return { exists: true }; },
+			inspectForUx: async () => ({
+				exists: true,
+				title: await readTmuxPaneTitle(handle.native.paneId, handle.native.socketPath, async () => ({ ...titleResult, stderr: "", aborted: false })),
+			}),
+			interrupt: async () => true, close: async () => true,
+		};
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, agent: "worker", depth: 0, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed", "a readable pipe title remains a UX value, not an unavailable lifecycle value");
+			titleResult = { stdout: "", exitCode: 1 };
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "unavailable", "an unavailable title read is fail-soft for UX");
+			titleResult = { stdout: "malformed\nsecond-line\n", exitCode: 0 };
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "unavailable", "a malformed title is rejected before UX state");
+			assert.equal(lifecycleInspections, 0, "UX inspection must use its separate post-fingerprint path");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+		}
+	});
+
+	test("active V3 tmux UX resolves the current pooled lease and stays unavailable while reconnecting", async () => {
+		await resetInteractiveShutdownForSession();
+		const runId = "ux-tmux-pooled-lease";
+		const handle = { mode: "tmux-pane" as const, native: { paneId: "%2", socketPath: "/private/tmux.sock", serverPid: 123, panePid: 456 } };
+		const disconnects: Array<() => void> = [];
+		const pooledCommands: Array<{ client: number; line: string; mutation: boolean | undefined }> = [];
+		let clientCount = 0;
+		const lease = await acquireTmuxControlLease({
+			authority: {
+				controlContract: "tmux-control-v1", executableGeneration: { realpath: "/private/tmux", dev: "1", ino: "1", size: "1", mtimeNs: "1", ctimeNs: "1" },
+				canonicalSocketPath: handle.native.socketPath, socketDev: 1, socketIno: 1, serverPid: handle.native.serverPid, serverStartedAt: 1,
+				attachedSessionId: "$1", sourcePaneId: "%1", sourcePanePid: 101, sourceWindowId: "@1",
+			},
+			createClient: async (onDisconnect) => {
+				const client = clientCount++;
+				disconnects.push(onDisconnect);
+				return {
+					close() {}, notificationSequence: () => 0, lastNotificationAt: () => null, waitForNotification: async () => "timeout" as const,
+					execute: async (line: string, options: { mutation?: boolean }) => {
+						pooledCommands.push({ client, line, mutation: options.mutation });
+						if (line.includes("#{pid}")) return ["123"];
+						if (line.startsWith("list-panes")) return ["%2|0|456"];
+						if (line.includes("#{pane_title}")) return [`pooled title ${client}`];
+						throw new Error(`unexpected control command: ${line}`);
+					},
+				} as any;
+			},
+			revalidate: async () => true,
+		});
+		assert.ok(lease);
+		let shortLivedCliReads = 0;
+		const capturedCliBackend: InteractivePaneBackend = {
+			mode: "tmux-pane", availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }),
+			inspectForUx: async () => { shortLivedCliReads += 1; return { exists: true, title: "captured CLI" }; },
+			interrupt: async () => true, close: async () => true,
+		};
+		const pooledUxBackend = (): InteractivePaneBackend => ({
+			...capturedCliBackend,
+			inspectForUx: async (target) => {
+				if (target.mode !== "tmux-pane") return undefined;
+				const server = await lease.run(buildTmuxServerPidArgs(target.native.socketPath));
+				const panes = await lease.run(buildTmuxPaneSnapshotArgs(target.native.socketPath));
+				if (server.exitCode !== 0 || server.stdout !== "123\n" || panes.exitCode !== 0 || panes.stdout !== "%2|0|456\n") return undefined;
+				const title = await readTmuxPaneTitle(target.native.paneId, target.native.socketPath, lease.run);
+				return title ? { exists: true, title } : undefined;
+			},
+		});
+		let activeUxBackend: InteractivePaneBackend | null = null;
+		try {
+			assert.equal(registerCommittedInteractiveRun({
+				runId, backend: capturedCliBackend, uxBackend: () => lease.acceptedTransport() ? activeUxBackend : null,
+				handle, generation: getInteractiveShutdownGenerationForTest(),
+			}), true);
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "unavailable", "pre-bind V3 UX must not use the captured CLI backend");
+			assert.equal(shortLivedCliReads, 0);
+			assert.equal(pooledCommands.length, 0);
+
+			activeUxBackend = pooledUxBackend();
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed");
+			assert.equal(shortLivedCliReads, 0, "connected UX inspection uses the pooled runner, never a short-lived CLI");
+			assert.deepEqual(pooledCommands.map(({ line }) => line.split(" ")[0]), ["display-message", "list-panes", "display-message"]);
+			assert.ok(pooledCommands.every(({ mutation }) => mutation === false), "UX inspection sends no mutation through the pooled client");
+
+			disconnects[0]!();
+			const commandsBeforePendingRead = pooledCommands.length;
+			const pending = await inspectInteractiveRunForUx(runId);
+			assert.equal(pending?.titleState, "unavailable", "a disconnected/reconnecting lease has fail-soft unavailable UX state");
+			assert.equal(pending?.exists, undefined);
+			assert.equal(pooledCommands.length, commandsBeforePendingRead, "pending UX must not send an unproven control command");
+			assert.equal(shortLivedCliReads, 0, "pending UX must not fall back to the captured CLI backend");
+
+			assert.equal(await lease.reconnect(), true);
+			activeUxBackend = pooledUxBackend();
+			assert.equal((await inspectInteractiveRunForUx(runId))?.titleState, "changed");
+			assert.equal(shortLivedCliReads, 0);
+			assert.deepEqual([...new Set(pooledCommands.map(({ client }) => client))], [0, 1], "UX follows the rebound pooled runner after reconnect");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			lease.release();
+			await resetInteractiveShutdownForSession();
+		}
 	});
 
 	test("provides exact focus, preview, keep, and durable promote ownership actions", async () => {

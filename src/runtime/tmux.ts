@@ -445,19 +445,13 @@ export async function inspectTmuxPane(
 	handle: TmuxPaneHandle,
 	run: TmuxCommandRunner = runTmuxCommand,
 	signal?: AbortSignal,
-	includeTitle = false,
 ): Promise<TmuxPaneSnapshot | undefined> {
 	if (!TMUX_PANE_ID_RE.test(handle.paneId)) return undefined;
 	const result = await run(buildTmuxPaneSnapshotArgs(handle.socketPath), { signal });
 	if (result.exitCode !== 0) return undefined;
 	const panes = parseTmuxPaneSnapshots(result.stdout);
 	if (!panes) return undefined;
-	const snapshot = panes.get(handle.paneId);
-	if (!snapshot) return { exists: false };
-	if (!includeTitle) return snapshot;
-	// This post-authority UX request cannot alter missing/dead/PID evidence.
-	const title = await readTmuxPaneTitle(handle.paneId, handle.socketPath, run, signal);
-	return title === undefined ? snapshot : { ...snapshot, title };
+	return panes.get(handle.paneId) ?? { exists: false };
 }
 
 export function isTmuxPaneGenerationCurrent(handle: TmuxPaneHandle): boolean {
@@ -479,6 +473,21 @@ export async function inspectTmuxPaneFingerprint(
 	const snapshot = await inspectTmuxPane(handle, run);
 	if (!snapshot || !snapshot.exists) return snapshot;
 	return snapshot.panePid === handle.panePid ? snapshot : { exists: false };
+}
+
+/**
+ * UX-only observation. The title query follows a complete current fingerprint
+ * proof and cannot influence lifecycle or cleanup authority.
+ */
+export async function inspectTmuxPaneFingerprintForUx(
+	handle: TmuxPaneHandle,
+	run: TmuxCommandRunner = runTmuxCommand,
+	signal?: AbortSignal,
+): Promise<TmuxPaneSnapshot | undefined> {
+	const snapshot = await inspectTmuxPaneFingerprint(handle, run);
+	if (!snapshot?.exists) return snapshot;
+	const title = await readTmuxPaneTitle(handle.paneId, handle.socketPath, run, signal);
+	return title === undefined ? snapshot : { ...snapshot, title };
 }
 
 export async function matchesTmuxPaneFingerprint(

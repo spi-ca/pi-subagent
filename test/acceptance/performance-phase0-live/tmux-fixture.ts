@@ -24,7 +24,11 @@ type TmuxTeardownHooks = {
 };
 /** Test seam for failures after each independently identity-bound fixture stage. */
 export type TmuxFixtureTestHooks = {
-  afterBinding?: (stage: "creation" | "source" | "sentinel", state: { socket: string; socketRoot: string; binding: TmuxServerBinding }) => void | Promise<void>;
+  afterBinding?: (stage: "creation" | "source" | "sentinel", state: {
+    socket: string; socketRoot: string; binding: TmuxServerBinding; session: string; sourcePaneId?: string; sentinelPaneId?: string;
+    /** Extends fixture-owned exact-death proof for a test-created pane process. */
+    trackExpectedProcess: (identity: ProcessIdentity) => void;
+  }) => void | Promise<void>;
 };
 
 /** Fixture setup never inherits shell startup hooks or the caller's PATH. */
@@ -177,6 +181,12 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
   };
   let socketRoot = "", socket = "", tmuxBinding: TmuxServerBinding | null = null, primaryFailure: unknown = null;
   let parentCompleted = false, transportCleanupProven = true, result: Omit<LiveEvidence["matrix"][number], "mode" | "sourceAndSentinelPreserved"> | null = null;
+  const trackExpectedProcess = (identity: ProcessIdentity): void => {
+    if (!tmuxBinding || !Number.isSafeInteger(identity.pid) || identity.pid <= 0 || !Number.isFinite(identity.startedAt) || identity.startedAt < 0) throw new Error("isolated tmux fixture process identity is unavailable");
+    const expected = tmuxBinding.expectedProcesses ?? [];
+    if (expected.some((entry) => entry.pid === identity.pid && entry.startedAt === identity.startedAt)) throw new Error("isolated tmux fixture process identity is duplicated");
+    tmuxBinding = { ...tmuxBinding, expectedProcesses: [...expected, identity] };
+  };
   try {
     const socketRootRaw = await fs.mkdtemp("/tmp/pi-s0-tmux-"); socketRoot = await fs.realpath(socketRootRaw); socket = path.join(socketRoot, "s");
     await fs.chmod(socketRoot, 0o700);
@@ -197,7 +207,7 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     }
     tmuxBinding = await bindCreatedTmuxServer(tmux, socket, socketRoot, creationSocketRoot, DEFAULT_COMMAND_TIMEOUT_MS, env, run);
     if (!tmuxBinding) throw new Error("isolated tmux creation binding is unavailable");
-    await testHooks.afterBinding?.("creation", { socket, socketRoot, binding: tmuxBinding });
+    await testHooks.afterBinding?.("creation", { socket, socketRoot, binding: tmuxBinding, session, trackExpectedProcess });
     // tmux 3.7a normalizes literal tab format output in this command path;
     // use a fixed non-ambiguous delimiter for the isolated fixture instead.
     const identity = await run(tmux, ["-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}|#{pid}"], { deadline, env });
@@ -214,7 +224,7 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     const sourcePanePid = Number(sourcePanePidResult.stdout.trim()), sourcePaneStartedAt = Number.isSafeInteger(sourcePanePid) && sourcePanePid > 0 ? getProcessStartedAt(sourcePanePid) : null;
     if (sourcePaneStartedAt === null) throw new Error("isolated tmux source fixture identity unavailable");
     tmuxBinding = { ...tmuxBinding, expectedProcesses: [{ pid: sourcePanePid, startedAt: sourcePaneStartedAt }] };
-    await testHooks.afterBinding?.("source", { socket, socketRoot, binding: tmuxBinding });
+    await testHooks.afterBinding?.("source", { socket, socketRoot, binding: tmuxBinding, session, sourcePaneId: source, trackExpectedProcess });
     const sentinelResult = await run(tmux, ["-S", socket, "split-window", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-t", source, `exec /bin/sleep ${TMUX_SOURCE_SENTINEL_LIFETIME_SECONDS}`], { deadline, env });
     if (sentinelResult.code !== 0) throw new Error("isolated tmux sentinel command failed");
     const sentinelMatch = sentinelResult.stdout.trim().match(/^(%\d+)\|([1-9]\d*)$/);
@@ -222,7 +232,7 @@ export async function runTmuxCell(root: string, agentDir: string, extension: str
     const sentinel = sentinelMatch[1]!, sentinelPid = Number(sentinelMatch[2]!), sentinelStartedAt = getProcessStartedAt(sentinelPid);
     if (sentinelStartedAt === null) throw new Error("isolated tmux sentinel fixture identity unavailable");
     tmuxBinding = { ...tmuxBinding, expectedProcesses: [...(tmuxBinding.expectedProcesses ?? []), { pid: sentinelPid, startedAt: sentinelStartedAt }] };
-    await testHooks.afterBinding?.("sentinel", { socket, socketRoot, binding: tmuxBinding });
+    await testHooks.afterBinding?.("sentinel", { socket, socketRoot, binding: tmuxBinding, session, sourcePaneId: source, sentinelPaneId: sentinel, trackExpectedProcess });
     const baseline = new Set([source, sentinel]);
     const listPanes = async (withinCell = true): Promise<string[]> => {
       const listed = await run(tmux, ["-S", socket, "list-panes", "-a", "-F", "#{pane_id}"], withinCell ? { deadline, env } : { timeoutMs: DEFAULT_COMMAND_TIMEOUT_MS, env });

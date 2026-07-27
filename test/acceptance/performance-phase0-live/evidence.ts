@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -100,7 +101,7 @@ export type LiveOptions = { execute: boolean; tier?: LiveTierId; resumeLiveRoot?
 export type LiveBackendExecutables = { tmux: ManagedChildPiExecutableGeneration; cmux: ManagedChildPiExecutableGeneration };
 export type LivePiGeneration = { bin: string; version: string; generation: ManagedChildPiExecutableGeneration };
 /** Preflight's exact Pi generation must be staged before every credentialed cell spawn. */
-export type LivePiExecutable = LivePiGeneration & LiveBackendExecutables & { themeAssets?: StagedLivePiThemeAssets };
+export type LivePiExecutable = LivePiGeneration & LiveBackendExecutables & { stagedAssets?: StagedLivePiAssets };
 
 export function record(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 export function exact(value: Record<string, unknown>, keys: readonly string[]): boolean { const actual = Object.keys(value).sort(), expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, index) => key === expected[index]); }
@@ -187,6 +188,76 @@ export function remainingDeadlineMs(deadline: CellDeadline): number { return dea
 export class Phase0DeadlineExhaustedError extends Error { constructor() { super("Phase 0 harness deadline exhausted."); } }
 export function requireRemainingDeadline(deadline: CellDeadline, _operation: string): number { const remaining = remainingDeadlineMs(deadline); if (remaining <= 0) throw new Phase0DeadlineExhaustedError(); return remaining; }
 export async function preflightLiveBenchmark(): Promise<void> { const runtime = await fs.stat(process.execPath); if (!runtime.isFile()) throw new Error("benchmark runtime is not a regular file"); for (const tier of LIVE_TIER_IDS) if (expectedChildRunCount(tier) !== (tier === ROUTINE_TIER_ID ? 15 : 16)) throw new Error("unexpected tier plan cardinality"); }
+/** Provider-live staging has one reviewed native release profile, for macOS arm64 only. */
+export function requireProviderLiveNativePiProfile(platform: string = process.platform, arch: string = process.arch): void {
+  if (platform !== "darwin" || arch !== "arm64") throw new Error("provider-live preflight requires the macOS arm64 native Pi profile");
+}
+
+const MACHO_64_BIG_ENDIAN_MAGIC = 0xfeedfacf;
+const MACHO_64_LITTLE_ENDIAN_MAGIC = 0xcffaedfe;
+const MACHO_CPU_TYPE_ARM64 = 0x0100000c;
+const PROVIDER_LIVE_PI_PROFILE_MISMATCH = "provider-live preflight Pi executable does not match the macOS arm64 Mach-O profile";
+
+/** Byte-level profile check for the one supported provider-live Pi executable format. */
+export function isProviderLiveNativePiArm64MachOHeader(header: Uint8Array): boolean {
+  if (header.length < 8) return false;
+  const bytes = Buffer.from(header), magic = bytes.readUInt32BE(0);
+  return magic === MACHO_64_BIG_ENDIAN_MAGIC
+    ? bytes.readUInt32BE(4) === MACHO_CPU_TYPE_ARM64
+    : magic === MACHO_64_LITTLE_ENDIAN_MAGIC && bytes.readUInt32LE(4) === MACHO_CPU_TYPE_ARM64;
+}
+
+function sameProviderLivePiFile(stat: fsSync.Stats, generation: ManagedChildPiExecutableGeneration): boolean {
+  return Number(stat.dev) === generation.dev && Number(stat.ino) === generation.ino
+    && Number(stat.size) === generation.size && stat.mtimeMs === generation.mtimeMs
+    && stat.ctimeMs === generation.ctimeMs && Number(stat.mode) === generation.mode
+    && Number(stat.uid) === generation.uid;
+}
+
+function sameProviderLivePiGeneration(left: ManagedChildPiExecutableGeneration, right: ManagedChildPiExecutableGeneration): boolean {
+  return left.executable === right.executable && left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
+    && left.mode === right.mode && left.uid === right.uid && left.nativeExecutable === right.nativeExecutable
+    && left.privateRoot === right.privateRoot;
+}
+
+/**
+ * Re-reads the selected canonical generation through an O_NOFOLLOW descriptor.
+ * This intentionally runs before any Pi version/auth/provider operation.
+ */
+export function requireProviderLiveNativePiArm64MachO(generation: ManagedChildPiExecutableGeneration): void {
+  let descriptor: number | undefined;
+  try {
+    revalidateManagedChildPiExecutableGeneration(generation);
+    descriptor = fsSync.openSync(generation.executable, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const before = fsSync.fstatSync(descriptor), pathBefore = fsSync.lstatSync(generation.executable);
+    if (!before.isFile() || pathBefore.isSymbolicLink() || !sameProviderLivePiFile(before, generation) || !sameProviderLivePiFile(pathBefore, generation) || fsSync.realpathSync(generation.executable) !== generation.executable) throw new Error("path generation changed");
+    const header = Buffer.alloc(8);
+    if (fsSync.readSync(descriptor, header, 0, header.length, 0) !== header.length || !isProviderLiveNativePiArm64MachOHeader(header)) throw new Error("Mach-O profile mismatch");
+    const after = fsSync.fstatSync(descriptor), pathAfter = fsSync.lstatSync(generation.executable);
+    if (!sameProviderLivePiFile(after, generation) || pathAfter.isSymbolicLink() || !sameProviderLivePiFile(pathAfter, generation)) throw new Error("path generation changed");
+    revalidateManagedChildPiExecutableGeneration(generation);
+  } catch {
+    throw new Error(PROVIDER_LIVE_PI_PROFILE_MISMATCH);
+  } finally {
+    if (descriptor !== undefined) fsSync.closeSync(descriptor);
+  }
+}
+
+/** Selects and descriptor-validates the only Pi format accepted by provider-live. */
+export function selectProviderLiveNativePiGeneration(executable: string | undefined): ManagedChildPiExecutableGeneration {
+  const requested = executable?.trim();
+  if (!requested || !path.isAbsolute(requested)) throw new Error(`Managed-child acceptance requires explicit absolute ${MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV}.`);
+  try {
+    const generation = captureManagedChildLivePiExecutableGeneration(requested);
+    requireProviderLiveNativePiArm64MachO(generation);
+    return generation;
+  } catch (error) {
+    if (error instanceof Error && error.message === PROVIDER_LIVE_PI_PROFILE_MISMATCH) throw error;
+    throw new Error(PROVIDER_LIVE_PI_PROFILE_MISMATCH);
+  }
+}
+
 export function resolveLiveBackendExecutable(env: NodeJS.ProcessEnv, name: "TMUX_BIN" | "CMUX_BIN"): ManagedChildPiExecutableGeneration {
   const requested = env[name]?.trim();
   if (!requested || !path.isAbsolute(requested)) throw new Error(`live benchmark requires explicit absolute ${name}`);
@@ -196,8 +267,13 @@ export function resolveLiveBackendExecutable(env: NodeJS.ProcessEnv, name: "TMUX
 
 export async function preflightLivePrerequisites(env: NodeJS.ProcessEnv): Promise<LivePiExecutable> {
   await preflightLiveBenchmark();
-  if (process.platform !== "darwin") throw new Error("the endpoint cmux live matrix requires macOS");
+  requireProviderLiveNativePiProfile();
+  // This descriptor/profile fence is intentionally before Pi's version probe,
+  // backend probes, auth inspection, and every possible provider spawn.
+  const selectedPi = selectProviderLiveNativePiGeneration(env[MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV]);
   const pi = await resolveLivePiExecutable(env), tmuxGeneration = resolveLiveBackendExecutable(env, "TMUX_BIN"), cmuxGeneration = resolveLiveBackendExecutable(env, "CMUX_BIN");
+  if (!sameProviderLivePiGeneration(selectedPi, pi.generation)) throw new Error(PROVIDER_LIVE_PI_PROFILE_MISMATCH);
+  requireProviderLiveNativePiArm64MachO(pi.generation);
   const tmux = await run(tmuxGeneration.executable, ["-V"], { env });
   const tmuxVersion = tmux.code === 0 ? parseTmuxVersionOutput(tmux.stdout) : null;
   if (!tmuxVersion || !isStableTmuxVersionAtLeast(tmuxVersion, MINIMUM_TMUX_VERSION)) throw new Error(`live benchmark requires stable tmux >=${MINIMUM_TMUX_VERSION}`);
@@ -223,16 +299,38 @@ async function syncDirectory(root: string): Promise<void> { const handle = await
 
 const STAGED_NATIVE_PI_DIRECTORY = "staged-native-pi";
 const STAGED_NATIVE_PI_FILE = "pi";
-/** The only executable-adjacent runtime assets staged for a credentialed child. */
-const STAGED_THEME_ASSET_PATHS = ["theme/dark.json", "theme/light.json"] as const;
-const MAX_STAGED_THEME_BYTES = 1024 * 1024;
-type StagedThemeAssetPath = typeof STAGED_THEME_ASSET_PATHS[number];
+type StagedAssetKind = "json" | "javascript" | "binary";
+type StagedAssetSpec = { readonly relativePath: string; readonly kind: StagedAssetKind; readonly maxBytes: number };
+/**
+ * Fixed reviewed macOS arm64 release profile. This is intentionally neither a
+ * directory copy nor discovery mechanism: adding a release dependency requires
+ * a code review of this manifest and its bounded validation policy.
+ */
+export const STAGED_NATIVE_PI_ASSET_MANIFEST = [
+  { relativePath: "package.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "theme/dark.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "theme/light.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "theme/theme-schema.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "assets/clankolas.png", kind: "binary", maxBytes: 4 * 1024 * 1024 },
+  { relativePath: "native/darwin/prebuilds/darwin-arm64/darwin-modifiers.node", kind: "binary", maxBytes: 8 * 1024 * 1024 },
+  { relativePath: "node_modules/@mariozechner/clipboard/index.js", kind: "javascript", maxBytes: 1024 * 1024 },
+  { relativePath: "node_modules/@mariozechner/clipboard/package.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "node_modules/@mariozechner/clipboard-darwin-arm64/package.json", kind: "json", maxBytes: 1024 * 1024 },
+  { relativePath: "node_modules/@mariozechner/clipboard-darwin-arm64/clipboard.darwin-arm64.node", kind: "binary", maxBytes: 8 * 1024 * 1024 },
+  { relativePath: "photon_rs_bg.wasm", kind: "binary", maxBytes: 8 * 1024 * 1024 },
+] as const satisfies readonly StagedAssetSpec[];
+type StagedAssetPath = typeof STAGED_NATIVE_PI_ASSET_MANIFEST[number]["relativePath"];
+const STAGED_ASSET_DIRECTORIES = [...new Set(STAGED_NATIVE_PI_ASSET_MANIFEST.flatMap(({ relativePath }) => {
+  const directories: string[] = [];
+  for (let directory = path.dirname(relativePath); directory !== "."; directory = path.dirname(directory)) directories.unshift(directory);
+  return directories;
+}))];
 type FileIdentity = { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number; mode: number; uid: number };
-export type StagedLivePiThemeAsset = FileIdentity & { relativePath: StagedThemeAssetPath; path: string; directory: string; directoryDev: number; directoryIno: number; digest: string };
-export type StagedLivePiThemeAssets = readonly StagedLivePiThemeAsset[];
+export type StagedLivePiAsset = FileIdentity & { relativePath: StagedAssetPath; path: string; directory: string; directoryDev: number; directoryIno: number; digest: string };
+export type StagedLivePiAssets = readonly StagedLivePiAsset[];
 export type StageLivePiExecutableHooks = {
   afterSourcePrevalidated?: () => void | Promise<void>;
-  afterThemeSourcePrevalidated?: () => void | Promise<void>;
+  afterAssetSourcesPrevalidated?: () => void | Promise<void>;
 };
 
 function currentUid(): number | null { return typeof process.getuid === "function" ? process.getuid() : null; }
@@ -248,35 +346,36 @@ async function requireSafeDirectoryAncestry(directory: string, privateRoot?: str
   const canonicalRoot = privateRoot === undefined ? undefined : await fs.realpath(privateRoot);
   for (let current = directory; ; current = path.dirname(current)) {
     const stat = await fs.lstat(current);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || !safeMode(stat.mode) || !safeOwner(stat.uid)) throw new Error("theme directory ancestry is unsafe");
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !safeMode(stat.mode) || !safeOwner(stat.uid)) throw new Error("staged asset directory ancestry is unsafe");
     if (current === canonicalRoot || current === path.dirname(current)) break;
   }
   if (canonicalRoot !== undefined) {
     const relative = path.relative(canonicalRoot, directory);
-    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("theme directory escaped private root");
+    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("staged asset directory escaped private root");
   }
 }
-/** Descriptor-bound, nonblocking, bounded JSON read; pathname replacement is detected before acceptance. */
-async function readSafeThemeAsset(file: string, privateRoot?: string): Promise<{ identity: FileIdentity; body: Buffer; digest: string }> {
+/** Descriptor-bound, nonblocking, bounded asset read; pathname replacement is detected before acceptance. */
+async function readSafeStagedAsset(file: string, spec: StagedAssetSpec, privateRoot?: string): Promise<{ identity: FileIdentity; body: Buffer; digest: string }> {
   const directory = path.dirname(file);
   await requireSafeDirectoryAncestry(directory, privateRoot);
-  // O_NONBLOCK rejects FIFOs/devices promptly before fstat, so untrusted source paths cannot stall staging.
   const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
   try {
     const before = fileIdentity(await handle.stat()), pathBefore = await fs.lstat(file);
-    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !exactFileIdentity(before, fileIdentity(pathBefore)) || !safeMode(before.mode) || !safeOwner(before.uid) || before.size <= 0 || before.size > MAX_STAGED_THEME_BYTES) throw new Error("theme asset is unsafe");
+    if (!pathBefore.isFile() || pathBefore.isSymbolicLink() || !exactFileIdentity(before, fileIdentity(pathBefore)) || !safeMode(before.mode) || !safeOwner(before.uid) || before.size <= 0 || before.size > spec.maxBytes) throw new Error("staged asset is unsafe");
     const body = Buffer.alloc(before.size), read = await handle.read(body, 0, body.length, 0);
     const after = fileIdentity(await handle.stat()), pathAfter = await fs.lstat(file);
-    if (read.bytesRead !== body.length || !exactFileIdentity(before, after) || !exactFileIdentity(before, fileIdentity(pathAfter)) || pathAfter.isSymbolicLink()) throw new Error("theme asset changed while reading");
-    const text = body.toString("utf8");
-    if (!Buffer.from(text, "utf8").equals(body)) throw new Error("theme asset is not valid UTF-8");
-    try { JSON.parse(text); } catch { throw new Error("theme asset JSON is malformed"); }
+    if (read.bytesRead !== body.length || !exactFileIdentity(before, after) || !exactFileIdentity(before, fileIdentity(pathAfter)) || pathAfter.isSymbolicLink()) throw new Error("staged asset changed while reading");
+    if (spec.kind === "json" || spec.kind === "javascript") {
+      const text = body.toString("utf8");
+      if (!Buffer.from(text, "utf8").equals(body)) throw new Error("staged text asset is not valid UTF-8");
+      if (spec.kind === "json") try { JSON.parse(text); } catch { throw new Error("staged JSON asset is malformed"); }
+    }
     return { identity: before, body, digest: crypto.createHash("sha256").update(body).digest("hex") };
   } finally { await handle.close(); }
 }
-function expectedThemeAsset(pi: LivePiExecutable, relativePath: StagedThemeAssetPath): StagedLivePiThemeAsset | null {
-  const assets = pi.themeAssets;
-  if (!assets || assets.length !== STAGED_THEME_ASSET_PATHS.length) return null;
+function expectedStagedAsset(pi: LivePiExecutable, relativePath: StagedAssetPath): StagedLivePiAsset | null {
+  const assets = pi.stagedAssets;
+  if (!assets || assets.length !== STAGED_NATIVE_PI_ASSET_MANIFEST.length) return null;
   const matched = assets.filter((asset) => asset.relativePath === relativePath);
   return matched.length === 1 ? matched[0]! : null;
 }
@@ -284,93 +383,95 @@ async function removeCreatedStagedDirectory(root: string, rootIdentity: { dev: n
   if (!sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity) || directoryIdentity === null) throw new Error("staged Pi cleanup authority was not proven");
   const stat = await fs.lstat(directory).catch(() => null);
   if (stat === null || !sameIdentity(stat, directoryIdentity) || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
-  // Only unlink the fixed allowlist and remove fixed empty directories. Never recurse into an attacker-controlled entry.
-  for (const relativePath of [STAGED_NATIVE_PI_FILE, ...STAGED_THEME_ASSET_PATHS]) {
+  // Unlink only fixed files, then remove only fixed empty directories. Never recurse into attacker-controlled entries.
+  for (const relativePath of [STAGED_NATIVE_PI_FILE, ...STAGED_NATIVE_PI_ASSET_MANIFEST.map((asset) => asset.relativePath)]) {
     const candidate = path.join(directory, relativePath), entry = await fs.lstat(candidate).catch(() => null);
     if (entry !== null) {
       if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
       await fs.unlink(candidate);
     }
   }
-  const theme = path.join(directory, "theme"), themeStat = await fs.lstat(theme).catch(() => null);
-  if (themeStat !== null) {
-    if (!themeStat.isDirectory() || themeStat.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
-    await fs.rmdir(theme);
+  for (const relativeDirectory of [...STAGED_ASSET_DIRECTORIES].reverse()) {
+    const candidate = path.join(directory, relativeDirectory), entry = await fs.lstat(candidate).catch(() => null);
+    if (entry !== null) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("staged Pi cleanup authority was not proven");
+      await fs.rmdir(candidate);
+    }
   }
   await fs.rmdir(directory);
 }
-/** Revalidates the staged executable and every exact allowlisted theme asset immediately before a credentialed parent spawn. */
+/** Revalidates the staged executable and every exact reviewed release asset immediately before a credentialed parent spawn. */
 export async function revalidateStagedLivePiBundle(pi: LivePiExecutable): Promise<void> {
   revalidateManagedChildPiExecutableGeneration(pi.generation);
-  if (!pi.themeAssets || pi.themeAssets.length !== STAGED_THEME_ASSET_PATHS.length) throw new Error("credentialed live Pi spawn requires staged theme assets");
+  if (!pi.stagedAssets || pi.stagedAssets.length !== STAGED_NATIVE_PI_ASSET_MANIFEST.length) throw new Error("credentialed live Pi spawn requires every staged release asset");
   const bundleRoot = path.dirname(pi.generation.executable);
-  for (const relativePath of STAGED_THEME_ASSET_PATHS) {
-    const asset = expectedThemeAsset(pi, relativePath);
-    if (!asset) throw new Error("credentialed live Pi spawn requires each staged theme asset exactly once");
-    const expectedPath = path.join(bundleRoot, relativePath);
-    if (asset.path !== expectedPath || asset.directory !== path.dirname(expectedPath)) throw new Error("staged Pi theme path is invalid");
+  for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) {
+    const asset = expectedStagedAsset(pi, spec.relativePath);
+    if (!asset) throw new Error("credentialed live Pi spawn requires each staged release asset exactly once");
+    const expectedPath = path.join(bundleRoot, spec.relativePath);
+    if (asset.path !== expectedPath || asset.directory !== path.dirname(expectedPath)) throw new Error("staged release asset path is invalid");
     const directory = await fs.lstat(asset.directory).catch(() => null);
-    if (!directory?.isDirectory() || directory.isSymbolicLink() || directory.dev !== asset.directoryDev || directory.ino !== asset.directoryIno || (directory.mode & 0o777) !== 0o700 || !safeOwner(directory.uid)) throw new Error("staged Pi theme directory changed");
-    const current = await readSafeThemeAsset(asset.path, pi.generation.privateRoot);
-    if (!exactFileIdentity(current.identity, asset) || current.digest !== asset.digest) throw new Error("staged Pi theme asset changed");
+    if (!directory?.isDirectory() || directory.isSymbolicLink() || directory.dev !== asset.directoryDev || directory.ino !== asset.directoryIno || (directory.mode & 0o777) !== 0o700 || !safeOwner(directory.uid)) throw new Error("staged release asset directory changed");
+    const current = await readSafeStagedAsset(asset.path, spec, pi.generation.privateRoot);
+    if (!exactFileIdentity(current.identity, asset) || current.digest !== asset.digest) throw new Error("staged release asset changed");
   }
 }
-/**
- * Stages the executable plus only `theme/dark.json` and `theme/light.json`.
- * No directory tree or other executable-adjacent asset is copied.
- */
+/** Stages Pi plus the fixed reviewed macOS release profile; no discovery or directory copy is permitted. */
 export async function stageLivePiExecutable(root: string, pi: LivePiExecutable, hooks: StageLivePiExecutableHooks = {}): Promise<LivePiExecutable> {
-  const rootIdentity = await privateLiveRoot(root), directory = path.join(root, STAGED_NATIVE_PI_DIRECTORY), destination = path.join(directory, STAGED_NATIVE_PI_FILE), themeDirectory = path.join(directory, "theme");
+  const rootIdentity = await privateLiveRoot(root), directory = path.join(root, STAGED_NATIVE_PI_DIRECTORY), destination = path.join(directory, STAGED_NATIVE_PI_FILE);
   let created = false, directoryIdentity: { dev: number; ino: number } | null = null;
   try {
     revalidateManagedChildPiExecutableGeneration(pi.generation);
-    const sourceAssets = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => ({ relativePath, asset: await readSafeThemeAsset(path.join(path.dirname(pi.generation.executable), relativePath)) })));
-    await hooks.afterSourcePrevalidated?.(); await hooks.afterThemeSourcePrevalidated?.();
-    await fs.mkdir(directory, { mode: 0o700 }); created = true;
-    await fs.chmod(directory, 0o700);
+    const sourceRoot = path.dirname(pi.generation.executable);
+    const sourceAssets = await Promise.all(STAGED_NATIVE_PI_ASSET_MANIFEST.map(async (spec) => ({ spec, asset: await readSafeStagedAsset(path.join(sourceRoot, spec.relativePath), spec) })));
+    await hooks.afterSourcePrevalidated?.(); await hooks.afterAssetSourcesPrevalidated?.();
+    await fs.mkdir(directory, { mode: 0o700 }); created = true; await fs.chmod(directory, 0o700);
     const directoryStat = await fs.lstat(directory);
     if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700 || !safeOwner(directoryStat.uid) || await fs.realpath(directory) !== directory || !sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi directory is unsafe");
     directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
     revalidateManagedChildPiExecutableGeneration(pi.generation);
-    await fs.copyFile(pi.generation.executable, destination, fsConstants.COPYFILE_EXCL);
-    await fs.chmod(destination, 0o700);
+    await fs.copyFile(pi.generation.executable, destination, fsConstants.COPYFILE_EXCL); await fs.chmod(destination, 0o700);
     revalidateManagedChildPiExecutableGeneration(pi.generation);
-    const staged = captureManagedChildLivePiExecutableGeneration(destination, directory);
-    revalidateManagedChildPiExecutableGeneration(staged);
+    const staged = captureManagedChildLivePiExecutableGeneration(destination, directory); revalidateManagedChildPiExecutableGeneration(staged);
     const stagedExecutable = await fs.open(destination, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
     try { await stagedExecutable.sync(); } finally { await stagedExecutable.close(); }
-    await fs.mkdir(themeDirectory, { mode: 0o700 }); await fs.chmod(themeDirectory, 0o700);
-    const stagedThemeDirectory = await fs.lstat(themeDirectory);
-    if (!stagedThemeDirectory.isDirectory() || stagedThemeDirectory.isSymbolicLink() || (stagedThemeDirectory.mode & 0o777) !== 0o700 || !safeOwner(stagedThemeDirectory.uid)) throw new Error("private staged theme directory is unsafe");
-    for (const { relativePath, asset } of sourceAssets) {
-      const handle = await fs.open(path.join(directory, relativePath), "wx", 0o600);
+    const stagedDirectories = new Map<string, { dev: number; ino: number }>([[".", { dev: directoryStat.dev, ino: directoryStat.ino }]]);
+    for (const relativeDirectory of STAGED_ASSET_DIRECTORIES) {
+      const stagedDirectory = path.join(directory, relativeDirectory);
+      await fs.mkdir(stagedDirectory, { mode: 0o700 }); await fs.chmod(stagedDirectory, 0o700);
+      const stat = await fs.lstat(stagedDirectory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 || !safeOwner(stat.uid)) throw new Error("private staged asset directory is unsafe");
+      stagedDirectories.set(relativeDirectory, { dev: stat.dev, ino: stat.ino });
+    }
+    for (const { spec, asset } of sourceAssets) {
+      const handle = await fs.open(path.join(directory, spec.relativePath), "wx", 0o600);
       try { await handle.writeFile(asset.body); await handle.sync(); } finally { await handle.close(); }
     }
-    const sourceAfter = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => ({ relativePath, asset: await readSafeThemeAsset(path.join(path.dirname(pi.generation.executable), relativePath)) })));
+    const sourceAfter = await Promise.all(sourceAssets.map(async ({ spec }) => ({ spec, asset: await readSafeStagedAsset(path.join(sourceRoot, spec.relativePath), spec) })));
     for (const source of sourceAssets) {
-      const after = sourceAfter.find((entry) => entry.relativePath === source.relativePath)!.asset;
-      if (!exactFileIdentity(source.asset.identity, after.identity) || source.asset.digest !== after.digest) throw new Error("theme source changed while staging");
+      const after = sourceAfter.find((entry) => entry.spec.relativePath === source.spec.relativePath)!.asset;
+      if (!exactFileIdentity(source.asset.identity, after.identity) || source.asset.digest !== after.digest) throw new Error("release asset source changed while staging");
     }
-    const themeAssets: StagedLivePiThemeAssets = await Promise.all(STAGED_THEME_ASSET_PATHS.map(async (relativePath) => {
-      const asset = await readSafeThemeAsset(path.join(directory, relativePath), directory);
-      const source = sourceAssets.find((entry) => entry.relativePath === relativePath)!.asset;
-      if (asset.digest !== source.digest) throw new Error("staged theme digest mismatch");
-      return { ...asset.identity, relativePath, path: path.join(directory, relativePath), directory: themeDirectory, directoryDev: stagedThemeDirectory.dev, directoryIno: stagedThemeDirectory.ino, digest: asset.digest };
+    const stagedAssets: StagedLivePiAssets = await Promise.all(STAGED_NATIVE_PI_ASSET_MANIFEST.map(async (spec) => {
+      const relativeDirectory = path.dirname(spec.relativePath), asset = await readSafeStagedAsset(path.join(directory, spec.relativePath), spec, directory);
+      const source = sourceAssets.find((entry) => entry.spec.relativePath === spec.relativePath)!.asset, directoryIdentity = stagedDirectories.get(relativeDirectory)!;
+      if (asset.digest !== source.digest) throw new Error("staged release asset digest mismatch");
+      return { ...asset.identity, relativePath: spec.relativePath, path: path.join(directory, spec.relativePath), directory: path.join(directory, relativeDirectory), directoryDev: directoryIdentity.dev, directoryIno: directoryIdentity.ino, digest: asset.digest };
     }));
-    await syncDirectory(themeDirectory); await syncDirectory(directory); await syncDirectory(root);
+    for (const relativeDirectory of [...STAGED_ASSET_DIRECTORIES].reverse()) await syncDirectory(path.join(directory, relativeDirectory));
+    await syncDirectory(directory); await syncDirectory(root);
     if (!sameIdentity(await fs.lstat(root).catch(() => null), rootIdentity)) throw new Error("private staged Pi root identity changed");
-    const stagedPi = { ...pi, bin: staged.executable, generation: staged, themeAssets };
+    const stagedPi = { ...pi, bin: staged.executable, generation: staged, stagedAssets };
     await revalidateStagedLivePiBundle(stagedPi);
     return stagedPi;
   } catch (error) {
     let cause = error;
-    if (created) {
-      try { await removeCreatedStagedDirectory(root, rootIdentity, directory, directoryIdentity); }
-      catch (cleanupError) { cause = new Error("staged Pi cleanup was not proven", { cause: cleanupError }); }
-    }
+    if (created) try { await removeCreatedStagedDirectory(root, rootIdentity, directory, directoryIdentity); }
+    catch (cleanupError) { cause = new Error("staged Pi cleanup was not proven", { cause: cleanupError }); }
     throw new Error("live Pi staging failed before provider spawn", { cause });
   }
 }
+
 export async function writeLiveCheckpoint(root: string, checkpoint: LiveCheckpoint): Promise<string> { if (!validateLiveCheckpoint(checkpoint)) throw new Error("refusing to persist an invalid live checkpoint"); const identity = await privateLiveRoot(root), destination = path.join(root, LIVE_CHECKPOINT_FILE), temporary = path.join(root, `.${LIVE_CHECKPOINT_FILE}.${crypto.randomUUID()}.tmp`); const handle = await fs.open(temporary, "wx", 0o600); try { await handle.writeFile(`${JSON.stringify(checkpoint)}\n`); await handle.sync(); } finally { await handle.close(); } if (!sameIdentity(await fs.lstat(root).catch(() => null), identity)) { await fs.rm(temporary, { force: true }); throw new Error("live checkpoint root identity changed before publish"); } try { await fs.rename(temporary, destination); await fs.chmod(destination, 0o600); await syncDirectory(root); } catch (error) { await fs.rm(temporary, { force: true }); throw error; } return destination; }
 export async function loadLiveCheckpoint(root: string): Promise<LiveCheckpoint> { const identity = await privateLiveRoot(root), file = path.join(root, LIVE_CHECKPOINT_FILE), before = await fs.lstat(file).catch(() => null), uid = typeof process.getuid === "function" ? process.getuid() : null; if (!before?.isFile() || before.isSymbolicLink() || (before.mode & 0o777) !== 0o600 || (uid !== null && before.uid !== uid) || before.size <= 0 || before.size > MAX_CHECKPOINT_BYTES) throw new Error("live checkpoint file is unsafe"); const raw = await fs.readFile(file); const after = await fs.lstat(file).catch(() => null); if (!sameIdentity(await fs.lstat(root).catch(() => null), identity) || !sameIdentity(after, before)) throw new Error("live checkpoint path identity changed while reading"); let parsed: unknown; try { parsed = JSON.parse(raw.toString("utf8")); } catch { throw new Error("live checkpoint JSON is malformed"); } if (!validateLiveCheckpoint(parsed)) throw new Error("live checkpoint schema is invalid"); return parsed; }
 /** Atomically moves a resumable root out of its caller-visible name before it can be used again. */

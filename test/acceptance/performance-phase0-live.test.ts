@@ -4,13 +4,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import {
   CHILD_MODEL, CMUX_CONCURRENCY_TIER_ID, LIVE_ACKNOWLEDGEMENTS, LIVE_CMUX16_ACKNOWLEDGEMENT, LIVE_CMUX16_GATE,
   LIVE_GATE, LIVE_RECORD_GATE, ROUTINE_TIER_ID, createPrivateEvidenceRoot, expectedChildRunCount, expectedLiveCells,
-  livePlan, loadLiveCheckpoint, parseArgs, requireLiveGate, validateLiveCheckpoint, validateLiveEvidence,
-  claimLiveCheckpoint, cleanupPhase0ReleaseWriters, formatPhase0FailureSummary, PHASE0_FAILURE_SUMMARY_FILE, resolveLiveBackendExecutable, resolveLivePiExecutable, revalidateStagedLivePiBundle, scrubSensitiveRecoveryArtifacts, stageLivePiExecutable, validatePhase0FailureSummary, writeLiveCheckpoint, writePhase0FailureSummary, type CellEvidence, type LiveEvidence, type LivePiExecutable, type Phase0ReleaseWriter,
+  isProviderLiveNativePiArm64MachOHeader, livePlan, loadLiveCheckpoint, parseArgs, requireLiveGate, requireProviderLiveNativePiArm64MachO, requireProviderLiveNativePiProfile, selectProviderLiveNativePiGeneration, validateLiveCheckpoint, validateLiveEvidence,
+  claimLiveCheckpoint, cleanupPhase0ReleaseWriters, formatPhase0FailureSummary, PHASE0_FAILURE_SUMMARY_FILE, resolveLiveBackendExecutable, resolveLivePiExecutable, revalidateStagedLivePiBundle, scrubSensitiveRecoveryArtifacts, stageLivePiExecutable, STAGED_NATIVE_PI_ASSET_MANIFEST, validatePhase0FailureSummary, writeLiveCheckpoint, writePhase0FailureSummary, type CellEvidence, type LiveEvidence, type LivePiExecutable, type Phase0ReleaseWriter,
 } from "./performance-phase0-live/evidence";
-import { getProcessStartedAt } from "../../src/runtime/run-protocol";
+import { classifyParentProcessIdentity, getProcessStartedAt } from "../../src/runtime/run-protocol";
 import { inspectTmuxPane } from "../../src/runtime/tmux";
 import { buildTmuxSourcePaneProbeArgs, parseTmuxSourcePaneProbe } from "../../src/runtime/runner";
 import { createTmuxControlTransportGate } from "../../src/runtime/tmux-control-gate";
@@ -32,10 +33,22 @@ function cell(mode: "inline" | "tmux" | "cmux", activeRuns: 1 | 16, workload: "i
 function evidence(tier: typeof ROUTINE_TIER_ID | typeof CMUX_CONCURRENCY_TIER_ID, source: { sourceRevision: "unknown" | string; sourceDirty: boolean; worktreeDigest: string } = { sourceRevision: "unknown", sourceDirty: true, worktreeDigest: "a".repeat(64) }): LiveEvidence {
   const plan = livePlan(tier); return { schemaVersion: 4, tier, planId: plan.planId, planDigest: plan.planDigest, phase: "M0-live", evidenceKind: "gated-provider-transport-benchmark", capturedAt: new Date().toISOString(), environment: { os: "darwin", arch: "arm64", bunVersion: "1", piVersion: "1", ...source }, requested: { provider: "openai-codex", model: CHILD_MODEL, childRuns: plan.childRuns }, matrix: expectedLiveCells(tier).map((entry) => cell(entry.mode, entry.activeRuns, entry.workload)), cleanup: { result: "clean", evidenceRoot: "private-0700", evidenceFile: "private-0600", residualDescendantCount: 0, residualBackendTargetCount: 0 } };
 }
-async function writeThemePair(root: string, dark: string | Buffer = '{"name":"dark"}\n', light: string | Buffer = '{"name":"light"}\n'): Promise<void> {
-  await fs.mkdir(path.join(root, "theme"), { mode: 0o700, recursive: true }); await fs.chmod(path.join(root, "theme"), 0o700);
-  await fs.writeFile(path.join(root, "theme", "dark.json"), dark, { mode: 0o600 });
-  await fs.writeFile(path.join(root, "theme", "light.json"), light, { mode: 0o600 });
+async function writeReleaseProfile(root: string, dark: string | Buffer = '{"name":"dark"}\n', light: string | Buffer = '{"name":"light"}\n'): Promise<void> {
+  for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) {
+    const file = path.join(root, spec.relativePath);
+    await fs.mkdir(path.dirname(file), { mode: 0o700, recursive: true }); await fs.chmod(path.dirname(file), 0o700);
+    const body = spec.relativePath === "theme/dark.json" ? dark
+      : spec.relativePath === "theme/light.json" ? light
+      : spec.kind === "json" ? '{"name":"fixture"}\n'
+      : spec.kind === "javascript" ? "module.exports = {};\n"
+      : Buffer.from([0, 1, 2, 3]);
+    await fs.writeFile(file, body, { mode: 0o600 }); await fs.chmod(file, 0o600);
+  }
+}
+async function removeReleaseProfile(root: string): Promise<void> {
+  for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) await fs.unlink(path.join(root, spec.relativePath)).catch(() => undefined);
+  const directories = [...new Set(STAGED_NATIVE_PI_ASSET_MANIFEST.map((spec) => path.dirname(spec.relativePath)).filter((directory) => directory !== "."))].sort((left, right) => right.length - left.length);
+  for (const directory of directories) await fs.rmdir(path.join(root, directory)).catch(() => undefined);
 }
 async function runPiStartup(executable: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return await new Promise((resolve, reject) => {
@@ -46,6 +59,16 @@ async function runPiStartup(executable: string, args: string[], env: NodeJS.Proc
     child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk)); child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.once("close", (code) => { clearTimeout(timer); resolve({ code, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") }); });
   });
+}
+/** Pi 0.81.1's provider-free TUI renders both its version header and idle editor keybinding. */
+async function waitForInitializedPiTui(runTmux: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>, socket: string, pane: string, version: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const capture = await runTmux(["-S", socket, "capture-pane", "-p", "-t", pane]);
+    if (capture.exitCode === 0 && capture.stdout.includes(`pi v${version}`) && capture.stdout.includes("ctrl+c/ctrl+d clear/exit")) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("provider-free staged Pi TUI did not render its initialized startup marker");
 }
 
 describe("two-tier gated Phase 0 live harness", () => {
@@ -65,6 +88,40 @@ describe("two-tier gated Phase 0 live harness", () => {
     await assert.rejects(() => resolveLivePiExecutable({ PATH: "/self-reporting/pi/bin" }), /explicit absolute PI_SUBAGENT_MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE/);
     assert.throws(() => resolveLiveBackendExecutable({}, "TMUX_BIN"), /explicit absolute TMUX_BIN/);
     assert.throws(() => resolveLiveBackendExecutable({ CMUX_BIN: "cmux" }, "CMUX_BIN"), /explicit absolute CMUX_BIN/);
+  });
+
+  test("requires the macOS arm64 native Pi profile before provider-live preflight", () => {
+    assert.doesNotThrow(() => requireProviderLiveNativePiProfile("darwin", "arm64"));
+    for (const [platform, arch] of [["darwin", "x64"], ["linux", "arm64"], ["win32", "arm64"]]) {
+      assert.throws(() => requireProviderLiveNativePiProfile(platform, arch), /provider-live preflight requires the macOS arm64 native Pi profile/);
+    }
+  });
+
+  test("descriptor-validates only exact arm64 Mach-O Pi bytes before any provider-live version, auth, or provider operation", async () => {
+    if (process.platform === "win32") return;
+    const macho64 = (cpuType: number, byteOrder: "le" | "be" = "le") => {
+      const header = Buffer.alloc(8);
+      if (byteOrder === "le") { header.writeUInt32LE(0xfeedfacf, 0); header.writeUInt32LE(cpuType, 4); }
+      else { header.writeUInt32BE(0xfeedfacf, 0); header.writeUInt32BE(cpuType, 4); }
+      return header;
+    };
+    const arm64 = macho64(0x0100000c), x64 = macho64(0x01000007), universal = Buffer.from([0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 0]), elf = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 0, 0, 0]), script = Buffer.from("#!/bin/sh\n");
+    assert.equal(isProviderLiveNativePiArm64MachOHeader(arm64), true);
+    assert.equal(isProviderLiveNativePiArm64MachOHeader(macho64(0x0100000c, "be")), true);
+    for (const bytes of [x64, universal, elf, script]) assert.equal(isProviderLiveNativePiArm64MachOHeader(bytes), false);
+    const root = await fs.mkdtemp(path.join(os.homedir(), ".provider-live-pi-profile-")), executable = path.join(root, "pi"), replacement = path.join(root, "replacement");
+    try {
+      await fs.chmod(root, 0o700); await fs.writeFile(executable, arm64, { mode: 0o700 }); await fs.chmod(executable, 0o700);
+      const accepted = selectProviderLiveNativePiGeneration(executable);
+      assert.equal(accepted.executable, await fs.realpath(executable));
+      await fs.writeFile(replacement, x64, { mode: 0o700 }); await fs.chmod(replacement, 0o700);
+      await fs.rename(replacement, executable);
+      assert.throws(() => requireProviderLiveNativePiArm64MachO(accepted), /Pi executable does not match the macOS arm64 Mach-O profile/);
+      for (const bytes of [x64, universal, elf, script]) {
+        await fs.writeFile(executable, bytes, { mode: 0o700 }); await fs.chmod(executable, 0o700);
+        assert.throws(() => selectProviderLiveNativePiGeneration(executable), /Pi executable does not match the macOS arm64 Mach-O profile/);
+      }
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
   test("requires exact tier selectors, acknowledgements, and environment gates", () => {
@@ -407,25 +464,28 @@ describe("two-tier gated Phase 0 live harness", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
-  test("stages only dark.json and light.json beside the validated native Pi and rejects source replacement without a provider", async () => {
+  test("stages the exact reviewed macOS release manifest beside the validated native Pi and rejects source replacement without a provider", async () => {
     if (process.platform === "win32") return;
     const root = await createPrivateEvidenceRoot(), sourceRoot = await fs.mkdtemp(path.join(os.homedir(), ".phase0-live-native-")), source = path.join(sourceRoot, "pi"), replacement = path.join(sourceRoot, "replacement");
     try {
-      await fs.chmod(sourceRoot, 0o700); await fs.copyFile(process.execPath, source); await fs.chmod(source, 0o700); await writeThemePair(sourceRoot); await fs.writeFile(path.join(sourceRoot, "theme", "unlisted.json"), "{}", { mode: 0o600 });
+      await fs.chmod(sourceRoot, 0o700); await fs.copyFile(process.execPath, source); await fs.chmod(source, 0o700); await writeReleaseProfile(sourceRoot); await fs.writeFile(path.join(sourceRoot, "theme", "unlisted.json"), "{}", { mode: 0o600 });
       const generation = captureManagedChildLivePiExecutableGeneration(source);
       const preflight: LivePiExecutable = { bin: generation.executable, version: "0.81.1", generation, tmux: generation, cmux: generation };
       const staged = await stageLivePiExecutable(root, preflight);
       assert.equal(staged.version, preflight.version); assert.equal(staged.bin, path.join(root, "staged-native-pi", "pi")); assert.notEqual(staged.bin, source);
       assert.equal((await fs.stat(path.dirname(staged.bin))).mode & 0o777, 0o700); assert.equal((await fs.stat(staged.bin)).mode & 0o777, 0o700);
-      for (const [name, body] of [["dark.json", '{"name":"dark"}\n'], ["light.json", '{"name":"light"}\n']] as const) {
-        const asset = path.join(root, "staged-native-pi", "theme", name);
-        assert.equal(await fs.readFile(asset, "utf8"), body); assert.equal((await fs.stat(asset)).mode & 0o777, 0o600);
+      assert.deepEqual(staged.stagedAssets?.map((asset) => asset.relativePath), STAGED_NATIVE_PI_ASSET_MANIFEST.map((asset) => asset.relativePath));
+      for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) {
+        const asset = path.join(root, "staged-native-pi", spec.relativePath);
+        assert.equal((await fs.stat(asset)).mode & 0o777, 0o600, spec.relativePath);
       }
-      assert.deepEqual(staged.themeAssets?.map((asset) => asset.relativePath), ["theme/dark.json", "theme/light.json"]); assert.deepEqual((await fs.readdir(path.join(root, "staged-native-pi", "theme"))).sort(), ["dark.json", "light.json"]);
+      assert.equal(await fs.readFile(path.join(root, "staged-native-pi", "theme", "dark.json"), "utf8"), '{"name":"dark"}\n');
+      assert.equal(await fs.readFile(path.join(root, "staged-native-pi", "theme", "light.json"), "utf8"), '{"name":"light"}\n');
+      assert.equal(await fs.lstat(path.join(root, "staged-native-pi", "theme", "unlisted.json")).catch(() => null), null);
       await revalidateStagedLivePiBundle(staged);
       await fs.copyFile(process.execPath, replacement); await fs.chmod(replacement, 0o700);
       const replacementRoot = await createPrivateEvidenceRoot(), replacementSource = path.join(sourceRoot, "replacement-source");
-      await fs.copyFile(process.execPath, replacementSource); await fs.chmod(replacementSource, 0o700); await writeThemePair(path.dirname(replacementSource));
+      await fs.copyFile(process.execPath, replacementSource); await fs.chmod(replacementSource, 0o700); await writeReleaseProfile(path.dirname(replacementSource));
       const replacementGeneration = captureManagedChildLivePiExecutableGeneration(replacementSource);
       await assert.rejects(() => stageLivePiExecutable(replacementRoot, { bin: replacementGeneration.executable, version: "0.81.1", generation: replacementGeneration, tmux: replacementGeneration, cmux: replacementGeneration }, {
         afterSourcePrevalidated: async () => { await fs.rename(replacement, replacementSource); },
@@ -442,19 +502,19 @@ describe("two-tier gated Phase 0 live harness", () => {
       await fs.chmod(sourceRoot, 0o700); await fs.copyFile(process.execPath, executable); await fs.chmod(executable, 0o700);
       const generation = captureManagedChildLivePiExecutableGeneration(executable), preflight: LivePiExecutable = { bin: generation.executable, version: "0.81.1", generation, tmux: generation, cmux: generation };
       const rejectSource = async (dark: string | Buffer, light: string | Buffer = '{"name":"light"}'): Promise<void> => {
-        await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeThemePair(sourceRoot, dark, light);
+        await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeReleaseProfile(sourceRoot, dark, light);
         const root = await createPrivateEvidenceRoot();
         try { await assert.rejects(() => stageLivePiExecutable(root, preflight), /staging failed before provider spawn/); assert.equal(await fs.lstat(path.join(root, "staged-native-pi")).catch(() => null), null); }
         finally { await fs.rm(root, { recursive: true, force: true }); }
       };
       await rejectSource('{not-json'); await rejectSource(Buffer.from([0x7b, 0xff, 0x7d]));
       const boundary = JSON.stringify("x".repeat(1024 * 1024 - 2));
-      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeThemePair(sourceRoot, boundary);
+      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeReleaseProfile(sourceRoot, boundary);
       const boundaryRoot = await createPrivateEvidenceRoot();
-      try { const staged = await stageLivePiExecutable(boundaryRoot, preflight); assert.equal((await fs.stat(staged.themeAssets![0]!.path)).size, 1024 * 1024); }
+      try { const staged = await stageLivePiExecutable(boundaryRoot, preflight); assert.equal((await fs.stat(staged.stagedAssets!.find((asset) => asset.relativePath === "theme/dark.json")!.path)).size, 1024 * 1024); }
       finally { await fs.rm(boundaryRoot, { recursive: true, force: true }); }
       await rejectSource(`${boundary} `);
-      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeThemePair(sourceRoot); const fifo = path.join(sourceRoot, "theme", "dark.json"); await fs.unlink(fifo);
+      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeReleaseProfile(sourceRoot); const fifo = path.join(sourceRoot, "theme", "dark.json"); await fs.unlink(fifo);
       const mkfifo = spawnSync("/usr/bin/mkfifo", [fifo]);
       if (mkfifo.status === 0) {
         const root = await createPrivateEvidenceRoot(), startedAt = performance.now();
@@ -464,7 +524,7 @@ describe("two-tier gated Phase 0 live harness", () => {
     } finally { await fs.rm(sourceRoot, { recursive: true, force: true }); }
   });
 
-  test("fails closed for missing, symlinked, unsafe, mutated, or replaced staged theme assets", async () => {
+  test("fails closed for missing, symlinked, unsafe, mutated, or replaced staged release assets", async () => {
     if (process.platform === "win32") return;
     const sourceRoot = await fs.mkdtemp(path.join(os.homedir(), ".phase0-live-theme-")), executable = path.join(sourceRoot, "pi");
     const makePreflight = async (): Promise<LivePiExecutable> => {
@@ -474,20 +534,25 @@ describe("two-tier gated Phase 0 live harness", () => {
     };
     try {
       await fs.chmod(sourceRoot, 0o700); const preflight = await makePreflight();
-      await assert.rejects(() => revalidateStagedLivePiBundle(preflight), /requires staged theme assets/);
-      for (const setup of [
-        async () => undefined,
-        async () => { await writeThemePair(sourceRoot); await fs.unlink(path.join(sourceRoot, "theme", "light.json")); await fs.symlink("/tmp/not-light", path.join(sourceRoot, "theme", "light.json")); },
-        async () => { await writeThemePair(sourceRoot); await fs.chmod(path.join(sourceRoot, "theme", "dark.json"), 0o666); },
-      ]) {
-        await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await setup(); const root = await createPrivateEvidenceRoot();
-        try { await assert.rejects(() => stageLivePiExecutable(root, preflight), /staging failed before provider spawn/); assert.equal(await fs.lstat(path.join(root, "staged-native-pi")).catch(() => null), null); }
-        finally { await fs.rm(root, { recursive: true, force: true }); }
+      await assert.rejects(() => revalidateStagedLivePiBundle(preflight), /requires every staged release asset/);
+      for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) {
+        await removeReleaseProfile(sourceRoot); await writeReleaseProfile(sourceRoot); await fs.unlink(path.join(sourceRoot, spec.relativePath));
+        const missingRoot = await createPrivateEvidenceRoot();
+        try { await assert.rejects(() => stageLivePiExecutable(missingRoot, preflight), /staging failed before provider spawn/, `missing ${spec.relativePath}`); assert.equal(await fs.lstat(path.join(missingRoot, "staged-native-pi")).catch(() => null), null); }
+        finally { await fs.rm(missingRoot, { recursive: true, force: true }); }
+        await removeReleaseProfile(sourceRoot); await writeReleaseProfile(sourceRoot); await fs.unlink(path.join(sourceRoot, spec.relativePath)); await fs.symlink("/tmp/not-staged-asset", path.join(sourceRoot, spec.relativePath));
+        const symlinkRoot = await createPrivateEvidenceRoot();
+        try { await assert.rejects(() => stageLivePiExecutable(symlinkRoot, preflight), /staging failed before provider spawn/, `symlink ${spec.relativePath}`); assert.equal(await fs.lstat(path.join(symlinkRoot, "staged-native-pi")).catch(() => null), null); }
+        finally { await fs.rm(symlinkRoot, { recursive: true, force: true }); }
       }
-      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeThemePair(sourceRoot); const mutationRoot = await createPrivateEvidenceRoot();
-      try { await assert.rejects(() => stageLivePiExecutable(mutationRoot, preflight, { afterThemeSourcePrevalidated: async () => { await fs.writeFile(path.join(sourceRoot, "theme", "light.json"), '{"changed":true}', { mode: 0o600 }); } }), /staging failed before provider spawn/); assert.equal(await fs.lstat(path.join(mutationRoot, "staged-native-pi")).catch(() => null), null); }
+      await removeReleaseProfile(sourceRoot); await writeReleaseProfile(sourceRoot); await fs.chmod(path.join(sourceRoot, "theme", "dark.json"), 0o666);
+      const unsafeRoot = await createPrivateEvidenceRoot();
+      try { await assert.rejects(() => stageLivePiExecutable(unsafeRoot, preflight), /staging failed before provider spawn/); assert.equal(await fs.lstat(path.join(unsafeRoot, "staged-native-pi")).catch(() => null), null); }
+      finally { await fs.rm(unsafeRoot, { recursive: true, force: true }); }
+      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeReleaseProfile(sourceRoot); const mutationRoot = await createPrivateEvidenceRoot();
+      try { await assert.rejects(() => stageLivePiExecutable(mutationRoot, preflight, { afterAssetSourcesPrevalidated: async () => { await fs.writeFile(path.join(sourceRoot, "theme", "light.json"), '{"changed":true}', { mode: 0o600 }); } }), /staging failed before provider spawn/); assert.equal(await fs.lstat(path.join(mutationRoot, "staged-native-pi")).catch(() => null), null); }
       finally { await fs.rm(mutationRoot, { recursive: true, force: true }); }
-      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeThemePair(sourceRoot); const destinationRoot = await createPrivateEvidenceRoot();
+      await fs.rm(path.join(sourceRoot, "theme"), { recursive: true, force: true }); await writeReleaseProfile(sourceRoot); const destinationRoot = await createPrivateEvidenceRoot();
       try {
         await fs.symlink("/tmp", path.join(destinationRoot, "staged-native-pi"));
         await assert.rejects(() => stageLivePiExecutable(destinationRoot, preflight), /staging failed before provider spawn/);
@@ -495,8 +560,8 @@ describe("two-tier gated Phase 0 live harness", () => {
       } finally { await fs.rm(destinationRoot, { recursive: true, force: true }); }
       const stagedRoot = await createPrivateEvidenceRoot();
       try {
-        const staged = await stageLivePiExecutable(stagedRoot, preflight); await fs.writeFile(staged.themeAssets!.find((asset) => asset.relativePath === "theme/light.json")!.path, '{"changed":true}', { mode: 0o600 });
-        await assert.rejects(() => revalidateStagedLivePiBundle(staged), /theme asset changed/);
+        const staged = await stageLivePiExecutable(stagedRoot, preflight); await fs.writeFile(staged.stagedAssets!.find((asset) => asset.relativePath === "theme/light.json")!.path, '{"changed":true}', { mode: 0o600 });
+        await assert.rejects(() => revalidateStagedLivePiBundle(staged), /release asset changed/);
       } finally { await fs.rm(stagedRoot, { recursive: true, force: true }); }
     } finally { await fs.rm(sourceRoot, { recursive: true, force: true }); }
   });
@@ -512,6 +577,57 @@ describe("two-tier gated Phase 0 live harness", () => {
       const events = result.stdout.trim().split("\n").map((line) => JSON.parse(line) as { type?: unknown });
       assert.ok(events.some((event) => event.type === "session"), "Pi did not emit a normal JSON session event");
     } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  const stagedPiTuiTmux37aTest = process.platform === "darwin" && process.arch === "arm64" && process.env.PI_SUBAGENT_REAL_TMUX_37A_FIXTURE === "1" && Boolean(process.env[MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV]) ? test : test.skip;
+  stagedPiTuiTmux37aTest("starts the real staged Pi TUI provider-free under exact tmux 3.7a and proves fixture teardown", { timeout: 25_000 }, async () => {
+    const requestedTmux = process.env.TMUX_BIN?.trim(), configuredPi = process.env[MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV]!;
+    assert.ok(requestedTmux && path.isAbsolute(requestedTmux), "TMUX_BIN must explicitly select tmux 3.7a");
+    const root = await createPrivateEvidenceRoot();
+    const fixture: { current: { socket: string; socketRoot: string; server: { pid: number; startedAt: number } } | null } = { current: null };
+    let markerObserved = false, intentionalFixtureFailureInjected = false;
+    try {
+      const tmux = captureManagedChildPiExecutableGeneration(requestedTmux!);
+      const version = await runPiStartup(tmux.executable, ["-V"], tmuxFixtureSetupEnv());
+      assert.equal(version.code, 0, version.stderr); assert.equal(version.stdout.trim(), "tmux 3.7a");
+      const preflight = await resolveLivePiExecutable({ [MANAGED_CHILD_ACCEPTANCE_PI_EXECUTABLE_ENV]: configuredPi });
+      const staged = await stageLivePiExecutable(root, { ...preflight, tmux: preflight.generation, cmux: preflight.generation });
+      const env = { ...tmuxFixtureSetupEnv(), HOME: root, PI_CODING_AGENT_DIR: root, PI_OFFLINE: "1" };
+      const runTmux = async (args: string[]) => {
+        const result = await runPiStartup(tmux.executable, args, env);
+        return { exitCode: result.code ?? 1, stdout: result.stdout, stderr: result.stderr };
+      };
+      await assert.rejects(() => runTmuxCell(root, "/fixture/no-provider-agent", "/fixture/no-provider-extension", { ...staged, tmux }, 1, "short-response", env, {
+        afterBinding: async (stage, state) => {
+          if (stage !== "sentinel") return;
+          fixture.current = { socket: state.socket, socketRoot: state.socketRoot, server: state.binding.server };
+          const socketStat = await fs.lstat(state.socket);
+          assert.ok(socketStat.isSocket()); assert.equal(BigInt(socketStat.dev), state.binding.socket.dev); assert.equal(BigInt(socketStat.ino), state.binding.socket.ino);
+          assert.equal(getProcessStartedAt(state.binding.server.pid), state.binding.server.startedAt);
+          const launched = await runTmux(["-S", state.socket, "new-window", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-t", state.session, staged.bin, "--no-context-files", "--no-extensions"]);
+          assert.equal(launched.exitCode, 0, launched.stderr);
+          const pane = launched.stdout.trim().match(/^(%\d+)\|([1-9]\d*)$/);
+          assert.ok(pane, "tmux did not return the staged Pi pane identity");
+          const startedAt = getProcessStartedAt(Number(pane![2]!));
+          assert.ok(startedAt !== null, "staged Pi pane process identity is unavailable");
+          state.trackExpectedProcess({ pid: Number(pane![2]!), startedAt: startedAt! });
+          await waitForInitializedPiTui(runTmux, state.socket, pane![1]!, staged.version);
+          markerObserved = true;
+          // Stop before runParentCell so this fixture never submits a prompt or dispatches a provider child.
+          intentionalFixtureFailureInjected = true;
+          throw new Error("provider-free staged Pi TUI fixture complete");
+        },
+      }), (error: unknown) => error instanceof Phase0CellFailure
+        && error.summary.cleanupProven === true && intentionalFixtureFailureInjected && markerObserved);
+      assert.ok(intentionalFixtureFailureInjected, "the intentional post-marker Phase0CellFailure was not injected");
+      assert.ok(markerObserved, "capture-pane never observed the initialized staged Pi TUI marker");
+      assert.ok(fixture.current, "tmux fixture binding was not captured");
+      assert.equal(classifyParentProcessIdentity(fixture.current!.server.pid, fixture.current!.server.startedAt), "dead");
+      assert.equal(await fs.lstat(fixture.current!.socket).catch(() => null), null);
+      assert.equal(await fs.lstat(fixture.current!.socketRoot).catch(() => null), null);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects a replaced preflight Pi generation before the credentialed parent spawn", async () => {

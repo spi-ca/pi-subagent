@@ -273,10 +273,61 @@ export function createRunId(): string {
 	return crypto.randomUUID();
 }
 
+function isPrivateOwnedDirectorySync(directory: string): boolean {
+	try {
+		const stat = fs.lstatSync(directory);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
+		return process.platform === "win32" || (stat.mode & 0o777) === 0o700;
+	} catch {
+		return false;
+	}
+}
+
+function hasValidStateRootMarkerSync(root: string): boolean {
+	try {
+		if (!isPrivateOwnedDirectorySync(root)) return false;
+		const markerPath = path.join(root, STATE_ROOT_MARKER_NAME);
+		const stat = fs.lstatSync(markerPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024) return false;
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
+		if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) return false;
+		const text = fs.readFileSync(markerPath, "utf8");
+		if (!text.endsWith("\n") || text.slice(0, -1).includes("\n")) return false;
+		const value = JSON.parse(text.slice(0, -1)) as unknown;
+		return isRecord(value)
+			&& hasExactKeys(value, ["version", "kind"])
+			&& value.version === 1
+			&& value.kind === "pi-subagent-state-root";
+	} catch {
+		return false;
+	}
+}
+
+function hasPrivateMarkerlessLegacyState(defaultRoot: string): boolean {
+	try {
+		if (!isPrivateOwnedDirectorySync(defaultRoot)) return false;
+		if (fs.existsSync(path.join(defaultRoot, STATE_ROOT_MARKER_NAME))) return false;
+		const entries = fs.readdirSync(defaultRoot);
+		if (entries.some((name) => name.startsWith(`.${STATE_ROOT_MARKER_NAME}.`) && name.endsWith(".tmp"))) return false;
+		return entries.length > 0;
+	} catch {
+		return false;
+	}
+}
+
+export function selectDefaultRunStateRoot(defaultRoot: string): string {
+	const resolved = path.resolve(defaultRoot);
+	const fallback = `${resolved}-owned-v1`;
+	if (hasValidStateRootMarkerSync(fallback)) return fallback;
+	return hasPrivateMarkerlessLegacyState(resolved) ? fallback : resolved;
+}
+
 export function getRunStateRoot(baseEnv: NodeJS.ProcessEnv = process.env): string {
 	const configured = baseEnv[RUN_STATE_DIR_ENV]?.trim();
+	if (configured) return path.resolve(configured);
 	const uidSuffix = typeof process.getuid === "function" ? `-${process.getuid()}` : "";
-	return configured ? path.resolve(configured) : path.join(os.tmpdir(), `pi-subagent-runs${uidSuffix}`);
+	return selectDefaultRunStateRoot(path.join(os.tmpdir(), `pi-subagent-runs${uidSuffix}`));
 }
 
 export async function isPrivateOwnedDirectory(directory: string): Promise<boolean> {

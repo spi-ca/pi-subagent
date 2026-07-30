@@ -50,6 +50,7 @@ import {
 	removeRunArtifacts,
 	scheduleRunArtifactCleanup,
 	startParentLeaseWriter,
+	selectDefaultRunStateRoot,
 	STATE_ROOT_MARKER_NAME,
 	RUN_DIRECTORY_MARKER_NAME,
 } from "../../src/runtime/run-protocol";
@@ -119,6 +120,50 @@ describe("run protocol", () => {
 		await assert.rejects(() => prepareRunArtifactPaths({ rootDir: root, runId: "new-run" }), /ownership marker is missing from nonempty root/);
 		assert.equal(fs.existsSync(path.join(root, STATE_ROOT_MARKER_NAME)), false);
 		assert.equal(fs.existsSync(path.join(root, "legacy.json")), true);
+	});
+
+	test("selects a fresh sibling for a private populated marker-less default root", async () => {
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
+		tempDirs.push(container);
+		const root = path.join(container, "default-root");
+		await fs.promises.mkdir(root, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
+
+		assert.equal(selectDefaultRunStateRoot(root), `${root}-owned-v1`);
+		assert.equal(fs.existsSync(path.join(root, STATE_ROOT_MARKER_NAME)), false);
+		assert.equal(await fs.promises.readFile(path.join(root, "legacy.json"), "utf8"), "legacy");
+	});
+
+	test("keeps empty, marked, unsafe, and marker-publication roots on the strict validation path", async () => {
+		if (process.platform === "win32") return;
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
+		tempDirs.push(container);
+		const empty = path.join(container, "empty");
+		const marked = path.join(container, "marked");
+		const unsafe = path.join(container, "unsafe");
+		const publishing = path.join(container, "publishing");
+		await fs.promises.mkdir(empty, { mode: 0o700 });
+		await fs.promises.mkdir(marked, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(marked, STATE_ROOT_MARKER_NAME), JSON.stringify({ version: 1, kind: "pi-subagent-state-root" }), { mode: 0o600 });
+		await fs.promises.mkdir(unsafe, { mode: 0o770 });
+		await fs.promises.writeFile(path.join(unsafe, "legacy.json"), "legacy", { mode: 0o600 });
+		await fs.promises.mkdir(publishing, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(publishing, `.${STATE_ROOT_MARKER_NAME}.42.abcdef.tmp`), "pending", { mode: 0o600 });
+
+		assert.equal(selectDefaultRunStateRoot(empty), empty);
+		assert.equal(selectDefaultRunStateRoot(marked), marked);
+		assert.equal(selectDefaultRunStateRoot(unsafe), unsafe);
+		assert.equal(selectDefaultRunStateRoot(publishing), publishing);
+	});
+
+	test("keeps selecting an initialized fallback after the legacy default is removed", async () => {
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
+		tempDirs.push(container);
+		const root = path.join(container, "default-root");
+		const fallback = `${root}-owned-v1`;
+		await prepareRunArtifactPaths({ rootDir: fallback, runId: "fallback-run" });
+
+		assert.equal(selectDefaultRunStateRoot(root), fallback);
 	});
 
 	test("rejects unsafe existing ancestors without creating or chmodding a root", async () => {

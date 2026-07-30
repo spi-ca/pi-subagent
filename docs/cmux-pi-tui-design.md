@@ -312,7 +312,7 @@ V2는 detached broker가 pane allocation과 commit 전 rollback을 소유하는 
 
 ### 8.2 저장 위치, 권한, artifact
 
-기본 root는 `${TMPDIR}/pi-subagent-runs-<uid>/`이며 `PI_SUBAGENT_RUN_STATE_DIR`로 override할 수 있다. root/run directory는 `0700`, JSON·입력 artifact는 `0600`, wrapper는 `0700`이다. root에는 immutable non-secret `state-root-marker.json`, 각 run에는 immutable non-secret `run-directory-marker.json`을 `0600` regular file로 no-replace publish하고 file/directory fsync 뒤 strict schema·owner·mode·no-symlink을 검증한다. 빈 trusted root만 marker 초기화가 가능하다. marker 없는 nonempty legacy/custom/default root 및 marker 없는 child directory는 보수적으로 quarantine/ignore하며 reaper가 inspect, execute cleanup 또는 recursive delete하지 않는다. symlink, 다른 UID 소유, 안전하지 않은 ancestor를 거부한다. raw provider error나 API key는 durable artifact에 기록하지 않는다.
+기본 root는 `${TMPDIR}/pi-subagent-runs-<uid>/`이며 `PI_SUBAGENT_RUN_STATE_DIR`로 override할 수 있다. root/run directory는 `0700`, JSON·입력 artifact는 `0600`, wrapper는 `0700`이다. root에는 immutable non-secret `state-root-marker.json`, 각 run에는 immutable non-secret `run-directory-marker.json`을 `0600` regular file로 no-replace publish하고 file/directory fsync 뒤 strict schema·owner·mode·no-symlink을 검증한다. 빈 trusted root만 marker 초기화가 가능하다. 기본 경로에 현재 UID 소유·`0700`인 marker 없는 nonempty legacy 상태가 있으면 원본을 수정하지 않고 deterministic sibling `${TMPDIR}/pi-subagent-runs-<uid>-owned-v1`을 새 root로 선택하며, fallback에 유효한 marker가 생긴 뒤에는 legacy 기본 경로가 제거되어도 선택을 유지한다. 명시 override, unsafe 기본 root, marker가 있으나 유효하지 않은 root와 marker 없는 child directory는 fallback 없이 보수적으로 quarantine/ignore하며 reaper가 inspect, execute cleanup 또는 recursive delete하지 않는다. symlink, 다른 UID 소유, 안전하지 않은 ancestor를 거부한다. raw provider error나 API key는 durable artifact에 기록하지 않는다.
 
 | artifact | writer | 성격과 용도 |
 |---|---|---|

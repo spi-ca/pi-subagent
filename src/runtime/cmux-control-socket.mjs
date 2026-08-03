@@ -98,7 +98,7 @@ function validateResponse(response, id) {
 	if (!errorKeys.every((key) => key === "code" || key === "message" || key === "data") || !own(response.error, "code") || !own(response.error, "message") || !isSafeString(response.error.code) || !isSafeString(response.error.message)) fail("CMUX_ENVELOPE", "cmux response error is invalid");
 	throw new CmuxControlSocketError(response.error.code, response.error.message, { data: response.error.data, remote: true });
 }
-function validateMethods(methods) { return Array.isArray(methods) && methods.every(isSafeString) && new Set(methods).size === methods.length; }
+function validateStringList(values) { return Array.isArray(values) && values.every(isSafeString) && new Set(values).size === values.length; }
 function strictParams(params, keys, values) {
 	if (!isObject(params) || !exactKeys(params, keys)) fail("CMUX_REQUEST", "cmux helper parameters are invalid");
 	for (const [key, validator] of Object.entries(values)) if (!validator(params[key])) fail("CMUX_REQUEST", `cmux helper parameter ${key} is invalid`);
@@ -147,17 +147,25 @@ export class CmuxControlSocketClient {
 	async handshake(options = {}) {
 		const capabilities = await this.request("system.capabilities", {}, { mutation: false });
 		const capabilityKeys = isObject(capabilities) ? Object.keys(capabilities) : [];
-		if (!isObject(capabilities) || !["version", "access_mode", "methods", "protocol", "socket_path"].every((key) => capabilityKeys.includes(key) || key === "socket_path")
-			|| capabilityKeys.some((key) => !["version", "access_mode", "methods", "protocol", "socket_path"].includes(key))
-			|| capabilities.version !== 2 || capabilities.protocol !== "cmux-socket" || !isSafeString(capabilities.access_mode) || !validateMethods(capabilities.methods)
+		if (!isObject(capabilities) || !["version", "access_mode", "methods", "protocol"].every((key) => capabilityKeys.includes(key))
+			|| capabilities.version !== 2 || capabilities.protocol !== "cmux-socket" || !isSafeString(capabilities.access_mode) || !validateStringList(capabilities.methods)
 			|| (capabilities.socket_path !== undefined && capabilities.socket_path !== this.connectionIdentity()?.socketPath)) fail("CMUX_HANDSHAKE", "cmux capabilities handshake is invalid");
+		// The server may add discovery metadata without changing control-v2. Keep
+		// only validated fields so unknown additions never become local authority.
+		const validatedCapabilities = {
+			version: capabilities.version,
+			protocol: capabilities.protocol,
+			access_mode: capabilities.access_mode,
+			methods: [...capabilities.methods],
+			...(capabilities.socket_path === undefined ? {} : { socket_path: capabilities.socket_path }),
+		};
 		const required = options.requiredMethods ?? CMUX_REQUIRED_METHODS;
-		if (!Array.isArray(required) || !required.every(isSafeString) || !required.every((name) => capabilities.methods.includes(name))) fail("CMUX_HANDSHAKE", "cmux lacks required control methods");
+		if (!Array.isArray(required) || !required.every(isSafeString) || !required.every((name) => validatedCapabilities.methods.includes(name))) fail("CMUX_HANDSHAKE", "cmux lacks required control methods");
 		const identify = await this.request("system.identify", {}, { mutation: false });
 		if (!isObject(identify)) fail("CMUX_IDENTIFY", "cmux identify response is invalid");
-		if (options.identify && await options.identify(identify, capabilities) !== true) fail("CMUX_IDENTIFY", "cmux identify callback rejected server");
-		if (options.appVersionValidator && await options.appVersionValidator(identify, capabilities) !== true) fail("CMUX_VERSION", "cmux app version validator rejected server");
-		return { ...capabilities, identify, connection: this.connectionIdentity() };
+		if (options.identify && await options.identify(identify, validatedCapabilities) !== true) fail("CMUX_IDENTIFY", "cmux identify callback rejected server");
+		if (options.appVersionValidator && await options.appVersionValidator(identify, validatedCapabilities) !== true) fail("CMUX_VERSION", "cmux app version validator rejected server");
+		return { ...validatedCapabilities, identify, connection: this.connectionIdentity() };
 	}
 	request(name, params = {}, options = {}) {
 		if (this.closed) return Promise.reject(new CmuxControlSocketError("CMUX_CLOSED", "cmux control client generation is closed"));

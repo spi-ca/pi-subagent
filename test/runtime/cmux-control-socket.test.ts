@@ -38,7 +38,18 @@ describe("cmux control socket", () => {
 		]), (error: unknown) => { assert.doesNotMatch(String(error), /handshake hung/); return true; });
 		client.close();
 	});
-	test("requires the exact v2 capabilities envelope rather than an app semantic version", async () => {
+	test("matches required methods while ignoring additive discovery fields from cmux 0.64.21+", async () => {
+		const fixture = await server((request, fake) => reply(request, fake, request.method === "system.capabilities" ? { ...capabilities, capabilities: ["events.v1", "terminal.replay.v1"], future_metadata: { version: 1 } } : { app_bundle_path: "/Applications/cmux.app" }));
+		const client = new CmuxControlSocketClient({ env: { CMUX_SOCKET_PATH: fixture.socket } });
+		const handshake = await client.handshake({ appVersionValidator: () => true });
+		assert.equal("capabilities" in handshake, false); assert.equal("future_metadata" in handshake, false); client.close();
+	});
+	test("requires the supported control methods as a subset", async () => {
+		const fixture = await server((request, fake) => reply(request, fake, request.method === "system.capabilities" ? { ...capabilities, methods: capabilities.methods.filter((method) => method !== "surface.create"), future_method: true } : {}));
+		const client = new CmuxControlSocketClient({ env: { CMUX_SOCKET_PATH: fixture.socket } });
+		await assert.rejects(() => client.handshake(), /lacks required control methods/); client.close();
+	});
+	test("requires the v2 transport contract rather than an app semantic version", async () => {
 		const fixture = await server((request, fake) => reply(request, fake, request.method === "system.capabilities" ? { ...capabilities, version: "0.64.20" } : {}));
 		const client = new CmuxControlSocketClient({ env: { CMUX_SOCKET_PATH: fixture.socket } });
 		await assert.rejects(() => client.handshake(), /capabilities handshake/); client.close();

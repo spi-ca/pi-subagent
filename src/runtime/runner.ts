@@ -625,6 +625,19 @@ let cmuxEventsStartingKey: string | null = null;
 let cmuxEventCursor: { boot_id: string; seq: number } | undefined;
 let cmuxEventsStarting: Promise<boolean> | null = null;
 const cmuxEventWaiters = new Set<() => void>();
+const CMUX_TOPOLOGY_MUTATION_EVENTS = new Set([
+  "window.created", "window.closed",
+  "workspace.created", "workspace.closed", "workspace.moved", "workspace.reordered",
+  "pane.created", "pane.closed", "pane.swapped", "pane.broken", "pane.joined",
+  "surface.created", "surface.closed", "surface.moved", "surface.reordered",
+]);
+function isCmuxTopologyMutationEvent(name: string): boolean {
+  return CMUX_TOPOLOGY_MUTATION_EVENTS.has(name);
+}
+/** Test seam for keeping high-volume output/focus events out of topology fencing. */
+export function isCmuxTopologyMutationEventForTest(name: string): boolean {
+  return isCmuxTopologyMutationEvent(name);
+}
 const signalCmuxTopologyHint = () => {
   advanceTopologyMutationGeneration();
   for (const resolve of [...cmuxEventWaiters]) resolve();
@@ -667,7 +680,7 @@ async function ensureCmuxEvents(expected: CmuxEventsAuthorityForTest): Promise<b
         const digest = crypto.createHash("sha256").update(JSON.stringify(identify, Object.keys(identify).sort())).digest("hex");
         return digest === expected.identifyDigest && await readCmuxAppBundleVersion(identify) === expected.appVersion;
       },
-      onEvent: () => { if (generation === cmuxEventsGeneration) signalCmuxTopologyHint(); },
+      onEvent: (event) => { if (generation === cmuxEventsGeneration && isCmuxTopologyMutationEvent(event.name)) signalCmuxTopologyHint(); },
       onReconcile: () => { if (generation === cmuxEventsGeneration) signalCmuxTopologyHint(); },
       onDisconnect: () => {
         if (generation !== cmuxEventsGeneration) return;

@@ -152,7 +152,10 @@ describe("pane launch broker", () => {
 		if (process.platform !== "darwin") return;
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-control-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const socket = path.join(root, "cmux.sock");
-		const identify = { app_bundle_path: "/Applications/cmux.app", app_version: "0.64.20", boot_id: "broker-fixture" };
+		const appBundle = path.join(root, "cmux.app");
+		await fs.promises.mkdir(path.join(appBundle, "Contents"), { recursive: true, mode: 0o755 });
+		await fs.promises.writeFile(path.join(appBundle, "Contents", "Info.plist"), "<plist><dict><key>CFBundleShortVersionString</key><string>0.64.20</string></dict></plist>\n", { mode: 0o600 });
+		const identify = { app_bundle_path: await fs.promises.realpath(appBundle), app_version: "0.64.20", boot_id: "broker-fixture" };
 		const methods = ["system.tree", "surface.split", "surface.create", "surface.respawn", "surface.send_key", "surface.close", "tab.action"];
 		const fake = await fakeCmuxControlServer(socket, (request, server) => {
 			const result = request.method === "system.capabilities"

@@ -60,6 +60,7 @@ import {
 	canStartInteractiveRun,
 	createInteractiveResultMutationQueueForTest,
 	cmuxEventsAuthorityKeyForTest,
+	isCmuxTopologyMutationEventForTest,
 	shouldReplaceCmuxEventsAuthorityForTest,
 	getInteractiveShutdownGenerationForTest,
 	resetInteractiveShutdownForSession,
@@ -182,6 +183,15 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, appVersion: "0.65.0" }), true);
 		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, identifyDigest: "b".repeat(64) }), true);
 		assert.equal(shouldReplaceCmuxEventsAuthorityForTest(key, { ...authority, connection: { ...authority.connection, socketIno: "3" } }), true);
+	});
+
+	test("fences cmux source preflight only for structural topology events", () => {
+		for (const name of ["window.created", "workspace.closed", "workspace.moved", "pane.joined", "surface.created", "surface.reordered"]) {
+			assert.equal(isCmuxTopologyMutationEventForTest(name), true, name);
+		}
+		for (const name of ["surface.input_sent", "surface.key_sent", "surface.selected", "surface.focused", "pane.focused", "pane.resized", "workspace.selected", "agent.hook.Stop"]) {
+			assert.equal(isCmuxTopologyMutationEventForTest(name), false, name);
+		}
 	});
 
 	test("keys cmux source preflight by shutdown, socket generation, workspace, and surface", async () => {

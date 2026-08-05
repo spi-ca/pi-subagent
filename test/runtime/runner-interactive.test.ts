@@ -176,6 +176,144 @@ describe("interactive pane runner preparation", () => {
 		assert.deepEqual(singleFlight.metrics(), { fetches: 2, joins: 4, failures: 0 });
 	});
 
+	test("accepts a changed but generation-stable cmux source observation", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174030";
+		const paneId = "123e4567-e89b-12d3-a456-426614174031";
+		const movedPaneId = "123e4567-e89b-12d3-a456-426614174032";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174033";
+		const tree = (currentPaneId: string) => `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: currentPaneId, surfaces: [{ id: surfaceId, pane_id: currentPaneId }] }] }] }] })}\n`;
+		let calls = 0, topologyGeneration = 0;
+		const resolved = await resolveSharedCmuxSourcePreflight({
+			run: async () => {
+				calls += 1;
+				if (calls === 1) topologyGeneration += 1;
+				return { exitCode: 0, stdout: tree(calls === 1 ? paneId : movedPaneId), stderr: "", aborted: false };
+			},
+			singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+			socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+			workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+			isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true,
+		});
+		assert.equal(calls, 2, "the second observation is generation-stable");
+		assert.equal(resolved.paneId, movedPaneId, "a stable canonical candidate is accepted even when it changed");
+	});
+
+	test("accepts a repeated cmux source identity across continuous unrelated topology churn", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174034";
+		const paneId = "123e4567-e89b-12d3-a456-426614174035";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174036";
+		const tree = (identity: { workspaceId: string; paneId: string; surfaceId: string }) => `${JSON.stringify({ windows: [{ workspaces: [{ id: identity.workspaceId, panes: [{ id: identity.paneId, surfaces: [{ id: identity.surfaceId, pane_id: identity.paneId }] }] }] }] })}\n`;
+		let calls = 0, topologyGeneration = 0;
+		const resolved = await resolveSharedCmuxSourcePreflight({
+			run: async () => {
+				calls += 1;
+				topologyGeneration += 1;
+				const identity = calls === 1
+					? { workspaceId, paneId, surfaceId }
+					: { workspaceId: workspaceId.toUpperCase(), paneId: paneId.toUpperCase(), surfaceId: surfaceId.toUpperCase() };
+				return { exitCode: 0, stdout: tree(identity), stderr: "", aborted: false };
+			},
+			singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+			socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+			workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+			isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true,
+		});
+		assert.equal(calls, 2, "the matching second canonical observation settles despite another unrelated mutation");
+		assert.equal(resolved.paneId, paneId.toUpperCase(), "canonical identity comparison is case-insensitive");
+	});
+
+	test("fences a repeated invalidated identity when shutdown changes during its final socket check", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174037";
+		const paneId = "123e4567-e89b-12d3-a456-426614174038";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174039";
+		const tree = `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }] }] }] }] })}\n`;
+		let calls = 0, topologyGeneration = 0, socketChecks = 0, shutdownCurrent = true;
+		let secondSocketCheckEntered!: () => void, resolveSecondSocketCheck!: (current: boolean) => void;
+		const secondSocketCheckStarted = new Promise<void>((resolve) => { secondSocketCheckEntered = resolve; });
+		const secondSocketCheck = new Promise<boolean>((resolve) => { resolveSecondSocketCheck = resolve; });
+		const preflight = resolveSharedCmuxSourcePreflight({
+			run: async () => {
+				calls += 1;
+				topologyGeneration += 1;
+				return { exitCode: 0, stdout: tree, stderr: "", aborted: false };
+			},
+			singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+			socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+			workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+			isShutdownCurrent: () => shutdownCurrent,
+			isSocketGenerationCurrent: () => {
+				socketChecks += 1;
+				if (socketChecks === 2) {
+					secondSocketCheckEntered();
+					return secondSocketCheck;
+				}
+				return true;
+			},
+		});
+		await secondSocketCheckStarted;
+		shutdownCurrent = false;
+		resolveSecondSocketCheck(true);
+		await assert.rejects(
+			() => preflight,
+			(error: unknown) => error instanceof CmuxSourcePreflightError && error.parserFailure === "shutdown-fenced",
+			"a current socket must not allow stale repeated-identity success after shutdown",
+		);
+		assert.equal(calls, 2, "the repeated identity reaches the final success path only after two invalidated observations");
+		assert.equal(socketChecks, 2, "the shutdown fence runs after the pending second socket-current result, preserving a socket failure's existing precedence");
+	});
+
+	test("fences repeated generation-invalidated identities when shutdown or socket currency changes", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174037";
+		const paneId = "123e4567-e89b-12d3-a456-426614174038";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174039";
+		const tree = `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }] }] }] }] })}\n`;
+		for (const [fence, expected] of [["shutdown", "shutdown-fenced"], ["socket", "socket-generation-changed"]] as const) {
+			let calls = 0, topologyGeneration = 0;
+			await assert.rejects(
+				() => resolveSharedCmuxSourcePreflight({
+					run: async () => {
+						calls += 1;
+						topologyGeneration += 1;
+						return { exitCode: 0, stdout: tree, stderr: "", aborted: false };
+					},
+					singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+					socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+					workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+					isShutdownCurrent: () => fence !== "shutdown" || calls < 2,
+					isSocketGenerationCurrent: () => fence !== "socket" || calls < 2,
+				}),
+				(error: unknown) => error instanceof CmuxSourcePreflightError && error.parserFailure === expected,
+			);
+			assert.equal(calls, 2, `${fence} changes after the first invalidated identity is retained`);
+		}
+	});
+
+	test("rejects cmux preflight after three generation-invalidated source movements", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174040";
+		const paneId = "123e4567-e89b-12d3-a456-426614174041";
+		const movedPaneId = "123e4567-e89b-12d3-a456-426614174042";
+		const movedAgainPaneId = "123e4567-e89b-12d3-a456-426614174043";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174044";
+		const tree = (currentPaneId: string) => `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: currentPaneId, surfaces: [{ id: surfaceId, pane_id: currentPaneId }] }] }] }] })}\n`;
+		const paneIds = [paneId, movedPaneId, movedAgainPaneId];
+		let calls = 0, topologyGeneration = 0;
+		await assert.rejects(
+			() => resolveSharedCmuxSourcePreflight({
+				run: async () => {
+					calls += 1;
+					topologyGeneration += 1;
+					return { exitCode: 0, stdout: tree(paneIds[calls - 1]!), stderr: "", aborted: false };
+				},
+				singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+				socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+				workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+				isShutdownCurrent: () => true, isSocketGenerationCurrent: () => true,
+			}),
+			(error: unknown) => error instanceof CmuxSourcePreflightError && error.parserFailure === "topology-mutated",
+		);
+		assert.equal(calls, 3, "all three changed, generation-invalidated observations consume the retry bound");
+	});
+
 	test("invalidates cmux events authority on app or identify generation changes", () => {
 		const authority = { connection: { socketPath: "/private/tmp/cmux.sock", socketDev: "1", socketIno: "2" }, appVersion: "0.64.20", identifyDigest: "a".repeat(64) };
 		const key = cmuxEventsAuthorityKeyForTest(authority);

@@ -4988,6 +4988,12 @@ type CmuxPreflightCommandResult = Awaited<ReturnType<BackendCommandRunner>> & {
   diagnostic?: { kind: "control" | "adapter"; code: string; state?: string; method?: string; remote?: true };
 };
 
+function sameCmuxSurfaceIdentity(left: CmuxSurfaceIdentity, right: CmuxSurfaceIdentity): boolean {
+  return left.workspaceId.toLowerCase() === right.workspaceId.toLowerCase()
+    && left.surfaceId.toLowerCase() === right.surfaceId.toLowerCase()
+    && left.paneId.toLowerCase() === right.paneId.toLowerCase();
+}
+
 export async function resolveSharedCmuxSourcePreflight(options: {
   run: BackendCommandRunner;
   singleFlight: LaunchPreflightSingleFlight;
@@ -5001,6 +5007,7 @@ export async function resolveSharedCmuxSourcePreflight(options: {
   maxAttempts?: number;
 }): Promise<CmuxSurfaceIdentity> {
   const attempts = options.maxAttempts ?? 3;
+  let generationInvalidatedIdentity: CmuxSurfaceIdentity | undefined;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (!options.isShutdownCurrent()) {
       throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=130 control=CMUX_ABORTED parser=shutdown-fenced", 130, "CMUX_ABORTED", "shutdown-fenced");
@@ -5026,7 +5033,12 @@ export async function resolveSharedCmuxSourcePreflight(options: {
     if (!await options.isSocketGenerationCurrent()) {
       throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=1 control=CMUX_SOCKET_ROTATED parser=socket-generation-changed", 1, "CMUX_SOCKET_ROTATED", "socket-generation-changed");
     }
+    if (!options.isShutdownCurrent()) {
+      throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=130 control=CMUX_ABORTED parser=shutdown-fenced", 130, "CMUX_ABORTED", "shutdown-fenced");
+    }
     if (options.getTopologyGeneration() === candidate.topologyGeneration) return candidate.identity;
+    if (generationInvalidatedIdentity && sameCmuxSurfaceIdentity(generationInvalidatedIdentity, candidate.identity)) return candidate.identity;
+    generationInvalidatedIdentity = candidate.identity;
   }
   throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=1 control=none parser=topology-mutated", 1, "none", "topology-mutated");
 }

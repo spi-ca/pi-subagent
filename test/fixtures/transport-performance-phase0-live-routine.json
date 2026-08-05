@@ -5,13 +5,13 @@
   "planDigest": "c4e5e3a498c44f13878a67b2da40b14241a3102a01b5bb7496749569c5523260",
   "phase": "M0-live",
   "evidenceKind": "gated-provider-transport-benchmark",
-  "capturedAt": "2026-08-04T10:39:04.768Z",
+  "capturedAt": "2026-08-05T04:44:00.642Z",
   "environment": {
     "os": "darwin",
     "arch": "arm64",
     "bunVersion": "1.3.14",
     "piVersion": "0.83.0",
-    "sourceRevision": "9d86ee31c1caef054997ddfff8ce92d55249b8bd",
+    "sourceRevision": "a38c29b1536b9c9ed39dfaf958557ac175cfa4cc",
     "sourceDirty": false,
     "worktreeDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
@@ -26,35 +26,35 @@
       "activeRuns": 1,
       "workload": "idle-wait",
       "timing": {
-        "monotonicElapsedMs": 11471.460417,
-        "settlementLatencyMs": 5466.793042,
-        "eventLoopDelayMeanMs": 40.883616146118726,
-        "eventLoopDelayMaxMs": 148.339113,
-        "eventLoopDelayP99Ms": 110.362623
+        "monotonicElapsedMs": 11400.466333,
+        "settlementLatencyMs": 5480.252208000001,
+        "eventLoopDelayMeanMs": 36.71730124369748,
+        "eventLoopDelayMaxMs": 100.195641,
+        "eventLoopDelayP99Ms": 95.748095
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 282352
+        "peakRssKiB": 411856
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 89706,
-            "startedAt": 1785872011000
+            "pid": 86378,
+            "startedAt": 1785937106000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 89706,
-            "startedAt": 1785872011000
+            "pid": 86378,
+            "startedAt": 1785937106000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 600,
-          "peakAggregateCpuMs": 680,
-          "peakAggregateRssKiB": 275584,
-          "peakIndividualRssKiB": 275584
+          "cumulativeCpuMs": 630,
+          "peakAggregateCpuMs": 650,
+          "peakAggregateRssKiB": 273312,
+          "peakIndividualRssKiB": 273312
         }
       },
       "backend": {
@@ -146,35 +146,35 @@
       "activeRuns": 1,
       "workload": "short-response",
       "timing": {
-        "monotonicElapsedMs": 6099.077875000001,
-        "settlementLatencyMs": 1743.2895000000026,
-        "eventLoopDelayMeanMs": 38.62417855462184,
-        "eventLoopDelayMaxMs": 118.973244,
-        "eventLoopDelayP99Ms": 115.998719
+        "monotonicElapsedMs": 7020.812750000001,
+        "settlementLatencyMs": 1435.9451659999977,
+        "eventLoopDelayMeanMs": 33.50263741935484,
+        "eventLoopDelayMaxMs": 98.256225,
+        "eventLoopDelayP99Ms": 89.587711
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 263632
+        "peakRssKiB": 261920
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 90644,
-            "startedAt": 1785872021000
+            "pid": 87329,
+            "startedAt": 1785937116000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 90644,
-            "startedAt": 1785872021000
+            "pid": 87329,
+            "startedAt": 1785937116000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 0,
-          "peakAggregateCpuMs": 690,
-          "peakAggregateRssKiB": 274112,
-          "peakIndividualRssKiB": 274112
+          "cumulativeCpuMs": 550,
+          "peakAggregateCpuMs": 660,
+          "peakAggregateRssKiB": 274256,
+          "peakIndividualRssKiB": 274256
         }
       },
       "backend": {
@@ -266,35 +266,35 @@
       "activeRuns": 1,
       "workload": "long-response",
       "timing": {
-        "monotonicElapsedMs": 11748.106875000001,
-        "settlementLatencyMs": 7282.30125,
-        "eventLoopDelayMeanMs": 35.08185297637795,
-        "eventLoopDelayMaxMs": 124.795851,
-        "eventLoopDelayP99Ms": 90.243071
+        "monotonicElapsedMs": 14034.156500000001,
+        "settlementLatencyMs": 9556.681332999997,
+        "eventLoopDelayMeanMs": 32.57339561609907,
+        "eventLoopDelayMaxMs": 97.37969,
+        "eventLoopDelayP99Ms": 83.886079
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 267120
+        "peakRssKiB": 266160
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 91224,
-            "startedAt": 1785872027000
+            "pid": 88038,
+            "startedAt": 1785937123000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 91224,
-            "startedAt": 1785872027000
+            "pid": 88038,
+            "startedAt": 1785937123000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 920,
-          "peakAggregateCpuMs": 940,
-          "peakAggregateRssKiB": 276224,
-          "peakIndividualRssKiB": 276224
+          "cumulativeCpuMs": 910,
+          "peakAggregateCpuMs": 1010,
+          "peakAggregateRssKiB": 274000,
+          "peakIndividualRssKiB": 274000
         }
       },
       "backend": {
@@ -386,35 +386,35 @@
       "activeRuns": 1,
       "workload": "cancel",
       "timing": {
-        "monotonicElapsedMs": 4725.438750000001,
-        "settlementLatencyMs": 516.203499999996,
-        "eventLoopDelayMeanMs": 37.81647415053763,
-        "eventLoopDelayMaxMs": 110.697355,
-        "eventLoopDelayP99Ms": 104.398847
+        "monotonicElapsedMs": 5117.990417000001,
+        "settlementLatencyMs": 450.1242920000004,
+        "eventLoopDelayMeanMs": 33.513102990990994,
+        "eventLoopDelayMaxMs": 99.032664,
+        "eventLoopDelayP99Ms": 92.667903
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 264064
+        "peakRssKiB": 262768
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 92363,
-            "startedAt": 1785872039000
+            "pid": 89432,
+            "startedAt": 1785937137000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 92363,
-            "startedAt": 1785872039000
+            "pid": 89432,
+            "startedAt": 1785937137000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 590,
+          "cumulativeCpuMs": 510,
           "peakAggregateCpuMs": 620,
-          "peakAggregateRssKiB": 275184,
-          "peakIndividualRssKiB": 275184
+          "peakAggregateRssKiB": 272784,
+          "peakIndividualRssKiB": 272784
         }
       },
       "backend": {
@@ -506,35 +506,35 @@
       "activeRuns": 1,
       "workload": "external-close",
       "timing": {
-        "monotonicElapsedMs": 5014.035042000003,
-        "settlementLatencyMs": 463.2788750000036,
-        "eventLoopDelayMeanMs": 41.11947686956522,
-        "eventLoopDelayMaxMs": 123.527779,
-        "eventLoopDelayP99Ms": 117.768191
+        "monotonicElapsedMs": 4615.7956669999985,
+        "settlementLatencyMs": 510.7365409999984,
+        "eventLoopDelayMeanMs": 34.266467265306126,
+        "eventLoopDelayMaxMs": 112.601528,
+        "eventLoopDelayP99Ms": 95.944703
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 263872
+        "peakRssKiB": 262144
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 92824,
-            "startedAt": 1785872044000
+            "pid": 89959,
+            "startedAt": 1785937142000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 92824,
-            "startedAt": 1785872044000
+            "pid": 89959,
+            "startedAt": 1785937142000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 590,
-          "peakAggregateCpuMs": 620,
-          "peakAggregateRssKiB": 276976,
-          "peakIndividualRssKiB": 276976
+          "cumulativeCpuMs": 560,
+          "peakAggregateCpuMs": 660,
+          "peakAggregateRssKiB": 273920,
+          "peakIndividualRssKiB": 273920
         }
       },
       "backend": {
@@ -626,39 +626,39 @@
       "activeRuns": 1,
       "workload": "idle-wait",
       "timing": {
-        "monotonicElapsedMs": 19315.96,
-        "settlementLatencyMs": 9636.131667000001,
-        "eventLoopDelayMeanMs": 35.51879148448687,
-        "eventLoopDelayMaxMs": 116.458552,
-        "eventLoopDelayP99Ms": 50.364415
+        "monotonicElapsedMs": 24616.571874999994,
+        "settlementLatencyMs": 10047.210790999998,
+        "eventLoopDelayMeanMs": 31.325888650847457,
+        "eventLoopDelayMaxMs": 94.070775,
+        "eventLoopDelayP99Ms": 37.584895
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 573184
+        "peakRssKiB": 571776
       },
       "descendants": {
         "peakCount": 2,
         "peakIdentities": [
           {
-            "pid": 93513,
-            "startedAt": 1785872050000
+            "pid": 90682,
+            "startedAt": 1785937149000
           },
           {
-            "pid": 93455,
-            "startedAt": 1785872050000
+            "pid": 90602,
+            "startedAt": 1785937148000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 93455,
-            "startedAt": 1785872050000
+            "pid": 90602,
+            "startedAt": 1785937148000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 480,
-          "peakAggregateCpuMs": 1050,
-          "peakAggregateRssKiB": 285200,
-          "peakIndividualRssKiB": 282608
+          "cumulativeCpuMs": 600,
+          "peakAggregateCpuMs": 2200,
+          "peakAggregateRssKiB": 437184,
+          "peakIndividualRssKiB": 434576
         }
       },
       "backend": {
@@ -702,115 +702,39 @@
       "activeRuns": 1,
       "workload": "short-response",
       "timing": {
-        "monotonicElapsedMs": 11622.358375000003,
-        "settlementLatencyMs": 3055.2519170000014,
-        "eventLoopDelayMeanMs": 33.56758314176245,
-        "eventLoopDelayMaxMs": 106.428061,
-        "eventLoopDelayP99Ms": 54.165503
+        "monotonicElapsedMs": 11537.377374999996,
+        "settlementLatencyMs": 2701.8122920000023,
+        "eventLoopDelayMeanMs": 30.86733727536232,
+        "eventLoopDelayMaxMs": 93.730725,
+        "eventLoopDelayP99Ms": 37.584895
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 572448
+        "peakRssKiB": 570224
       },
       "descendants": {
         "peakCount": 2,
         "peakIdentities": [
           {
-            "pid": 95527,
-            "startedAt": 1785872070000
+            "pid": 93417,
+            "startedAt": 1785937173000
           },
           {
-            "pid": 95470,
-            "startedAt": 1785872069000
+            "pid": 93357,
+            "startedAt": 1785937173000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 95470,
-            "startedAt": 1785872069000
+            "pid": 93357,
+            "startedAt": 1785937173000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 420,
-          "peakAggregateCpuMs": 1090,
-          "peakAggregateRssKiB": 285776,
-          "peakIndividualRssKiB": 283168
-        }
-      },
-      "backend": {
-        "topologyProbeCount": 1,
-        "transportCounters": {
-          "source": "authoritative-live-artifact:transport-tmux",
-          "availability": "measured",
-          "backendRequests": 25,
-          "backendSpawns": 3,
-          "requestBacklogHighWater": 4,
-          "lineBacklogHighWater": 5,
-          "byteBacklogHighWater": 201,
-          "controlDisconnects": 3,
-          "reconnects": 0,
-          "unknownOutcomes": 0,
-          "exactSnapshots": 21,
-          "exactCleanupMutations": 0,
-          "residualRecovery": 0,
-          "persistentClientCreates": 3,
-          "persistentClientRestarts": 0,
-          "healthyPeriodicStatusQueries": 0,
-          "notificationToReconcileLatencyMs": 0,
-          "lifecycleCompletionLatencyMs": 43
-        }
-      },
-      "verifiedProviderChildren": 1,
-      "cleanup": {
-        "result": "clean",
-        "residualDescendantCount": 0,
-        "residualBackendTargetCount": 0
-      },
-      "settlement": "settled",
-      "requestedProvider": "openai-codex",
-      "requestedModel": "openai-codex/gpt-5.4-mini",
-      "observedProvider": "openai-codex",
-      "observedModel": "gpt-5.4-mini",
-      "sourceAndSentinelPreserved": true
-    },
-    {
-      "mode": "tmux",
-      "activeRuns": 1,
-      "workload": "long-response",
-      "timing": {
-        "monotonicElapsedMs": 17449.554707999996,
-        "settlementLatencyMs": 8504.708291999996,
-        "eventLoopDelayMeanMs": 35.87812010666667,
-        "eventLoopDelayMaxMs": 117.772724,
-        "eventLoopDelayP99Ms": 51.609599
-      },
-      "parent": {
-        "cpuDeltaMs": 0,
-        "peakRssKiB": 572224
-      },
-      "descendants": {
-        "peakCount": 2,
-        "peakIdentities": [
-          {
-            "pid": 96824,
-            "startedAt": 1785872081000
-          },
-          {
-            "pid": 96768,
-            "startedAt": 1785872081000
-          }
-        ],
-        "verifiedProviderIdentities": [
-          {
-            "pid": 96768,
-            "startedAt": 1785872081000
-          }
-        ],
-        "resources": {
-          "cumulativeCpuMs": 450,
-          "peakAggregateCpuMs": 1070,
-          "peakAggregateRssKiB": 287216,
-          "peakIndividualRssKiB": 284640
+          "cumulativeCpuMs": 470,
+          "peakAggregateCpuMs": 1100,
+          "peakAggregateRssKiB": 283904,
+          "peakIndividualRssKiB": 281296
         }
       },
       "backend": {
@@ -833,7 +757,83 @@
           "persistentClientRestarts": 0,
           "healthyPeriodicStatusQueries": 0,
           "notificationToReconcileLatencyMs": 1,
-          "lifecycleCompletionLatencyMs": 233
+          "lifecycleCompletionLatencyMs": 159
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "tmux",
+      "activeRuns": 1,
+      "workload": "long-response",
+      "timing": {
+        "monotonicElapsedMs": 17531.346208000003,
+        "settlementLatencyMs": 8706.369875000004,
+        "eventLoopDelayMeanMs": 31.55773046153846,
+        "eventLoopDelayMaxMs": 90.378106,
+        "eventLoopDelayP99Ms": 38.502399
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 571040
+      },
+      "descendants": {
+        "peakCount": 2,
+        "peakIdentities": [
+          {
+            "pid": 94756,
+            "startedAt": 1785937185000
+          },
+          {
+            "pid": 94681,
+            "startedAt": 1785937184000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 94681,
+            "startedAt": 1785937184000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 480,
+          "peakAggregateCpuMs": 1110,
+          "peakAggregateRssKiB": 284976,
+          "peakIndividualRssKiB": 282384
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-tmux",
+          "availability": "measured",
+          "backendRequests": 25,
+          "backendSpawns": 3,
+          "requestBacklogHighWater": 4,
+          "lineBacklogHighWater": 5,
+          "byteBacklogHighWater": 201,
+          "controlDisconnects": 3,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 21,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 3,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 1,
+          "lifecycleCompletionLatencyMs": 191
         }
       },
       "verifiedProviderChildren": 1,
@@ -854,39 +854,39 @@
       "activeRuns": 1,
       "workload": "cancel",
       "timing": {
-        "monotonicElapsedMs": 15607.317584000004,
-        "settlementLatencyMs": 4946.429042000003,
-        "eventLoopDelayMeanMs": 36.539905556231,
-        "eventLoopDelayMaxMs": 120.237899,
-        "eventLoopDelayP99Ms": 55.050239
+        "monotonicElapsedMs": 13287.012833,
+        "settlementLatencyMs": 4535.6289169999945,
+        "eventLoopDelayMeanMs": 31.302280101265822,
+        "eventLoopDelayMaxMs": 91.505048,
+        "eventLoopDelayP99Ms": 38.502399
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 573728
+        "peakRssKiB": 573968
       },
       "descendants": {
         "peakCount": 2,
         "peakIdentities": [
           {
-            "pid": 98665,
-            "startedAt": 1785872099000
+            "pid": 96719,
+            "startedAt": 1785937203000
           },
           {
-            "pid": 98607,
-            "startedAt": 1785872099000
+            "pid": 96662,
+            "startedAt": 1785937202000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 98607,
-            "startedAt": 1785872099000
+            "pid": 96662,
+            "startedAt": 1785937202000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 480,
-          "peakAggregateCpuMs": 1080,
-          "peakAggregateRssKiB": 284848,
-          "peakIndividualRssKiB": 282256
+          "cumulativeCpuMs": 460,
+          "peakAggregateCpuMs": 1070,
+          "peakAggregateRssKiB": 284400,
+          "peakIndividualRssKiB": 281808
         }
       },
       "backend": {
@@ -930,39 +930,39 @@
       "activeRuns": 1,
       "workload": "external-close",
       "timing": {
-        "monotonicElapsedMs": 15498.256041999994,
-        "settlementLatencyMs": 5294.828041000001,
-        "eventLoopDelayMeanMs": 35.531867976047906,
-        "eventLoopDelayMaxMs": 111.02259,
-        "eventLoopDelayP99Ms": 49.577983
+        "monotonicElapsedMs": 16371.832999999999,
+        "settlementLatencyMs": 5291.646500000003,
+        "eventLoopDelayMeanMs": 30.120476019900497,
+        "eventLoopDelayMaxMs": 94.011739,
+        "eventLoopDelayP99Ms": 49.905663
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 572416
+        "peakRssKiB": 570272
       },
       "descendants": {
         "peakCount": 2,
         "peakIdentities": [
           {
-            "pid": 455,
-            "startedAt": 1785872115000
+            "pid": 98237,
+            "startedAt": 1785937216000
           },
           {
-            "pid": 348,
-            "startedAt": 1785872114000
+            "pid": 98178,
+            "startedAt": 1785937215000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 348,
-            "startedAt": 1785872114000
+            "pid": 98178,
+            "startedAt": 1785937215000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 320,
-          "peakAggregateCpuMs": 1180,
-          "peakAggregateRssKiB": 286880,
-          "peakIndividualRssKiB": 284304
+          "cumulativeCpuMs": 400,
+          "peakAggregateCpuMs": 1110,
+          "peakAggregateRssKiB": 284352,
+          "peakIndividualRssKiB": 281776
         }
       },
       "backend": {
@@ -974,7 +974,7 @@
           "backendSpawns": 3,
           "requestBacklogHighWater": 4,
           "lineBacklogHighWater": 5,
-          "byteBacklogHighWater": 195,
+          "byteBacklogHighWater": 201,
           "controlDisconnects": 3,
           "reconnects": 0,
           "unknownOutcomes": 0,
@@ -984,7 +984,7 @@
           "persistentClientCreates": 3,
           "persistentClientRestarts": 0,
           "healthyPeriodicStatusQueries": 0,
-          "notificationToReconcileLatencyMs": 6,
+          "notificationToReconcileLatencyMs": 2,
           "lifecycleCompletionLatencyMs": 0
         }
       },
@@ -1006,35 +1006,35 @@
       "activeRuns": 1,
       "workload": "idle-wait",
       "timing": {
-        "monotonicElapsedMs": 47997.444292,
-        "settlementLatencyMs": 38808.945208000005,
-        "eventLoopDelayMeanMs": 28.96821603265306,
-        "eventLoopDelayMaxMs": 95.7472,
-        "eventLoopDelayP99Ms": 42.762239
+        "monotonicElapsedMs": 43937.38866600001,
+        "settlementLatencyMs": 38725.07108300002,
+        "eventLoopDelayMeanMs": 27.616981884582255,
+        "eventLoopDelayMaxMs": 73.282596,
+        "eventLoopDelayP99Ms": 35.848191
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 569248
+        "peakRssKiB": 569664
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 1734,
-            "startedAt": 1785872129000
+            "pid": 99728,
+            "startedAt": 1785937231000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 1813,
-            "startedAt": 1785872130000
+            "pid": 99813,
+            "startedAt": 1785937232000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 10,
-          "peakAggregateCpuMs": 800,
-          "peakAggregateRssKiB": 280640,
-          "peakIndividualRssKiB": 280640
+          "cumulativeCpuMs": 180,
+          "peakAggregateCpuMs": 790,
+          "peakAggregateRssKiB": 280128,
+          "peakIndividualRssKiB": 280128
         }
       },
       "backend": {
@@ -1045,8 +1045,8 @@
           "backendRequests": 17,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 3,
-          "byteBacklogHighWater": 9522,
+          "lineBacklogHighWater": 4,
+          "byteBacklogHighWater": 7775,
           "controlDisconnects": 0,
           "reconnects": 1,
           "unknownOutcomes": 0,
@@ -1078,35 +1078,35 @@
       "activeRuns": 1,
       "workload": "short-response",
       "timing": {
-        "monotonicElapsedMs": 42183.709375000006,
-        "settlementLatencyMs": 33976.15925,
-        "eventLoopDelayMeanMs": 27.879958663053298,
-        "eventLoopDelayMaxMs": 79.778507,
-        "eventLoopDelayP99Ms": 38.043647
+        "monotonicElapsedMs": 37367.03195800001,
+        "settlementLatencyMs": 31980.882000000012,
+        "eventLoopDelayMeanMs": 30.455863834242095,
+        "eventLoopDelayMaxMs": 80.369775,
+        "eventLoopDelayP99Ms": 38.764543
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 570320
+        "peakRssKiB": 568096
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 5099,
-            "startedAt": 1785872178000
+            "pid": 3077,
+            "startedAt": 1785937276000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 5180,
-            "startedAt": 1785872178000
+            "pid": 3159,
+            "startedAt": 1785937276000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 190,
-          "peakAggregateCpuMs": 740,
-          "peakAggregateRssKiB": 280960,
-          "peakIndividualRssKiB": 280960
+          "cumulativeCpuMs": 200,
+          "peakAggregateCpuMs": 890,
+          "peakAggregateRssKiB": 278832,
+          "peakIndividualRssKiB": 278832
         }
       },
       "backend": {
@@ -1117,80 +1117,8 @@
           "backendRequests": 12,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 2,
-          "byteBacklogHighWater": 8900,
-          "controlDisconnects": 0,
-          "reconnects": 0,
-          "unknownOutcomes": 0,
-          "exactSnapshots": 4,
-          "exactCleanupMutations": 0,
-          "residualRecovery": 0,
-          "persistentClientCreates": 2,
-          "persistentClientRestarts": 0,
-          "healthyPeriodicStatusQueries": 0,
-          "notificationToReconcileLatencyMs": 0,
-          "lifecycleCompletionLatencyMs": 7
-        }
-      },
-      "verifiedProviderChildren": 1,
-      "cleanup": {
-        "result": "clean",
-        "residualDescendantCount": 0,
-        "residualBackendTargetCount": 0
-      },
-      "settlement": "settled",
-      "requestedProvider": "openai-codex",
-      "requestedModel": "openai-codex/gpt-5.4-mini",
-      "observedProvider": "openai-codex",
-      "observedModel": "gpt-5.4-mini",
-      "sourceAndSentinelPreserved": true
-    },
-    {
-      "mode": "cmux",
-      "activeRuns": 1,
-      "workload": "long-response",
-      "timing": {
-        "monotonicElapsedMs": 44199.150792,
-        "settlementLatencyMs": 37751.192916,
-        "eventLoopDelayMeanMs": 28.574213843722564,
-        "eventLoopDelayMaxMs": 70.902433,
-        "eventLoopDelayP99Ms": 39.976959
-      },
-      "parent": {
-        "cpuDeltaMs": 0,
-        "peakRssKiB": 569648
-      },
-      "descendants": {
-        "peakCount": 1,
-        "peakIdentities": [
-          {
-            "pid": 8118,
-            "startedAt": 1785872220000
-          }
-        ],
-        "verifiedProviderIdentities": [
-          {
-            "pid": 8194,
-            "startedAt": 1785872221000
-          }
-        ],
-        "resources": {
-          "cumulativeCpuMs": 100,
-          "peakAggregateCpuMs": 710,
-          "peakAggregateRssKiB": 279024,
-          "peakIndividualRssKiB": 279024
-        }
-      },
-      "backend": {
-        "topologyProbeCount": 1,
-        "transportCounters": {
-          "source": "authoritative-live-artifact:transport-cmux",
-          "availability": "measured",
-          "backendRequests": 12,
-          "backendSpawns": 0,
-          "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 2,
-          "byteBacklogHighWater": 8303,
+          "lineBacklogHighWater": 3,
+          "byteBacklogHighWater": 7775,
           "controlDisconnects": 0,
           "reconnects": 0,
           "unknownOutcomes": 0,
@@ -1220,37 +1148,109 @@
     {
       "mode": "cmux",
       "activeRuns": 1,
-      "workload": "cancel",
+      "workload": "long-response",
       "timing": {
-        "monotonicElapsedMs": 38922.10695800002,
-        "settlementLatencyMs": 33880.33016699998,
-        "eventLoopDelayMeanMs": 29.861892222680414,
-        "eventLoopDelayMaxMs": 81.911612,
-        "eventLoopDelayP99Ms": 41.189375
+        "monotonicElapsedMs": 43251.48933399998,
+        "settlementLatencyMs": 37926.621166,
+        "eventLoopDelayMeanMs": 30.453266320150657,
+        "eventLoopDelayMaxMs": 72.396628,
+        "eventLoopDelayP99Ms": 38.371327
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 571136
+        "peakRssKiB": 568432
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 11221,
-            "startedAt": 1785872265000
+            "pid": 5582,
+            "startedAt": 1785937314000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 11294,
-            "startedAt": 1785872266000
+            "pid": 5665,
+            "startedAt": 1785937314000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 130,
-          "peakAggregateCpuMs": 790,
-          "peakAggregateRssKiB": 281616,
-          "peakIndividualRssKiB": 281616
+          "cumulativeCpuMs": 200,
+          "peakAggregateCpuMs": 850,
+          "peakAggregateRssKiB": 278864,
+          "peakIndividualRssKiB": 278864
+        }
+      },
+      "backend": {
+        "topologyProbeCount": 1,
+        "transportCounters": {
+          "source": "authoritative-live-artifact:transport-cmux",
+          "availability": "measured",
+          "backendRequests": 12,
+          "backendSpawns": 0,
+          "requestBacklogHighWater": 1,
+          "lineBacklogHighWater": 2,
+          "byteBacklogHighWater": 7775,
+          "controlDisconnects": 0,
+          "reconnects": 0,
+          "unknownOutcomes": 0,
+          "exactSnapshots": 4,
+          "exactCleanupMutations": 0,
+          "residualRecovery": 0,
+          "persistentClientCreates": 2,
+          "persistentClientRestarts": 0,
+          "healthyPeriodicStatusQueries": 0,
+          "notificationToReconcileLatencyMs": 0,
+          "lifecycleCompletionLatencyMs": 11
+        }
+      },
+      "verifiedProviderChildren": 1,
+      "cleanup": {
+        "result": "clean",
+        "residualDescendantCount": 0,
+        "residualBackendTargetCount": 0
+      },
+      "settlement": "settled",
+      "requestedProvider": "openai-codex",
+      "requestedModel": "openai-codex/gpt-5.4-mini",
+      "observedProvider": "openai-codex",
+      "observedModel": "gpt-5.4-mini",
+      "sourceAndSentinelPreserved": true
+    },
+    {
+      "mode": "cmux",
+      "activeRuns": 1,
+      "workload": "cancel",
+      "timing": {
+        "monotonicElapsedMs": 40763.301749999984,
+        "settlementLatencyMs": 34647.40320900001,
+        "eventLoopDelayMeanMs": 43.28401319631094,
+        "eventLoopDelayMaxMs": 127.789782,
+        "eventLoopDelayP99Ms": 61.177855
+      },
+      "parent": {
+        "cpuDeltaMs": 0,
+        "peakRssKiB": 567904
+      },
+      "descendants": {
+        "peakCount": 1,
+        "peakIdentities": [
+          {
+            "pid": 8475,
+            "startedAt": 1785937357000
+          }
+        ],
+        "verifiedProviderIdentities": [
+          {
+            "pid": 8561,
+            "startedAt": 1785937358000
+          }
+        ],
+        "resources": {
+          "cumulativeCpuMs": 230,
+          "peakAggregateCpuMs": 1310,
+          "peakAggregateRssKiB": 277968,
+          "peakIndividualRssKiB": 277968
         }
       },
       "backend": {
@@ -1261,8 +1261,8 @@
           "backendRequests": 17,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 3,
-          "byteBacklogHighWater": 8928,
+          "lineBacklogHighWater": 1,
+          "byteBacklogHighWater": 7775,
           "controlDisconnects": 0,
           "reconnects": 1,
           "unknownOutcomes": 0,
@@ -1294,35 +1294,35 @@
       "activeRuns": 1,
       "workload": "external-close",
       "timing": {
-        "monotonicElapsedMs": 39974.924708999984,
-        "settlementLatencyMs": 35303.02308299998,
-        "eventLoopDelayMeanMs": 27.892377746425165,
-        "eventLoopDelayMaxMs": 74.245408,
-        "eventLoopDelayP99Ms": 35.094527
+        "monotonicElapsedMs": 41626.110167000035,
+        "settlementLatencyMs": 35437.946042000025,
+        "eventLoopDelayMeanMs": 46.144267130434784,
+        "eventLoopDelayMaxMs": 151.720539,
+        "eventLoopDelayP99Ms": 112.328703
       },
       "parent": {
         "cpuDeltaMs": 0,
-        "peakRssKiB": 571536
+        "peakRssKiB": 567600
       },
       "descendants": {
         "peakCount": 1,
         "peakIdentities": [
           {
-            "pid": 13862,
-            "startedAt": 1785872305000
+            "pid": 10605,
+            "startedAt": 1785937399000
           }
         ],
         "verifiedProviderIdentities": [
           {
-            "pid": 13938,
-            "startedAt": 1785872305000
+            "pid": 10689,
+            "startedAt": 1785937400000
           }
         ],
         "resources": {
-          "cumulativeCpuMs": 130,
-          "peakAggregateCpuMs": 730,
-          "peakAggregateRssKiB": 279616,
-          "peakIndividualRssKiB": 279616
+          "cumulativeCpuMs": 200,
+          "peakAggregateCpuMs": 1210,
+          "peakAggregateRssKiB": 278512,
+          "peakIndividualRssKiB": 278512
         }
       },
       "backend": {
@@ -1333,8 +1333,8 @@
           "backendRequests": 16,
           "backendSpawns": 0,
           "requestBacklogHighWater": 1,
-          "lineBacklogHighWater": 2,
-          "byteBacklogHighWater": 8310,
+          "lineBacklogHighWater": 3,
+          "byteBacklogHighWater": 7775,
           "controlDisconnects": 0,
           "reconnects": 0,
           "unknownOutcomes": 0,

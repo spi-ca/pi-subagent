@@ -222,6 +222,46 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(resolved.paneId, paneId.toUpperCase(), "canonical identity comparison is case-insensitive");
 	});
 
+	test("fences a repeated invalidated identity when shutdown changes during its final socket check", async () => {
+		const workspaceId = "123e4567-e89b-12d3-a456-426614174037";
+		const paneId = "123e4567-e89b-12d3-a456-426614174038";
+		const surfaceId = "123e4567-e89b-12d3-a456-426614174039";
+		const tree = `${JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: paneId, surfaces: [{ id: surfaceId, pane_id: paneId }] }] }] }] })}\n`;
+		let calls = 0, topologyGeneration = 0, socketChecks = 0, shutdownCurrent = true;
+		let secondSocketCheckEntered!: () => void, resolveSecondSocketCheck!: (current: boolean) => void;
+		const secondSocketCheckStarted = new Promise<void>((resolve) => { secondSocketCheckEntered = resolve; });
+		const secondSocketCheck = new Promise<boolean>((resolve) => { resolveSecondSocketCheck = resolve; });
+		const preflight = resolveSharedCmuxSourcePreflight({
+			run: async () => {
+				calls += 1;
+				topologyGeneration += 1;
+				return { exitCode: 0, stdout: tree, stderr: "", aborted: false };
+			},
+			singleFlight: new LaunchPreflightSingleFlight(), shutdownGeneration: 1,
+			socketGeneration: { socketPath: "/tmp/cmux.sock", socketDev: "1", socketIno: "2" },
+			workspaceId, surfaceId, getTopologyGeneration: () => topologyGeneration,
+			isShutdownCurrent: () => shutdownCurrent,
+			isSocketGenerationCurrent: () => {
+				socketChecks += 1;
+				if (socketChecks === 2) {
+					secondSocketCheckEntered();
+					return secondSocketCheck;
+				}
+				return true;
+			},
+		});
+		await secondSocketCheckStarted;
+		shutdownCurrent = false;
+		resolveSecondSocketCheck(true);
+		await assert.rejects(
+			() => preflight,
+			(error: unknown) => error instanceof CmuxSourcePreflightError && error.parserFailure === "shutdown-fenced",
+			"a current socket must not allow stale repeated-identity success after shutdown",
+		);
+		assert.equal(calls, 2, "the repeated identity reaches the final success path only after two invalidated observations");
+		assert.equal(socketChecks, 2, "the shutdown fence runs after the pending second socket-current result, preserving a socket failure's existing precedence");
+	});
+
 	test("fences repeated generation-invalidated identities when shutdown or socket currency changes", async () => {
 		const workspaceId = "123e4567-e89b-12d3-a456-426614174037";
 		const paneId = "123e4567-e89b-12d3-a456-426614174038";

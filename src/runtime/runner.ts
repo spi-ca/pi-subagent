@@ -5033,6 +5033,9 @@ export async function resolveSharedCmuxSourcePreflight(options: {
     if (!await options.isSocketGenerationCurrent()) {
       throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=1 control=CMUX_SOCKET_ROTATED parser=socket-generation-changed", 1, "CMUX_SOCKET_ROTATED", "socket-generation-changed");
     }
+    if (!options.isShutdownCurrent()) {
+      throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=130 control=CMUX_ABORTED parser=shutdown-fenced", 130, "CMUX_ABORTED", "shutdown-fenced");
+    }
     if (options.getTopologyGeneration() === candidate.topologyGeneration) return candidate.identity;
     if (generationInvalidatedIdentity && sameCmuxSurfaceIdentity(generationInvalidatedIdentity, candidate.identity)) return candidate.identity;
     generationInvalidatedIdentity = candidate.identity;

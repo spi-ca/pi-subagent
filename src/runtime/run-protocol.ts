@@ -318,9 +318,14 @@ function hasPrivateMarkerlessLegacyState(defaultRoot: string): boolean {
 
 export function selectDefaultRunStateRoot(defaultRoot: string): string {
 	const resolved = path.resolve(defaultRoot);
-	const fallback = `${resolved}-owned-v1`;
-	if (hasValidStateRootMarkerSync(fallback)) return fallback;
-	return hasPrivateMarkerlessLegacyState(resolved) ? fallback : resolved;
+	if (!hasPrivateMarkerlessLegacyState(resolved)) return resolved;
+	// A previous migration fallback can itself predate root markers or lose its
+	// marker while retaining private recovery artifacts. Preserve it untouched
+	// and advance deterministically instead of making the extension unloadable.
+	for (let generation = 1; ; generation += 1) {
+		const fallback = `${resolved}-owned-v1${generation === 1 ? "" : `-${generation}`}`;
+		if (hasValidStateRootMarkerSync(fallback) || !hasPrivateMarkerlessLegacyState(fallback)) return fallback;
+	}
 }
 
 export function getRunStateRoot(baseEnv: NodeJS.ProcessEnv = process.env): string {

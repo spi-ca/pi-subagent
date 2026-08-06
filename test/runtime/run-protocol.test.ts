@@ -156,11 +156,30 @@ describe("run protocol", () => {
 		assert.equal(selectDefaultRunStateRoot(publishing), publishing);
 	});
 
-	test("keeps selecting an initialized fallback after the legacy default is removed", async () => {
+	test("advances past a populated marker-less migration fallback without modifying retained state", async () => {
 		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
 		tempDirs.push(container);
 		const root = path.join(container, "default-root");
 		const fallback = `${root}-owned-v1`;
+		await fs.promises.mkdir(root, { mode: 0o700 });
+		await fs.promises.mkdir(fallback, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(root, "legacy.json"), "default", { mode: 0o600 });
+		await fs.promises.writeFile(path.join(fallback, "retained.json"), "fallback", { mode: 0o600 });
+
+		assert.equal(selectDefaultRunStateRoot(root), `${fallback}-2`);
+		assert.equal(fs.existsSync(path.join(root, STATE_ROOT_MARKER_NAME)), false);
+		assert.equal(fs.existsSync(path.join(fallback, STATE_ROOT_MARKER_NAME)), false);
+		assert.equal(await fs.promises.readFile(path.join(root, "legacy.json"), "utf8"), "default");
+		assert.equal(await fs.promises.readFile(path.join(fallback, "retained.json"), "utf8"), "fallback");
+	});
+
+	test("keeps selecting the first initialized migration fallback", async () => {
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
+		tempDirs.push(container);
+		const root = path.join(container, "default-root");
+		const fallback = `${root}-owned-v1`;
+		await fs.promises.mkdir(root, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
 		await prepareRunArtifactPaths({ rootDir: fallback, runId: "fallback-run" });
 
 		assert.equal(selectDefaultRunStateRoot(root), fallback);

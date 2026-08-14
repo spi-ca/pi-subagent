@@ -19,6 +19,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   getAmbiguousInheritedCliApiKeyMessage,
   getProviderFromModelSpecifier,
+  INHERITED_CLI_API_KEY_ENV_VAR,
   PROVIDER_API_KEY_ENV_VAR_MAP,
   resolveInheritedCliApiKeyEnvBinding,
   type InheritedCliApiKeyEnvBinding,
@@ -359,7 +360,7 @@ const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
 const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 const SUBAGENT_ORIGINAL_AGENT_DIR_ENV = "PI_SUBAGENT_ORIGINAL_AGENT_DIR";
-const SUBAGENT_INHERITED_API_KEY_ENV = "PI_SUBAGENT_INHERITED_API_KEY";
+const SUBAGENT_INHERITED_API_KEY_ENV = INHERITED_CLI_API_KEY_ENV_VAR;
 export const SUBAGENT_MANAGED_CHILD_POLICY_ENV = "PI_SUBAGENT_CMUX_CHILD_POLICY";
 export const SUBAGENT_MANAGED_TITLE_ENV = "PI_SUBAGENT_MANAGED_TITLE";
 export type ManagedChildPolicy = "inherit" | "managed";

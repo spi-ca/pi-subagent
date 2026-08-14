@@ -281,7 +281,7 @@ describe("inherited CLI args", () => {
     });
   });
 
-  test("returns an ambiguous state for explicit providers without a known env var mapping", () => {
+  test("uses generic overlay auth for explicit providers without a known env var mapping", () => {
     const parsed = parseInheritedCliArgs([
       "node",
       "pi",
@@ -291,9 +291,12 @@ describe("inherited CLI args", () => {
     ]);
 
     assert.deepEqual(resolveInheritedCliApiKeyEnvBinding(parsed), {
-      state: "ambiguous",
-      reason: "unsupported-provider",
-      provider: "custom-provider",
+      state: "resolved",
+      binding: {
+        name: "PI_SUBAGENT_INHERITED_API_KEY",
+        value: "super-secret",
+        provider: "custom-provider",
+      },
     });
   });
 

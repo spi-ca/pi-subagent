@@ -12,6 +12,8 @@ export interface InheritedCliApiKeyEnvBinding {
   provider: string;
 }
 
+export const INHERITED_CLI_API_KEY_ENV_VAR = "PI_SUBAGENT_INHERITED_API_KEY";
+
 export type InheritedCliApiKeyEnvResolution =
   | { state: "absent" }
   | { state: "resolved"; binding: InheritedCliApiKeyEnvBinding }
@@ -97,14 +99,7 @@ export function resolveInheritedCliApiKeyEnvBinding(
     };
   }
 
-  const name = getProviderApiKeyEnvVar(provider);
-  if (!name) {
-    return {
-      state: "ambiguous",
-      reason: "unsupported-provider",
-      provider,
-    };
-  }
+  const name = getProviderApiKeyEnvVar(provider) ?? INHERITED_CLI_API_KEY_ENV_VAR;
 
   return {
     state: "resolved",
@@ -116,8 +111,8 @@ export function getAmbiguousInheritedCliApiKeyMessage(
   resolution: Extract<InheritedCliApiKeyEnvResolution, { state: "ambiguous" }>,
 ): string {
   if (resolution.reason === "unsupported-provider" && resolution.provider) {
-    return `Inherited CLI --api-key could not be safely mapped to a provider-specific environment variable for provider "${resolution.provider}". The child will not inherit the CLI key and may fall back to existing provider-specific environment variables or other configured auth. To guarantee key inheritance, rerun the parent with an explicit supported --provider or fully-qualified --model (provider/model).`;
+    return `Inherited CLI --api-key could not be safely mapped to auth for provider "${resolution.provider}". The child will not inherit the CLI key and may fall back to existing provider-specific environment variables or other configured auth. To guarantee key inheritance, rerun the parent with an explicit --provider or fully-qualified --model (provider/model).`;
   }
 
-  return "Inherited CLI --api-key could not be safely mapped to a provider-specific environment variable. The child will not inherit the CLI key and may fall back to existing provider-specific environment variables or other configured auth. To guarantee key inheritance, rerun the parent with an explicit --provider or fully-qualified --model (provider/model).";
+  return "Inherited CLI --api-key could not be safely mapped to auth. The child will not inherit the CLI key and may fall back to existing provider-specific environment variables or other configured auth. To guarantee key inheritance, rerun the parent with an explicit --provider or fully-qualified --model (provider/model).";
 }

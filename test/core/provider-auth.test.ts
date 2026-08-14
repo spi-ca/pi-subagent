@@ -54,4 +54,15 @@ describe("documented provider API-key environment mapping", () => {
       binding: { name: "AWS_BEARER_TOKEN_BEDROCK", value: "bedrock-secret", provider: "amazon-bedrock" },
     });
   });
+
+  test("falls back to generic overlay auth for extension-owned providers", () => {
+    assert.equal(getProviderApiKeyEnvVar("kiro-api-key"), null);
+    assert.deepEqual(resolveInheritedCliApiKeyEnvBinding({
+      apiKey: "kiro-secret",
+      provider: "kiro-api-key",
+    }), {
+      state: "resolved",
+      binding: { name: "PI_SUBAGENT_INHERITED_API_KEY", value: "kiro-secret", provider: "kiro-api-key" },
+    });
+  });
 });

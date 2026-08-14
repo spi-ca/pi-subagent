@@ -485,6 +485,24 @@ describe("subagent auth propagation", () => {
     assert.equal(outcome.warningMessage, null);
   });
 
+  test("propagates explicit extension provider CLI keys through generic overlay auth", () => {
+    const outcome = resolveInheritedCliApiKeyForChild(
+      {
+        apiKey: "super-secret",
+        provider: "Kiro-API-Key",
+        fallbackModel: "claude-opus-5",
+      },
+      { source: "user", model: "claude-opus-5" },
+    );
+
+    assert.deepEqual(outcome.inheritedApiKeyBinding, {
+      name: "PI_SUBAGENT_INHERITED_API_KEY",
+      value: "super-secret",
+      provider: "kiro-api-key",
+    });
+    assert.equal(outcome.warningMessage, null);
+  });
+
   test("does not propagate a CLI key when parent provider conflicts with user agent model", () => {
     const outcome = resolveInheritedCliApiKeyForChild(
       {

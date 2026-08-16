@@ -454,7 +454,7 @@ Herdr pane mode가 시작되지 않거나 자동 cleanup이 보류되면 fallbac
 
 ## 11. 구현 검증 상태
 
-`bun test --pass-with-no-tests`의 현재 unit scope에는 `test/runtime/pane-launch-broker.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/interactive-reaper.test.ts`, `test/runtime/runner-interactive.test.ts`가 포함된다. 표의 **부분**은 assertion 또는 mock/process 단위의 직접 증거는 있지만, 실제 parent→broker→backend 전체 흐름, live backend, crash point 또는 packaged install 증거가 없다는 뜻이다.
+`bun test --isolate --pass-with-no-tests`의 현재 unit scope에는 `test/runtime/pane-launch-broker.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/interactive-reaper.test.ts`, `test/runtime/runner-interactive.test.ts`가 포함된다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다. 표의 **부분**은 assertion 또는 mock/process 단위의 직접 증거는 있지만, 실제 parent→broker→backend 전체 흐름, live backend, crash point 또는 packaged install 증거가 없다는 뜻이다.
 
 | 항목 | 구현 | 단위 테스트 상태 | live backend | package/acceptance |
 |---|---:|---:|---:|---:|
@@ -475,7 +475,7 @@ Herdr pane mode가 시작되지 않거나 자동 cleanup이 보류되면 fallbac
 
 ```bash
 bun run check
-bun test --pass-with-no-tests
+bun test --isolate --pass-with-no-tests
 bun run ci
 bun pm pack --dry-run
 

@@ -373,11 +373,11 @@ installed Pi의 `--no-extensions` + explicit extension loading capability를 확
 - reaper는 budget/iterator ownership, processed-name fallback, full graph ordering, lock/claim/quiescence와 unresolved retention을 검증한다.
 - managed-child는 `inherit`/`managed`에서 child bridge, nested delegation, allowlist equivalence 및 excluded tool absence를 검증한다.
 
-구현 전/후 공통 정적 gate는 다음 명령을 유지한다.
+구현 전/후 공통 정적 gate는 다음 명령을 유지한다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다.
 
 ```bash
 bun run check
-bun test --pass-with-no-tests
+bun test --isolate --pass-with-no-tests
 ```
 
 ### 18.2 제안 test와 측정값

@@ -699,11 +699,11 @@ Phase 0A 및 Phases 5–8은 이 문서에서 재정의하지 않는다. 각각 
 
 ## 18. 검증과 benchmark 계획
 
-구현 전후 공통 static gate는 다음 명령으로 확인한다.
+구현 전후 공통 static gate는 다음 명령으로 확인한다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다.
 
 ```bash
 bun run check
-bun test --pass-with-no-tests
+bun test --isolate --pass-with-no-tests
 ```
 
 ### Issue #24 완료: abnormal interactive completion 경계 focused 검증

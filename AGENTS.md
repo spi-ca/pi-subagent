@@ -28,9 +28,11 @@ bun run ci
 ```
 
 `bun run ci` runs `bun run check` (type check via `tsc --noEmit`) followed by
-`bun test --pass-with-no-tests`, and is the required check before treating a
-change as verified. `bun run test` and `bun run check` also exist
-individually as defined in `package.json`. Live/acceptance/benchmark scripts
+`bun run test` (`bun test --isolate --pass-with-no-tests`), and is the required
+check before treating a change as verified. File isolation is required because
+tests intentionally use file-global Bun mocks and process globals. `bun run
+test` and `bun run check` also exist individually as defined in `package.json`.
+Live/acceptance/benchmark scripts
 (`acceptance:*`, `benchmark:*`) are opt-in and gated by explicit environment
 variables; see [`docs/development.md`](docs/development.md) before running
 them.

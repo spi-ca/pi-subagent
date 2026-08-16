@@ -2,13 +2,13 @@
   "schemaVersion": 2,
   "phase": "M7",
   "evidenceKind": "local-reaper-performance-baseline",
-  "capturedAt": "2026-08-05T04:37:37.624Z",
+  "capturedAt": "2026-08-16T15:28:37.143Z",
   "environment": {
-    "sourceRevision": "a38c29b1536b9c9ed39dfaf958557ac175cfa4cc",
+    "sourceRevision": "345e5e65ec537838aaf9e93d69bc92adc6e4325f",
     "sourceDirty": false,
     "worktreeDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "os": "darwin",
-    "arch": "arm64",
+    "os": "linux",
+    "arch": "x64",
     "bunVersion": "1.3.14"
   },
   "execution": {
@@ -37,19 +37,19 @@
   },
   "metrics": {
     "startupLatencyMs": {
-      "value": 3.894916999997804,
+      "value": 4.8861320000005435,
       "unit": "ms"
     },
     "totalEnumerationMs": {
-      "value": 4.989624999998341,
+      "value": 7.000936000000365,
       "unit": "ms"
     },
     "peakRssDeltaBytes": {
-      "value": 209403904,
+      "value": 192540672,
       "unit": "bytes"
     },
     "eventLoopDelayMs": {
-      "value": 97.658163,
+      "value": 155.212181,
       "unit": "ms"
     },
     "entryCount": {
@@ -65,7 +65,7 @@
       "unit": "count"
     },
     "graphPlanMs": {
-      "value": 89.72962499999994,
+      "value": 139.57831499999975,
       "unit": "ms"
     },
     "mutationBeforeGraphCount": {
@@ -73,11 +73,11 @@
       "unit": "count"
     },
     "startupReturnMs": {
-      "value": 6.714083999999275,
+      "value": 1.1079379999991943,
       "unit": "ms"
     },
     "fullClassificationMs": {
-      "value": 5800.353666999999,
+      "value": 2929.527065,
       "unit": "ms"
     },
     "classifiedCount": {

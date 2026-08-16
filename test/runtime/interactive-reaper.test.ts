@@ -2,6 +2,7 @@ import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { reapStaleInteractiveRuns, startStaleInteractiveReaper } from "../../src/runtime/runner";
@@ -115,6 +116,50 @@ describe("stale interactive run reaper", () => {
 			() => reapStaleInteractiveRuns({ rootDir: root }),
 			/Refusing to reap an untrusted subagent state root/,
 		);
+	});
+
+	test("uses bounded terminal_id fallback in stale Herdr cleanup and retains an unproven post-close absence", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-herdr-")); tempDirs.push(root);
+		const runId = "herdr-delivery-unknown", socketPath = path.join(root, "herdr.sock");
+		let exists = true, requests = 0, closedPaneId: string | undefined;
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "child", terminal_id: "terminal" };
+		const movedPane = { ...pane, workspace_id: "moved-workspace", tab_id: "moved-tab", pane_id: "moved-child" };
+		const server = net.createServer((socket) => socket.once("data", (chunk) => {
+			requests += 1;
+			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string; params: { pane_id?: string } };
+			if (request.method === "pane.close") { exists = false; closedPaneId = request.params.pane_id; }
+			const response = request.method === "pane.get"
+				? (!exists || request.params.pane_id === pane.pane_id
+					? { id: request.id, error: { code: "pane_not_found", message: "missing" } }
+					: { id: request.id, result: { pane: movedPane } })
+				: request.method === "pane.list"
+					? { id: request.id, result: { panes: exists ? [movedPane] : [] } }
+					: { id: request.id, result: request.method === "ping" ? { protocol: 20 } : { type: "ok" } };
+			socket.end(`${JSON.stringify(response)}\n`);
+		}));
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		try {
+			const stateRoot = path.join(root, "state");
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const intent = {
+				version: 2, runId, parentSessionId: "p", parentPid: 42, parentStartedAt: 1, terminalMode: "herdr-pane",
+				source: { socketPath, workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 }, childSessionFile: paths.childSessionPath, createdAt: 1,
+				brokerNonce: "a".repeat(43), runtimePath: process.execPath, runtimeInterpreterPath: process.execPath, backendPath: process.execPath, brokerEntrypoint: process.execPath,
+			};
+			const allocation = { version: 2, runId, terminalMode: "herdr-pane", target: { socketPath, workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 }, allocatedAt: 1 };
+			await Promise.all([
+				writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`),
+				writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`),
+				writePrivateFile(paths.decisionPath, `${JSON.stringify({ version: 2, runId, kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath })}\n`),
+				writePrivateFile(paths.launchPath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: 1, ownership: "parent-owned" })}\n`),
+				writePrivateFile(paths.launchDeliveryUnknownPath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, recordedAt: 1 })}\n`),
+			]);
+			const outcome = await reapStaleInteractiveRuns({ rootDir: stateRoot, now: 100, staleAfterMs: 1, isProcessIdentityAlive: () => false, scheduleCleanup: () => undefined });
+			assert.equal(outcome.reaped.includes(runId), false, "an empty fallback list after close is unknown, not absence proof");
+			assert.equal(exists, false);
+			assert.equal(closedPaneId, movedPane.pane_id, "reaper must rebind the moved terminal before cleanup mutation");
+			assert.ok(requests <= 12, `bounded Herdr recovery probes: ${requests}`);
+		} finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
 	});
 
 	test("skips the reserved fork source root instead of classifying it as a run", async () => {

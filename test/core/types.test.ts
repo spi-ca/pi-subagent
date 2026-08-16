@@ -1,9 +1,9 @@
 import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import { aggregateUsage, getDefaultTerminalModeFromEnv, isInsideCmux, isInsideTmux, type SingleResult } from "../../src/core/types";
+import { aggregateUsage, getDefaultTerminalModeFromEnv, isInsideCmux, isInsideHerdr, isInsideTmux, type SingleResult } from "../../src/core/types";
 import { parseTmuxEnvironment } from "../../src/runtime/tmux";
 
-const TRACKED_ENV = ["CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "TMUX", "TMUX_PANE"] as const;
+const TRACKED_ENV = ["CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "TMUX", "TMUX_PANE", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "PI_SUBAGENT_TERMINAL_MODE"] as const;
 const originalEnv = Object.fromEntries(TRACKED_ENV.map((name) => [name, process.env[name]]));
 
 function setTerminalEnv(values: Partial<Record<(typeof TRACKED_ENV)[number], string>> = {}) {
@@ -69,6 +69,26 @@ describe("terminal environment detection", () => {
 		});
 		assert.equal(isInsideCmux(), true);
 		assert.equal(getDefaultTerminalModeFromEnv(), "cmux-pane");
+	});
+
+	test("uses Herdr after cmux and before tmux, with an explicit override", () => {
+		setTerminalEnv({ HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_WORKSPACE_ID: "workspace", HERDR_TAB_ID: "tab", HERDR_PANE_ID: "pane", TMUX: "/tmp/tmux/default,1,0", TMUX_PANE: "%3" });
+		assert.equal(isInsideHerdr(), true);
+		assert.equal(getDefaultTerminalModeFromEnv(), "herdr-pane");
+		assert.equal(getDefaultTerminalModeFromEnv({ PI_SUBAGENT_TERMINAL_MODE: "inline" }), "inline");
+		assert.equal(getDefaultTerminalModeFromEnv({ PI_SUBAGENT_TERMINAL_MODE: "herdr-pane" }), "herdr-pane");
+		assert.equal(isInsideHerdr({ HERDR_ENV: "1", HERDR_SOCKET_PATH: "relative", HERDR_WORKSPACE_ID: "workspace", HERDR_TAB_ID: "tab", HERDR_PANE_ID: "pane" }), false);
+		const validHerdr = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_WORKSPACE_ID: "workspace", HERDR_TAB_ID: "tab", HERDR_PANE_ID: "pane" };
+		for (const invalidHerdr of [
+			{ ...validHerdr, HERDR_SOCKET_PATH: "/tmp//herdr.sock" },
+			{ ...validHerdr, HERDR_SOCKET_PATH: `/${"é".repeat(52)}` },
+			{ ...validHerdr, HERDR_WORKSPACE_ID: "😀".repeat(65) },
+			{ ...validHerdr, HERDR_TAB_ID: "😀".repeat(65) },
+			{ ...validHerdr, HERDR_PANE_ID: "😀".repeat(65) },
+		]) {
+			assert.equal(isInsideHerdr(invalidHerdr), false);
+			assert.equal(getDefaultTerminalModeFromEnv({ ...invalidHerdr, TMUX: "/tmp/tmux/default,1,0", TMUX_PANE: "%3" }), "tmux-pane");
+		}
 	});
 
 	test("uses tmux when both tmux identity variables are present", () => {

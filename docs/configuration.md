@@ -172,8 +172,11 @@ Generic presence는 별도 설정 항목이 아닙니다. root parent만 depende
 확장은 현재 환경에 따라 다음 우선순위로 실행 방식을 선택합니다.
 
 1. `CMUX_WORKSPACE_ID`와 `CMUX_SURFACE_ID`가 모두 canonical UUID이면 `cmux-pane`
-2. `TMUX`가 canonical socket/server/session 형식이고 `TMUX_PANE`이 canonical `%N`이면 `tmux-pane`
-3. 그 외 환경에서는 `inline`
+2. `HERDR_ENV=1`과 absolute `HERDR_SOCKET_PATH`, non-control `HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_PANE_ID`가 있으면 `herdr-pane`
+3. `TMUX`가 canonical socket/server/session 형식이고 `TMUX_PANE`이 canonical `%N`이면 `tmux-pane`
+4. 그 외 환경에서는 `inline`
+
+`PI_SUBAGENT_TERMINAL_MODE=inline|cmux-pane|tmux-pane|herdr-pane`는 auto-detection보다 우선합니다. 잘못된 값은 무시하고 안전한 auto-detection을 유지하며 Windows는 항상 `inline`입니다.
 
 ### Interactive pane layout
 
@@ -229,6 +232,10 @@ cmux를 감지했지만 socket owner/mode/inode, authorization, API/app version 
 managed child의 출력·지시는 항상 untrusted로 취급하지만, child 프로세스는 부모와 같은 UID의 협력 peer이며 hostile sandbox 경계가 아닙니다. `0700`/`0600`, no-symlink, no-replace publication은 다른 UID, 경로 경쟁·교체와 실수로 인한 교체를 막는 장치이지 악의적인 same-UID 코드의 관찰·변조를 막지 않습니다. 이 경계는 public `detached-ownership.json` promotion marker와 reaper 판단에도 그대로 적용됩니다. hostile child를 견뎌야 하면 별도 UID 또는 mandatory MAC sandbox와 좁은 IPC를 사용하세요. 그것이 불가능하면 managed mode와 durable promotion을 사용하지 마세요. 구현 artifact의 상세는 [cmux/tmux 설계](./cmux-pi-tui-design.md#82-저장-위치-권한-artifact)를 참고하세요.
 
 버전 정책의 tmux **최소 지원 문턱**은 stable `>=3.7a`입니다. 이는 `tmux-control-v1` parser fixture가 capture한 `3.7b` baseline 및 2026-07-21의 exact `3.7b` historical PASS와 구별됩니다. 즉 `3.7b` fixture/output 계약은 strict하게 유지하지만 production gate의 minimum을 `3.7b`로 올려 해석하지 않습니다. Pi와 cmux 문턱은 각각 stable `>=0.80.10`, `>=0.64.20`입니다. 기존 `--version`, control handshake/identify, tmux gate probe 결과만 재사용하므로 추가 probe command나 handshake를 만들지 않습니다. cmux control record와 gated tmux V3 `transport-gate.json`에는 minimum 문자열 대신 실제 감지 버전을 기록하고(V2 safe path는 minimum을 검사하지만 별도 version artifact를 남기지 않음), executable·socket·server·app identity generation이 바뀌면 캐시된 판정도 재사용하지 않습니다. 버전 문턱과 별개로 API family, capability, fixture, parser와 output 계약은 strict하게 유지합니다.
+
+### Herdr pane
+
+`herdr-pane`는 Herdr CLI를 실행하지 않습니다. 설치된 Herdr `v0.8.0`의 protocol **19**와 preview의 protocol **20**만 지원하며, `ping`으로 협상한 실제 revision을 durable intent·allocation·launch gate에 모두 기록합니다. 이후 split, launch delivery, focus, interrupt, close 직전에는 같은 revision을 다시 확인합니다. broker runtime의 executable provenance만 durable intent에 기록하고, owner-only Unix socket으로 두 revision의 공통 subset인 `pane.get`/`pane.split`/`pane.send_text`/`pane.send_keys`/`pane.focus`/`pane.close`를 처리합니다. protocol 20 전용 field나 method는 protocol 19에 보내지 않으며, 그 밖의 revision은 거부합니다. split 응답의 workspace/tab/pane/terminal binding을 정확히 기록한 뒤 commit과 launch gate를 기다리고, `events.subscribe`는 wake-up hint로만 사용합니다. 모든 lifecycle 판단은 `pane.get`으로 재확인하며 timeout·disconnect 뒤 mutation을 replay하지 않습니다. cancellation, focus, close, promotion/reaper는 exact recorded target만 대상으로 합니다. Herdr은 child별 split만 지원하므로 `auto`/`split` layout 설정은 Herdr placement를 바꾸지 않습니다.
 
 ### tmux pane
 

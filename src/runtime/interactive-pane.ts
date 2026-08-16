@@ -1,5 +1,14 @@
 import type { TerminalMode } from "../core/types.js";
 import {
+	closeHerdrPane,
+	createHerdrSplit,
+	focusHerdrPane,
+	inspectHerdrPane,
+	interruptHerdrPane,
+	parseHerdrEnvironment,
+	type HerdrPaneHandle,
+} from "./herdr.js";
+import {
 	closeCmuxSurface,
 	isCanonicalCmuxId,
 	createCmuxSplit,
@@ -17,16 +26,17 @@ import {
 	type TmuxPaneHandle,
 } from "./tmux.js";
 
-export type InteractivePaneMode = Extract<TerminalMode, "cmux-pane" | "tmux-pane">;
+export type InteractivePaneMode = Extract<TerminalMode, "cmux-pane" | "tmux-pane" | "herdr-pane">;
 
 export interface InteractivePanePlacementDiagnostics {
 	layout: "auto" | "split";
-	placement: "cmux-split" | "cmux-new-surface" | "tmux-split" | "tmux-new-window";
+	placement: "cmux-split" | "cmux-new-surface" | "tmux-split" | "tmux-new-window" | "herdr-split";
 }
 
 export type InteractivePaneHandle =
 	| { mode: "cmux-pane"; native: CmuxSurfaceHandle; placement?: InteractivePanePlacementDiagnostics }
-	| { mode: "tmux-pane"; native: TmuxPaneHandle; placement?: InteractivePanePlacementDiagnostics };
+	| { mode: "tmux-pane"; native: TmuxPaneHandle; placement?: InteractivePanePlacementDiagnostics }
+	| { mode: "herdr-pane"; native: HerdrPaneHandle; placement?: InteractivePanePlacementDiagnostics };
 
 export interface InteractivePaneSnapshot {
 	exists: boolean;
@@ -98,6 +108,38 @@ export const cmuxInteractivePaneBackend: InteractivePaneBackend = {
 	},
 };
 
+export const herdrInteractivePaneBackend: InteractivePaneBackend = {
+	mode: "herdr-pane",
+	availabilityError(env = process.env) {
+		if (process.platform === "win32") return "Interactive terminal pane backends are unavailable on Windows.";
+		return parseHerdrEnvironment(env) ? null : "Herdr pane mode requires HERDR_ENV=1, an absolute HERDR_SOCKET_PATH, and exact workspace/tab/pane IDs.";
+	},
+	async launch(options) {
+		return {
+			mode: "herdr-pane",
+			native: await createHerdrSplit({
+				cwd: options.cwd,
+				wrapperPath: options.wrapperPath,
+				signal: options.signal,
+				onAllocated: async (native) => await options.onAllocated?.({ mode: "herdr-pane", native }),
+			}),
+			placement: { layout: "split", placement: "herdr-split" },
+		};
+	},
+	async inspect(handle) {
+		return handle.mode === "herdr-pane" ? await inspectHerdrPane(handle.native) : undefined;
+	},
+	async interrupt(handle) {
+		return handle.mode === "herdr-pane" && await interruptHerdrPane(handle.native);
+	},
+	async close(handle) {
+		return handle.mode === "herdr-pane" && await closeHerdrPane(handle.native);
+	},
+	async focus(handle) {
+		return handle.mode === "herdr-pane" && await focusHerdrPane(handle.native);
+	},
+};
+
 export const tmuxInteractivePaneBackend: InteractivePaneBackend = {
 	mode: "tmux-pane",
 	availabilityError(env = process.env) {
@@ -144,5 +186,6 @@ export const tmuxInteractivePaneBackend: InteractivePaneBackend = {
 export function getInteractivePaneBackend(mode: TerminalMode): InteractivePaneBackend | null {
 	if (mode === "cmux-pane") return cmuxInteractivePaneBackend;
 	if (mode === "tmux-pane") return tmuxInteractivePaneBackend;
+	if (mode === "herdr-pane") return herdrInteractivePaneBackend;
 	return null;
 }

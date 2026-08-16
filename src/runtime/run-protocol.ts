@@ -69,7 +69,7 @@ export interface LaunchRecordV1 {
 	parentRunId?: string;
 	parentSessionId: string;
 	ownership: RunOwnership;
-	terminalMode: "cmux-pane" | "tmux-pane";
+	terminalMode: "cmux-pane" | "tmux-pane" | "herdr-pane";
 	cmuxWorkspaceId?: string;
 	cmuxSurfaceId?: string;
 	cmuxSurfaceUuid?: string;
@@ -233,6 +233,8 @@ export interface RunArtifactPaths {
 	launchGatePath: string;
 	brokerClaimPath: string;
 	residualRiskPath: string;
+	/** Exact allocation retained after pane.send_text was dispatched but unacknowledged. */
+	launchDeliveryUnknownPath: string;
 	brokerStatusPath: string;
 	/** Public immutable detached-ownership v1 authority; excludes the target from reaping. */
 	detachedOwnershipPath: string;
@@ -530,6 +532,7 @@ export function resolveRunArtifactPaths(runId: string, rootDir = getRunStateRoot
 		launchGatePath: path.join(runDir, "launch.gate"),
 		brokerClaimPath: path.join(runDir, "broker-claim.json"),
 		residualRiskPath: path.join(runDir, "residual-risk.json"),
+		launchDeliveryUnknownPath: path.join(runDir, "launch-delivery-unknown.json"),
 		brokerStatusPath: path.join(runDir, "broker-status.json"),
 		detachedOwnershipPath: path.join(runDir, "detached-ownership.json"),
 		promotionRequestPath: path.join(runDir, "promotion-request.json"),
@@ -1083,7 +1086,11 @@ export function cmuxIdsEqual(left: unknown, right: unknown): boolean {
 export const TMUX_PANE_ID_RE = /^%(?:0|[1-9][0-9]*)$/;
 export const TMUX_SESSION_ID_RE = /^\$(?:0|[1-9][0-9]*)$/;
 export const TMUX_WINDOW_ID_RE = /^@(?:0|[1-9][0-9]*)$/;
-type V2Mode = "cmux-pane" | "tmux-pane";
+type V2Mode = "cmux-pane" | "tmux-pane" | "herdr-pane";
+/** Herdr IDs are opaque public protocol values, never shell/URL fragments. */
+/** `protocol` is the immutable result of the exact pre-allocation ping gate. */
+export type HerdrProtocolVersion = 19 | 20;
+export type HerdrSourceV2 = { socketPath: string; workspaceId: string; tabId: string; sourcePaneId: string; sourceTerminalId: string; protocol: HerdrProtocolVersion };
 export type CmuxSourceV2 = { workspaceId: string; sourceSurfaceId: string };
 /** Immutable control-v2 connection generation, never a credential. */
 export type CmuxControlTransportV2 = { transport: "cmux-control-v2"; socketPath: string; socketDev: string; socketIno: string; accessMode: string; apiVersion: 2; appVersion: string; identifyDigest: string; bootIdentity?: string };
@@ -1121,29 +1128,35 @@ export type LayoutAllocationFieldsV2 =
 type LaunchIntentV2Base = { version: 2; runId: string; parentRunId?: string; parentSessionId: string; parentPid: number; parentStartedAt: number; childSessionFile: string; createdAt: number; brokerNonce: string; runtimePath: string; runtimeInterpreterPath: string; backendPath: string; brokerEntrypoint: string };
 type LegacyCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2 };
 type LegacyTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 };
+type HerdrLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "herdr-pane"; source: HerdrSourceV2 };
 type LayoutCmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "cmux-pane"; source: CmuxSourceV2; control?: CmuxControlTransportV2 } & Extract<LayoutPlacementRequestV2, { placement: "cmux-split" | "cmux-new-surface" }>;
 type LayoutTmuxLaunchIntentV2 = LaunchIntentV2Base & { terminalMode: "tmux-pane"; source: TmuxSourceV2 } & (
 	| Extract<LayoutPlacementRequestV2, { placement: "tmux-split" }>
 	| (Extract<LayoutPlacementRequestV2, { placement: "tmux-new-window" }> & { windowLabel: string })
 );
 /** Legacy cmux records without control are diagnostic-only and never production mutation authority. */
-export type LaunchIntentV2 = LegacyCmuxLaunchIntentV2 | LegacyTmuxLaunchIntentV2 | LayoutCmuxLaunchIntentV2 | LayoutTmuxLaunchIntentV2;
+export type LaunchIntentV2 = LegacyCmuxLaunchIntentV2 | LegacyTmuxLaunchIntentV2 | HerdrLaunchIntentV2 | LayoutCmuxLaunchIntentV2 | LayoutTmuxLaunchIntentV2;
 export interface BrokerClaimV2 { version: 2; runId: string; brokerNonce: string; pid: number; brokerStartedAt?: number; claimedAt: number }
 export interface ResidualRiskV2 { version: 2; runId: string; reason: "possible-unrecorded-allocation"; recordedAt: number }
+/** Not an allocation-unknown quarantine: this binds the already recorded Herdr target. */
+export interface LaunchDeliveryUnknownV2 { version: 2; runId: string; terminalMode: "herdr-pane"; allocationPath: string; recordedAt: number; }
 type LegacyCmuxAllocationRecordV2 = { version: 2; runId: string; terminalMode: "cmux-pane"; target: { workspaceId: string; surfaceId: string; paneId: string }; allocatedAt: number };
 type LegacyTmuxAllocationRecordV2 = { version: 2; runId: string; terminalMode: "tmux-pane"; target: { socketPath?: string; serverPid: number; paneId: string; panePid: number; generation?: TmuxGenerationV2 }; allocatedAt: number };
+type HerdrAllocationRecordV2 = { version: 2; runId: string; terminalMode: "herdr-pane"; target: { socketPath: string; workspaceId: string; tabId: string; paneId: string; terminalId: string; protocol: HerdrProtocolVersion }; allocatedAt: number };
 type LayoutCmuxAllocationRecordV2 = LegacyCmuxAllocationRecordV2 & { control?: CmuxControlTransportV2 } & Extract<LayoutAllocationFieldsV2, { placement: "cmux-split" | "cmux-new-surface" }>;
 type LayoutTmuxAllocationRecordV2 = LegacyTmuxAllocationRecordV2 & Extract<LayoutAllocationFieldsV2, { placement: "tmux-split" | "tmux-new-window" }>;
-export type AllocationRecordV2 = LegacyCmuxAllocationRecordV2 | LegacyTmuxAllocationRecordV2 | LayoutCmuxAllocationRecordV2 | LayoutTmuxAllocationRecordV2;
+export type AllocationRecordV2 = LegacyCmuxAllocationRecordV2 | LegacyTmuxAllocationRecordV2 | HerdrAllocationRecordV2 | LayoutCmuxAllocationRecordV2 | LayoutTmuxAllocationRecordV2;
 export interface CommittedLaunchRecordV2 { version: 2; runId: string; terminalMode: V2Mode; allocationPath: string; childSessionFile: string; committedAt: number; ownership: "parent-owned" }
 export type DecisionV2 =
 	| { version: 2; runId: string; kind: "cancel"; decidedAt: number; reason: "parent-abort" | "ready-timeout" | "commit-timeout" }
 	| { version: 2; runId: string; kind: "commit"; decidedAt: number; allocationPath: string; launchPath: string };
 export type BrokerStatusV2 =
 	| { version: 2; runId: string; writer: "broker"; pid: number; phase: "ready" | "committed"; updatedAt: number }
-	| { version: 2; runId: string; writer: "broker"; pid: number; phase: "failed"; updatedAt: number; errorCode: "intent-invalid" | "allocation-failed" | "commit-failed" | "possible-unrecorded-allocation" | "acceptance-handoff-unresolved" }
+	| { version: 2; runId: string; writer: "broker"; pid: number; phase: "failed"; updatedAt: number; errorCode: "intent-invalid" | "allocation-failed" | "commit-failed" | "possible-unrecorded-allocation" | "launch-delivery-unknown" | "acceptance-handoff-unresolved" }
 	| { version: 2; runId: string; writer: "parent"; phase: "failed"; updatedAt: number; errorCode: "possible-unrecorded-allocation" };
-export interface LaunchGateV2 { version: 2; runId: string; terminalMode: V2Mode; launchPath: string; publishedAt: number }
+export type LaunchGateV2 =
+	| { version: 2; runId: string; terminalMode: "cmux-pane" | "tmux-pane"; launchPath: string; publishedAt: number }
+	| { version: 2; runId: string; terminalMode: "herdr-pane"; protocol: HerdrProtocolVersion; launchPath: string; publishedAt: number };
 export type CompletionErrorCodeV2 = "child-error" | "bridge-error" | "lease-expired" | "surface-closed" | "parent-aborted" | "wrapper-exited" | "pane-missing" | "inspect-exhausted" | "reaper-cleanup-failed";
 export interface CompletionRecordV2 { version: 2; runId: string; status: CompletionStatus; completedAt: number; errorCode?: CompletionErrorCodeV2 }
 /** A digest-bound, LF-complete JSONL prefix. This shape is intentionally exact. */
@@ -1186,6 +1199,16 @@ function isCmuxControlTransport(value: unknown): value is CmuxControlTransportV2
 		&& typeof value.accessMode === "string" && value.accessMode.length > 0 && value.apiVersion === 2
 		&& typeof value.appVersion === "string" && isStableSemverAtLeast(value.appVersion, MINIMUM_CMUX_VERSION)
 		&& typeof value.identifyDigest === "string" && /^[a-f0-9]{64}$/.test(value.identifyDigest);
+}
+function isHerdrPublicId(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 256 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+function isHerdrProtocol(value: unknown): value is HerdrProtocolVersion { return value === 19 || value === 20; }
+function isHerdrSource(value: unknown): value is HerdrSourceV2 {
+	return isRecord(value) && exactKeys(value, ["socketPath", "workspaceId", "tabId", "sourcePaneId", "sourceTerminalId", "protocol"])
+		&& typeof value.socketPath === "string" && path.isAbsolute(value.socketPath) && path.normalize(value.socketPath) === value.socketPath
+		&& isHerdrPublicId(value.workspaceId) && isHerdrPublicId(value.tabId) && isHerdrPublicId(value.sourcePaneId)
+		&& isHerdrPublicId(value.sourceTerminalId) && isHerdrProtocol(value.protocol);
 }
 function isCmuxSource(value: unknown): value is CmuxSourceV2 {
 	return isRecord(value) && exactKeys(value, ["workspaceId", "sourceSurfaceId"])
@@ -1279,7 +1302,9 @@ export function parseLaunchIntentV2(value: unknown, expectedRunId?: string, runD
 	const layoutIntentKeys = [...legacyIntentKeys, "layout", "placement", "container", "control", "windowLabel"];
 	const executionPaths = [value.runtimePath, value.runtimeInterpreterPath, value.backendPath, value.brokerEntrypoint];
 	if (typeof value.brokerNonce !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(value.brokerNonce) || !executionPaths.every((field) => typeof field === "string" && field.length > 0 && path.isAbsolute(field))) return null;
-	const sourceIsValid = value.terminalMode === "cmux-pane" ? isCmuxSource(value.source) : value.terminalMode === "tmux-pane" && isTmuxSource(value.source);
+	const sourceIsValid = value.terminalMode === "cmux-pane" ? isCmuxSource(value.source)
+		: value.terminalMode === "tmux-pane" ? isTmuxSource(value.source)
+			: value.terminalMode === "herdr-pane" && isHerdrSource(value.source);
 	if (!sourceIsValid) return null;
 	const layoutFieldNames = ["layout", "placement", "container"];
 	const hasAnyLayoutField = layoutFieldNames.some((key) => Object.hasOwn(value, key));
@@ -1309,8 +1334,11 @@ export function parseAllocationRecordV2(value: unknown, expectedRunId?: string):
 	const layoutAllocationKeys = [...legacyAllocationKeys, "layout", "placement", "container", "control"];
 	const targetIsValid = value.terminalMode === "cmux-pane"
 		? exactKeys(value.target, ["workspaceId", "surfaceId", "paneId"]) && [value.target.workspaceId, value.target.surfaceId, value.target.paneId].every((id) => typeof id === "string" && CMUX_UUID_RE.test(id))
-		: value.terminalMode === "tmux-pane" && hasOnlyOptionalKeys(value.target, ["serverPid", "paneId", "panePid"], ["socketPath", "generation"])
-			&& typeof value.target.paneId === "string" && TMUX_PANE_ID_RE.test(value.target.paneId) && pid(value.target.serverPid) && pid(value.target.panePid) && (value.target.socketPath === undefined || typeof value.target.socketPath === "string") && (value.target.generation === undefined || isTmuxGeneration(value.target.generation));
+		: value.terminalMode === "tmux-pane" ? hasOnlyOptionalKeys(value.target, ["serverPid", "paneId", "panePid"], ["socketPath", "generation"])
+			&& typeof value.target.paneId === "string" && TMUX_PANE_ID_RE.test(value.target.paneId) && pid(value.target.serverPid) && pid(value.target.panePid) && (value.target.socketPath === undefined || typeof value.target.socketPath === "string") && (value.target.generation === undefined || isTmuxGeneration(value.target.generation))
+			: value.terminalMode === "herdr-pane" && exactKeys(value.target, ["socketPath", "workspaceId", "tabId", "paneId", "terminalId", "protocol"])
+				&& typeof value.target.socketPath === "string" && path.isAbsolute(value.target.socketPath) && path.normalize(value.target.socketPath) === value.target.socketPath
+				&& [value.target.workspaceId, value.target.tabId, value.target.paneId, value.target.terminalId].every(isHerdrPublicId) && isHerdrProtocol(value.target.protocol);
 	if (!targetIsValid) return null;
 	const layoutFieldNames = ["layout", "placement", "container"];
 	const hasAnyLayoutField = layoutFieldNames.some((key) => Object.hasOwn(value, key));
@@ -1334,7 +1362,7 @@ export function parseDecisionV2(value: unknown, expectedRunId?: string, runDir?:
 	return null;
 }
 export function parseCommittedLaunchRecordV2(value: unknown, expectedRunId?: string, runDir?: string): CommittedLaunchRecordV2 | null {
-	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "terminalMode", "allocationPath", "childSessionFile", "committedAt", "ownership"]) || (value.terminalMode !== "cmux-pane" && value.terminalMode !== "tmux-pane") || value.ownership !== "parent-owned" || !positive(value.committedAt) || typeof value.allocationPath !== "string" || typeof value.childSessionFile !== "string" || !path.isAbsolute(value.childSessionFile)) return null;
+	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "terminalMode", "allocationPath", "childSessionFile", "committedAt", "ownership"]) || (value.terminalMode !== "cmux-pane" && value.terminalMode !== "tmux-pane" && value.terminalMode !== "herdr-pane") || value.ownership !== "parent-owned" || !positive(value.committedAt) || typeof value.allocationPath !== "string" || typeof value.childSessionFile !== "string" || !path.isAbsolute(value.childSessionFile)) return null;
 	if (runDir && (!containedPath(value.allocationPath, runDir, "allocation.json") || !containedPath(value.childSessionFile, runDir, "child-session.jsonl"))) return null;
 	return value as unknown as CommittedLaunchRecordV2;
 }
@@ -1350,13 +1378,21 @@ export function parseResidualRiskV2(value: unknown, expectedRunId?: string): Res
 	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "reason", "recordedAt"]) || value.reason !== "possible-unrecorded-allocation" || !positive(value.recordedAt)) return null;
 	return value as unknown as ResidualRiskV2;
 }
+export function parseLaunchDeliveryUnknownV2(value: unknown, expectedRunId?: string, runDir?: string): LaunchDeliveryUnknownV2 | null {
+	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "terminalMode", "allocationPath", "recordedAt"])
+		|| value.terminalMode !== "herdr-pane" || typeof value.allocationPath !== "string" || !positive(value.recordedAt)
+		|| (runDir !== undefined && !containedPath(value.allocationPath, runDir, "allocation.json"))) return null;
+	return value as unknown as LaunchDeliveryUnknownV2;
+}
 export function parseLaunchGateV2(value: unknown, expectedRunId?: string, runDir?: string): LaunchGateV2 | null {
-	if (!isRecord(value) || !validRun(value, expectedRunId) || !exactKeys(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"]) || (value.terminalMode !== "cmux-pane" && value.terminalMode !== "tmux-pane") || !positive(value.publishedAt) || typeof value.launchPath !== "string" || (runDir && !containedPath(value.launchPath, runDir, "launch.json"))) return null;
-	return value as unknown as LaunchGateV2;
+	if (!isRecord(value) || !validRun(value, expectedRunId) || !positive(value.publishedAt) || typeof value.launchPath !== "string" || (runDir && !containedPath(value.launchPath, runDir, "launch.json"))) return null;
+	if (value.terminalMode === "herdr-pane" && exactKeys(value, ["version", "runId", "terminalMode", "protocol", "launchPath", "publishedAt"]) && isHerdrProtocol(value.protocol)) return value as LaunchGateV2;
+	if ((value.terminalMode === "cmux-pane" || value.terminalMode === "tmux-pane") && exactKeys(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"])) return value as LaunchGateV2;
+	return null;
 }
 export function parseBrokerStatusV2(value: unknown, expectedRunId?: string): BrokerStatusV2 | null {
 	if (!isRecord(value) || !validRun(value, expectedRunId) || !positive(value.updatedAt)) return null;
-	if (value.writer === "broker" && typeof value.pid === "number" && pid(value.pid) && ((value.phase === "ready" || value.phase === "committed") ? exactKeys(value, ["version", "runId", "writer", "pid", "phase", "updatedAt"]) : value.phase === "failed" && exactKeys(value, ["version", "runId", "writer", "pid", "phase", "updatedAt", "errorCode"]) && ["intent-invalid", "allocation-failed", "commit-failed", "possible-unrecorded-allocation", "acceptance-handoff-unresolved"].includes(String(value.errorCode)))) return value as BrokerStatusV2;
+	if (value.writer === "broker" && typeof value.pid === "number" && pid(value.pid) && ((value.phase === "ready" || value.phase === "committed") ? exactKeys(value, ["version", "runId", "writer", "pid", "phase", "updatedAt"]) : value.phase === "failed" && exactKeys(value, ["version", "runId", "writer", "pid", "phase", "updatedAt", "errorCode"]) && ["intent-invalid", "allocation-failed", "commit-failed", "possible-unrecorded-allocation", "launch-delivery-unknown", "acceptance-handoff-unresolved"].includes(String(value.errorCode)))) return value as BrokerStatusV2;
 	if (value.writer === "parent" && value.phase === "failed" && exactKeys(value, ["version", "runId", "writer", "phase", "updatedAt", "errorCode"]) && value.errorCode === "possible-unrecorded-allocation") return value as BrokerStatusV2;
 	return null;
 }
@@ -1430,6 +1466,11 @@ export function hasAllocationIntentSourceBinding(
 		if (intent.terminalMode === "cmux-pane" && allocation.terminalMode === "cmux-pane") {
 			return cmuxIdsEqual(allocation.target.workspaceId, intent.source.workspaceId)
 				&& !cmuxIdsEqual(allocation.target.surfaceId, intent.source.sourceSurfaceId);
+		}
+		if (intent.terminalMode === "herdr-pane" && allocation.terminalMode === "herdr-pane") {
+			return allocation.target.socketPath === intent.source.socketPath && allocation.target.workspaceId === intent.source.workspaceId
+				&& allocation.target.tabId === intent.source.tabId && allocation.target.protocol === intent.source.protocol
+				&& allocation.target.terminalId !== intent.source.sourceTerminalId;
 		}
 		if (intent.terminalMode === "tmux-pane" && allocation.terminalMode === "tmux-pane") {
 			return hasTmuxGeneration(intent.source) && hasTmuxGeneration(allocation.target)
@@ -1511,6 +1552,7 @@ export function hasValidV2StateDependencies(options: {
 	// authority, even when its paths and run id are otherwise valid.
 	if (launch && (!allocation || decision?.kind !== "commit" || launch.terminalMode !== allocation.terminalMode)) return false;
 	if (gate && (!launch || !allocation || decision?.kind !== "commit" || gate.terminalMode !== allocation.terminalMode || gate.terminalMode !== launch.terminalMode)) return false;
+	if (allocation?.terminalMode === "herdr-pane" && gate?.terminalMode === "herdr-pane" && gate.protocol !== allocation.target.protocol) return false;
 	return true;
 }
 

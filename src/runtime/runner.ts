@@ -53,6 +53,16 @@ import {
   type CmuxSurfaceIdentity,
 } from "./cmux.js";
 import {
+  closeHerdrPane,
+  inspectHerdrPane,
+  interruptHerdrPane,
+  parseHerdrEnvironment,
+  resolveHerdrCallerPane,
+  subscribeHerdrPane,
+  type HerdrPaneHandle,
+  type HerdrPaneSubscription,
+} from "./herdr.js";
+import {
   getInteractivePaneBackend,
   type InteractivePaneBackend,
   type InteractivePaneHandle,
@@ -128,6 +138,7 @@ import {
   parseCompletionAuthority,
   parseDecisionV2,
   parseLaunchGateV2,
+  parseLaunchDeliveryUnknownV2,
   parseLaunchIntentV2,
   parseLaunchRecord,
   hasAllocationIntentSourceBinding,
@@ -158,6 +169,7 @@ import {
   type CompletionEvidenceRefV3,
   type CompletionRecord,
   type CompletionRecordV1,
+  type HerdrProtocolVersion,
   type ObserverCompletionErrorCodeV3,
   type RunArtifactPaths,
   type TmuxGenerationV2,
@@ -349,6 +361,9 @@ export const STOPPED_BOOTSTRAP_IDENTITY_GATE_RETRY_BUDGET_MS = STOPPED_BOOTSTRAP
 export const STOPPED_BOOTSTRAP_WATCHDOG_SECONDS = 15;
 const POLL_INTERVAL_MS = 100;
 const INTERACTIVE_PANE_POLL_INTERVAL_MS = 250;
+/** Herdr only inspects on authority wakeups while subscribed; degraded probes back off. */
+const HERDR_DEGRADED_WATCHDOG_MIN_MS = 5_000;
+const HERDR_DEGRADED_WATCHDOG_MAX_MS = 30_000;
 const INTERACTIVE_REAPER_VALIDATION_CONCURRENCY = 8;
 const INTERACTIVE_CHILD_START_GRACE_MS = 5_000;
 const ABORT_WAIT_MS = 3000;
@@ -419,7 +434,7 @@ export interface InteractiveRunUxSnapshot {
   invocationId?: string;
   agent: string;
   depth: number;
-  backend: "cmux-pane" | "tmux-pane";
+  backend: "cmux-pane" | "tmux-pane" | "herdr-pane";
   placement?: string;
   ownership: InteractiveRunOwnership;
   startedAt: number;
@@ -1828,6 +1843,14 @@ export async function reapStaleInteractiveRuns(options: {
       const snapshot = await inspectCmuxSurface(handle, run).catch(() => undefined);
       return snapshot !== undefined && !snapshot.exists;
     }
+    if (allocation.terminalMode === "herdr-pane") {
+      const handle: HerdrPaneHandle = { ...allocation.target };
+      if (options.signal?.aborted || !await authorizeMutation()) return false;
+      await interruptHerdrPane(handle).catch(() => false);
+      if (options.signal?.aborted || !await authorizeMutation()) return false;
+      await closeHerdrPane(handle).catch(() => false);
+      return (await inspectHerdrPane(handle).catch(() => undefined))?.exists === false;
+    }
     const generationIsCurrent = options.isTmuxGenerationCurrent ?? isTmuxGenerationCurrent;
     if (!hasTmuxGeneration(allocation.target)
       || !generationIsCurrent(allocation.target.generation, allocation.target.serverPid)) return false;
@@ -1877,6 +1900,7 @@ export async function reapStaleInteractiveRuns(options: {
   const v2ArtifactPaths = (paths: RunArtifactPaths) => [
     paths.launchIntentPath, paths.allocationPath, paths.decisionPath, paths.launchPath,
     paths.launchGatePath, paths.brokerClaimPath, paths.residualRiskPath, paths.completionPath, paths.brokerStatusPath,
+    paths.launchDeliveryUnknownPath,
   ];
   const removeSensitiveArtifacts = async (paths: RunArtifactPaths, preserveChildSession = false): Promise<boolean> =>
     await removeSelectedSensitiveArtifacts(paths, options.removeSensitivePath, preserveChildSession);
@@ -1967,11 +1991,11 @@ export async function reapStaleInteractiveRuns(options: {
         classification.outcome.skipped = [entry.name];
         return classification;
       }
-      const hasV2Path = [v2Artifacts[0], v2Artifacts[1], v2Artifacts[2], v2Artifacts[4], v2Artifacts[5], v2Artifacts[6], v2Artifacts[8]]
+      const hasV2Path = [v2Artifacts[0], v2Artifacts[1], v2Artifacts[2], v2Artifacts[4], v2Artifacts[5], v2Artifacts[6], v2Artifacts[8], v2Artifacts[9]]
         .some((artifact) => artifact?.outcome !== "missing")
         || v2Artifacts.some((artifact) => artifact.outcome === "valid" && artifact.value.version === BROKER_PROTOCOL_VERSION);
       if (hasV2Path) {
-        const [intentArtifact, allocationArtifact, decisionArtifact, launchArtifact, gateArtifact, claimArtifact, riskArtifact, completionArtifact, statusArtifact] = v2Artifacts;
+        const [intentArtifact, allocationArtifact, decisionArtifact, launchArtifact, gateArtifact, claimArtifact, riskArtifact, completionArtifact, statusArtifact, deliveryUnknownArtifact] = v2Artifacts;
         const rawIntent = intentArtifact?.outcome === "valid" ? intentArtifact.value : null;
         const controlV3 = rawIntent?.version === 3;
         const intent = controlV3 ? parseLaunchIntentV3(rawIntent, entry.name, paths.runDir, { allowLegacyTmuxWindowLabel: true }) : parseLaunchIntentV2(rawIntent, entry.name, paths.runDir, { allowLegacyTmuxWindowLabel: true });
@@ -2001,11 +2025,12 @@ export async function reapStaleInteractiveRuns(options: {
         const status = controlV3
           ? parseBrokerStatusV3(statusArtifact?.outcome === "valid" ? statusArtifact.value : null, entry.name)
           : parseBrokerStatusV2(statusArtifact?.outcome === "valid" ? statusArtifact.value : null, entry.name);
+        const deliveryUnknown = controlV3 ? null : parseLaunchDeliveryUnknownV2(deliveryUnknownArtifact?.outcome === "valid" ? deliveryUnknownArtifact.value : null, entry.name, paths.runDir);
         const artifactValues: Array<{ artifact: Awaited<ReturnType<typeof readBrokerArtifact>> | undefined; value: unknown }> = [
           { artifact: intentArtifact, value: intent }, { artifact: allocationArtifact, value: allocation },
           { artifact: decisionArtifact, value: decision }, { artifact: launchArtifact, value: launch },
           { artifact: gateArtifact, value: gate }, { artifact: claimArtifact, value: claim }, { artifact: riskArtifact, value: risk }, { artifact: completionArtifact, value: completion },
-          { artifact: statusArtifact, value: status },
+          { artifact: statusArtifact, value: status }, { artifact: deliveryUnknownArtifact, value: deliveryUnknown },
         ];
         const presentButInvalid = artifactValues.some(({ artifact, value }) => artifact?.outcome === "valid" && !value);
         const validChain = !controlV3 || intent?.version === 3
@@ -2017,7 +2042,8 @@ export async function reapStaleInteractiveRuns(options: {
           || (gate !== null && gate.terminalMode !== intent.terminalMode)
           || !hasValidV2StateDependencies({ allocation: allocation as any, decision: decision as any, launch: launch as any, gate: gate as any })
           || !validChain
-          || (claim !== null && claim.brokerNonce !== intent.brokerNonce);
+          || (claim !== null && claim.brokerNonce !== intent.brokerNonce)
+          || (deliveryUnknown !== null && (!allocation || allocation.terminalMode !== "herdr-pane" || deliveryUnknown.allocationPath !== paths.allocationPath));
         if (presentButInvalid || inconsistent || resolveBackendPath(intent.terminalMode, intent.backendPath) !== intent.backendPath) {
           classification.deferredInvalid = { runId: entry.name, paths, kind: "malformed", ...(intent?.parentRunId ? { parentRunId: intent.parentRunId } : {}) };
           return classification;
@@ -2117,6 +2143,10 @@ export async function reapStaleInteractiveRuns(options: {
           options.cmuxRun ?? createCmuxControlCommandRunner({ env: process.env, expectedControl: control }));
         return snapshot === undefined ? "unknown" : snapshot.exists ? "live" : "absent";
       }
+      if (promoted.allocation.terminalMode === "herdr-pane") {
+        const snapshot = await inspectHerdrPane(promoted.allocation.target).catch(() => undefined);
+        return snapshot === undefined ? "unknown" : snapshot.exists ? "live" : "absent";
+      }
       const target = promoted.allocation.target;
       if (!hasTmuxGeneration(target) || !(options.isTmuxGenerationCurrent ?? isTmuxGenerationCurrent)(target.generation, target.serverPid)) return "unknown";
       const executable = resolveBackendExecutable("tmux-pane");
@@ -2172,8 +2202,8 @@ export async function reapStaleInteractiveRuns(options: {
     try {
     try { await assertSafeRunArtifactPaths(paths); } catch { outcome.invalid.push(intent.runId); continue; }
     const controlV3 = intent.version === 3;
-    let [allocationArtifact, decisionArtifact, riskArtifact, statusArtifact] = await Promise.all([
-      readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.decisionPath), readBrokerArtifact(paths.residualRiskPath), readBrokerArtifact(paths.brokerStatusPath),
+    let [allocationArtifact, decisionArtifact, riskArtifact, statusArtifact, deliveryUnknownArtifact] = await Promise.all([
+      readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.decisionPath), readBrokerArtifact(paths.residualRiskPath), readBrokerArtifact(paths.brokerStatusPath), readBrokerArtifact(paths.launchDeliveryUnknownPath),
     ]);
     let allocation: AllocationRecordV2 | AllocationRecordV3 | null = controlV3
       ? parseAllocationRecordV3(allocationArtifact.outcome === "valid" ? allocationArtifact.value : null, intent.runId)
@@ -2187,10 +2217,13 @@ export async function reapStaleInteractiveRuns(options: {
     let status = controlV3
       ? parseBrokerStatusV3(statusArtifact.outcome === "valid" ? statusArtifact.value : null, intent.runId)
       : parseBrokerStatusV2(statusArtifact.outcome === "valid" ? statusArtifact.value : null, intent.runId);
+    let deliveryUnknown = controlV3 ? null : parseLaunchDeliveryUnknownV2(deliveryUnknownArtifact.outcome === "valid" ? deliveryUnknownArtifact.value : null, intent.runId, paths.runDir);
     const authorityIsInvalid = () => (allocationArtifact.outcome === "valid" && !allocation)
       || (decisionArtifact.outcome === "valid" && !decision)
       || (riskArtifact.outcome === "valid" && !risk)
-      || (statusArtifact.outcome === "valid" && !status);
+      || (statusArtifact.outcome === "valid" && !status)
+      || (deliveryUnknownArtifact.outcome === "valid" && !deliveryUnknown)
+      || (deliveryUnknown !== null && (!allocation || allocation.terminalMode !== "herdr-pane" || deliveryUnknown.allocationPath !== paths.allocationPath));
     if (authorityIsInvalid()) {
       await quarantineV2(intent.runId, paths);
       continue;
@@ -2227,8 +2260,9 @@ export async function reapStaleInteractiveRuns(options: {
         lease: freshLease, now: checkedAt, staleAfterMs, parentPid: intent.parentPid, parentStartedAt: intent.parentStartedAt,
         isProcessIdentityAlive: options.isProcessIdentityAlive ?? isParentProcessIdentityAlive,
       })) return false;
-      const [freshAllocationArtifact, freshStatusArtifact, freshClaimArtifact, freshStateValue] = await Promise.all([
-        readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.brokerStatusPath), readBrokerArtifact(paths.brokerClaimPath), readBoundedPrivateJson(paths.statePath),
+      const [freshAllocationArtifact, freshStatusArtifact, freshClaimArtifact, freshDeliveryUnknownArtifact, freshStateValue] = await Promise.all([
+        readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.brokerStatusPath), readBrokerArtifact(paths.brokerClaimPath),
+        readBrokerArtifact(paths.launchDeliveryUnknownPath), readBoundedPrivateJson(paths.statePath),
       ]);
       const freshAllocation = controlV3
         ? parseAllocationRecordV3(freshAllocationArtifact.outcome === "valid" ? freshAllocationArtifact.value : null, intent.runId)
@@ -2239,8 +2273,16 @@ export async function reapStaleInteractiveRuns(options: {
       const freshBrokerClaim = controlV3
         ? parseBrokerClaimV3(freshClaimArtifact.outcome === "valid" ? freshClaimArtifact.value : null, intent.runId)
         : parseBrokerClaimV2(freshClaimArtifact.outcome === "valid" ? freshClaimArtifact.value : null, intent.runId);
-      if (JSON.stringify(freshAllocation) !== JSON.stringify(allocation) || JSON.stringify(freshStatus) !== JSON.stringify(status)
-        || JSON.stringify(freshBrokerClaim) !== JSON.stringify(brokerClaim)) return false;
+      const freshDeliveryUnknown = controlV3 ? null : parseLaunchDeliveryUnknownV2(
+        freshDeliveryUnknownArtifact.outcome === "valid" ? freshDeliveryUnknownArtifact.value : null,
+        intent.runId,
+        paths.runDir,
+      );
+      if (freshDeliveryUnknownArtifact.outcome === "invalid"
+        || (freshDeliveryUnknownArtifact.outcome === "valid" && !freshDeliveryUnknown)
+        || JSON.stringify(freshAllocation) !== JSON.stringify(allocation) || JSON.stringify(freshStatus) !== JSON.stringify(status)
+        || JSON.stringify(freshBrokerClaim) !== JSON.stringify(brokerClaim)
+        || JSON.stringify(freshDeliveryUnknown) !== JSON.stringify(deliveryUnknown)) return false;
       if (freshStatus?.writer === "broker" && freshStatus.phase === "ready" && "pid" in freshStatus && isBrokerAlive(freshStatus.pid)) return false;
       const freshState = parseRunState(freshStateValue, intent.runId);
       if (observedChildState?.childPid !== freshState?.childPid || observedChildState?.childStartedAt !== freshState?.childStartedAt) return false;
@@ -2263,8 +2305,8 @@ export async function reapStaleInteractiveRuns(options: {
       await (options.publishImmutable ?? publishImmutableJson)(paths.decisionPath, {
         version: controlV3 ? 3 : BROKER_PROTOCOL_VERSION, runId: intent.runId, kind: "cancel", decidedAt: now, reason,
       }).catch(() => undefined);
-      [allocationArtifact, decisionArtifact, riskArtifact, statusArtifact] = await Promise.all([
-        readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.decisionPath), readBrokerArtifact(paths.residualRiskPath), readBrokerArtifact(paths.brokerStatusPath),
+      [allocationArtifact, decisionArtifact, riskArtifact, statusArtifact, deliveryUnknownArtifact] = await Promise.all([
+        readBrokerArtifact(paths.allocationPath), readBrokerArtifact(paths.decisionPath), readBrokerArtifact(paths.residualRiskPath), readBrokerArtifact(paths.brokerStatusPath), readBrokerArtifact(paths.launchDeliveryUnknownPath),
       ]);
       allocation = controlV3
         ? parseAllocationRecordV3(allocationArtifact.outcome === "valid" ? allocationArtifact.value : null, intent.runId)
@@ -2278,6 +2320,7 @@ export async function reapStaleInteractiveRuns(options: {
       status = controlV3
         ? parseBrokerStatusV3(statusArtifact.outcome === "valid" ? statusArtifact.value : null, intent.runId)
         : parseBrokerStatusV2(statusArtifact.outcome === "valid" ? statusArtifact.value : null, intent.runId);
+      deliveryUnknown = controlV3 ? null : parseLaunchDeliveryUnknownV2(deliveryUnknownArtifact.outcome === "valid" ? deliveryUnknownArtifact.value : null, intent.runId, paths.runDir);
       launch = controlV3
         ? parseCommittedLaunchRecordV3(await readBrokerJson(paths.launchPath), intent.runId, paths.runDir)
         : parseCommittedLaunchRecordV2(await readBrokerJson(paths.launchPath), intent.runId, paths.runDir);
@@ -2869,7 +2912,10 @@ export function resolveBrokerRuntime(env: NodeJS.ProcessEnv = process.env): stri
 }
 
 /** Resolve an existing executable backend without classifying its provenance. */
-export function resolveBackendExecutable(mode: "cmux-pane" | "tmux-pane", env: NodeJS.ProcessEnv = process.env): string | null {
+export function resolveBackendExecutable(mode: "cmux-pane" | "tmux-pane" | "herdr-pane", env: NodeJS.ProcessEnv = process.env): string | null {
+  // Herdr is socket-native: the broker runtime is its executable provenance,
+  // not a nonexistent Herdr CLI binary.
+  if (mode === "herdr-pane") return resolveBrokerRuntime(env);
   if (mode === "cmux-pane") {
     const configured = env[CMUX_BUNDLED_CLI_PATH_ENV]?.trim();
     if (configured) return resolveConfiguredExecutable(env, configured);
@@ -2881,7 +2927,7 @@ export function resolveBackendExecutable(mode: "cmux-pane" | "tmux-pane", env: N
 }
 
 /** Revalidate the exact executable selected before a lifecycle operation. */
-export function resolveBackendPath(_mode: "cmux-pane" | "tmux-pane", candidate: string): string | null {
+export function resolveBackendPath(_mode: "cmux-pane" | "tmux-pane" | "herdr-pane", candidate: string): string | null {
   return resolveRegularFile(candidate, true);
 }
 
@@ -2897,7 +2943,7 @@ const unavailableTmuxControlRunner: BackendCommandRunner = async () => ({
 
 /** Each lifecycle operation revalidates the preflight-selected executable. */
 function createBackendCommandRunner(
-  mode: "cmux-pane" | "tmux-pane",
+  mode: "cmux-pane" | "tmux-pane" | "herdr-pane",
   backendPath: string,
   initialGeneration: ReturnType<typeof readExecutableGeneration> = readExecutableGeneration(backendPath),
 ): BackendCommandRunner {
@@ -2959,6 +3005,7 @@ async function inspectActiveInteractiveSnapshot(options: {
   const { handle, run, backendKey, generation } = options;
   const observationGeneration = topologyMutationGeneration;
   const batchGeneration = generation * 1_000_000 + observationGeneration;
+  if (handle.mode === "herdr-pane") return undefined;
   if (handle.mode === "cmux-pane") {
     const native = handle.native;
     const key = `cmux:${backendKey}:${native.workspaceId.toLowerCase()}`;
@@ -3045,6 +3092,7 @@ function bindInteractiveBackend(
   backendGeneration: ReturnType<typeof readExecutableGeneration>,
   transportRun?: BackendCommandRunner,
 ): InteractivePaneBackend {
+  if (backend.mode === "herdr-pane") return backend;
   const run = transportRun ?? createBackendCommandRunner(backend.mode, backendPath, backendGeneration);
   if (backend.mode === "cmux-pane") {
     return {
@@ -4923,7 +4971,7 @@ interface RunAgentInInteractivePaneOptions {
   runStateRoot: string;
 }
 
-const MULTIPLEXER_IDENTITY_ENV = new Set(["TMUX", "TMUX_PANE", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID"]);
+const MULTIPLEXER_IDENTITY_ENV = new Set(["TMUX", "TMUX_PANE", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"]);
 
 // Pi 0.80.10 docs/providers.md environment contract. Interactive children
 // receive these through the private 0600 artifact, not broker argv/environment.
@@ -5044,7 +5092,7 @@ export async function resolveSharedCmuxSourcePreflight(options: {
   throw new CmuxSourcePreflightError("cmux source topology preflight failed: exit=1 control=none parser=topology-mutated", 1, "none", "topology-mutated");
 }
 
-export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane" | "tmux-pane", resolvedBackendExecutable?: string): NodeJS.ProcessEnv {
+export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane" | "tmux-pane" | "herdr-pane", resolvedBackendExecutable?: string): NodeJS.ProcessEnv {
   const minimal: NodeJS.ProcessEnv = {
     // Keep the resolver PATH for env-shebang runtime/backend shims. This is
     // still an explicit allowlisted value, not inherited shell state.
@@ -5058,7 +5106,9 @@ export function buildBrokerEnvironment(env: NodeJS.ProcessEnv, mode: "cmux-pane"
   }
   for (const key of mode === "cmux-pane"
     ? ["CMUX_SOCKET_PATH", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", CMUX_BUNDLED_CLI_PATH_ENV]
-    : ["TMUX", "TMUX_PANE"]) {
+    : mode === "herdr-pane"
+      ? ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"]
+      : ["TMUX", "TMUX_PANE"]) {
     if (env[key] !== undefined) minimal[key] = env[key];
   }
   if (mode === "tmux-pane") {
@@ -5123,7 +5173,7 @@ export function buildInteractivePaneWrapperScript(options: {
     // variables again here before the private allowlist is sourced.
     "unset NODE_OPTIONS NODE_PATH BUN_OPTIONS DENO_DIR LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH BASH_ENV ENV",
     "for _pi_env_name in $(compgen -e); do",
-    `  case "$_pi_env_name" in TMUX|TMUX_PANE|CMUX_WORKSPACE_ID|CMUX_SURFACE_ID|${SUBAGENT_INHERITED_API_KEY_ENV}) ;; *) unset "$_pi_env_name" ;; esac`,
+    `  case "$_pi_env_name" in TMUX|TMUX_PANE|CMUX_WORKSPACE_ID|CMUX_SURFACE_ID|HERDR_ENV|HERDR_SOCKET_PATH|HERDR_WORKSPACE_ID|HERDR_TAB_ID|HERDR_PANE_ID|${SUBAGENT_INHERITED_API_KEY_ENV}) ;; *) unset "$_pi_env_name" ;; esac`,
     "done",
     "unset _pi_env_name",
     ...(options.secretEnvPath
@@ -5167,19 +5217,22 @@ export function shouldRetainBrokerRecoveryMetadata(options: {
   launch?: Awaited<ReturnType<typeof readBrokerArtifact>>;
   gate?: Awaited<ReturnType<typeof readBrokerArtifact>>;
   residualRisk?: Awaited<ReturnType<typeof readBrokerArtifact>>;
+  launchDeliveryUnknown?: Awaited<ReturnType<typeof readBrokerArtifact>>;
 }): boolean {
   // Invalid immutable authority is quarantined rather than deleted. A valid
   // allocation is retained until the exact target's absence was observed.
-  if ([options.status, options.decision, options.allocation, options.launch, options.gate, options.residualRisk].some((artifact) => artifact?.outcome === "invalid")) return true;
+  if ([options.status, options.decision, options.allocation, options.launch, options.gate, options.residualRisk, options.launchDeliveryUnknown].some((artifact) => artifact?.outcome === "invalid")) return true;
   const status = parseBrokerStatusV2(options.status.outcome === "valid" ? options.status.value : null, options.runId);
   const decision = parseDecisionV2(options.decision.outcome === "valid" ? options.decision.value : null, options.runId, options.runDir);
   const allocation = parseAllocationRecordV2(options.allocation.outcome === "valid" ? options.allocation.value : null, options.runId);
   const launch = parseCommittedLaunchRecordV2(options.launch?.outcome === "valid" ? options.launch.value : null, options.runId, options.runDir);
   const gate = parseLaunchGateV2(options.gate?.outcome === "valid" ? options.gate.value : null, options.runId, options.runDir);
   const residualRisk = parseResidualRiskV2(options.residualRisk?.outcome === "valid" ? options.residualRisk.value : null, options.runId);
-  if ((options.status.outcome === "valid" && !status) || (options.decision.outcome === "valid" && !decision) || (options.allocation.outcome === "valid" && !allocation) || (options.launch?.outcome === "valid" && !launch) || (options.gate?.outcome === "valid" && !gate) || (options.residualRisk?.outcome === "valid" && !residualRisk)) return true;
+  const deliveryUnknown = parseLaunchDeliveryUnknownV2(options.launchDeliveryUnknown?.outcome === "valid" ? options.launchDeliveryUnknown.value : null, options.runId, options.runDir);
+  if ((options.status.outcome === "valid" && !status) || (options.decision.outcome === "valid" && !decision) || (options.allocation.outcome === "valid" && !allocation) || (options.launch?.outcome === "valid" && !launch) || (options.gate?.outcome === "valid" && !gate) || (options.residualRisk?.outcome === "valid" && !residualRisk) || (options.launchDeliveryUnknown?.outcome === "valid" && !deliveryUnknown)) return true;
   if (!hasValidV2StateDependencies({ allocation, decision, launch, gate })) return true;
-  if (residualRisk || (status?.phase === "failed" && status.errorCode === "possible-unrecorded-allocation")) return true;
+  if (deliveryUnknown && (!allocation || allocation.terminalMode !== "herdr-pane" || deliveryUnknown.allocationPath !== path.join(options.runDir, "allocation.json"))) return true;
+  if (residualRisk || deliveryUnknown || (status?.phase === "failed" && status.errorCode === "possible-unrecorded-allocation")) return true;
   if (status?.writer === "broker" && status.phase === "ready" && !allocation) return true;
   return Boolean(allocation && !options.targetConfirmedAbsent);
 }
@@ -5194,7 +5247,7 @@ async function publishParentResidualRisk(paths: RunArtifactPaths, runId: string)
 
 export function allocationMatchesInteractiveBackend(
   allocation: ReturnType<typeof parseAllocationRecordV2>,
-  mode: "cmux-pane" | "tmux-pane",
+  mode: "cmux-pane" | "tmux-pane" | "herdr-pane",
 ): allocation is NonNullable<ReturnType<typeof parseAllocationRecordV2>> {
   return allocation !== null && allocation.terminalMode === mode;
 }
@@ -5206,7 +5259,7 @@ export function hasCommittedInteractiveLaunchAuthority(options: {
   decision: ReturnType<typeof parseDecisionV2>;
   launch: ReturnType<typeof parseCommittedLaunchRecordV2>;
   gate: ReturnType<typeof parseLaunchGateV2>;
-  mode: "cmux-pane" | "tmux-pane";
+  mode: "cmux-pane" | "tmux-pane" | "herdr-pane";
 }): boolean {
   const { intent, allocation, decision, launch, gate, mode } = options;
   return intent !== null
@@ -5229,9 +5282,11 @@ export function hasCommittedInteractiveLaunchAuthority(options: {
 export async function publishInteractiveLaunchGate(options: {
   paths: Pick<RunArtifactPaths, "runDir" | "launchGatePath" | "launchPath">;
   runId: string;
-  terminalMode: "cmux-pane" | "tmux-pane";
+  terminalMode: "cmux-pane" | "tmux-pane" | "herdr-pane";
   generation: number;
   protocolVersion?: 2 | 3;
+  /** Required only for the exact negotiated Herdr V2 gate. */
+  herdrProtocol?: HerdrProtocolVersion;
   /** Test seam for deterministic publication/fence ordering. */
   beforePublishForTest?: () => Promise<void>;
 }): Promise<NonNullable<ReturnType<typeof parseLaunchGateV2>> | LaunchGateV3> {
@@ -5241,10 +5296,14 @@ export async function publishInteractiveLaunchGate(options: {
       throw new Error("Interactive session shutdown fenced this committed run before gate publication.");
     }
     const protocolVersion = options.protocolVersion ?? 2;
+    if (options.terminalMode === "herdr-pane" && options.herdrProtocol === undefined) {
+      throw new Error("Herdr launch gate requires its negotiated protocol.");
+    }
     const gate = {
       version: protocolVersion,
       runId: options.runId,
       terminalMode: options.terminalMode,
+      ...(options.terminalMode === "herdr-pane" ? { protocol: options.herdrProtocol as HerdrProtocolVersion } : {}),
       launchPath: options.paths.launchPath,
       publishedAt: Date.now(),
     };
@@ -5261,6 +5320,7 @@ export async function publishInteractiveLaunchGate(options: {
 }
 
 function allocationToHandle(allocation: NonNullable<ReturnType<typeof parseAllocationRecordV2>>): InteractivePaneHandle {
+  if (allocation.terminalMode === "herdr-pane") return { mode: "herdr-pane", native: allocation.target };
   const placement = "layout" in allocation
     ? { layout: allocation.layout, placement: allocation.placement }
     : undefined;
@@ -5412,6 +5472,13 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   let tmuxReconnectPending = false;
   let removeTmuxDisconnectListener: (() => void) | null = null;
   let cmuxFocusSupported = false;
+  let herdrSubscription: HerdrPaneSubscription | null = null;
+  const herdrWakeWaiters = new Set<() => void>();
+  const signalHerdrWake = () => { for (const wake of [...herdrWakeWaiters]) wake(); herdrWakeWaiters.clear(); };
+  const waitForHerdrWake = async (timeoutMs: number): Promise<void> => await new Promise<void>((resolve) => {
+    const finish = () => { clearTimeout(timer); herdrWakeWaiters.delete(finish); resolve(); };
+    const timer = setTimeout(finish, timeoutMs); herdrWakeWaiters.add(finish);
+  });
   let releaseTmuxLaunchMutex: (() => void) | null = backend.mode === "tmux-pane" ? await acquireTmuxLaunchMutex(options.signal) : null;
   let releaseCmuxLaunchMutex: (() => void) | null = backend.mode === "cmux-pane" ? await acquireCmuxLaunchMutex(options.signal) : null;
   const releaseTmuxLaunch = () => { releaseTmuxLaunchMutex?.(); releaseTmuxLaunchMutex = null; };
@@ -5654,7 +5721,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       });
       source = { workspaceId: resolved.workspaceId, sourceSurfaceId: resolved.surfaceId };
       cmuxLayoutRunners.set(cmuxLayoutRunnerKey(source.workspaceId), backendRun);
-    } else {
+    } else if (backend.mode === "tmux-pane") {
       const identity = parseTmuxEnvironment();
       if (!identity) throw new Error("tmux pane mode requires valid inherited tmux identity.");
       const launchIdentity = readTmuxLaunchIdentity(identity.socketPath, identity.serverPid);
@@ -5707,6 +5774,14 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         // fallback is allowed only before any transport authority exists.
         tmuxTransportGate = await publishTmuxControlTransportGate(runPaths.transportGatePath, candidateGate);
       }
+    } else {
+      const configured = parseHerdrEnvironment(process.env);
+      if (!configured) throw new Error("Herdr pane mode requires a complete Herdr environment.");
+      // `resolveHerdrCallerPane` negotiates protocol 19/20 and records the live
+      // binding, rather than trusting an environment address that may move.
+      const live = await resolveHerdrCallerPane(process.env);
+      if (!live) throw new Error("Herdr source pane is unavailable or no longer matches its configured workspace/tab binding.");
+      source = { socketPath: live.socketPath, workspaceId: live.workspaceId, tabId: live.tabId, sourcePaneId: live.paneId, sourceTerminalId: live.terminalId, protocol: live.protocol };
     }
 
     const tmuxControlEnabled = backend.mode === "tmux-pane" && tmuxTransportGate !== null;
@@ -5737,7 +5812,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       const intent = {
         version: tmuxControlV3 ? 3 : 2, runId, parentRunId: process.env[SUBAGENT_RUN_ID_ENV]?.trim() || undefined,
         parentSessionId: options.parentSessionId ?? "unknown", parentPid: process.pid, parentStartedAt, terminalMode: backend.mode, source,
-        layout: request.layout, placement: request.placement, container: request.container,
+        ...(backend.mode === "herdr-pane" ? {} : { layout: request.layout, placement: request.placement, container: request.container }),
         ...(backend.mode === "tmux-pane" && request.placement === "tmux-new-window" ? { windowLabel: buildTmuxWindowLabel(result.agent, runId) } : {}),
         ...(backend.mode === "cmux-pane" ? { control: cmuxControlTransport } : tmuxControlV3 ? {
           transport: "tmux-control-v1", transportGatePath: runPaths.transportGatePath, transportGateDigest,
@@ -5867,9 +5942,11 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       });
       // Do not replace committedAllocation with cmuxLease.allocation: that
       // DTO intentionally omits full AllocationRecordV2 authority.
-    } else {
+    } else if (backend.mode === "tmux-pane") {
       const request = selectTmuxInteractivePlacement({ layout: options.interactivePaneLayout, source, sourceTopology: tmuxSourceTopology });
       await createAndCommit(request);
+    } else {
+      await createAndCommit({});
     }
     if (!committedAllocation) throw new Error("Committed allocation authority is missing.");
     handle = allocationToHandle(committedAllocation as AllocationRecordV2);
@@ -5894,13 +5971,20 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // The resolver follows each accepted pooled lease rebind/reconnect and
       // returns unavailable while the lease is still proving a new epoch.
       ...(tmuxControlEnabled ? { uxBackend: () => tmuxParentLease?.acceptedTransport() ? backend : null } : {}),
-      handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
+      handle, paths: runPaths, agent: result.agent, depth: options.parentDepth + 1, focusSupported: backend.mode === "herdr-pane" || backend.mode === "cmux-pane" && cmuxFocusSupported, release: committedRelease, treePermitLease: options.treePermitLease,
       sessionIdentity, sessionResultStartOffset, applyCompletionWinner, stopLeaseWriterAndDrain,
       publishParentCompletion: async (status, errorCode) => await publishTerminalParentCompletion(runPaths, runId, status, errorCode),
       // Preserve the post-commit observation even if a reset races adoption.
       generation: committedAfterFence ? -1 : options.interactiveShutdownGeneration,
     })) {
       throw new Error("Interactive session shutdown fenced this committed run before launch.");
+    }
+    if (handle.mode === "herdr-pane") {
+      herdrSubscription = subscribeHerdrPane({
+        handle: handle.native,
+        onReconcile: () => signalHerdrWake(),
+        onWake: signalHerdrWake,
+      });
     }
     const releaseAfterCompletionWinner = async (completion: CompletionRecord): Promise<boolean> => {
       const active = activeInteractiveRuns.get(runId);
@@ -5950,6 +6034,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       terminalMode: backend.mode,
       generation: options.interactiveShutdownGeneration,
       protocolVersion: tmuxControlEnabled ? 3 : 2,
+      herdrProtocol: backend.mode === "herdr-pane" && authorityAllocation?.version === 2 && authorityAllocation.terminalMode === "herdr-pane"
+        ? authorityAllocation.target.protocol : undefined,
     });
     if (lifecycleRunId) lifecycleEventServer?.activateRun(lifecycleRunId);
     const validGateAuthority = tmuxControlEnabled
@@ -6181,6 +6267,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     const childLaunchStartedAt = performance.now();
     let observedTopologyMutationGeneration = topologyMutationGeneration;
     let nextDegradedCmuxInspectDue = 0;
+    let nextDegradedHerdrInspectDue = 0;
+    let herdrDegradedWatchdogMs = HERDR_DEGRADED_WATCHDOG_MIN_MS;
     let tmuxInspectionDue = backend.mode === "tmux-pane";
     let observedTmuxNotificationSequence = tmuxParentLease?.notificationSequence() ?? 0;
     let pendingTmuxNotification: Promise<"notification" | "timeout" | "disconnect"> | null = null;
@@ -6225,6 +6313,10 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
           runLifecycleServerWait(lifecycleEventServer, runId, INTERACTIVE_PANE_POLL_INTERVAL_MS),
           waitForCmuxTopologyHint(INTERACTIVE_PANE_POLL_INTERVAL_MS),
         ])
+        : handle!.mode === "herdr-pane" ? Promise.race([
+          runLifecycleServerWait(lifecycleEventServer, runId, HERDR_DEGRADED_WATCHDOG_MIN_MS),
+          waitForHerdrWake(HERDR_DEGRADED_WATCHDOG_MIN_MS),
+        ])
         : delay(INTERACTIVE_PANE_POLL_INTERVAL_MS));
     };
     const failClosedTerminalPublication = () => {
@@ -6247,6 +6339,42 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       result.exitCode = 1;
       result.stopReason = "error";
       result.errorMessage = "completion-authority-invalid";
+      result.stderr = result.stderr ? `${result.stderr}\n${result.errorMessage}` : result.errorMessage;
+      return normalizeCompletedResult(result, false);
+    };
+    /**
+     * A post-dispatch send_text failure has a durable, exact allocation but no
+     * delivery acknowledgement. Probe only that handle a few times to settle
+     * transport noise; never replay the command, publish a parent winner, or
+     * close a pane that may already be running the wrapper.
+     */
+    const reconcileHerdrLaunchDeliveryUnknown = async (): Promise<"none" | "retained" | "invalid"> => {
+      if (handle?.mode !== "herdr-pane") return "none";
+      const artifact = await readBrokerArtifact(activePaths.launchDeliveryUnknownPath);
+      if (artifact.outcome === "missing") return "none";
+      const marker = artifact.outcome === "valid"
+        ? parseLaunchDeliveryUnknownV2(artifact.value, runId, activePaths.runDir)
+        : null;
+      if (!marker || marker.allocationPath !== activePaths.allocationPath
+        || committedAllocation?.terminalMode !== "herdr-pane"
+        || committedAllocation.target.terminalId !== handle.native.terminalId) return "invalid";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const snapshot = await backend.inspect(handle).catch(() => undefined);
+        if (snapshot !== undefined) return "retained";
+        if (attempt < 2) await delay(INTERACTIVE_PANE_POLL_INTERVAL_MS);
+      }
+      return "retained";
+    };
+    const retainHerdrLaunchDeliveryUnknown = async (state: "retained" | "invalid") => {
+      preserveDiagnostics = true;
+      retainRecoveryMetadata = true;
+      skipFinalRelease = true;
+      await stopLeaseWriterAndDrain();
+      result.exitCode = 1;
+      result.stopReason = "error";
+      result.errorMessage = state === "invalid"
+        ? "Herdr launch-delivery authority is invalid; exact allocation retained for recovery."
+        : "Herdr launch delivery is unknown; exact allocation retained without replay.";
       result.stderr = result.stderr ? `${result.stderr}\n${result.errorMessage}` : result.errorMessage;
       return normalizeCompletedResult(result, false);
     };
@@ -6298,6 +6426,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         applyInteractiveOwnershipUnknownResult(result);
         return normalizeCompletedResult(result, false);
       }
+      const deliveryReconciliation = await reconcileHerdrLaunchDeliveryUnknown();
+      if (deliveryReconciliation !== "none") return await retainHerdrLaunchDeliveryUnknown(deliveryReconciliation);
       // Check after every wake as well as before every drain. An invalid fence
       // fails closed: callbacks remain suppressed and recovery artifacts stay.
       const fenceOutcome = await awaitTerminalPublicationBounded(fenceCallbacksForCompletion(false));
@@ -6332,7 +6462,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
           preserveDiagnostics = true; retainRecoveryMetadata = true; skipFinalRelease = true;
           return normalizeCompletedResult(result, false);
         }
-        recordPhase0LiveTelemetry(backend.mode === "tmux-pane" ? "tmux" : "cmux", "lifecycleCompletionLatencyMs", Math.max(0, Date.now() - completion.completedAt), "durable-completion");
+        recordPhase0LiveTelemetry(backend.mode === "tmux-pane" ? "tmux" : backend.mode === "herdr-pane" ? "herdr" : "cmux", "lifecycleCompletionLatencyMs", Math.max(0, Date.now() - completion.completedAt), "durable-completion");
         if (!await stopLeaseWriterAndDrain()) return failClosedTerminalPublication();
         const verified = await applyCompletionWinner(completion);
         completedNormally = verified && completion.status === "completed";
@@ -6501,28 +6631,31 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
 
       const lifecycleHeartbeat = lifecycleEventServer?.lastHeartbeat(runId);
       const lifecycleConnected = Boolean(lifecycleEventServer?.isConnected(runId));
-      const lifecycleHealthy = backend.mode === "cmux-pane" && lifecycleConnected
+      const lifecycleSocketHealthy = lifecycleConnected
         && lifecycleHeartbeat !== null && lifecycleHeartbeat !== undefined
-        && performance.now() - lifecycleHeartbeat < DEFAULT_PARENT_LEASE_STALE_MS
-        && observedTopologyMutationGeneration === topologyMutationGeneration;
+        && performance.now() - lifecycleHeartbeat < DEFAULT_PARENT_LEASE_STALE_MS;
+      const healthyHerdrEvents = backend.mode === "herdr-pane" && Boolean(herdrSubscription?.isHealthy());
+      const lifecycleHealthy = (backend.mode === "cmux-pane" || backend.mode === "herdr-pane")
+        && lifecycleSocketHealthy
+        && observedTopologyMutationGeneration === topologyMutationGeneration
+        && (backend.mode !== "herdr-pane" || healthyHerdrEvents);
       if (lifecycleHealthy) {
-        // Authenticated lifecycle frames wake this wait (heartbeats at 1s).
-        // Durable completion remains authoritative and is read at loop top;
-        // healthy cmux runs issue no periodic topology request.
-        await Promise.race([
-          lifecycleEventServer!.waitForEvent(runId, 5_000),
-          waitForCmuxTopologyHint(5_000),
-        ]);
+        // Authenticated lifecycle frames and a live Herdr subscription are
+        // wake authority. Durable completion remains authoritative at loop top;
+        // healthy runs issue no periodic backend inspection.
+        await (backend.mode === "herdr-pane"
+          ? Promise.race([lifecycleEventServer!.waitForEvent(runId, 5_000), waitForHerdrWake(5_000)])
+          : Promise.race([lifecycleEventServer!.waitForEvent(runId, 5_000), waitForCmuxTopologyHint(5_000)]));
         continue;
       }
       const degradedCmux = backend.mode === "cmux-pane" && lifecycleRunId !== null;
-      if (degradedCmux && observedTopologyMutationGeneration === topologyMutationGeneration
-        && performance.now() < nextDegradedCmuxInspectDue) {
-        const waitMs = Math.min(5_000, Math.max(1, nextDegradedCmuxInspectDue - performance.now()));
-        await Promise.race([
-          runLifecycleServerWait(lifecycleEventServer, runId, waitMs),
-          waitForCmuxTopologyHint(waitMs),
-        ]);
+      const degradedHerdr = backend.mode === "herdr-pane" && !healthyHerdrEvents;
+      if ((degradedCmux && observedTopologyMutationGeneration === topologyMutationGeneration || degradedHerdr)
+        && performance.now() < (degradedCmux ? nextDegradedCmuxInspectDue : nextDegradedHerdrInspectDue)) {
+        const waitMs = Math.max(1, (degradedCmux ? nextDegradedCmuxInspectDue : nextDegradedHerdrInspectDue) - performance.now());
+        await (degradedHerdr
+          ? Promise.race([runLifecycleServerWait(lifecycleEventServer, runId, waitMs), waitForHerdrWake(waitMs)])
+          : Promise.race([runLifecycleServerWait(lifecycleEventServer, runId, Math.min(5_000, waitMs)), waitForCmuxTopologyHint(Math.min(5_000, waitMs))]));
         continue;
       }
 
@@ -6542,15 +6675,17 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // not a transport failure when an allocation/close advanced the topology
       // epoch while the request was in flight.
       const inspectionTopologyMutationGeneration = topologyMutationGeneration;
-      const pane = await inspectActiveInteractiveSnapshot({
-        handle,
-        run: backendRun,
-        backendKey: executableGenerationKey(backendGeneration),
-        generation: options.interactiveShutdownGeneration,
-        tmuxAcceptedTransport: backend.mode === "tmux-pane"
-          ? () => tmuxParentLease?.acceptedTransport() ?? null
-          : undefined,
-      });
+      const pane = handle.mode === "herdr-pane"
+        ? await backend.inspect(handle).catch(() => undefined)
+        : await inspectActiveInteractiveSnapshot({
+          handle,
+          run: backendRun,
+          backendKey: executableGenerationKey(backendGeneration),
+          generation: options.interactiveShutdownGeneration,
+          tmuxAcceptedTransport: backend.mode === "tmux-pane"
+            ? () => tmuxParentLease?.acceptedTransport() ?? null
+            : undefined,
+        });
       if (tmuxNotificationReceivedAt !== null) { recordPhase0LiveTelemetry("tmux", "notificationToReconcileLatencyMs", Math.max(0, Date.now() - tmuxNotificationReceivedAt), "notification"); tmuxNotificationReceivedAt = null; }
       if (backend.mode === "tmux-pane" && tmuxParentLease) {
         const tmuxSequenceAfterInspect = tmuxParentLease.notificationSequence();
@@ -6581,6 +6716,10 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         }
         queryFailures += 1;
         if (degradedCmux) nextDegradedCmuxInspectDue = performance.now() + 5_000;
+        if (degradedHerdr) {
+          nextDegradedHerdrInspectDue = performance.now() + herdrDegradedWatchdogMs;
+          herdrDegradedWatchdogMs = Math.min(HERDR_DEGRADED_WATCHDOG_MAX_MS, herdrDegradedWatchdogMs * 2);
+        }
         const handleId = handle.mode === "cmux-pane" ? handle.native.surfaceId : handle.native.paneId;
         if (queryFailures >= 20 && !degradedCmux) {
           const recovery = await recheckBeforeObserverPublication(inspectionTopologyMutationGeneration);
@@ -6621,6 +6760,10 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         }
         observedTopologyMutationGeneration = topologyMutationGeneration;
         if (degradedCmux) nextDegradedCmuxInspectDue = performance.now() + 5_000;
+        if (degradedHerdr) {
+          nextDegradedHerdrInspectDue = performance.now() + HERDR_DEGRADED_WATCHDOG_MIN_MS;
+          herdrDegradedWatchdogMs = HERDR_DEGRADED_WATCHDOG_MIN_MS;
+        }
         // Batched topology is read-sharing evidence only. Before absence can
         // publish terminal state (or prove cleanup) obtain an independent
         // exact-handle inspection; a stale batch must never be authority.
@@ -6650,7 +6793,9 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
             && !await fileExists(paths.wrapperStatusPath)) {
             await (handle.mode === "cmux-pane"
               ? Promise.race([runLifecycleServerWait(lifecycleEventServer, runId, INTERACTIVE_PANE_POLL_INTERVAL_MS), waitForCmuxTopologyHint(INTERACTIVE_PANE_POLL_INTERVAL_MS)])
-              : delay(INTERACTIVE_PANE_POLL_INTERVAL_MS));
+              : handle.mode === "herdr-pane"
+                ? Promise.race([runLifecycleServerWait(lifecycleEventServer, runId, HERDR_DEGRADED_WATCHDOG_MIN_MS), waitForHerdrWake(HERDR_DEGRADED_WATCHDOG_MIN_MS)])
+                : delay(INTERACTIVE_PANE_POLL_INTERVAL_MS));
             continue;
           }
           const recovery = await recheckBeforeObserverPublication(terminalInspectionTopologyMutationGeneration);
@@ -6684,7 +6829,9 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
           return result;
         }
       }
-      await (handle.mode === "cmux-pane" ? waitForCmuxTopologyHint(INTERACTIVE_PANE_POLL_INTERVAL_MS) : delay(INTERACTIVE_PANE_POLL_INTERVAL_MS));
+      await (handle.mode === "cmux-pane" ? waitForCmuxTopologyHint(INTERACTIVE_PANE_POLL_INTERVAL_MS)
+        : handle.mode === "herdr-pane" ? waitForHerdrWake(HERDR_DEGRADED_WATCHDOG_MIN_MS)
+        : delay(INTERACTIVE_PANE_POLL_INTERVAL_MS));
     }
   } catch (error) {
     // An error before staged gate consumption may need exact cleanup. Release
@@ -6737,6 +6884,9 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   } finally {
     releaseTmuxLaunch();
     releaseCmuxLaunch();
+    herdrSubscription?.stop();
+    herdrSubscription = null;
+    signalHerdrWake();
     await stopLeaseWriterAndDrain();
     if (lifecycleRunId) lifecycleEventServer?.terminalRun(lifecycleRunId);
     // All terminal closes occur at their winner site under the interactive
@@ -6760,19 +6910,20 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // Decide retention from tri-state authority reads before any delayed
       // cleanup. Invalid artifacts and uncertain allocations are recovery
       // state, not ordinary diagnostic output.
-      const [status, decision, allocation, launch, gate, residualRisk, completionArtifact, intentArtifact] = await Promise.all([
+      const [status, decision, allocation, launch, gate, residualRisk, launchDeliveryUnknown, completionArtifact, intentArtifact] = await Promise.all([
         readBrokerArtifact(paths.brokerStatusPath),
         readBrokerArtifact(paths.decisionPath),
         readBrokerArtifact(paths.allocationPath),
         readBrokerArtifact(paths.launchPath),
         readBrokerArtifact(paths.launchGatePath),
         readBrokerArtifact(paths.residualRiskPath),
+        readBrokerArtifact(paths.launchDeliveryUnknownPath),
         readBrokerArtifact(paths.completionPath),
         readBrokerArtifact(paths.launchIntentPath),
       ]);
       retainRecoveryMetadata ||= shouldRetainBrokerRecoveryMetadata({
         runId: path.basename(paths.runDir), runDir: paths.runDir, targetConfirmedAbsent,
-        status, decision, allocation, launch, gate, residualRisk,
+        status, decision, allocation, launch, gate, residualRisk, launchDeliveryUnknown,
       });
       const runId = path.basename(paths.runDir);
       const retainedCompletion = parseCompletionAuthority(

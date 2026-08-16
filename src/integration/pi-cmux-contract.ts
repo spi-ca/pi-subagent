@@ -12,7 +12,7 @@ export type PiSubagentDetachedEventName = typeof PI_SUBAGENT_DETACHED_EVENT;
 export type PiSubagentInvocationKind = "foreground" | "background";
 export type PiSubagentActiveStatus = "running" | "cancelling";
 export type PiSubagentTerminalStatus = "completed" | "failed" | "cancelled";
-export type PiSubagentDetachedBackend = "cmux-pane" | "tmux-pane";
+export type PiSubagentDetachedBackend = "cmux-pane" | "tmux-pane" | "herdr-pane";
 
 export interface PiSubagentDashboardActiveItem {
   readonly id: string;
@@ -106,7 +106,7 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-
 const ACTIVE_STATUSES = new Set<PiSubagentActiveStatus>(["running", "cancelling"]);
 const TERMINAL_STATUSES = new Set<PiSubagentTerminalStatus>(["completed", "failed", "cancelled"]);
 const KINDS = new Set<PiSubagentInvocationKind>(["foreground", "background"]);
-const DETACHED_BACKENDS = new Set<PiSubagentDetachedBackend>(["cmux-pane", "tmux-pane"]);
+const DETACHED_BACKENDS = new Set<PiSubagentDetachedBackend>(["cmux-pane", "tmux-pane", "herdr-pane"]);
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);

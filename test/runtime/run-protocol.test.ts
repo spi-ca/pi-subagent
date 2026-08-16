@@ -27,7 +27,9 @@ import {
 	parseCompletionRecordV2,
 	parseCompletionRecordV3,
 	parseDecisionV2,
+	parseLaunchGateV2,
 	parseLaunchIntentV2,
+	parseLaunchDeliveryUnknownV2,
 	hasAllocationIntentSourceBinding,
 	hasValidV2StateDependencies,
 	parseLaunchRecord,
@@ -416,6 +418,14 @@ describe("run protocol", () => {
 		assert.deepEqual(await readBrokerArtifact(paths.allocationPath), { outcome: "invalid" });
 		assert.equal(parseDecisionV2({ version: 2, runId: "v2", kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath }, "v2", paths.runDir)?.kind, "commit");
 		assert.equal(parseAllocationRecordV2({ version: 2, runId: "v2", terminalMode: "tmux-pane", target: { paneId: "%01", serverPid: 1, panePid: 2 }, allocatedAt: 1 }, "v2"), null);
+		const deliveryUnknown = { version: 2 as const, runId: "v2", terminalMode: "herdr-pane" as const, allocationPath: paths.allocationPath, recordedAt: 1 };
+		assert.deepEqual(parseLaunchDeliveryUnknownV2(deliveryUnknown, "v2", paths.runDir), deliveryUnknown);
+		assert.equal(parseLaunchDeliveryUnknownV2({ ...deliveryUnknown, allocationPath: paths.launchPath }, "v2", paths.runDir), null);
+		for (const protocol of [19, 20] as const) {
+			const gate = { version: 2 as const, runId: "v2", terminalMode: "herdr-pane" as const, protocol, launchPath: paths.launchPath, publishedAt: 1 };
+			assert.deepEqual(parseLaunchGateV2(gate, "v2", paths.runDir), gate);
+		}
+		assert.equal(parseLaunchGateV2({ version: 2, runId: "v2", terminalMode: "herdr-pane", protocol: 18, launchPath: paths.launchPath, publishedAt: 1 }, "v2", paths.runDir), null);
 	});
 
 	test("binds allocation source authority to its immutable intent", () => {
@@ -442,6 +452,23 @@ describe("run protocol", () => {
 		const legacyAllocation = parseAllocationRecordV2({ ...tmuxAllocation, target: legacyTarget }, "r");
 		assert.ok(legacyIntent && legacyAllocation, "generation-less V2 records remain parser-compatible diagnostics");
 		assert.equal(hasAllocationIntentSourceBinding(legacyIntent, legacyAllocation), false);
+		const herdrIntent = { ...cmuxIntent, terminalMode: "herdr-pane" as const, source: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 as const }, backendPath: "/usr/bin/bun" };
+		const herdrAllocation = { version: 2 as const, runId: "r", terminalMode: "herdr-pane" as const, target: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 as const }, allocatedAt: 1 };
+		for (const protocol of [19, 20] as const) {
+			const intent = { ...herdrIntent, source: { ...herdrIntent.source, protocol } };
+			const allocation = { ...herdrAllocation, target: { ...herdrAllocation.target, protocol } };
+			assert.deepEqual(parseLaunchIntentV2(intent, "r"), intent);
+			assert.deepEqual(parseAllocationRecordV2(allocation, "r"), allocation);
+			assert.equal(hasAllocationIntentSourceBinding(intent, allocation), true);
+		}
+		assert.equal(parseLaunchIntentV2({ ...herdrIntent, source: { ...herdrIntent.source, sourceTerminalId: undefined } }, "r"), null);
+		assert.equal(parseLaunchIntentV2({ ...herdrIntent, source: { ...herdrIntent.source, protocol: 21 } }, "r"), null);
+		assert.deepEqual(parseAllocationRecordV2(herdrAllocation, "r"), herdrAllocation);
+		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, herdrAllocation), true);
+		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, paneId: herdrIntent.source.sourcePaneId } }), true, "pane address is not source identity");
+		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, terminalId: "source-terminal" } }), false);
+		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, protocol: 19 } }), false);
+		assert.equal(parseAllocationRecordV2({ ...herdrAllocation, target: { ...herdrAllocation.target, terminalId: "bad\nterminal" } }, "r"), null);
 	});
 
 	test("strictly parses every layout-aware V2 placement and preserves exact legacy split records", () => {

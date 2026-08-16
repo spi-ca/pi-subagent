@@ -16,7 +16,7 @@
  *
  * Plus three execution surfaces:
  *   - inline: child pi runs headlessly and streams JSON stdout.
- *   - cmux-pane / tmux-pane: child pi runs as an interactive TUI in a managed pane.
+ *   - cmux-pane / tmux-pane / herdr-pane: child pi runs as an interactive TUI in a managed pane.
  */
 
 import * as crypto from "node:crypto";

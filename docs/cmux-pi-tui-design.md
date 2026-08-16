@@ -8,16 +8,17 @@
 
 ## 1. 결론
 
-현재 terminal mode는 다음 세 가지다.
+현재 terminal mode는 다음 네 가지다.
 
 ```ts
-export type TerminalMode = "inline" | "cmux-pane" | "tmux-pane";
+export type TerminalMode = "inline" | "cmux-pane" | "tmux-pane" | "herdr-pane";
 ```
 
 자동 선택 우선순위는 다음과 같다.
 
 ```text
 CMUX_WORKSPACE_ID + CMUX_SURFACE_ID → cmux-pane
+HERDR_ENV + HERDR_SOCKET_PATH + IDs → herdr-pane
 TMUX + TMUX_PANE                   → tmux-pane
 그 외                              → inline
 ```

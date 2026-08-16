@@ -4,13 +4,14 @@
 
 import type { Message } from "@earendil-works/pi-ai";
 import type { AccountingUsage } from "./accounting-usage.js";
+import { parseHerdrEnvironment } from "./herdr-environment.js";
 import { getFinalAssistantText } from "./runner-events.js";
 
 /** Context mode for delegated runs. */
 export type DelegationMode = "spawn" | "fork";
 
 /** Execution surface for delegated runs. */
-export type TerminalMode = "inline" | "cmux-pane" | "tmux-pane";
+export type TerminalMode = "inline" | "cmux-pane" | "tmux-pane" | "herdr-pane";
 
 /** Display label for the subagent tool. */
 export const SUBAGENT_TOOL_LABEL = "Subagent";
@@ -30,6 +31,11 @@ export function isInsideCmux(env: NodeJS.ProcessEnv = process.env): boolean {
 	return CMUX_UUID_RE.test(env.CMUX_WORKSPACE_ID?.trim() ?? "") && CMUX_UUID_RE.test(env.CMUX_SURFACE_ID?.trim() ?? "");
 }
 
+/** Whether the process has the complete local Herdr pane identity. */
+export function isInsideHerdr(env: NodeJS.ProcessEnv = process.env): boolean {
+	return parseHerdrEnvironment(env) !== null;
+}
+
 /** Whether the current process has a canonical tmux pane identity. */
 export function isInsideTmux(env: NodeJS.ProcessEnv = process.env): boolean {
 	// Keep this canonical parser local to avoid a core↔runtime dependency cycle.
@@ -39,10 +45,16 @@ export function isInsideTmux(env: NodeJS.ProcessEnv = process.env): boolean {
 	return Boolean(match) && CANONICAL_POSITIVE_PID_RE.test(match?.[2] ?? "") && Number.isSafeInteger(Number(match?.[2])) && TMUX_PANE_ID_RE.test(env.TMUX_PANE?.trim() ?? "");
 }
 
+/** Explicit process-local override; invalid values intentionally retain safe auto-detection. */
+export const SUBAGENT_TERMINAL_MODE_ENV = "PI_SUBAGENT_TERMINAL_MODE";
+
 /** Default execution surface inferred from the current environment. */
 export function getDefaultTerminalModeFromEnv(env: NodeJS.ProcessEnv = process.env, platform = process.platform): TerminalMode {
 	if (platform === "win32") return DEFAULT_TERMINAL_MODE;
+	const explicit = env[SUBAGENT_TERMINAL_MODE_ENV];
+	if (explicit === "inline" || explicit === "cmux-pane" || explicit === "tmux-pane" || explicit === "herdr-pane") return explicit;
 	if (isInsideCmux(env)) return "cmux-pane";
+	if (isInsideHerdr(env)) return "herdr-pane";
 	return isInsideTmux(env) ? "tmux-pane" : DEFAULT_TERMINAL_MODE;
 }
 

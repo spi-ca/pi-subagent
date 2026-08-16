@@ -155,6 +155,62 @@ describe("production dashboard boundary", () => {
     }
   });
 
+  test("reports absent, invalid, and valid Herdr identities in doctor output without exposing identity values", async () => {
+    const herdrEnvironmentNames = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const;
+    const previousHerdrEnvironment = new Map(herdrEnvironmentNames.map((name) => [name, process.env[name]]));
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const commands = new Map<string, { handler: (rawArgs: string, ctx: unknown) => Promise<void> }>();
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH;
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
+        registerTool: () => undefined,
+        on: () => undefined,
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const command = commands.get("subagents");
+      assert.ok(command);
+      const assertHerdrStatus = async (status: "not present" | "invalid" | "valid") => {
+        let doctorOutput = "";
+        await command.handler("doctor", { ui: { notify: (message: string) => { doctorOutput = message; } } });
+        assert.match(doctorOutput, new RegExp(`herdr identity: ${status}`));
+        return doctorOutput;
+      };
+
+      for (const name of herdrEnvironmentNames) delete process.env[name];
+      await assertHerdrStatus("not present");
+
+      const standaloneValues: Record<(typeof herdrEnvironmentNames)[number], string> = {
+        HERDR_ENV: "1",
+        HERDR_SOCKET_PATH: "/tmp/doctor-herdr.sock",
+        HERDR_WORKSPACE_ID: "doctor-workspace",
+        HERDR_TAB_ID: "doctor-tab",
+        HERDR_PANE_ID: "doctor-pane",
+      };
+      for (const name of herdrEnvironmentNames) {
+        process.env[name] = standaloneValues[name];
+        await assertHerdrStatus("invalid");
+        delete process.env[name];
+      }
+
+      for (const name of herdrEnvironmentNames) process.env[name] = standaloneValues[name];
+      const validOutput = await assertHerdrStatus(process.platform === "linux" || process.platform === "darwin" ? "valid" : "invalid");
+      assert.doesNotMatch(validOutput, /doctor-herdr|doctor-workspace|doctor-tab|doctor-pane/);
+    } finally {
+      for (const name of herdrEnvironmentNames) {
+        const value = previousHerdrEnvironment.get(name);
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+  });
+
   test("settles initial root presence only when the session starts idle", async () => {
     const previousDepth = process.env.PI_SUBAGENT_DEPTH;
     const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();

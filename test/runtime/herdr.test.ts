@@ -8,9 +8,13 @@ import { parseHerdrEnvironment as parseSharedHerdrEnvironment } from "../../src/
 import {
 	HerdrSocketClient,
 	HerdrUnknownOutcomeError,
+	closeHerdrPane,
 	createHerdrSplit,
+	createHerdrTab,
 	focusHerdrPane,
 	inspectHerdrPane,
+	inspectHerdrPaneForUx,
+	interruptHerdrPane,
 	isHerdrPublicId,
 	parseHerdrEnvironment,
 	shellQuoteHerdrWrapper,
@@ -39,6 +43,7 @@ async function serverFor(handler: (request: Record<string, unknown>, socket: net
 }
 
 const sourcePane = { workspace_id: "space one", tab_id: "tab/one", pane_id: "pane one", terminal_id: "term-one" };
+const socketGeneration = (socketPath: string) => { const stat = fs.lstatSync(socketPath, { bigint: true }); return { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() }; };
 
 describe("Herdr socket client", () => {
 	test("keeps public ids opaque but bounded and non-control", () => {
@@ -73,7 +78,7 @@ describe("Herdr socket client", () => {
 			const pane = request.method === "pane.get"
 				? (request.params as { pane_id: string }).pane_id === "new pane" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : sourcePane
 				: request.method === "pane.split" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : undefined;
-			const result = request.method === "ping" ? { protocol: 20 } : pane ? { type: "pane_info", pane } : { type: "ok" };
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : pane ? { type: "pane_info", pane } : { type: "ok" };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 		let published = false;
@@ -89,6 +94,59 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 
+	test("creates one unfocused protocol-19/20 child tab through one direct layout.apply", async () => {
+		for (const protocol of [19, 20] as const) {
+			const child = { ...sourcePane, tab_id: `child-tab-${protocol}`, pane_id: `child-pane-${protocol}`, terminal_id: `child-terminal-${protocol}` };
+			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+			const fixture = await serverFor((request, socket) => {
+				calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
+				const pane = request.method === "pane.get" ? (request.params as { pane_id: string }).pane_id === child.pane_id ? child : sourcePane : undefined;
+				const layout = request.params as { root?: { command?: unknown; cwd?: unknown; env?: unknown } };
+				const result = request.method === "ping" ? { type: "pong", protocol }
+					: request.method === "layout.apply" ? { type: "layout_apply", layout: { workspace_id: child.workspace_id, tab_id: child.tab_id, focused_pane_id: child.pane_id, root: { type: "pane", pane_id: child.pane_id, command: layout.root?.command, cwd: layout.root?.cwd, env: layout.root?.env } } }
+					: pane ? { type: "pane_info", pane } : { type: "ok" };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+			const handle = await createHerdrTab({ cwd: "/workspace/task", wrapperPath: "/tmp/private/wrapper.sh", env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id, BASH_ENV: "/hostile/bashrc", NODE_OPTIONS: "--require /hostile.js", LD_PRELOAD: "/hostile.so" } });
+			assert.equal(handle.allocatedTabId, child.tab_id);
+			assert.deepEqual(calls.find((call) => call.method === "layout.apply")?.params, { workspace_id: sourcePane.workspace_id, focus: false, tab_label: "pi-subagent:direct:wrapper.sh", root: { type: "pane", cwd: path.parse("/tmp/private/wrapper.sh").root, command: ["/tmp/private/wrapper.sh"], env: { BASH_ENV: "", ENV: "", NODE_OPTIONS: "", NODE_PATH: "", BUN_OPTIONS: "", LD_PRELOAD: "", LD_LIBRARY_PATH: "", LD_AUDIT: "", DYLD_INSERT_LIBRARIES: "", DYLD_LIBRARY_PATH: "", DYLD_FRAMEWORK_PATH: "" } } });
+			assert.equal(calls.some((call) => call.method === "pane.send_text" || call.method === "pane.close" || call.method === "pane.send_keys"), false);
+			await fixture.close();
+		}
+	});
+
+	test("suppresses automatic interrupt and close after an auto child moves outside its allocated tab, while preserving focus", async () => {
+		const moved = { ...sourcePane, tab_id: "user-tab", pane_id: "moved-child", terminal_id: "child-terminal" };
+		const calls: string[] = [];
+		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : request.method === "pane.get" ? { type: "pane_info", pane: moved }
+				: request.method === "pane.focus" ? { type: "pane_info", pane: moved } : { type: "pane_list", panes: [moved] };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: "child-tab", paneId: "child-pane", terminalId: moved.terminal_id, allocatedTabId: "child-tab", protocol: 20 as const };
+		assert.equal(await interruptHerdrPane(handle), false);
+		assert.equal(await closeHerdrPane(handle), false);
+		assert.equal(await focusHerdrPane(handle), true, "manual focus remains available after ownership transfer");
+		assert.equal(calls.includes("pane.send_keys"), false);
+		assert.equal(calls.includes("pane.close"), false);
+		assert.equal(calls.includes("pane.focus"), true);
+		await fixture.close();
+	});
+
+	test("rejects a split response that reuses the immutable source pane id", async () => {
+		const calls: string[] = [];
+		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
+			const pane = request.method === "pane.split" ? { ...sourcePane, terminal_id: "new-terminal" } : sourcePane;
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : { type: "pane_info", pane };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		await assert.rejects(createHerdrSplit({ cwd: "/tmp", wrapperPath: "/tmp/wrapper.sh", env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id } }), HerdrUnknownOutcomeError);
+		assert.equal(calls.includes("pane.send_text"), false);
+		await fixture.close();
+	});
+
 	test("negotiates protocol 19 and pins it through allocation", async () => {
 		const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 		const fixture = await serverFor((request, socket) => {
@@ -96,7 +154,7 @@ describe("Herdr socket client", () => {
 			const pane = request.method === "pane.get"
 				? (request.params as { pane_id: string }).pane_id === "new pane" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : sourcePane
 				: request.method === "pane.split" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : undefined;
-			const result = request.method === "ping" ? { protocol: 19 } : pane ? { type: "pane_info", pane } : { type: "ok" };
+			const result = request.method === "ping" ? { type: "pong", protocol: 19 } : pane ? { type: "pane_info", pane } : { type: "ok" };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 		const handle = await createHerdrSplit({ cwd: "/tmp", wrapperPath: "/tmp/wrapper.sh", env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id } });
@@ -109,12 +167,35 @@ describe("Herdr socket client", () => {
 		let pings = 0; const calls: string[] = [];
 		const fixture = await serverFor((request, socket) => {
 			calls.push(request.method as string);
-			const result = request.method === "ping" ? { protocol: ++pings === 1 ? 19 : 20 } : { type: "pane_info", pane: sourcePane };
+			const result = request.method === "ping" ? { type: "pong", protocol: ++pings === 1 ? 19 : 20 } : { type: "pane_info", pane: sourcePane };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 		await assert.rejects(createHerdrSplit({ cwd: "/tmp", wrapperPath: "/tmp/wrapper.sh", env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id } }), /protocol changed/);
 		assert.equal(calls.includes("pane.split"), false);
 		await fixture.close();
+	});
+
+	test("rejects every wrong response discriminator, never treating it as query or mutation success", async () => {
+		const cases: Array<[string, boolean]> = [
+			["ping", false], ["pane.get", false], ["pane.list", false], ["pane.split", true], ["pane.focus", true],
+			["pane.send_text", true], ["pane.send_keys", true], ["pane.close", true], ["layout.apply", true],
+		];
+		for (const [method, mutation] of cases) {
+			const fixture = await serverFor((request, socket) => socket.end(`${JSON.stringify({ id: request.id, result: { type: "wrong" } })}\n`));
+			await assert.rejects(new HerdrSocketClient(fixture.socketPath).request(method, {}, { mutation }), (error: unknown) => mutation ? error instanceof HerdrUnknownOutcomeError : error instanceof Error && error.name === "HerdrProtocolError");
+			await fixture.close();
+		}
+	});
+
+	test("does not acknowledge an events subscription with a wrong discriminator", async () => {
+		let reconciled = 0;
+		const fixture = await serverFor((request, socket) => socket.write(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`));
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, reconnectDelayMs: 100, onReconcile: () => { reconciled += 1; } });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.equal(subscription.isHealthy(), false);
+		assert.equal(reconciled, 0);
+		subscription.stop(); await subscription.closed; await fixture.close();
 	});
 
 	test("marks a post-dispatch timeout as an unknown mutating outcome", async () => {
@@ -139,7 +220,7 @@ describe("Herdr socket client", () => {
 					const pane = request.method === "pane.get"
 						? (request.params as { pane_id: string }).pane_id === "new pane" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : sourcePane
 						: request.method === "pane.split" ? { ...sourcePane, pane_id: "new pane", terminal_id: "new-term" } : undefined;
-					const result = request.method === "ping" ? { protocol: 20 } : pane ? { type: "pane_info", pane } : { type: "ok" };
+					const result = request.method === "ping" ? { type: "pong", protocol: 20 } : pane ? { type: "pane_info", pane } : { type: "ok" };
 					socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 				});
 				await assert.rejects(createHerdrSplit({
@@ -152,14 +233,37 @@ describe("Herdr socket client", () => {
 		}
 	});
 
+	test("reads the exact bounded managed Unicode title only as diagnostic UX comparison data", async () => {
+		const title = "worker [depth=1;run=title] · running";
+		const fixture = await serverFor((request, socket) => {
+			const pane = { ...sourcePane, terminal_title_stripped: title, terminal_title: "ignored" };
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		assert.deepEqual(await inspectHerdrPaneForUx(handle), { exists: true, title });
+		await fixture.close();
+	});
+
+	test("rejects unsafe, malformed, and oversized Herdr diagnostic titles", async () => {
+		for (const title of ["bad\u0000title", "bad\u0085title", "bad\u001btitle", "bad\u202etitle", "bad\ud800title", "x".repeat(513)]) {
+			const fixture = await serverFor((request, socket) => {
+				const pane = { ...sourcePane, terminal_title_stripped: title, terminal_title: title };
+				socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`);
+			});
+			const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+			assert.deepEqual(await inspectHerdrPaneForUx(handle), { exists: true, title: undefined });
+			await fixture.close();
+		}
+	});
+
 	test("gates and revalidates exact Herdr focus before mutation", async () => {
 		const calls: string[] = [];
 		const fixture = await serverFor((request, socket) => {
 			calls.push(request.method as string);
-			const result = request.method === "ping" ? { protocol: 20 } : request.method === "pane.get" ? { pane: sourcePane } : { type: "pane_info", pane: sourcePane };
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : { type: "pane_info", pane: sourcePane };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
-		assert.equal(await focusHerdrPane({ socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }), true);
+		assert.equal(await focusHerdrPane({ socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }), true);
 		assert.deepEqual(calls, ["ping", "pane.get", "pane.focus"]);
 		await fixture.close();
 	});
@@ -172,10 +276,10 @@ describe("Herdr socket client", () => {
 				calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
 				const response = request.method === "pane.get"
 					? { id: request.id, error: { code: "pane_not_found", message: "moved" } }
-					: { id: request.id, result: { panes: [moved] } };
+					: { id: request.id, result: { type: "pane_list", panes: [moved] } };
 				socket.end(`${JSON.stringify(response)}\n`);
 			});
-			const handle = { socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol };
+			const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol };
 			assert.deepEqual(await inspectHerdrPane(handle), { exists: true });
 			assert.deepEqual(calls, [{ method: "pane.get", params: { pane_id: sourcePane.pane_id } }, { method: "pane.list", params: {} }]);
 			assert.deepEqual({ workspaceId: handle.workspaceId, tabId: handle.tabId, paneId: handle.paneId }, { workspaceId: moved.workspace_id, tabId: moved.tab_id, paneId: moved.pane_id });
@@ -192,11 +296,11 @@ describe("Herdr socket client", () => {
 			const fixture = await serverFor((request, socket) => {
 				const response = request.method === "pane.get"
 					? { id: request.id, error: { code: "pane_not_found", message: "moved" } }
-					: { id: request.id, result: { panes } };
+					: { id: request.id, result: { type: "pane_list", panes } };
 				socket.end(`${JSON.stringify(response)}\n`);
 			});
-			const handle = { socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol };
-			assert.equal(await inspectHerdrPane(handle), undefined, `protocol ${protocol} ${_name} must remain unknown`);
+			const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol };
+			assert.deepEqual(await inspectHerdrPane(handle), _name === "zero" ? { exists: false } : undefined, `protocol ${protocol} ${_name} classification`);
 			await fixture.close();
 		}
 	});
@@ -208,11 +312,11 @@ describe("Herdr socket client", () => {
 		const fixture = await serverFor((request, socket) => {
 			calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
 			const paneId = (request.params as { pane_id?: string }).pane_id;
-			const result = request.method === "ping" ? { protocol: 20 }
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 }
 				: request.method === "pane.split" ? { type: "pane_info", pane: allocated }
-				: request.method === "pane.get" && paneId === "allocated pane" ? { pane: { ...allocated, terminal_id: "wrong-terminal" } }
-				: request.method === "pane.get" ? { pane: sourcePane }
-				: request.method === "pane.list" ? { panes: [moved] }
+				: request.method === "pane.get" && paneId === "allocated pane" ? { type: "pane_info", pane: { ...allocated, terminal_id: "wrong-terminal" } }
+				: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane }
+				: request.method === "pane.list" ? { type: "pane_list", panes: [moved] }
 				: { type: "ok" };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
@@ -238,7 +342,7 @@ describe("Herdr socket client", () => {
 			}
 			socket.end(`${JSON.stringify({ id: request.id, result: { pane: (request.params as { pane_id: string }).pane_id === moved.pane_id ? moved : sourcePane } })}\n`);
 		});
-		const handle = { socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
 		let reconciled = 0;
 		const subscription = subscribeHerdrPane({ handle, onReconcile: () => { reconciled += 1; } });
 		await new Promise((resolve) => setTimeout(resolve, 40));
@@ -259,7 +363,7 @@ describe("Herdr socket client", () => {
 			if (request.method === "pane.get") paneGets += 1;
 			socket.end(`${JSON.stringify({ id: request.id, result: { pane: sourcePane } })}\n`);
 		});
-		const handle = { socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
 		const subscription = subscribeHerdrPane({ handle, onReconcile: () => undefined });
 		await new Promise((resolve) => setTimeout(resolve, 40));
 		assert.deepEqual({ subscriptions, paneGets }, { subscriptions: 1, paneGets: 1 });
@@ -284,7 +388,7 @@ describe("Herdr socket client", () => {
 			if (request.method === "pane.get") paneGets += 1;
 			socket.end(`${JSON.stringify({ id: request.id, result: { pane: sourcePane } })}\n`);
 		});
-		const handle = { socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
 		const subscription = subscribeHerdrPane({ handle, onReconcile: () => undefined });
 		await Promise.race([recoveredPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("subscription did not reconnect")), 1_000))]);
 		await new Promise((resolve) => setTimeout(resolve, 30));

@@ -2,8 +2,10 @@ import type { TerminalMode } from "../core/types.js";
 import {
 	closeHerdrPane,
 	createHerdrSplit,
+	createHerdrTab,
 	focusHerdrPane,
 	inspectHerdrPane,
+	inspectHerdrPaneForUx,
 	interruptHerdrPane,
 	parseHerdrEnvironment,
 	type HerdrPaneHandle,
@@ -30,7 +32,7 @@ export type InteractivePaneMode = Extract<TerminalMode, "cmux-pane" | "tmux-pane
 
 export interface InteractivePanePlacementDiagnostics {
 	layout: "auto" | "split";
-	placement: "cmux-split" | "cmux-new-surface" | "tmux-split" | "tmux-new-window" | "herdr-split";
+	placement: "cmux-split" | "cmux-new-surface" | "tmux-split" | "tmux-new-window" | "herdr-split" | "herdr-new-tab";
 }
 
 export type InteractivePaneHandle =
@@ -50,6 +52,8 @@ export interface InteractivePaneLaunchOptions {
 	/** Published by the durable allocation callback to release tmux's staged wrapper. */
 	launchGatePath?: string;
 	signal?: AbortSignal;
+	/** Resolved policy; omitted direct callers retain the default auto layout. */
+	layout?: "auto" | "split";
 	/**
 	 * Persist the exact backend allocation before any child wrapper can run.
 	 * Backends must close that newly allocated target if this rejects.
@@ -115,19 +119,24 @@ export const herdrInteractivePaneBackend: InteractivePaneBackend = {
 		return parseHerdrEnvironment(env) ? null : "Herdr pane mode requires HERDR_ENV=1, an absolute HERDR_SOCKET_PATH, and exact workspace/tab/pane IDs.";
 	},
 	async launch(options) {
+		const layout = options.layout ?? "auto";
+		const create = layout === "auto" ? createHerdrTab : createHerdrSplit;
 		return {
 			mode: "herdr-pane",
-			native: await createHerdrSplit({
+			native: await create({
 				cwd: options.cwd,
 				wrapperPath: options.wrapperPath,
 				signal: options.signal,
 				onAllocated: async (native) => await options.onAllocated?.({ mode: "herdr-pane", native }),
 			}),
-			placement: { layout: "split", placement: "herdr-split" },
+			placement: { layout, placement: layout === "auto" ? "herdr-new-tab" : "herdr-split" },
 		};
 	},
 	async inspect(handle) {
 		return handle.mode === "herdr-pane" ? await inspectHerdrPane(handle.native) : undefined;
+	},
+	async inspectForUx(handle) {
+		return handle.mode === "herdr-pane" ? await inspectHerdrPaneForUx(handle.native) : undefined;
 	},
 	async interrupt(handle) {
 		return handle.mode === "herdr-pane" && await interruptHerdrPane(handle.native);

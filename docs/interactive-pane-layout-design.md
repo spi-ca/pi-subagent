@@ -14,6 +14,7 @@ interactive subagent의 **실행 동시성**과 **동시에 화면을 차지하�
 |---|---|---|
 | cmux | 하나의 전용 오른쪽 pane 안에 child별 terminal surface를 tab으로 적층 | 최초 한 번만 split |
 | tmux | child별 detached window에 단일 pane 생성 | parent window를 split하지 않음 |
+| Herdr | child별 unfocused 새 tab의 strict root pane | 현재 tab을 split하거나 focus하지 않음 |
 
 기존의 child별 오른쪽 split 방식은 명시적인 `split` 호환 모드로 남긴다. `auto`에서 tiled grid, process queue, inline overflow, nested tmux 실행은 사용하지 않는다.
 
@@ -94,9 +95,9 @@ tmux: tmux split-window -h -t <source-pane>
 | 용어 | 의미 |
 |---|---|
 | run | 하나의 subagent 실행과 그 lifecycle artifact 집합 |
-| allocation | run 하나에 할당된 실제 cmux surface 또는 tmux pane |
-| container | allocation을 담는 cmux pane 또는 tmux window |
-| source | 위임을 시작한 parent Pi의 cmux surface 또는 tmux pane |
+| allocation | run 하나에 할당된 실제 cmux surface, tmux pane 또는 Herdr pane |
+| container | allocation을 담는 cmux pane, tmux window 또는 Herdr tab |
+| source | 위임을 시작한 parent Pi의 cmux surface, tmux pane 또는 Herdr pane |
 | shared pane | cmux에서 sibling/descendant surface를 tab으로 담는 pane |
 | layout coordinator | 동시 launch를 직렬화하고 container를 선택·재사용하는 parent-process 객체 |
 | legacy split | run마다 source를 `right` split하는 현재 방식 |
@@ -128,10 +129,10 @@ PI_SUBAGENT_PANE_LAYOUT=auto|split
 
 기본값은 `auto`다.
 
-| 값 | cmux | tmux |
-|---|---|---|
-| `auto` | shared pane + surface tabs | detached window per child |
-| `split` | child별 `new-split right` | child별 `split-window -h` |
+| 값 | cmux | tmux | Herdr |
+|---|---|---|---|
+| `auto` | shared pane + surface tabs | detached window per child | child별 unfocused `layout.apply` 새 tab의 strict root pane |
+| `split` | child별 `new-split right` | child별 `split-window -h` | child별 `pane.split right` |
 
 잘못된 값은 extension 초기화 단계에서 actionable error로 거부한다. backend launch 뒤 조용히 다른 layout이나 inline으로 fallback하지 않는다.
 
@@ -166,13 +167,13 @@ runner
   │   └─ committed allocation의 shared-container state adopt/release
   └─ detached V2 broker
       ├─ strict launch-intent의 placement request 검증
-      ├─ pre-commit native allocation (split / new-surface / new-window)
+      ├─ pre-commit native allocation (cmux split/new-surface, tmux split/new-window, Herdr split/new-tab)
       ├─ exact allocation.json durable publish
       └─ decision 경쟁과 commit 전 exact rollback
 ```
 
 - coordinator는 정책, serialization, placement 선택, shared state의 adopt/release만 소유한다. pre-commit allocation을 직접 실행하거나 durable authority를 publish하지 않는다.
-- broker는 **유일한 pre-commit allocator 및 durable publisher**다. 요청된 cmux split/new-surface 또는 tmux new-window/split을 실행하고 canonical target을 `allocation.json`에 먼저 publish한다.
+- broker는 **유일한 pre-commit allocator 및 durable publisher**다. 요청된 cmux split/new-surface, tmux new-window/split 또는 Herdr new-tab/split을 실행하고 canonical target을 `allocation.json`에 먼저 publish한다.
 - parent는 `launch-intent.json`에 strict V2 layout placement request를 넣는다. broker의 commit 뒤에만 allocation을 읽고 request와 정확히 일치하는 target을 active registry와 coordinator state에 adopt한다. mismatch, 누락 또는 malformed field는 command target으로 쓰지 않고 recovery/retain 경로로 보낸다.
 - coordinator state는 process-local 배치 최적화일 뿐 reaper authority가 아니다. startup reaper는 coordinator 없이 durable exact allocation만 descendant-first로 처리한다.
 
@@ -262,18 +263,27 @@ broker는 source socket/server/session 관계와 returned session/window/pane/PI
 
 명시적 `split` compatibility mode만 `tmux-split` + exact source-pane container를 요청한다. 그 경우 broker가 existing `split-window -h` allocation path를 쓴다. lifecycle은 stable pane ID와 server/pane-PID fingerprint로 inspect, Escape, exact `kill-pane`을 수행하며 session/window 전체를 닫지 않는다.
 
-## 9. legacy `split` mode
+## 9. Herdr `auto` 상세 설계
+
+Herdr `auto`는 protocol 19/20 공통 `layout.apply`를 정확히 한 번 사용합니다. request는 immutable source workspace와 일치하고 `tab_id`는 **없으며**, `focus: false`, bounded diagnostic `tab_label`, 하나의 root pane과 `[wrapperPath]` direct exact argv를 가집니다. root pane의 initial `cwd`는 trusted filesystem root이고, direct wrapper는 gate 통과 뒤 validated effective task/workspace `cwd`로 이동한 후 Pi를 시작합니다. 이 순서는 gate 전에 프로젝트 `bunfig.toml` 또는 Bun preload가 broker/verifier에 적용되는 일을 막습니다.
+
+socket owner/mode, exact `HERDR_*` environment binding 및 protocol 19/20 fail-closed 점검 절차는 [cmux/tmux/Herdr 실제 Pi TUI 설계의 Herdr troubleshooting](./cmux-pi-tui-design.md#102-herdr-fail-closed-점검)을 따른다. broker는 mutation 전에 `herdr-workspace.workspaceId`가 immutable source workspace와 정확히 같은지 확인한다. `layout_apply.layout.root`의 strict discriminator·workspace·new-tab·root-pane·argv/cwd binding을 먼저 확인하고, 그 root pane을 `pane.get`으로 조회해 terminal binding을 확정할 때만 allocation을 수용한다. command line을 typed/display하지 않으며 auto의 gate rejection은 조용하다. 별도 tab 생성 RPC, `pane.send_text`, parent `pane.send_keys`/`pane.close`, auto rollback은 사용하지 않는다.
+
+`split`은 `herdr-source.workspaceId/tabId/paneId/terminalId` 네 값 모두가 immutable source와 정확히 같을 때만 source pane의 기존 오른쪽 split 호환 경로를 사용하고 `pane.send_text`로 wrapper를 delivery한다. 따라서 이 legacy mode는 숨겨진 command text나 atomic terminal binding을 약속하지 않는다. target pane ID가 immutable source pane ID 또는 terminal identity로 직전에 rebound한 current source pane ID와 같거나, terminal ID가 immutable source terminal ID와 같거나, tab/workspace binding이 맞지 않으면 dispatched mutation의 unknown outcome으로 fail-closed한다. label 또는 topology diff로 target을 채택하지 않는다. durable allocation에는 child tab provenance를 남긴다. auto의 post-launch cancellation은 authenticated child bridge의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용한다. present/unknown/hung child는 recovery/manual cleanup 상태와 late watcher를 유지하고, bounded `pane.list`가 confirmed absence를 보일 때만 retire한다. terminal이 이후 다른 tab으로 rebind되면 자동 interrupt/close와 reaper close는 보류하며, 수동 focus도 protocol과 current terminal binding을 다시 검증한 뒤에만 가능하다.
+
+## 10. legacy `split` mode
 
 `split`은 기존 화면 동작을 보존하는 explicit compatibility policy다.
 
 ```text
 cmux: source surface 오른쪽에 run별 split
 tmux: source pane 오른쪽에 run별 split
+Herdr: source pane 오른쪽에 run별 split
 ```
 
 반복 split으로 parent 폭이 줄어드는 것은 이 mode의 의도된 trade-off다. `auto` capability 부재, tiled 재배치, queue, inline fallback을 자동으로 선택하지 않는다.
 
-## 10. V2 lifecycle protocol과의 결합
+## 11. V2 lifecycle protocol과의 결합
 
 layout 변경은 result/completion channel을 바꾸지 않는다.
 
@@ -283,14 +293,14 @@ control channel   = state/completion/parent lease sidecar
 terminal backend  = broker allocation + parent committed lifecycle
 ```
 
-### 10.1 backward-compatible strict V2 layout schema migration
+### 11.1 backward-compatible strict V2 layout schema migration
 
 obsolete `LaunchRecordV1`에 optional placement/container diagnostics를 덧붙이는 방식은 사용하지 않는다. V2 parser는 **두 개의 exact branch**를 지원한다.
 
 1. 현재의 legacy V2 intent/allocation처럼 layout field가 전혀 없는 record는 backward compatibility를 위해 `split` allocation으로 해석한다. legacy record의 existing strict key set은 넓히지 않는다.
 2. 새 layout-aware V2 intent/allocation은 `layout`, `placement`, `container`를 모두 가지며, 각 discriminant별 exact key set과 canonical identity 관계를 만족해야 한다. optional generic field, mixed backend field, `*_ref`, partial container는 거부한다.
 
-구현 schema는 다음 strict discriminated branch를 enforce한다. 아래는 layout portion만 보인 **축약 excerpt**이며, 전체 base field·legacy branch·parser의 canonical source는 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts)다. 이 excerpt를 완전한 object shape로 취급하면 안 된다.
+구현 schema는 다음 strict discriminated branch를 enforce한다. 아래는 layout portion만 보인 **축약 excerpt**이며, parent/reaper parser는 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts), detached broker parser는 [`src/runtime/pane-launch-broker.mjs`](../src/runtime/pane-launch-broker.mjs)가 각각 source of truth다. 두 parser와 broker/parent binding의 직접 증거는 `test/runtime/run-protocol.test.ts` 및 `test/runtime/pane-launch-broker.test.ts`다. 이 excerpt를 완전한 object shape로 취급하면 안 된다.
 
 ```ts
 type LayoutModeV2 = "auto" | "split";
@@ -311,6 +321,16 @@ type TmuxSessionContainerV2 = {
   kind: "tmux-session"; socketPath?: string; serverPid: number;
   sessionId: string; sourceWindowId: string;
 };
+type HerdrSourceContainerV2 = {
+  kind: "herdr-source"; workspaceId: string; tabId: string;
+  paneId: string; terminalId: string;
+};
+type HerdrWorkspaceContainerV2 = {
+  kind: "herdr-workspace"; workspaceId: string;
+};
+type HerdrTabContainerV2 = {
+  kind: "herdr-tab"; workspaceId: string; tabId: string;
+};
 
 type LayoutPlacementRequestV2 =
   | { layout: LayoutModeV2; placement: "cmux-split";
@@ -320,7 +340,11 @@ type LayoutPlacementRequestV2 =
   | { layout: "split"; placement: "tmux-split";
       container: TmuxSourcePaneContainerV2 }
   | { layout: "auto"; placement: "tmux-new-window";
-      container: TmuxSessionContainerV2 };
+      container: TmuxSessionContainerV2 }
+  | { layout: "split"; placement: "herdr-split";
+      container: HerdrSourceContainerV2 }
+  | { layout: "auto"; placement: "herdr-new-tab";
+      container: HerdrWorkspaceContainerV2 };
 
 type LayoutAllocationFieldsV2 =
   | { layout: LayoutModeV2; placement: "cmux-split";
@@ -332,10 +356,14 @@ type LayoutAllocationFieldsV2 =
         sessionId: string; windowId: string; paneId: string; panePid: number } }
   | { layout: "auto"; placement: "tmux-new-window";
       container: { kind: "tmux-window"; socketPath?: string; serverPid: number;
-        sessionId: string; windowId: string; paneId: string; panePid: number } };
+        sessionId: string; windowId: string; paneId: string; panePid: number } }
+  | { layout: "split"; placement: "herdr-split";
+      container: HerdrTabContainerV2 }
+  | { layout: "auto"; placement: "herdr-new-tab";
+      container: HerdrTabContainerV2 };
 ```
 
-새 layout-aware `LaunchIntentV2`는 source identity와 `LayoutPlacementRequestV2`가 backend/mode에 맞는 위의 정확한 branch일 때만 valid다. 예를 들어 cmux `auto`의 root 첫 allocation은 `cmux-split`/`cmux-source`, existing shared pane은 `cmux-new-surface`/`cmux-pane`, nested source stacking은 `cmux-new-surface`/`cmux-source-pane`이어야 한다. tmux `auto`는 `tmux-new-window`/`tmux-session`만, `split`은 `tmux-split`/`tmux-source-pane`만 허용한다.
+새 layout-aware `LaunchIntentV2`는 source identity와 `LayoutPlacementRequestV2`가 backend/mode에 맞는 위의 정확한 branch일 때만 valid다. 예를 들어 cmux `auto`의 root 첫 allocation은 `cmux-split`/`cmux-source`, existing shared pane은 `cmux-new-surface`/`cmux-pane`, nested source stacking은 `cmux-new-surface`/`cmux-source-pane`이어야 한다. tmux `auto`는 `tmux-new-window`/`tmux-session`만, `split`은 `tmux-split`/`tmux-source-pane`만 허용한다. Herdr `auto`는 `herdr-new-tab`/`herdr-workspace`만 허용하며 workspace는 immutable source와 같아야 한다. Herdr `split`은 `herdr-split`/`herdr-source`만 허용하며 workspace/tab/pane/terminal 전체가 immutable source와 같아야 한다.
 
 새 layout-aware `AllocationRecordV2`는 matching `LayoutAllocationFieldsV2`를 포함한다. broker가 request의 `layout`/`placement`을 반복하고, `container`에는 exact created container만 durable 기록한다 (cmux pane UUID 또는 tmux socket/server/session/window/pane fingerprint). target identity는 기존처럼 child surface 또는 pane fingerprint다. parent adoption은 intent request와 allocation의 backend, layout, placement, container relation, target을 모두 비교한다.
 
@@ -343,20 +371,20 @@ type LayoutAllocationFieldsV2 =
 
 `DecisionV2`, committed `launch.json`, `launch.gate`는 layout diagnostics를 위한 optional field를 추가하지 않는다. 이 artifact들은 현재처럼 commit/dependency/ownership 또는 start authorization에 실제 필요한 exact fields만 가진 strict record로 유지한다. `launch`과 `gate`가 allocation path/mode chain으로 layout-aware allocation에 의존하는 것으로 충분하다.
 
-### 10.2 정상 종료, cancel, crash
+### 11.2 정상 종료, cancel, crash
 
 1. `agent_settled` completion 확인 및 final session drain
 2. parent가 `coordinator.release`를 호출하고, release가 shared serialized lock을 획득한 뒤 exact committed handle을 close
 3. release가 close outcome을 처리한 뒤에도 lock을 유지한 채 terminal/absent가 확인된 matching adopted allocation만 active set에서 제거하고, 마지막 surface면 state를 retire; 확인되지 않은 close는 recovery state로 retain
 4. secret/task/wrapper artifact 정리
 
-shutdown과 completion이 경쟁해도 close/release는 idempotent하다. cancel은 exact allocations에 Escape를 보낸 뒤 grace period 후 exact close한다. cmux shared pane, tmux session/window, user container에는 broad close를 보내지 않는다.
+shutdown과 completion이 경쟁해도 close/release는 idempotent하다. cmux/tmux과 Herdr `split` cancel은 exact allocations에 Escape를 보낸 뒤 grace period 후 exact close한다. Herdr `auto`는 인증된 child bridge의 cooperative `ctx.abort()`/`ctx.shutdown()`만 요청하며 parent `pane.send_keys`, `pane.close`, rollback 또는 reaper mutation을 하지 않는다. cmux shared pane, tmux session/window, Herdr tab, user container에는 broad close를 보내지 않는다.
 
-parent crash 또는 startup reaper는 coordinator 상태를 읽지 않는다. immutable allocation/intent dependency chain에서 exact target만 찾고 descendant-first로 cleanup한다. 같은 cmux pane을 공유하는 records도 surface별로 닫으며, tmux는 socket/server/pane/pane-PID fingerprint가 모두 맞을 때만 닫는다. layout migration 뒤에도 reaper는 coordinator-independent exact allocation reaper로 남는다.
+parent crash 또는 startup reaper는 coordinator 상태를 읽지 않는다. immutable allocation/intent dependency chain에서 exact target만 찾고 descendant-first로 cleanup한다. 같은 cmux pane을 공유하는 records도 surface별로 닫으며, tmux는 socket/server/pane/pane-PID fingerprint가 모두 맞을 때만 닫는다. Herdr auto child가 present/unknown/hung이면 recovery/manual cleanup과 late watcher를 유지하고 confirmed terminal absence에서만 retire한다. layout migration 뒤에도 reaper는 coordinator-independent exact allocation reaper로 남는다.
 
-## 11. race와 failure 처리
+## 12. race와 failure 처리
 
-### 11.1 동시 최초 launch
+### 12.1 동시 최초 launch
 
 요구사항:
 
@@ -368,7 +396,7 @@ N개의 root sibling이 동시에 allocate
 
 첫 broker split이 실패하면 parent coordinator는 shared state를 adopt/publish하지 않는다. 대기 중인 request는 다음 순서에서 재시도하거나 동일한 actionable error를 받는다. 부분 allocation 또는 handle을 성공으로 반환하지 않는다.
 
-### 11.2 command delivery 실패
+### 12.2 command delivery 실패
 
 broker allocation 뒤 parent gate/respawn 또는 staged verifier의 wrapper 시작 확인에 실패하면 해당 committed allocation만 exact cleanup한다.
 
@@ -377,19 +405,19 @@ broker allocation 뒤 parent gate/respawn 또는 staged verifier의 wrapper 시�
 
 기존 sibling과 사용자 container를 rollback 대상으로 삼지 않는다.
 
-### 11.3 첫 child가 먼저 종료
+### 12.3 첫 child가 먼저 종료
 
 첫 child surface가 shared pane을 만들었다는 이유로 container owner가 되지 않는다. 먼저 종료되면 그 surface만 닫고 나머지 surface는 계속 실행한다.
 
-### 11.4 마지막 child 종료와 새 launch 경쟁
+### 12.4 마지막 child 종료와 새 launch 경쟁
 
 `coordinator.release`는 exact last allocation을 닫기 전에 allocation과 같은 serialized lock을 획득하고, close outcome·active-set 제거·empty-state retire까지 이를 유지한다. 따라서 대기 중인 allocate는 stale last-surface `paneId`를 관찰하거나 재사용할 수 없다. release 뒤 새 allocation은 live active state만 사용하고, retire된 state를 관찰하면 새 shared pane을 만든다. 남아 있는 pane이 user surface를 담는지 판별하거나 그 pane을 되살리는 경쟁 상태를 만들지 않는 보수적 정책이다.
 
-### 11.5 reload
+### 12.5 reload
 
 `/reload` 또는 session shutdown은 active run shutdown을 먼저 수행한다. coordinator는 모든 allocation release 뒤 메모리 state를 비운다. reload 후 이전 process의 in-memory pane ID를 재사용하지 않는다.
 
-### 11.6 사용자의 수동 layout 변경
+### 12.6 사용자의 수동 layout 변경
 
 사용자는 실행 중 다음 작업을 할 수 있다.
 
@@ -406,18 +434,19 @@ broker allocation 뒤 parent gate/respawn 또는 staged verifier의 wrapper 시�
 4. fingerprint가 달라지면 ID 재사용 가능성으로 간주해 close하지 않는다.
 5. shared container state가 실제 tree와 다르면 state를 무효화하고 다음 launch에서 재구성한다.
 
-## 12. UX 세부 정책
+## 13. UX 세부 정책
 
-### 12.1 focus
+### 13.1 focus
 
 자동 launch는 parent focus를 유지한다.
 
 - cmux: `--focus false`
 - tmux: `new-window -d`
+- Herdr: `layout.apply` 또는 `pane.split`의 `focus: false`
 
-background 실행 여부와 focus 여부는 별개다. foreground subagent 호출도 child TUI로 focus를 강제 이동하지 않는다.
+background 실행 여부와 focus 여부는 별개다. foreground subagent 호출도 child TUI로 focus를 강제 이동하지 않는다. `/subagents focus`는 negotiated cmux 또는 protocol-gated Herdr의 exact rebound child pane에만 사용하며, tmux는 fail-closed한다.
 
-### 12.2 cross-backend pane title (구현됨)
+### 13.2 cross-backend pane title (구현됨)
 
 wrapper는 cmux/tmux 모두에서 printable-ASCII base title `<agent> [depth=<n>;run=<prefix>]`를 사용한다. effective child environment와 `cwd`를 설치한 직후, tree permit이 child를 `STOP`할 수 **전에** wrapper가 `<base> · queued` OSC title을 발행한다. 이어 child bridge가 정확히 `ready`, `running`, `waiting`, `returning`, `failed` suffix를 쓴다. 즉 허용 lifecycle suffix 전체는 `queued`, `ready`, `running`, `waiting`, `returning`, `failed`이며, abort는 `waiting`으로 표시한다. 최종 title은 control 문자를 제거한 96자 이내이며 task, prompt, secret, cwd를 포함하지 않는다.
 
@@ -431,19 +460,19 @@ pane/surface title은 lifecycle/cleanup authority가 아니다. title 설정 또
 
 현재 production tmux broker는 **window 이름**을 `subagent:<agent-token>:<8-char-run-prefix>`로 allocation 시 한 번 설정한다. pane title의 lifecycle 갱신은 이 이름을 바꾸지 않으며 user rename도 복구하지 않는다. 이름은 cleanup authority가 아니고 exact tmux fingerprint만 기존 lifecycle 판단에 사용한다. strict protocol 전달, legacy recovery와 검증 상태는 [안정적인 tmux window 이름 설계 및 구현](./tmux-window-naming-design.md)에 기록한다.
 
-### 12.3 어떤 child가 보이는가
+### 13.3 어떤 child가 보이는가
 
 cmux shared pane에서는 첫 surface가 기본 선택 상태일 수 있고, 이후 `--focus false` surface는 tab으로만 추가된다. 자동 tab 전환은 사용자의 화면을 흔들 수 있으므로 하지 않는다.
 
 tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status line이나 choose-tree로 child window를 선택한다.
 
-### 12.4 `pi-cmux`와의 관계
+### 13.4 `pi-cmux`와의 관계
 
 각 cmux surface에서 로드된 `pi-cmux` sidebar/progress/log는 그대로 동작할 수 있다. surface별 status key를 사용하므로 stacked surface끼리 충돌하지 않는다.
 
 `agent_end` 알림과 flash가 병렬 child마다 발생할 수 있는 문제는 layout과 별개다. 이 억제는 더 이상 후속 항목이 아니다. `inherit` child에는 `pi-subagent`가 검토된 `subagent-child-v1` profile로 `PI_CMUX_NOTIFY_LEVEL=disabled`와 `PI_CMUX_SIDEBAR_FLASH=disabled`를 주입하며, parent 알림은 유지한다. `managed` child는 inherited `pi-cmux` 자체를 로드하지 않는다. 자세한 package 경계와 profile은 [`pi-subagent`와 `pi-cmux` 연동 가이드](./pi-cmux-integration.md)를 따른다.
 
-## 13. 보안과 안전
+## 14. 보안과 안전
 
 1. task, prompt, API key를 title이나 CLI metadata에 넣지 않는다.
 2. wrapper path는 기존 shell quoting 규칙을 유지한다.
@@ -454,15 +483,15 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 7. malformed JSON/ID는 launch 실패로 처리하고 command target으로 사용하지 않는다.
 8. 새 strict layout intent/allocation artifact도 기존 private run directory 권한과 immutable publish 규칙을 유지한다.
 
-## 14. 구현과 검증 상태
+## 15. 구현과 검증 상태
 
 `auto`와 `split` runtime wiring은 구현됐다. 이 문서의 historical layout PASS는 M0 performance benchmark나 JSONL/completion/wrapper polling 제거의 증거가 아니다. title은 별도 gated real tmux/cmux smoke로 검증한다. 현재 source에는 strict V2 layout branch·binding, cmux `new-surface`/topology, tmux same-session `new-window`/fingerprint, detached broker의 allocation-first publish, process-global coordinator의 adopt/release lock, runner의 gate·exact cleanup, CLI/env policy 전파가 연결돼 있다. `auto`는 기본값이고 `split`은 명시적 호환 모드다.
 
 이 구현 사실과 stress/acceptance 증거는 구분한다. static scope는 `test/runtime/interactive-layout.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/cmux.test.ts`, `test/runtime/tmux.test.ts`, `test/runtime/pane-launch-broker.test.ts` 및 관련 runner/reaper test가 다룬다. cmux와 tmux `auto` live layout smoke는 모두 **PASS**했지만, tmux는 3 top-level + parent/2 nested의 제한된 scenario만 다룬다.
 
-## 15. 실제 테스트 범위와 미검증 acceptance
+## 16. 실제 테스트 범위와 미검증 acceptance
 
-### 15.1 static test에서 직접 확인한 범위
+### 16.1 static test에서 직접 확인한 범위
 
 - layout resolver의 `auto` 기본값, CLI > env 우선순위와 exact lowercase 거부
 - coordinator root `auto`의 N=`1/6/16/17/50` deterministic stress: split 정확히 1회, `new-surface` N-1회, unique target, staggered reverse release와 final active count 0
@@ -471,10 +500,10 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 - nested source-pane request, explicit `split`, stale shared pane 무효화, exact allocation adopt, release/allocate race와 retry/idempotence
 - `mapConcurrent` N=`17/50`: worker 최대 16, 결과 index 보존, abort 뒤 dequeue 없음
 - cmux의 strict canonical topology·surface lifecycle과 tmux의 complete-row topology/fingerprint·same-session window primitive
-- broker/protocol의 strict layout branch, allocation-first publish, source/target alias 거부와 exact cleanup binding
+- broker/protocol의 strict layout branch, allocation-first publish, Herdr allocated-tab provenance 보존, source/target alias 거부와 exact cleanup binding
 - runner public lifecycle seam과 deterministic fake backend component harness: foreground/background/parallel-chain overlap, cancel·external-close·shutdown·reload 이후 source/sentinel 비변형 및 exact target cleanup
 
-### 15.2 아직 주장하지 않는 범위
+### 16.2 아직 주장하지 않는 범위
 
 다음은 구현 wiring 또는 설계 목표이지만 현재 automated/live acceptance로 확인됐다고 주장하지 않는다.
 
@@ -486,11 +515,11 @@ tmux에서는 parent window를 계속 표시한다. 사용자는 tmux status lin
 
 현재 broker launch closure에는 fake backend 주입 seam이 없으므로, M1은 public lifecycle helper와 coordinator를 결합한 deterministic component harness까지만 검증한다. 위 항목들은 별도 broker/runtime integration 또는 명시적으로 gated live acceptance가 추가되기 전까지 **planned/unverified**다.
 
-### 15.3 live layout evidence
+### 16.3 live layout evidence
 
-cmux와 tmux `auto` smoke는 19절의 제한된 scenario에서 각각 **PASS**했다. tmux는 top-level child 3개와 nested parent + descendant 2개를 검증했으며, 이는 6개 coordinator unit concurrency나 50 task/16 초과 stress의 증거가 아니다. 기존 tmux crash/reaper **PASS**는 parent crash와 exact reaper cleanup의 별도 acceptance로, 이 layout 검증을 대체하지 않는다.
+cmux와 tmux `auto` smoke는 20절의 제한된 scenario에서 각각 **PASS**했다. tmux는 top-level child 3개와 nested parent + descendant 2개를 검증했으며, 이는 6개 coordinator unit concurrency나 50 task/16 초과 stress의 증거가 아니다. 기존 tmux crash/reaper **PASS**는 parent crash와 exact reaper cleanup의 별도 acceptance로, 이 layout 검증을 대체하지 않는다.
 
-## 16. acceptance criteria 상태
+## 17. acceptance criteria 상태
 
 | 기준 | 상태 |
 |---|---|
@@ -500,36 +529,36 @@ cmux와 tmux `auto` smoke는 19절의 제한된 scenario에서 각각 **PASS**�
 | process-global coordinator, broker-only pre-commit allocation, strict layout records, release lock 및 shutdown fence | ✓ |
 | child별 exact surface/pane lifecycle·reaper cleanup과 shared container/window/session broad-close 방지 | ✓ |
 | schema/primitives/broker/coordinator/runner/auth/reaper 테스트 | ✓ |
-| cmux live layout smoke | PASS — 2026-07-20, 19절 evidence |
+| cmux live layout smoke | PASS — 2026-07-20, 20절 evidence |
 | tmux `auto` layout live smoke | PASS — 2026-07-20; 3 top-level + parent/2 nested limited smoke. 이전 tmux crash/reaper PASS는 별도 acceptance. |
 
-## 17. 보류한 대안
+## 18. 보류한 대안
 
-### 17.1 tiled grid
+### 18.1 tiled grid
 
 동시에 여러 child를 볼 수 있지만 parent를 포함한 3~5개의 Pi TUI가 모두 작아진다. tmux는 `select-layout tiled`를 지원하지만 cmux와 동작 차이가 크고 nested 문제도 남는다. 기본안에서 제외한다.
 
-### 17.2 visible pane 수 제한과 queue
+### 18.2 visible pane 수 제한과 queue
 
 pane 수는 제한되지만 task 실행도 대기해 병렬 위임의 장점을 잃는다. layout 때문에 scheduler 의미를 바꾸지 않는다.
 
-### 17.3 overflow를 inline/background로 실행
+### 18.3 overflow를 inline/background로 실행
 
 사용자가 요청하거나 환경이 결정한 interactive mode를 layout 압박 때문에 조용히 바꾸면 결과 관찰과 오류 semantics가 달라진다. 사용하지 않는다.
 
-### 17.4 tmux preview slot과 `swap-pane`
+### 18.4 tmux preview slot과 `swap-pane`
 
 child는 detached window에서 실행하고 하나의 side preview pane과 `swap-pane`으로 선택 child를 교체할 수 있다. UX는 좋을 수 있지만 container 이동, focus, pane fingerprint와 cleanup race가 크게 늘어난다. auto v1 안정화 뒤 별도 설계로 검토한다.
 
-### 17.5 cmux child별 workspace
+### 18.5 cmux child별 workspace
 
 각 child가 전체 크기를 얻지만 workspace가 빠르게 늘고 parent와 child의 시각적 연관성이 약해진다. cmux가 이미 pane 내부 surface tab을 제공하므로 기본안으로 선택하지 않는다.
 
-### 17.6 side pane 내부에 nested tmux 실행
+### 18.6 side pane 내부에 nested tmux 실행
 
 backend를 중첩해 PTY, keybinding, resize, cancel과 orphan 처리를 이중화한다. 사용하지 않는다.
 
-## 18. Phase 0: cmux CLI probe — GO readiness
+## 19. Phase 0: cmux CLI probe — GO readiness
 
 Phase 0 gated live probe 결과는 semantic cmux `0.64.20` 지원 fixture로 [`test/fixtures/cmux-layout-contract-v1.json`](../test/fixtures/cmux-layout-contract-v1.json)에 고정했다. 따라서 cmux CLI contract readiness는 **GO**다.
 
@@ -539,9 +568,9 @@ Phase 0 gated live probe 결과는 semantic cmux `0.64.20` 지원 fixture로 [`t
 | allocation identity | 두 response가 direct top-level canonical `workspace_id`, `pane_id`, `surface_id`를 가지며 workspace/pane은 같고 surface는 다름 |
 | 마지막 surface retire 전제 | `last_surface_pane`이 `removed` |
 
-fixture는 sanitized response envelope과 direct canonical identity 관계를 parser test가 검증하는 durable Phase 0 evidence다. fixture guard는 `bun test test/runtime/cmux.test.ts`이며, fixture를 새 live probe 결과로 교체하는 유일한 경로는 `PI_SUBAGENT_CMUX_LAYOUT_PHASE0=1 bun run acceptance:cmux-layout-phase0`이다. 이 fixture와 strict V2 schema, cmux/tmux backend primitive, detached broker, parent coordinator, 설정·runner 연결은 production `auto` runtime에 모두 반영됐다. live 범위는 19절의 cmux 및 제한된 tmux **PASS**를 따른다.
+fixture는 sanitized response envelope과 direct canonical identity 관계를 parser test가 검증하는 durable Phase 0 evidence다. fixture guard는 `bun test test/runtime/cmux.test.ts`이며, fixture를 새 live probe 결과로 교체하는 유일한 경로는 `PI_SUBAGENT_CMUX_LAYOUT_PHASE0=1 bun run acceptance:cmux-layout-phase0`이다. 이 fixture와 strict V2 schema, cmux/tmux backend primitive, detached broker, parent coordinator, 설정·runner 연결은 production `auto` runtime에 모두 반영됐다. live 범위는 20절의 cmux 및 제한된 tmux **PASS**를 따른다.
 
-## 19. Live layout smoke 기록
+## 20. Live layout smoke 기록
 
 > 각 backend subsection의 ID는 해당 backend의 2026-07-20 live smoke snapshot/evidence에서 온 것이다. 검증용 temporary nested agent들은 모두 제거했으며 패키지에 bundled agent는 없다.
 
@@ -562,3 +591,7 @@ fixture는 sanitized response envelope과 direct canonical identity 관계를 pa
 - broker 또는 acceptance process, tmux log leak은 남지 않았으며 temporary `.pi`도 제거됐다.
 
 이 evidence는 tmux `auto` detached-window placement와 exact cleanup의 제한된 live smoke다. `50` task 또는 `>16` active allocation stress, cancel, reload는 검증하지 않았고, `split`은 unit/static 검증 범위에만 있다. 2026-07-20의 tmux crash/reaper acceptance **PASS**는 parent crash와 exact reaper cleanup의 별도 증거로, 이 layout smoke를 대체하지 않는다.
+
+### Herdr 진단 메타데이터와 race 경계
+
+auto-tab label은 범위가 제한된 구조화 진단 정보이며 ownership handle이 아닙니다. ownership은 exact terminal ID와 socket generation으로 계속 결정됩니다. Herdr title readback은 identity inspection 뒤에만, 그리고 bounded printable인 경우에만 `terminal_title_stripped`를 먼저 사용하고 그다음 `terminal_title`을 사용합니다. raw title은 UX 진단 경로 밖으로 절대 나가지 않습니다. Herdr의 pane/terminal revision 관찰은 upstream에서 atomic하지 않으므로 movement/revision race는 destructive retry로 해소하지 않고 unknown으로 유지합니다.

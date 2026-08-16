@@ -183,11 +183,11 @@ done
 ```text
 index.ts                    — Pi 패키지 manifest가 참조하는 확장 진입점
 src/core/                   — 에이전트 발견, 신뢰/경로 검사, 스키마, 체인 헬퍼, 이벤트 파싱, 공통 타입
-src/runtime/                — 자식 runner, process-local scheduler와 durable tree permit/source ownership, cmux/tmux adapter, one-shot `pane-launch-broker.mjs`, 공통 interactive-pane backend, child bridge, lifecycle/broker protocol, session tail, inline 경로
+src/runtime/                — 자식 runner, process-local scheduler와 durable tree permit/source ownership, cmux/tmux/Herdr adapter, one-shot `pane-launch-broker.mjs`, 공통 interactive-pane backend, child bridge, lifecycle/broker protocol, session tail, inline 경로
 src/integration/            — `pi-cmux`/`pi-cmux-presence` 연동용 duplicated wire contract와 root-only presence producer
 src/ui/                     — subagent 도구 호출과 결과를 위한 TUI 렌더링
 test/core/                  — 발견, 신뢰, 메타데이터, 체인 동작, 공통 타입 단위 테스트
-test/runtime/               — runner, cmux/tmux/backend/bridge/protocol/reaper, 인증 전파, CLI 파싱 테스트
+test/runtime/               — runner, cmux/tmux/Herdr backend/bridge/protocol/reaper, 인증 전파, CLI 파싱 테스트
 test/integration/           — presence producer, fake-adapter e2e 같은 통합 테스트
 test/ui/                    — src/ui/ TUI 렌더링 테스트
 test/entrypoint/            — 공개 확장/도구 진입점 계약 테스트
@@ -204,10 +204,10 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 
 ## 개발 설계 문서
 
-- [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — legacy Zellij bridge를 제거하고 cmux/tmux 기반 실제 Pi TUI, V2 one-shot broker, session-backed result channel, orphan/recovery 방지와 opt-in acceptance runbook을 기록한 설계와 구현 기준
+- [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — legacy Zellij bridge를 제거하고 cmux/tmux/Herdr 기반 실제 Pi TUI, V2 one-shot broker, session-backed result channel, Herdr fail-closed 점검, orphan/recovery 방지와 opt-in acceptance runbook을 기록한 설계와 구현 기준
 - [`pi-cmux-integration.md`](./pi-cmux-integration.md) — `pi-subagent`와 `pi-cmux`의 역할 경계 및 운영 정책
 - [`pi-cmux-presence-integration.md`](./pi-cmux-presence-integration.md) — root-only generic presence producer, duplicated wire contract, replay/privacy/authority 경계와 focused 검증
-- [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — 구현된 `auto`/`split` layout의 설계·정적 테스트 범위와 live 검증 상태. cmux와 tmux `auto` smoke는 2026-07-20에 모두 **PASS**했으며, tmux smoke는 제한된 3 top-level + parent/2 nested 범위입니다. 기존 tmux crash/reaper **PASS**는 별도 acceptance입니다.
+- [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — cmux/tmux/Herdr의 구현된 `auto`/`split` layout, strict authority 경계와 정적 테스트 범위. cmux와 tmux `auto` smoke는 2026-07-20에 모두 **PASS**했으며, Herdr는 strict fake-socket/broker·protocol test 범위이고 tmux smoke는 제한된 3 top-level + parent/2 nested 범위입니다. 기존 tmux crash/reaper **PASS**는 별도 acceptance입니다.
 - [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — Linux/macOS transport 설계와 구현 상태. cmux control-socket v2, private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거, optional events hint와 stable-minimum gated `tmux -C`가 구현됐습니다. Windows는 forced-inline입니다.
 - [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — transport 설계 다음에 읽는 companion 문서. Phase 0A cache/preflight/UI/fork·async I/O, hardened lease, Phase 5 scheduler, Phase 6 exact tail/signature와 conservative Phase 7 reaper와 managed-child opt-in profile이 구현됐고 managed-child default 전환은 남아 있습니다.
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 foreground assistant/tool/summary usage persistence, interactive verified-final replay와 advisory preview의 구분, provider-backed installed-Pi acceptance, background completion usage 회계의 명시적 비목표
@@ -226,3 +226,7 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 - 전체 구현 목록보다 안정적인 개념을 우선합니다.
 - 예외를 추가하기보다 모순을 제거합니다.
 - 중복된 명령 목록은 최소화하고 `package.json`과 맞춥니다.
+
+### Herdr 테스트 경계
+
+Herdr 테스트에는 fake owner-only Unix socket을 사용하며 live mutating Herdr acceptance test는 실행하지 않습니다. 집중 검증 근거는 `bun test test/runtime/herdr.test.ts test/runtime/pane-launch-broker.test.ts test/runtime/interactive-reaper.test.ts test/runtime/runner-interactive.test.ts test/runtime/run-protocol.test.ts`입니다. protocol 19/20 workspace-scoped `layout.apply` 한 번(`tab_id` 없음, `focus: false`, root direct wrapper argv), strict `layout_apply.layout.root` 뒤의 `pane.get` terminal binding, 조용한 gate rejection, auto에서 `pane.send_text`와 parent mutation을 사용하지 않는 동작, 최종 task/workspace `cwd` 이전의 trusted-root bootstrap, title/label 진단, 명시적인 terminal `present|absent|unknown` 상태, socket 교체, generation 없는 legacy record의 fail-closed 동작을 다룹니다.

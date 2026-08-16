@@ -118,7 +118,7 @@ describe("stale interactive run reaper", () => {
 		);
 	});
 
-	test("uses bounded terminal_id fallback in stale Herdr cleanup and retains an unproven post-close absence", async () => {
+	test("uses bounded terminal_id fallback in generation-bound stale Herdr cleanup and recognizes a complete empty list as absent", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-herdr-")); tempDirs.push(root);
 		const runId = "herdr-delivery-unknown", socketPath = path.join(root, "herdr.sock");
 		let exists = true, requests = 0, closedPaneId: string | undefined;
@@ -131,22 +131,24 @@ describe("stale interactive run reaper", () => {
 			const response = request.method === "pane.get"
 				? (!exists || request.params.pane_id === pane.pane_id
 					? { id: request.id, error: { code: "pane_not_found", message: "missing" } }
-					: { id: request.id, result: { pane: movedPane } })
+					: { id: request.id, result: { type: "pane_info", pane: movedPane } })
 				: request.method === "pane.list"
-					? { id: request.id, result: { panes: exists ? [movedPane] : [] } }
-					: { id: request.id, result: request.method === "ping" ? { protocol: 20 } : { type: "ok" } };
+					? { id: request.id, result: { type: "pane_list", panes: exists ? [movedPane] : [] } }
+					: { id: request.id, result: request.method === "ping" ? { type: "pong", protocol: 20 } : { type: "ok" } };
 			socket.end(`${JSON.stringify(response)}\n`);
 		}));
 		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const generation = { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() };
 		try {
 			const stateRoot = path.join(root, "state");
 			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
 			const intent = {
 				version: 2, runId, parentSessionId: "p", parentPid: 42, parentStartedAt: 1, terminalMode: "herdr-pane",
-				source: { socketPath, workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 }, childSessionFile: paths.childSessionPath, createdAt: 1,
+				source: { socketPath, workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20, generation }, childSessionFile: paths.childSessionPath, createdAt: 1,
 				brokerNonce: "a".repeat(43), runtimePath: process.execPath, runtimeInterpreterPath: process.execPath, backendPath: process.execPath, brokerEntrypoint: process.execPath,
 			};
-			const allocation = { version: 2, runId, terminalMode: "herdr-pane", target: { socketPath, workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 }, allocatedAt: 1 };
+			const allocation = { version: 2, runId, terminalMode: "herdr-pane", target: { socketPath, workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20, generation }, allocatedAt: 1 };
 			await Promise.all([
 				writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`),
 				writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`),
@@ -155,10 +157,81 @@ describe("stale interactive run reaper", () => {
 				writePrivateFile(paths.launchDeliveryUnknownPath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, recordedAt: 1 })}\n`),
 			]);
 			const outcome = await reapStaleInteractiveRuns({ rootDir: stateRoot, now: 100, staleAfterMs: 1, isProcessIdentityAlive: () => false, scheduleCleanup: () => undefined });
-			assert.equal(outcome.reaped.includes(runId), false, "an empty fallback list after close is unknown, not absence proof");
+			assert.equal(outcome.reaped.includes(runId), true, "a complete empty fallback list after close is absence proof");
 			assert.equal(exists, false);
 			assert.equal(closedPaneId, movedPane.pane_id, "reaper must rebind the moved terminal before cleanup mutation");
 			assert.ok(requests <= 12, `bounded Herdr recovery probes: ${requests}`);
+		} finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+	});
+
+	test("retains an auto Herdr child moved outside its allocated tab without interrupting or closing it", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-herdr-")); tempDirs.push(root);
+		const runId = "herdr-auto-tab-moved", socketPath = path.join(root, "herdr.sock");
+		const allocated = { workspace_id: "workspace", tab_id: "child-tab", pane_id: "child", terminal_id: "terminal" };
+		const moved = { ...allocated, tab_id: "user-tab", pane_id: "moved-child" };
+		const calls: string[] = [];
+		const server = net.createServer((socket) => socket.once("data", (chunk) => {
+			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string; params: { pane_id?: string } };
+			calls.push(request.method);
+			const response = request.method === "ping" ? { id: request.id, result: { type: "pong", protocol: 20 } }
+				: request.method === "pane.get" ? { id: request.id, result: { type: "pane_info", pane: moved } }
+					: request.method === "pane.list" ? { id: request.id, result: { type: "pane_list", panes: [moved] } }
+						: { id: request.id, result: { type: "ok" } };
+			socket.end(`${JSON.stringify(response)}\n`);
+		}));
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const generation = { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() };
+		try {
+			const stateRoot = path.join(root, "state");
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const intent = {
+				version: 2, runId, parentSessionId: "p", parentPid: 42, parentStartedAt: 1, terminalMode: "herdr-pane",
+				source: { socketPath, workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20, generation },
+				layout: "auto", placement: "herdr-new-tab", tabLabel: `pi-subagent:${runId}:agent`, container: { kind: "herdr-workspace", workspaceId: "workspace" }, childSessionFile: paths.childSessionPath, workingDirectory: paths.runDir, createdAt: 1,
+				brokerNonce: "a".repeat(43), runtimePath: process.execPath, runtimeInterpreterPath: process.execPath, backendPath: process.execPath, brokerEntrypoint: process.execPath,
+			};
+			const allocation = { version: 2, runId, terminalMode: "herdr-pane", layout: "auto", placement: "herdr-new-tab", container: { kind: "herdr-tab", workspaceId: "workspace", tabId: allocated.tab_id }, target: { socketPath, workspaceId: allocated.workspace_id, tabId: allocated.tab_id, paneId: allocated.pane_id, terminalId: allocated.terminal_id, protocol: 20, generation }, allocatedAt: 1 };
+			await Promise.all([
+				writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`),
+				writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`),
+				writePrivateFile(paths.decisionPath, `${JSON.stringify({ version: 2, runId, kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath })}\n`),
+				writePrivateFile(paths.launchPath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: 1, ownership: "parent-owned" })}\n`),
+			]);
+			const outcome = await reapStaleInteractiveRuns({ rootDir: stateRoot, now: 100, staleAfterMs: 1, isProcessIdentityAlive: () => false, scheduleCleanup: () => undefined });
+			assert.equal(outcome.reaped.includes(runId), false);
+			assert.equal(calls.includes("ping"), false, "new-tab cleanup is read-only and does not negotiate mutation authority");
+			assert.equal(calls.includes("pane.get"), true, "the moved terminal is revalidated before retention");
+			assert.equal(calls.includes("pane.send_keys"), false);
+			assert.equal(calls.includes("pane.close"), false);
+		} finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+	});
+
+	test("retains a generation-less Herdr record without contacting or mutating its pane", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-herdr-")); tempDirs.push(root);
+		const runId = "herdr-generation-less", socketPath = path.join(root, "herdr.sock");
+		let requests = 0;
+		const server = net.createServer(() => { requests += 1; });
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		try {
+			const stateRoot = path.join(root, "state");
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const intent = {
+				version: 2, runId, parentSessionId: "p", parentPid: 42, parentStartedAt: 1, terminalMode: "herdr-pane",
+				source: { socketPath, workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 },
+				childSessionFile: paths.childSessionPath, createdAt: 1, brokerNonce: "a".repeat(43), runtimePath: process.execPath, runtimeInterpreterPath: process.execPath, backendPath: process.execPath, brokerEntrypoint: process.execPath,
+			};
+			const allocation = { version: 2, runId, terminalMode: "herdr-pane", target: { socketPath, workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 }, allocatedAt: 1 };
+			await Promise.all([
+				writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`),
+				writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`),
+				writePrivateFile(paths.decisionPath, `${JSON.stringify({ version: 2, runId, kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath })}\n`),
+				writePrivateFile(paths.launchPath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: 1, ownership: "parent-owned" })}\n`),
+			]);
+			const outcome = await reapStaleInteractiveRuns({ rootDir: stateRoot, now: 100, staleAfterMs: 1, isProcessIdentityAlive: () => false, scheduleCleanup: () => undefined });
+			assert.equal(outcome.reaped.includes(runId), false);
+			assert.equal(requests, 0);
+			assert.equal(fs.existsSync(paths.runDir), true, "generation-less diagnostics remain retained");
 		} finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
 	});
 

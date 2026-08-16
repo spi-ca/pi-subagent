@@ -1,26 +1,61 @@
 flowchart TB
-  subgraph Launch[placement and allocation]
+  R[runner]
+
+  subgraph Cmux[cmux auto only: process-local shared-pane coordination]
     direction LR
-    R[runner] --> C[coordinator]
-    C --> I[strict intent]
-    I --> B[detached broker]
+    C[cmux coordinator] --> CI[strict cmux placement intent]
+    CI --> CP[shared-pane request<br/>split 또는 new-surface]
   end
 
-  subgraph Ownership[durable ownership]
+  subgraph Herdr[Herdr: direct layout / explicit legacy split]
     direction LR
-    D[exact allocation] --> V[commit verification]
-    V --> H[adopted child handle]
+    HI[strict Herdr intent<br/>workspace · source pane · protocol · socket generation]
+    HT[broker: layout.apply 1회<br/>auto · tab_id 없음 · unfocused new tab<br/>root pane direct wrapper argv]
+    HB[strict layout_apply.layout.root<br/>→ pane.get terminal binding]
+    HS[broker: pane.split → pane.send_text<br/>split · source right pane]
   end
 
-  X[cmux or tmux backend]
-  Z[reaper]
+  subgraph Tmux[tmux: detached-broker placement]
+    direction LR
+    TI[strict tmux intent<br/>session · source pane · generation]
+    TA[broker: new-window -d<br/>auto · detached child window]
+    TS[broker: split-window -h -d<br/>split · source right pane]
+  end
 
-  B -->|allocate| X
-  B -->|publish first| D
-  C -->|adopt and release| H
-  H -->|exact close| X
-  D -->|recovery authority| Z
-  Z -->|exact cleanup| X
+  B[detached broker<br/>only pre-commit allocator]
+  A[exact allocation.json<br/>durable publish first]
+  V[runner strict record verification]
+  D[adopted child handle]
+  G[gate-verified wrapper<br/>effective task/workspace cwd → Pi]
+  Z[reaper / cancellation]
+  X[exact allocated target only]
+  HC[Herdr auto post-launch<br/>authenticated child ctx.abort / ctx.shutdown]
+  HR[present · unknown · hung<br/>retain recovery/manual cleanup + late watcher]
+
+  R -->|cmux launch| C
+  R -->|Herdr launch| HI
+  R -->|tmux launch| TI
+  CP --> B
+  HI --> B
+  TI --> B
+  B -->|cmux: validate and allocate| A
+  B -->|Herdr auto| HT
+  HT --> HB
+  B -->|Herdr split| HS
+  B -->|tmux auto| TA
+  B -->|tmux split| TS
+  HB --> A
+  HS --> A
+  TA --> A
+  TS --> A
+  A --> V
+  V --> D
+  D --> G
+  G -->|cmux/tmux/split interrupt / close| X
+  D -->|Herdr auto cancel| HC
+  HC --> HR
+  A -->|recovery authority| Z
+  Z -->|exact cleanup, never auto Herdr mutation| X
 
   classDef authority stroke-width:3px
-  class D authority
+  class A authority

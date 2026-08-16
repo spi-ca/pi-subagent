@@ -12,9 +12,9 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 - **병렬 실행** — 서로 독립적인 작업을 여러 하위 에이전트로 동시에 실행합니다. Linux/macOS에서는 로컬 round-robin queue와 durable tree-wide permit authority가 root parent와 모든 nested child의 활성 실행 합계를 기본 16개로 제한합니다. root parent 자체도 durable `ACTIVE` lease 하나를 사용하므로 tree cap은 child 실행 수와 별개입니다. Windows는 tree-wide hard cap을 지원하지 않으며 process-local scheduling으로 fallback합니다.
 - **체인 실행** — 앞 단계의 요약을 다음 단계에 넘기며 순차 워크플로를 구성합니다.
 - **백그라운드 실행** — 선택적 최상위 `background: true`가 호출을 즉시 반환시키고, 완료/실패/취소 결과는 나중에 자동 steer 메시지로 전달됩니다.
-- **실행 환경 자동 선택** — cmux/tmux에서는 실제 child Pi TUI를 열며, 기본 `auto` layout은 cmux의 shared right pane 또는 tmux의 child별 detached window를 사용합니다. `split`은 child별 split 호환 모드입니다.
+- **실행 환경 자동 선택** — cmux, tmux, Herdr에서는 실제 interactive child Pi TUI를 엽니다. 기본 `auto`는 cmux의 shared right pane, tmux의 child별 detached window, Herdr의 focus를 옮기지 않는 child별 새 tab root pane을 사용합니다. `split`은 child별 오른쪽 split 호환 모드입니다.
 - **선택적 managed child profile** — `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`는 inherited extension을 끄고 nested delegation 및 interactive lifecycle에 필요한 extension만 명시적으로 로드합니다.
-- **Parent TUI 관리 UX** — `/subagents` 하나로 상태/preview/상세 진단, exact-ID 취소, negotiated cmux focus, session keep와 durable promote를 제공하고 footer에 compact 집계를 표시합니다.
+- **Parent TUI 관리 UX** — `/subagents` 하나로 상태/preview/상세 진단, exact-ID 취소, negotiated cmux 또는 exact rebound Herdr focus, session keep와 durable promote를 제공하고 footer에 compact 집계를 표시합니다.
 - **선택적 generic presence** — root parent는 dependency 없이 `pi-presence:update:v1`/`pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1` 재발행 요청을 수신합니다. 설치된 `pi-cmux-presence`가 같은 Pi process에서 이를 선택적으로 소비할 수 있으며, presence는 observer 출력이고 lifecycle authority가 아닙니다.
 - **런타임 보호 장치** — 최대 위임 깊이와 순환 위임 방지로 재귀 실행 위험을 줄입니다.
 - **프로젝트 에이전트 신뢰 확인** — `.pi/agents`의 프로젝트 로컬 에이전트는 Pi가 현재 프로젝트를 trusted로 판정하거나 exact canonical root가 승인된 세션에서만 사용합니다.
@@ -166,11 +166,11 @@ CLI > 환경 변수 > 신뢰된 프로젝트 파일 > 전역 파일 > 내장 기
 `PI_SUBAGENT_TERMINAL_MODE`가 정확한 값이면 auto-detection보다 항상 우선합니다. 지정하지 않았을 때 확장이 현재 환경을 보고 다음 순서로 자동 선택합니다.
 
 - cmux 내부: `cmux-pane` — 기본 `auto`에서는 root sibling이 하나의 새 오른쪽 pane 안의 surface를 공유하고, nested descendant는 정확한 source pane에 surface로 쌓입니다.
-- Herdr 내부: `herdr-pane` — cmux가 아니고 owner-only Unix socket의 exact workspace/tab/pane binding이 검증될 때 child별 오른쪽 split을 만듭니다. 설치된 Herdr v0.8.0의 protocol 19와 preview protocol 20의 공통 socket subset을 지원합니다.
+- Herdr 내부: `herdr-pane` — cmux가 아니고 owner-only Unix socket의 exact workspace/tab/pane/terminal binding이 검증될 때 기본 `auto`는 parent focus를 유지한 채 child마다 새 tab의 strict root pane에서 실행하고, `split`은 child별 오른쪽 split 호환 모드입니다. 설치된 Herdr v0.8.0의 protocol 19와 preview protocol 20의 공통 socket subset을 지원합니다.
 - tmux 내부: `tmux-pane` — cmux와 Herdr가 모두 아니면 child마다 같은 session의 detached window를 사용합니다.
 - 그 외 환경: `inline`
 
-따라서 명시적 `PI_SUBAGENT_TERMINAL_MODE`가 항상 최우선이고, 자동 감지는 **cmux > Herdr > tmux > inline** 순입니다. Herdr 식별자가 불완전하거나 검증되지 않으면 tmux 또는 inline으로 안전하게 계속합니다.
+따라서 명시적 `PI_SUBAGENT_TERMINAL_MODE`가 항상 최우선이고, 자동 감지는 **cmux > Herdr > tmux > inline** 순입니다. Herdr 식별자가 불완전하면 tmux 또는 inline 감지를 계속하지만, Herdr를 선택한 뒤 socket/binding/protocol/strict allocation 검증이 실패하면 다른 backend나 inline으로 fallback하지 않고 fail-closed합니다.
 
 ![Runtime execution modes and layout](docs/diagram/runtime-execution-modes.png)
 
@@ -178,9 +178,9 @@ _2x PNG · [SVG](docs/diagram/runtime-execution-modes.svg) · [Mermaid source](d
 
 `pi-cmux`는 위 실행 환경 선택이나 child surface lifecycle에 필요하지 않은 선택적 workflow UX 확장입니다. 설치하지 않아도 cmux child Pi TUI, 결과 반환, 취소와 cleanup이 동작합니다. `pi-cmux`의 child별 sidebar·command/review workflow가 필요하면 해당 package를 사용하고, root Pi와 subagent 집계의 socket-only status/progress/attention만 필요하면 별도 `pi-cmux-presence`를 선택할 수 있습니다. 차이와 검증 방법은 [`pi-cmux` 연동 가이드](docs/pi-cmux-integration.md)와 [`pi-cmux-presence` 연동](docs/pi-cmux-presence-integration.md)을 참고하세요.
 
-`PI_SUBAGENT_TERMINAL_MODE=inline|cmux-pane|tmux-pane|herdr-pane`는 terminal mode의 유일한 명시적 override이며, Windows에서는 무시되고 항상 `inline`입니다. `--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`는 별도 layout 설정으로 CLI > 환경 변수 > 기본 `auto` 순입니다. 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
+`PI_SUBAGENT_TERMINAL_MODE=inline|cmux-pane|tmux-pane|herdr-pane`는 terminal mode의 유일한 명시적 override이며, Windows에서는 무시되고 항상 `inline`입니다. `--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`는 별도 layout 설정으로 CLI > 환경 변수 > 기본 `auto` 순입니다. 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. Herdr의 기본 `auto`는 child마다 unfocused 새 tab의 root pane에서 실행하고, `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
 
-interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달하고 정확한 surface/pane만 닫습니다. parent 취소 또는 session shutdown은 parent-owned target에 Escape를 보낸 뒤 exact surface/pane을 닫습니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
+interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달합니다. cmux/tmux과 Herdr `split`은 exact surface/pane만 Escape 후 닫지만, Herdr `auto`는 인증된 child의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용하고 present/unknown/hung terminal은 recovery/manual cleanup과 late watcher로 보존합니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
 
 ### 위임 보호 장치
 
@@ -239,3 +239,7 @@ bun run ci
 ## 라이선스
 
 MIT. 자세한 내용은 [`LICENSE`](LICENSE)와 [`NOTICE`](NOTICE)를 참고하세요.
+
+### Herdr 안전 경계
+
+Herdr 지원은 live mutating acceptance가 아니라 strict fake-socket 테스트로 검증됩니다. `auto`는 protocol 19/20의 workspace-scoped `layout.apply` 한 번으로 `tab_id` 없이 unfocused 새 tab의 root pane에 wrapper direct argv를 시작하고, strict `layout_apply.layout.root` 뒤 `pane.get` terminal binding만 수용합니다. `pane.send_text`로 command line을 입력·표시하지 않으며 gate rejection은 조용합니다. auto post-launch 취소는 인증된 child의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용하므로 parent는 `pane.send_keys`/`pane.close`/rollback/reaper mutation을 보내지 않습니다. auto-tab label과 title은 diagnostic-only이고 lifecycle authority는 generation-bound socket과 exact terminal identity입니다.

@@ -904,6 +904,13 @@ export function registerChildBridge(
 		setRuntimeTitle(ctx, "ready");
 		await phase0ProofClient?.start();
 		lifecycleClient = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath).catch(() => null);
+		lifecycleClient?.setControlHandler(async (command) => {
+			if (command !== "abort" || terminal) return;
+			// Authenticated parent control is cooperative: the bridge owns the
+			// child abort, durable completion, and session shutdown in that order.
+			ctx.abort();
+			await finish(ctx, "aborted", "parent-control", "surface-closed");
+		});
 		await writeState("idle", "session_start").catch(reportBridgeError);
 		await startChecker(ctx, monotonicNow()).catch(reportBridgeError); // initial check is a hard gate
 		if (!terminal) scheduleChecker(ctx); // an initial orphan must not create a timer

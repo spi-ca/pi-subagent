@@ -25,13 +25,38 @@ const HERDR_RECONNECT_MIN_MS = 100;
 const HERDR_RECONNECT_MAX_MS = 5_000;
 /** A reconciliation list must remain a bounded recovery operation. */
 const HERDR_MAX_LISTED_PANES = 128;
+/** Every consumed Herdr response has the schema's exact tagged-union arm. */
+const HERDR_RESULT_TYPES: Readonly<Record<string, string>> = Object.freeze({
+	ping: "pong", "pane.get": "pane_info", "pane.list": "pane_list",
+	"pane.split": "pane_info", "pane.focus": "pane_info",
+	"pane.send_text": "ok", "pane.send_keys": "ok", "pane.close": "ok",
+	"layout.apply": "layout_apply",
+});
+const HERDR_MAX_TAB_LABEL_BYTES = 128;
+function defaultHerdrTabLabel(wrapperPath: string): string {
+	const slug = path.basename(wrapperPath).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63) || "agent";
+	return `pi-subagent:direct:${slug}`;
+}
+function safeHerdrTabLabel(value: unknown, fallback: string): string {
+	const label = typeof value === "string" ? value : fallback;
+	if (Buffer.byteLength(label, "utf8") > HERDR_MAX_TAB_LABEL_BYTES || !/^pi-subagent:[A-Za-z0-9._-]+:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(label)) throw new Error("Herdr tab label is not a bounded structured diagnostic label.");
+	return label;
+}
 
-export interface HerdrPaneHandle {
+export interface HerdrSocketGeneration {
+	/** Decimal bigint stat fields; numeric conversion can lose identity bits. */
+	socketDev: string;
+	socketIno: string;
+}
+
+export interface HerdrPaneHandle extends HerdrSocketGeneration {
 	workspaceId: string;
 	tabId: string;
 	paneId: string;
 	/** Stable across pane moves; pane_id is deliberately not used as identity. */
 	terminalId: string;
+	/** Immutable child-tab provenance for auto layout cleanup. */
+	allocatedTabId?: string;
 	/** Immutable ping result; every mutation rechecks this exact revision. */
 	protocol: HerdrProtocolVersion;
 	socketPath: string;
@@ -53,13 +78,25 @@ export class HerdrProtocolError extends Error {
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 
 /** Check the owner-only local authority socket immediately before connecting. */
-export function assertStrictHerdrSocket(socketPath: string): fs.Stats {
+export function assertStrictHerdrSocket(socketPath: string): fs.BigIntStats {
 	if (!isHerdrSocketPath(socketPath) || (process.platform !== "linux" && process.platform !== "darwin")) throw new Error("Herdr pane mode requires an absolute normalized Unix-domain socket on Linux or macOS.");
-	const stat = fs.lstatSync(socketPath);
-	if (!stat.isSocket() || stat.isSymbolicLink() || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0) throw new Error("HERDR_SOCKET_PATH is not an owner-only Unix-domain socket.");
+	const stat = fs.lstatSync(socketPath, { bigint: true });
+	if (!stat.isSocket() || stat.isSymbolicLink() || (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid())) || (stat.mode & 0o077n) !== 0n) throw new Error("HERDR_SOCKET_PATH is not an owner-only Unix-domain socket.");
 	return stat;
 }
-function sameSocket(left: fs.Stats, right: fs.Stats): boolean { return left.dev === right.dev && left.ino === right.ino && right.isSocket() && !right.isSymbolicLink(); }
+function sameSocket(left: fs.BigIntStats, right: fs.BigIntStats): boolean { return left.dev === right.dev && left.ino === right.ino && right.isSocket() && !right.isSymbolicLink(); }
+function socketGeneration(stat: fs.BigIntStats): HerdrSocketGeneration { return { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() }; }
+function isSocketGeneration(value: Partial<HerdrSocketGeneration>): value is HerdrSocketGeneration {
+	return typeof value.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev)
+		&& typeof value.socketIno === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketIno);
+}
+/** Capture the owner-only socket identity once; all durable Herdr authority uses it. */
+export function captureHerdrSocketGeneration(socketPath: string): HerdrSocketGeneration { return socketGeneration(assertStrictHerdrSocket(socketPath)); }
+function assertHerdrSocketGeneration(socketPath: string, expected: Partial<HerdrSocketGeneration>): fs.BigIntStats {
+	const stat = assertStrictHerdrSocket(socketPath);
+	if (!isSocketGeneration(expected) || socketGeneration(stat).socketDev !== expected.socketDev || socketGeneration(stat).socketIno !== expected.socketIno) throw new Error("HERDR_SOCKET_PATH generation changed or is unbound.");
+	return stat;
+}
 function safeRequestId(): string { return `pi-subagent:${crypto.randomUUID()}`; }
 /** Avoid shell parsing while producing the exact POSIX command sent to Herdr. */
 export function shellQuoteHerdrWrapper(wrapperPath: string): string {
@@ -68,15 +105,34 @@ export function shellQuoteHerdrWrapper(wrapperPath: string): string {
 }
 
 /** Protocol payloads consistently nest the authoritative pane at one of these locations. */
-function parsePane(value: unknown, protocol: HerdrProtocolVersion): HerdrPaneHandle | null {
+function parsePane(value: unknown, protocol: HerdrProtocolVersion): Omit<HerdrPaneHandle, keyof HerdrSocketGeneration> | null {
 	if (!isRecord(value) || !isHerdrPublicId(value.workspace_id) || !isHerdrPublicId(value.tab_id) || !isHerdrPublicId(value.pane_id) || !isHerdrPublicId(value.terminal_id)) return null;
 	return { workspaceId: value.workspace_id, tabId: value.tab_id, paneId: value.pane_id, terminalId: value.terminal_id, protocol, socketPath: "" };
 }
-function paneFromSnapshot(value: unknown, protocol: HerdrProtocolVersion): HerdrPaneHandle | null {
+function paneFromSnapshot(value: unknown, protocol: HerdrProtocolVersion): Omit<HerdrPaneHandle, keyof HerdrSocketGeneration> | null {
 	if (!isRecord(value)) return null;
 	return parsePane(value.pane, protocol) ?? parsePane(value, protocol) ?? (isRecord(value.agent) ? parsePane(value.agent.pane, protocol) : null) ?? (isRecord(value.session) ? parsePane(value.session.pane, protocol) : null);
 }
-function bindPane(handle: HerdrPaneHandle, observed: HerdrPaneHandle | null): HerdrPaneHandle | null {
+/** Strict direct-layout acknowledgement. Herdr creates one new tab whose sole
+ * root pane is also focused; terminal identity is obtained only from pane.get. */
+function layoutAppliedRootPane(value: unknown, workspaceId: string, sourceTabId: string, wrapperPath: string, cwd: string): { tabId: string; paneId: string } | null {
+	const layout = isRecord(value) && isRecord(value.layout) ? value.layout : null;
+	const root = layout && isRecord(layout.root) ? layout.root : null;
+	if (!isRecord(value) || value.type !== "layout_apply" || !layout
+		|| layout.workspace_id !== workspaceId || !isHerdrPublicId(layout.tab_id) || layout.tab_id === sourceTabId
+		|| !isHerdrPublicId(layout.focused_pane_id) || !root || root.type !== "pane" || !isHerdrPublicId(root.pane_id)
+		|| layout.focused_pane_id !== root.pane_id || root.cwd !== cwd
+		|| !Array.isArray(root.command) || root.command.length !== 1 || root.command[0] !== wrapperPath) return null;
+	return { tabId: layout.tab_id, paneId: root.pane_id };
+}
+
+/** Explicitly clear startup/injection hooks before any shell or JS starts. */
+export const HERDR_DIRECT_STARTUP_ENV = Object.freeze({
+	BASH_ENV: "", ENV: "", NODE_OPTIONS: "", NODE_PATH: "", BUN_OPTIONS: "",
+	LD_PRELOAD: "", LD_LIBRARY_PATH: "", LD_AUDIT: "", DYLD_INSERT_LIBRARIES: "",
+	DYLD_LIBRARY_PATH: "", DYLD_FRAMEWORK_PATH: "",
+});
+function bindPane(handle: HerdrPaneHandle, observed: Omit<HerdrPaneHandle, keyof HerdrSocketGeneration> | null): HerdrPaneHandle | null {
 	if (!observed || observed.terminalId !== handle.terminalId) return null;
 	// This intentionally mutates the live registry handle. A move changes its
 	// address, not its lifecycle identity; all later inspect/focus/close calls
@@ -87,9 +143,9 @@ function bindPane(handle: HerdrPaneHandle, observed: HerdrPaneHandle | null): He
 
 /** Strict, one-request-per-connection NDJSON client. It never retries mutations. */
 export class HerdrSocketClient {
-	constructor(readonly socketPath: string, readonly timeoutMs = HERDR_DEFAULT_TIMEOUT_MS) {}
+	constructor(readonly socketPath: string, readonly timeoutMs = HERDR_DEFAULT_TIMEOUT_MS, readonly generation?: HerdrSocketGeneration) {}
 	async request(method: string, params: Record<string, unknown>, options: { mutation?: boolean; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
-		const before = assertStrictHerdrSocket(this.socketPath); const id = safeRequestId(); const line = `${JSON.stringify({ id, method, params })}\n`;
+		const before = this.generation ? assertHerdrSocketGeneration(this.socketPath, this.generation) : assertStrictHerdrSocket(this.socketPath); const id = safeRequestId(); const line = `${JSON.stringify({ id, method, params })}\n`;
 		if (Buffer.byteLength(line, "utf8") > HERDR_MAX_LINE_BYTES) throw new Error("Herdr request exceeds the strict wire limit.");
 		return await new Promise<Record<string, unknown>>((resolve, reject) => {
 			let socket: net.Socket | undefined; let settled = false; let dispatched = false; let received = Buffer.alloc(0);
@@ -106,7 +162,7 @@ export class HerdrSocketClient {
 				socket = net.createConnection({ path: this.socketPath });
 				socket.once("connect", () => {
 					try {
-						const after = assertStrictHerdrSocket(this.socketPath);
+						const after = this.generation ? assertHerdrSocketGeneration(this.socketPath, this.generation) : assertStrictHerdrSocket(this.socketPath);
 						if (!sameSocket(before, after)) return finish(new HerdrProtocolError("HERDR_SOCKET_PATH changed while connecting."));
 						dispatched = true;
 						socket!.write(line, (error) => { if (error) finish(uncertain(`Herdr request write failed: ${error.message}`)); });
@@ -126,8 +182,9 @@ export class HerdrSocketClient {
 						&& Object.keys(response.error).length === 2 && typeof response.error.code === "string" && typeof response.error.message === "string") {
 						return finish(new HerdrRequestError(response.error.code, response.error.message, method));
 					}
+					const expectedType = HERDR_RESULT_TYPES[method];
 					if (Object.keys(response).length !== 2 || !Object.hasOwn(response, "result") || !isRecord(response.result)
-						|| options.mutation && typeof response.result.type !== "string") return finish(uncertain("Herdr response envelope or result is invalid."));
+						|| expectedType !== undefined && response.result.type !== expectedType) return finish(uncertain("Herdr response envelope or result discriminator is invalid."));
 					finish(undefined, response.result);
 				});
 				socket.once("error", (error) => finish(uncertain(`Herdr socket error: ${error.message}`)));
@@ -148,7 +205,7 @@ export class HerdrSocketClient {
 		if (!isHerdrPublicId(paneId)) return undefined;
 		try {
 			const pane = paneFromSnapshot(await this.request("pane.get", { pane_id: paneId }), protocol);
-			return pane ? { ...pane, socketPath: this.socketPath } : undefined;
+			return pane ? { ...pane, socketPath: this.socketPath, ...(this.generation ?? {}) } as HerdrPaneHandle : undefined;
 		} catch (error) {
 			if (error instanceof HerdrRequestError && error.code === "pane_not_found") return null;
 			throw error;
@@ -161,29 +218,40 @@ export class HerdrSocketClient {
 			if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return undefined;
 			const panes = result.panes.map((value) => parsePane(value, protocol));
 			return panes.every((pane): pane is HerdrPaneHandle => pane !== null)
-				? panes.map((pane) => ({ ...pane, socketPath: this.socketPath })) : undefined;
+				? panes.map((pane) => ({ ...pane, socketPath: this.socketPath, ...(this.generation ?? {}) } as HerdrPaneHandle)) : undefined;
 		} catch { return undefined; }
 	}
 }
 
+export type HerdrTerminalClassification = { state: "present"; handle: HerdrPaneHandle } | { state: "absent" } | { state: "unknown" };
 /**
- * Reconcile by stable terminal_id and update a moved pane's current address.
- * A missing/reused public pane ID never proves absence: a bounded global list
- * must identify exactly one terminal, otherwise state is unknown.
+ * Classify an owned terminal without treating a failed lookup as absence.
+ * Only a complete bounded global pane.list with zero terminal_id matches is
+ * absence proof; all malformed, failed, duplicate, and replacement evidence
+ * remains unknown.
  */
-export async function reconcileHerdrPaneBinding(handle: HerdrPaneHandle, hintedPane?: unknown): Promise<HerdrPaneHandle | undefined> {
+export async function classifyHerdrTerminal(handle: HerdrPaneHandle, hintedPane?: unknown): Promise<HerdrTerminalClassification> {
+	try { assertHerdrSocketGeneration(handle.socketPath, handle); } catch { return { state: "unknown" }; }
 	const hinted = bindPane(handle, paneFromSnapshot(hintedPane, handle.protocol));
-	if (hinted) return hinted;
-	const client = new HerdrSocketClient(handle.socketPath);
+	if (hinted) return { state: "present", handle: hinted };
+	const client = new HerdrSocketClient(handle.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: handle.socketDev, socketIno: handle.socketIno });
 	try {
 		const observed = await client.getPane(handle.paneId, handle.protocol);
 		const direct = bindPane(handle, observed ?? null);
-		if (direct) return direct;
-	} catch { /* use the separate bounded all-workspaces recovery query */ }
+		if (direct) return { state: "present", handle: direct };
+	} catch { /* list is the only separate absence proof */ }
 	const listed = await client.listPanes(handle.protocol);
-	if (!listed) return undefined;
+	if (!listed) return { state: "unknown" };
 	const matches = listed.filter((pane) => pane.terminalId === handle.terminalId);
-	return matches.length === 1 ? bindPane(handle, matches[0]!) ?? undefined : undefined;
+	if (matches.length === 0) return { state: "absent" };
+	if (matches.length !== 1) return { state: "unknown" };
+	const rebound = bindPane(handle, matches[0]!);
+	return rebound ? { state: "present", handle: rebound } : { state: "unknown" };
+}
+/** Rebind a present terminal; callers needing absence proof use classifyHerdrTerminal. */
+export async function reconcileHerdrPaneBinding(handle: HerdrPaneHandle, hintedPane?: unknown): Promise<HerdrPaneHandle | undefined> {
+	const result = await classifyHerdrTerminal(handle, hintedPane);
+	return result.state === "present" ? result.handle : undefined;
 }
 
 export interface HerdrPaneSubscription { stop(): void; closed: Promise<void>; isHealthy(): boolean; }
@@ -209,7 +277,7 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 		let delay = minDelay;
 		while (!stopped) {
 			try {
-				assertStrictHerdrSocket(options.handle.socketPath);
+				assertHerdrSocketGeneration(options.handle.socketPath, options.handle);
 				await new Promise<void>((resolve, reject) => {
 					const id = safeRequestId(); let buffer = Buffer.alloc(0); let acknowledged = false; let settled = false;
 					const socket = current = net.createConnection({ path: options.handle.socketPath });
@@ -245,40 +313,96 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 
 export async function resolveHerdrCallerPane(env: NodeJS.ProcessEnv = process.env): Promise<HerdrPaneHandle | null> {
 	const configured = parseHerdrEnvironment(env); if (!configured) return null;
-	const client = new HerdrSocketClient(configured.socketPath); const protocol = await client.assertSupportedProtocol();
+	const generation = captureHerdrSocketGeneration(configured.socketPath);
+	const client = new HerdrSocketClient(configured.socketPath, HERDR_DEFAULT_TIMEOUT_MS, generation); const protocol = await client.assertSupportedProtocol();
 	const pane = await client.getPane(configured.paneId, protocol);
-	return pane && pane.workspaceId === configured.workspaceId && pane.tabId === configured.tabId ? pane : null;
+	return pane && pane.paneId === configured.paneId && pane.workspaceId === configured.workspaceId && pane.tabId === configured.tabId ? { ...pane, ...generation } : null;
 }
 /** Allocate, durably publish through the caller callback, then launch by text exactly once. */
-export async function createHerdrSplit(options: { cwd: string; wrapperPath: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; }): Promise<HerdrPaneHandle> {
+async function createHerdrPane(options: { cwd: string; wrapperPath: string; tabLabel?: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; layout: "split" | "auto"; }): Promise<HerdrPaneHandle> {
 	const source = await resolveHerdrCallerPane(options.env); if (!source) throw new Error("Herdr pane mode requires exact HERDR_WORKSPACE_ID, HERDR_TAB_ID, HERDR_PANE_ID, and a matching pane.get response.");
-	const client = new HerdrSocketClient(source.socketPath);
-	// Never carry a preflight result across the mutation boundary.
+	const client = new HerdrSocketClient(source.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: source.socketDev, socketIno: source.socketIno });
 	await client.assertSupportedProtocol(source.protocol);
 	const current = await client.getPane(source.paneId, source.protocol);
 	if (!current || current.terminalId !== source.terminalId || current.workspaceId !== source.workspaceId || current.tabId !== source.tabId) throw new Error("Herdr source binding changed before allocation.");
-	const result = await client.request("pane.split", { target_pane_id: current.paneId, direction: "right", cwd: options.cwd, focus: false }, { mutation: true, signal: options.signal });
-	const allocated = paneFromSnapshot(result, source.protocol);
-	if (!allocated || allocated.workspaceId !== current.workspaceId || allocated.tabId !== current.tabId
-		|| allocated.terminalId === current.terminalId) {
-		throw new HerdrUnknownOutcomeError("Herdr pane.split did not return an exact new terminal binding; reconcile before any retry.", "pane.split");
+	const method = options.layout === "auto" ? "layout.apply" : "pane.split";
+	// The layout's initial process executes the direct gate's Bun verifier.
+	// Never let a configurable run state directory select its Bun project root.
+	const bootstrapCwd = path.parse(options.wrapperPath).root;
+	if (!path.isAbsolute(path.normalize(options.cwd)) || path.normalize(options.cwd) !== options.cwd
+		|| !path.isAbsolute(options.wrapperPath) || !path.isAbsolute(bootstrapCwd) || path.normalize(bootstrapCwd) !== bootstrapCwd) throw new Error("Herdr direct layout requires normalized absolute cwd and wrapper path.");
+	let result: Record<string, unknown>;
+	try {
+		result = await client.request(method, options.layout === "auto"
+			// `tab_id` is deliberately absent: layout.apply creates one new tab with
+			// one root pane and starts the private wrapper directly, not through a shell.
+			? { workspace_id: current.workspaceId, focus: false, tab_label: safeHerdrTabLabel(options.tabLabel, defaultHerdrTabLabel(options.wrapperPath)), root: { type: "pane", cwd: bootstrapCwd, command: [options.wrapperPath], env: HERDR_DIRECT_STARTUP_ENV } }
+			: { target_pane_id: current.paneId, direction: "right", cwd: bootstrapCwd, focus: false }, { mutation: true, signal: options.signal });
+	} catch (error) {
+		if (options.layout === "auto") throw error instanceof HerdrUnknownOutcomeError ? error : new HerdrUnknownOutcomeError(`Herdr ${method} dispatch outcome is unknown; reconcile before any retry.`, method);
+		throw error;
 	}
-	const handle = { ...allocated, socketPath: source.socketPath };
-	try { await options.onAllocated?.(handle); } catch (error) { await closeHerdrPane(handle).catch(() => undefined); throw error; }
-	// send_text is a mutation too. Re-gate and rebind after durable allocation;
-	// a moved pane keeps terminal_id but must receive text at its new pane_id.
+	let allocated: Omit<HerdrPaneHandle, keyof HerdrSocketGeneration> | null = null;
+	try {
+		if (options.layout === "auto") {
+			const root = layoutAppliedRootPane(result, current.workspaceId, current.tabId, options.wrapperPath, bootstrapCwd);
+			if (root) {
+				const observed = await client.getPane(root.paneId, source.protocol);
+				allocated = observed && observed.workspaceId === current.workspaceId && observed.tabId === root.tabId && observed.paneId === root.paneId ? observed : null;
+			}
+		} else allocated = paneFromSnapshot(result, source.protocol);
+	} catch (error) {
+		throw error instanceof HerdrUnknownOutcomeError ? error : new HerdrUnknownOutcomeError(`Herdr ${method} post-dispatch verification failed; reconcile before any retry.`, method);
+	}
+	if (!allocated || allocated.workspaceId !== current.workspaceId
+		|| options.layout === "auto" && allocated.tabId === current.tabId
+		|| options.layout === "split" && allocated.tabId !== current.tabId
+		|| allocated.paneId === current.paneId
+		|| allocated.terminalId === current.terminalId) {
+		throw new HerdrUnknownOutcomeError(`Herdr ${method} did not return an exact new terminal binding; reconcile before any retry.`, method);
+	}
+	const handle: HerdrPaneHandle = { ...allocated, socketPath: source.socketPath, socketDev: source.socketDev, socketIno: source.socketIno, ...(options.layout === "auto" ? { allocatedTabId: allocated.tabId } : {}) };
+	try { await options.onAllocated?.(handle); } catch (error) {
+		// The direct auto layout wrapper is already running behind its durable
+		// gate. Its allocation is recovery state, never rollback authority.
+		if (options.layout !== "auto") await closeHerdrPane(handle).catch(() => undefined);
+		throw error;
+	}
+	if (options.layout === "auto") return handle;
 	await client.assertSupportedProtocol(handle.protocol);
-	// The allocation callback is a durable handoff boundary. Recover a move
-	// missed during it by terminal_id before sending the one launch mutation.
 	if (!await reconcileHerdrPaneBinding(handle)) throw new Error("Herdr allocated pane changed before launch delivery.");
 	await client.request("pane.send_text", { pane_id: handle.paneId, text: `exec ${shellQuoteHerdrWrapper(options.wrapperPath)}\n` }, { mutation: true, signal: options.signal }); return handle;
 }
+/** Explicit compatibility layout: allocate one right-side pane. */
+export async function createHerdrSplit(options: { cwd: string; wrapperPath: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; }): Promise<HerdrPaneHandle> {
+	return await createHerdrPane({ ...options, layout: "split" });
+}
+/** Default auto layout: one unfocused new tab/root pane directly execs the wrapper. */
+export async function createHerdrTab(options: { cwd: string; wrapperPath: string; tabLabel?: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; }): Promise<HerdrPaneHandle> {
+	return await createHerdrPane({ ...options, layout: "auto" });
+}
 export async function inspectHerdrPane(handle: HerdrPaneHandle): Promise<HerdrPaneSnapshot | undefined> {
-	// Reconciliation deliberately has no negative result: a stale public pane
-	// address can be moved, while malformed/ambiguous recovery evidence is
-	// unknown rather than proof that our terminal disappeared.
-	const pane = await reconcileHerdrPaneBinding(handle);
-	return pane ? { exists: true } : undefined;
+	const result = await classifyHerdrTerminal(handle);
+	return result.state === "present" ? { exists: true } : result.state === "absent" ? { exists: false } : undefined;
+}
+const HERDR_MAX_DIAGNOSTIC_TITLE_BYTES = 512;
+const HERDR_UNSAFE_TITLE_CODE_POINT = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/u;
+function safeDiagnosticTitle(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > HERDR_MAX_DIAGNOSTIC_TITLE_BYTES || HERDR_UNSAFE_TITLE_CODE_POINT.test(value)) return undefined;
+	return value;
+}
+/** Read terminal titles solely for UX after lifecycle identity has been established. */
+export async function inspectHerdrPaneForUx(handle: HerdrPaneHandle): Promise<HerdrPaneSnapshot | undefined> {
+	const result = await classifyHerdrTerminal(handle);
+	if (result.state !== "present") return result.state === "absent" ? { exists: false } : undefined;
+	try {
+		const client = new HerdrSocketClient(handle.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: handle.socketDev, socketIno: handle.socketIno });
+		const value = await client.request("pane.get", { pane_id: handle.paneId });
+		const pane = paneFromSnapshot(value, handle.protocol);
+		if (!pane || pane.terminalId !== handle.terminalId) return { exists: true };
+		return { exists: true, title: safeDiagnosticTitle((isRecord(value.pane) ? value.pane : value).terminal_title_stripped)
+			?? safeDiagnosticTitle((isRecord(value.pane) ? value.pane : value).terminal_title) };
+	} catch { return { exists: true }; }
 }
 /**
  * Mutation authority is always re-established after the protocol gate. A pane
@@ -286,13 +410,17 @@ export async function inspectHerdrPane(handle: HerdrPaneHandle): Promise<HerdrPa
  * stale pane_id—must select the address used for the mutation.
  */
 async function revalidateHerdrMutationTarget(handle: HerdrPaneHandle): Promise<HerdrSocketClient | null> {
-	const client = new HerdrSocketClient(handle.socketPath);
+	if (!isSocketGeneration(handle)) return null;
+	const client = new HerdrSocketClient(handle.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: handle.socketDev, socketIno: handle.socketIno });
 	await client.assertSupportedProtocol(handle.protocol);
-	return await reconcileHerdrPaneBinding(handle) ? client : null;
+	return (await classifyHerdrTerminal(handle)).state === "present" ? client : null;
 }
 export async function interruptHerdrPane(handle: HerdrPaneHandle): Promise<boolean> {
 	const client = await revalidateHerdrMutationTarget(handle);
 	if (!client) return false;
+	// Direct new-tab children are cooperative-only lifecycle targets. Their
+	// parent never sends terminal keys, whether still placed or user-moved.
+	if (handle.allocatedTabId !== undefined) return false;
 	await client.request("pane.send_keys", { pane_id: handle.paneId, keys: ["esc"] }, { mutation: true });
 	return true;
 }
@@ -304,7 +432,10 @@ export async function focusHerdrPane(handle: HerdrPaneHandle): Promise<boolean> 
 }
 export async function closeHerdrPane(handle: HerdrPaneHandle): Promise<boolean> {
 	const client = await revalidateHerdrMutationTarget(handle);
-	if (!client) return true;
+	if (!client) return (await classifyHerdrTerminal(handle)).state === "absent";
+	// Direct new-tab children are never parent close authority. Confirmed
+	// absence is handled by read-only recovery, not a Herdr mutation.
+	if (handle.allocatedTabId !== undefined) return false;
 	await client.request("pane.close", { pane_id: handle.paneId }, { mutation: true });
-	return (await inspectHerdrPane(handle))?.exists === false;
+	return (await classifyHerdrTerminal(handle)).state === "absent";
 }

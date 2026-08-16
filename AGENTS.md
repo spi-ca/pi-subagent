@@ -11,7 +11,7 @@ allowlists) for delegation targets.
 `pi-subagent` is a Pi extension package that lets a Pi coding agent delegate
 tasks to specialized subagents: single calls, parallel batches, and
 sequential chains, with explicit control over context handoff (`spawn` vs
-`fork`) and execution environment (inline, tmux, cmux).
+`fork`) and execution environment (inline, cmux, tmux, Herdr).
 
 ## Runtime
 
@@ -55,7 +55,7 @@ them.
 
 | Doc | Use For |
 |-----|---------|
-| [`docs/development.md`](docs/development.md) | Setup, verification commands, project structure, design-doc index |
+| [`docs/development.md`](docs/development.md) | Setup, verification commands, project structure, and cmux/tmux/Herdr design-doc index |
 | [`docs/configuration.md`](docs/configuration.md) | User-facing settings and environment variables |
 | [`docs/usage.md`](docs/usage.md) | How to invoke subagent delegation from Pi |
 | [`docs/agents.md`](docs/agents.md) | How package users author subagent definition files |

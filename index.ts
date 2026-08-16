@@ -42,6 +42,7 @@ import { type AgentConfig, findNearestProjectAgentsDir, type AgentDiscoveryResul
 import { AgentDiscoveryCache } from "./src/core/agent-discovery-cache.js";
 import { settleWithUnrefTimeout } from "./src/core/async-settle.js";
 import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
+import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -117,6 +118,7 @@ const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
 const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 const SUBAGENT_TRUSTED_PROJECTS_ENV = "PI_SUBAGENT_TRUSTED_PROJECTS";
 const SUBAGENT_DENIED_PROJECTS_ENV = "PI_SUBAGENT_DENIED_PROJECTS";
+const HERDR_IDENTITY_ENV_NAMES = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const;
 /** Keeps the TUI selector responsive even when configured concurrency is high. */
 const SUBAGENT_UX_SELECTOR_LIMIT = 32;
 const INTERACTIVE_OWNERSHIP_PRESENTATION: Readonly<Record<InteractiveRunUxSnapshot["ownership"], { readonly icon: string; readonly label: string; readonly attention: number }>> = Object.freeze({
@@ -550,7 +552,7 @@ export default function (pi: ExtensionAPI) {
     type: "boolean",
   });
   pi.registerFlag("subagent-pane-layout", {
-    description: "Interactive pane layout: auto (shared pane/window) or split (per-run split).",
+    description: "Interactive pane layout: auto (backend-native surface/window/tab) or split (per-run split).",
     type: "string",
   });
   // Resolve at extension initialization so an invalid inherited child value
@@ -660,12 +662,14 @@ export default function (pi: ExtensionAPI) {
         if (command.kind === "doctor") {
           const terminal = getDefaultTerminalModeFromEnv();
           const hasCmuxFields = process.env.CMUX_WORKSPACE_ID !== undefined || process.env.CMUX_SURFACE_ID !== undefined;
+          const hasHerdrFields = HERDR_IDENTITY_ENV_NAMES.some((name) => process.env[name] !== undefined);
           const hasTmuxFields = process.env.TMUX !== undefined || process.env.TMUX_PANE !== undefined;
           const piCmuxTool = pi.getAllTools().some((tool) => tool.name === "cmux_open_terminal" && tool.sourceInfo.source !== "builtin");
           const piCmuxCommand = pi.getCommands().some((entry) => entry.source === "extension" && /^(?:cmv|cmh|cmo|cmt)(?::\d+)?$/.test(entry.name));
           const lines = [
             `terminal: ${terminal}`,
             `cmux identity: ${hasCmuxFields ? isInsideCmux() ? "valid" : "invalid" : "not present"}`,
+            `herdr identity: ${hasHerdrFields ? parseHerdrEnvironment() ? "valid" : "invalid" : "not present"}`,
             `tmux identity: ${hasTmuxFields ? isInsideTmux() ? "valid" : "invalid" : "not present"}`,
             `layout: ${interactivePaneLayout}`,
             `child policy: ${resolveManagedChildPolicy()}`,

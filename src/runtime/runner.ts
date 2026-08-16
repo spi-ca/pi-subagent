@@ -57,10 +57,12 @@ import {
   inspectHerdrPane,
   interruptHerdrPane,
   parseHerdrEnvironment,
+  observeHerdrAgentWait,
   resolveHerdrCallerPane,
   subscribeHerdrPane,
   type HerdrPaneHandle,
   type HerdrPaneSubscription,
+  type HerdrAgentWaitObserver,
 } from "./herdr.js";
 import {
   getInteractivePaneBackend,
@@ -5621,6 +5623,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   let removeTmuxDisconnectListener: (() => void) | null = null;
   let cmuxFocusSupported = false;
   let herdrSubscription: HerdrPaneSubscription | null = null;
+  let herdrAgentWaitObserver: HerdrAgentWaitObserver | null = null;
   const herdrWakeWaiters = new Set<() => void>();
   const signalHerdrWake = () => { for (const wake of [...herdrWakeWaiters]) wake(); herdrWakeWaiters.clear(); };
   const waitForHerdrWake = async (timeoutMs: number): Promise<void> => await new Promise<void>((resolve) => {
@@ -6146,6 +6149,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         onReconcile: () => signalHerdrWake(),
         onWake: signalHerdrWake,
       });
+      herdrAgentWaitObserver = observeHerdrAgentWait({ handle: handle.native, onWake: signalHerdrWake });
     }
     const releaseAfterCompletionWinner = async (completion: CompletionRecord): Promise<boolean> => {
       const active = activeInteractiveRuns.get(runId);
@@ -7074,8 +7078,14 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   } finally {
     releaseTmuxLaunch();
     releaseCmuxLaunch();
-    herdrSubscription?.stop();
+    const stoppedHerdrAgentWaitObserver = herdrAgentWaitObserver;
+    stoppedHerdrAgentWaitObserver?.stop();
+    herdrAgentWaitObserver = null;
+    await stoppedHerdrAgentWaitObserver?.closed.catch(() => undefined);
+    const stoppedHerdrSubscription = herdrSubscription;
+    stoppedHerdrSubscription?.stop();
     herdrSubscription = null;
+    await stoppedHerdrSubscription?.closed.catch(() => undefined);
     signalHerdrWake();
     await stopLeaseWriterAndDrain();
     if (lifecycleRunId) lifecycleEventServer?.terminalRun(lifecycleRunId);

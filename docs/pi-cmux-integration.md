@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작한다. producer는 idle에서는 열지 않고 active·queued·새 terminal 집계에서 열며, parent `agent_settled`의 quiescent aggregate에서 remove한다. remove는 cancellation·surface cleanup 권한이 아니다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, 철회, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
+root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 Herdr의 내부 socket `agent.*` 또는 child `pane.report_metadata` presentation 채널과도, dashboard/aggregate/detached를 변환한 channel과도 별개이며 root parent(depth `0`)에서만 동작한다. producer는 idle에서는 열지 않고 active·queued·새 terminal 집계에서 열며, parent `agent_settled`의 quiescent aggregate에서 remove한다. remove는 cancellation·surface cleanup 권한이 아니다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, 철회, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
 
 ## 5. 권장 운영 정책
 
@@ -251,7 +251,7 @@ slash command는 하나만 등록한다. session-local foreground/background inv
 /subagents doctor            probe 없는 integration 진단
 /subagents cancel <full-id>   foreground/background invocation 취소
 /subagents details <full-id>  invocation 또는 interactive run 상세
-/subagents focus <run-id>     negotiated cmux 또는 protocol-gated exact rebound Herdr target focus
+/subagents focus <run-id>     negotiated cmux 또는 전후 identity를 검증하는 user-initiated Herdr focus
 /subagents keep <run-id>      session shutdown까지 surface 보존
 /subagents promote <run-id>   durable user ownership으로 승격
 ```

@@ -23,6 +23,9 @@ const HERDR_SUBSCRIBE_CONNECT_TIMEOUT_MS = 5_000;
 const HERDR_SUBSCRIBE_ACK_TIMEOUT_MS = 5_000;
 const HERDR_RECONNECT_MIN_MS = 100;
 const HERDR_RECONNECT_MAX_MS = 5_000;
+const HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS = 1_000;
+const HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS = 1_250;
+const HERDR_AGENT_WAIT_MAX_OBSERVERS = 16;
 /** A reconciliation list must remain a bounded recovery operation. */
 const HERDR_MAX_LISTED_PANES = 128;
 /** Every consumed Herdr response has the schema's exact tagged-union arm. */
@@ -30,7 +33,8 @@ const HERDR_RESULT_TYPES: Readonly<Record<string, string>> = Object.freeze({
 	ping: "pong", "pane.get": "pane_info", "pane.list": "pane_list",
 	"pane.split": "pane_info", "pane.focus": "pane_info",
 	"pane.send_text": "ok", "pane.send_keys": "ok", "pane.close": "ok",
-	"layout.apply": "layout_apply",
+	"pane.report_metadata": "ok", "layout.apply": "layout_apply",
+	"agent.get": "agent_info", "agent.wait": "agent_info", "agent.focus": "agent_info",
 });
 const HERDR_MAX_TAB_LABEL_BYTES = 128;
 function defaultHerdrTabLabel(wrapperPath: string): string {
@@ -113,6 +117,34 @@ function paneFromSnapshot(value: unknown, protocol: HerdrProtocolVersion): Omit<
 	if (!isRecord(value)) return null;
 	return parsePane(value.pane, protocol) ?? parsePane(value, protocol) ?? (isRecord(value.agent) ? parsePane(value.agent.pane, protocol) : null) ?? (isRecord(value.session) ? parsePane(value.session.pane, protocol) : null);
 }
+
+export type HerdrAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+export interface HerdrAgentInfo {
+	workspaceId: string;
+	tabId: string;
+	paneId: string;
+	terminalId: string;
+	status: HerdrAgentStatus;
+	focused: boolean;
+	revision: number;
+	stateChangeSeq: number;
+}
+const HERDR_AGENT_STATUS_VALUES = ["idle", "working", "blocked", "done", "unknown"] as const;
+const HERDR_AGENT_STATUSES = new Set<HerdrAgentStatus>(HERDR_AGENT_STATUS_VALUES);
+function isNonnegativeSafeInteger(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
+/** AgentInfo is a lifecycle hint only after every bounded identity field validates. */
+function parseAgentInfo(value: unknown): HerdrAgentInfo | null {
+	const agent = isRecord(value) && isRecord(value.agent) ? value.agent : null;
+	if (!agent || !isHerdrPublicId(agent.workspace_id) || !isHerdrPublicId(agent.tab_id) || !isHerdrPublicId(agent.pane_id) || !isHerdrPublicId(agent.terminal_id)
+		|| typeof agent.agent_status !== "string" || !HERDR_AGENT_STATUSES.has(agent.agent_status as HerdrAgentStatus)
+		|| typeof agent.focused !== "boolean" || !isNonnegativeSafeInteger(agent.revision)
+		|| Object.hasOwn(agent, "state_change_seq") && !isNonnegativeSafeInteger(agent.state_change_seq)) return null;
+	return { workspaceId: agent.workspace_id, tabId: agent.tab_id, paneId: agent.pane_id, terminalId: agent.terminal_id,
+		status: agent.agent_status as HerdrAgentStatus, focused: agent.focused, revision: agent.revision, stateChangeSeq: Object.hasOwn(agent, "state_change_seq") ? agent.state_change_seq as number : 0 };
+}
+function sameAgentBinding(agent: HerdrAgentInfo, handle: HerdrPaneHandle): boolean {
+	return agent.terminalId === handle.terminalId && agent.workspaceId === handle.workspaceId && agent.tabId === handle.tabId && agent.paneId === handle.paneId;
+}
 /** Strict direct-layout acknowledgement. Herdr creates one new tab whose sole
  * root pane is also focused; terminal identity is obtained only from pane.get. */
 function layoutAppliedRootPane(value: unknown, workspaceId: string, sourceTabId: string, wrapperPath: string, cwd: string): { tabId: string; paneId: string } | null {
@@ -145,6 +177,7 @@ function bindPane(handle: HerdrPaneHandle, observed: Omit<HerdrPaneHandle, keyof
 export class HerdrSocketClient {
 	constructor(readonly socketPath: string, readonly timeoutMs = HERDR_DEFAULT_TIMEOUT_MS, readonly generation?: HerdrSocketGeneration) {}
 	async request(method: string, params: Record<string, unknown>, options: { mutation?: boolean; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
+		if (options.signal?.aborted) throw new HerdrProtocolError("Herdr request was aborted before dispatch.");
 		const before = this.generation ? assertHerdrSocketGeneration(this.socketPath, this.generation) : assertStrictHerdrSocket(this.socketPath); const id = safeRequestId(); const line = `${JSON.stringify({ id, method, params })}\n`;
 		if (Buffer.byteLength(line, "utf8") > HERDR_MAX_LINE_BYTES) throw new Error("Herdr request exceeds the strict wire limit.");
 		return await new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -194,31 +227,51 @@ export class HerdrSocketClient {
 		});
 	}
 	/** Negotiate only the reviewed common subset and optionally pin its prior result. */
-	async assertSupportedProtocol(expected?: HerdrProtocolVersion): Promise<HerdrProtocolVersion> {
-		const result = await this.request("ping", {});
+	async assertSupportedProtocol(expected?: HerdrProtocolVersion, signal?: AbortSignal): Promise<HerdrProtocolVersion> {
+		const result = await this.request("ping", {}, { signal });
 		if (!isSupportedHerdrProtocol(result.protocol)) throw new HerdrProtocolError("Herdr protocol must be one of 19 or 20.");
 		if (expected !== undefined && result.protocol !== expected) throw new HerdrProtocolError(`Herdr protocol changed from ${expected} to ${result.protocol}.`);
 		return result.protocol;
 	}
 	/** `undefined` is malformed/unknown; only `null` is an explicit not-found response. */
-	async getPane(paneId: string, protocol: HerdrProtocolVersion): Promise<HerdrPaneHandle | null | undefined> {
-		if (!isHerdrPublicId(paneId)) return undefined;
+	async getPane(paneId: string, protocol: HerdrProtocolVersion, signal?: AbortSignal): Promise<HerdrPaneHandle | null | undefined> {
+		if (!isHerdrPublicId(paneId) || signal?.aborted) return undefined;
 		try {
-			const pane = paneFromSnapshot(await this.request("pane.get", { pane_id: paneId }), protocol);
+			const pane = paneFromSnapshot(await this.request("pane.get", { pane_id: paneId }, { signal }), protocol);
 			return pane ? { ...pane, socketPath: this.socketPath, ...(this.generation ?? {}) } as HerdrPaneHandle : undefined;
 		} catch (error) {
 			if (error instanceof HerdrRequestError && error.code === "pane_not_found") return null;
 			throw error;
 		}
 	}
+	/** Strict agent reads are observation-only and require the protocol's nested AgentInfo arm. */
+	async getAgent(paneId: string, signal?: AbortSignal): Promise<HerdrAgentInfo | undefined> {
+		if (!isHerdrPublicId(paneId) || signal?.aborted) return undefined;
+		return parseAgentInfo(await this.request("agent.get", { target: paneId }, { signal })) ?? undefined;
+	}
+	async waitForAgent(paneId: string, until: readonly HerdrAgentStatus[], timeoutMs: number, signal?: AbortSignal): Promise<HerdrAgentInfo | undefined> {
+		if (!isHerdrPublicId(paneId) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS
+			|| until.length === 0 || !until.every((status) => HERDR_AGENT_STATUSES.has(status))) return undefined;
+		return parseAgentInfo(await this.request("agent.wait", { target: paneId, until: [...until], timeout_ms: timeoutMs }, { signal })) ?? undefined;
+	}
+	async focusAgent(paneId: string): Promise<HerdrAgentInfo | undefined> {
+		if (!isHerdrPublicId(paneId)) return undefined;
+		return parseAgentInfo(await this.request("agent.focus", { target: paneId }, { mutation: true })) ?? undefined;
+	}
 	/** The schema's `{}` list view spans workspaces, so a moved terminal can rebind its workspace and tab. */
-	async listPanes(protocol: HerdrProtocolVersion): Promise<HerdrPaneHandle[] | undefined> {
+	async listPanes(protocol: HerdrProtocolVersion, signal?: AbortSignal): Promise<HerdrPaneHandle[] | undefined> {
+		if (signal?.aborted) return undefined;
 		try {
-			const result = await this.request("pane.list", {});
+			const result = await this.request("pane.list", {}, { signal });
 			if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return undefined;
 			const panes = result.panes.map((value) => parsePane(value, protocol));
-			return panes.every((pane): pane is HerdrPaneHandle => pane !== null)
-				? panes.map((pane) => ({ ...pane, socketPath: this.socketPath, ...(this.generation ?? {}) } as HerdrPaneHandle)) : undefined;
+			if (!panes.every((pane): pane is HerdrPaneHandle => pane !== null)) return undefined;
+			const paneIds = new Set<string>(), terminalIds = new Set<string>();
+			for (const pane of panes) {
+				if (paneIds.has(pane.paneId) || terminalIds.has(pane.terminalId)) return undefined;
+				paneIds.add(pane.paneId); terminalIds.add(pane.terminalId);
+			}
+			return panes.map((pane) => ({ ...pane, socketPath: this.socketPath, ...(this.generation ?? {}) } as HerdrPaneHandle));
 		} catch { return undefined; }
 	}
 }
@@ -230,18 +283,22 @@ export type HerdrTerminalClassification = { state: "present"; handle: HerdrPaneH
  * absence proof; all malformed, failed, duplicate, and replacement evidence
  * remains unknown.
  */
-export async function classifyHerdrTerminal(handle: HerdrPaneHandle, hintedPane?: unknown): Promise<HerdrTerminalClassification> {
+export async function classifyHerdrTerminal(handle: HerdrPaneHandle, signal?: AbortSignal): Promise<HerdrTerminalClassification> {
+	if (signal?.aborted) return { state: "unknown" };
 	try { assertHerdrSocketGeneration(handle.socketPath, handle); } catch { return { state: "unknown" }; }
-	const hinted = bindPane(handle, paneFromSnapshot(hintedPane, handle.protocol));
-	if (hinted) return { state: "present", handle: hinted };
 	const client = new HerdrSocketClient(handle.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: handle.socketDev, socketIno: handle.socketIno });
 	try {
-		const observed = await client.getPane(handle.paneId, handle.protocol);
+		const observed = await client.getPane(handle.paneId, handle.protocol, signal);
+		if (signal?.aborted) return { state: "unknown" };
 		const direct = bindPane(handle, observed ?? null);
 		if (direct) return { state: "present", handle: direct };
-	} catch { /* list is the only separate absence proof */ }
-	const listed = await client.listPanes(handle.protocol);
-	if (!listed) return { state: "unknown" };
+	} catch {
+		if (signal?.aborted) return { state: "unknown" };
+		/* list is the only separate absence proof */
+	}
+	if (signal?.aborted) return { state: "unknown" };
+	const listed = await client.listPanes(handle.protocol, signal);
+	if (signal?.aborted || !listed) return { state: "unknown" };
 	const matches = listed.filter((pane) => pane.terminalId === handle.terminalId);
 	if (matches.length === 0) return { state: "absent" };
 	if (matches.length !== 1) return { state: "unknown" };
@@ -249,28 +306,101 @@ export async function classifyHerdrTerminal(handle: HerdrPaneHandle, hintedPane?
 	return rebound ? { state: "present", handle: rebound } : { state: "unknown" };
 }
 /** Rebind a present terminal; callers needing absence proof use classifyHerdrTerminal. */
-export async function reconcileHerdrPaneBinding(handle: HerdrPaneHandle, hintedPane?: unknown): Promise<HerdrPaneHandle | undefined> {
-	const result = await classifyHerdrTerminal(handle, hintedPane);
+export async function reconcileHerdrPaneBinding(handle: HerdrPaneHandle, signal?: AbortSignal): Promise<HerdrPaneHandle | undefined> {
+	const result = await classifyHerdrTerminal(handle, signal);
 	return result.state === "present" ? result.handle : undefined;
 }
 
 export interface HerdrPaneSubscription { stop(): void; closed: Promise<void>; isHealthy(): boolean; }
+export interface HerdrAgentWaitObserver { stop(): void; closed: Promise<void>; isActive(): boolean; }
+let activeHerdrAgentWaitObservers = 0;
 /**
- * Events only wake a single coalesced authoritative reconciliation. A move
- * carries previous_pane_id plus the new pane object; matching terminal_id
- * updates the live binding before any "missing" result can be published.
+ * A bounded observation-only wait supplements event wakeups. It has no
+ * lifecycle, cleanup, or absence authority: snapshots remain authoritative.
  */
+export function observeHerdrAgentWait(options: { handle: HerdrPaneHandle; onWake: () => void; serverTimeoutMs?: number; clientTimeoutMs?: number; retryDelayMs?: number; }): HerdrAgentWaitObserver {
+	const serverTimeoutMs = options.serverTimeoutMs ?? HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS;
+	const clientTimeoutMs = options.clientTimeoutMs ?? HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS;
+	const retryDelayMs = options.retryDelayMs ?? HERDR_RECONNECT_MIN_MS;
+	if (!Number.isSafeInteger(serverTimeoutMs) || serverTimeoutMs <= 0 || serverTimeoutMs > HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS
+		|| !Number.isSafeInteger(clientTimeoutMs) || clientTimeoutMs <= serverTimeoutMs || clientTimeoutMs > HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS
+		|| !Number.isSafeInteger(retryDelayMs) || retryDelayMs < HERDR_RECONNECT_MIN_MS || retryDelayMs > HERDR_RECONNECT_MAX_MS) {
+		throw new Error("Herdr agent wait observer requires finite ordered timeouts.");
+	}
+	if (activeHerdrAgentWaitObservers >= HERDR_AGENT_WAIT_MAX_OBSERVERS) return { stop: () => undefined, closed: Promise.resolve(), isActive: () => false };
+	activeHerdrAgentWaitObservers += 1;
+	let stopped = false;
+	let running = true;
+	const controller = new AbortController();
+	const sleep = async (ms: number) => await new Promise<void>((resolve) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = () => { if (timer) clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+		timer = setTimeout(finish, ms);
+		if (controller.signal.aborted) finish(); else controller.signal.addEventListener("abort", finish, { once: true });
+	});
+	const wake = () => { if (!stopped) options.onWake(); };
+	const closed = (async () => {
+		let delay = retryDelayMs;
+		try {
+			while (!stopped) {
+				const terminal = await classifyHerdrTerminal(options.handle, controller.signal);
+				if (stopped) return;
+				if (terminal.state === "absent") { wake(); return; }
+				if (terminal.state !== "present") { wake(); await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2); continue; }
+				try {
+					const client = new HerdrSocketClient(options.handle.socketPath, clientTimeoutMs, { socketDev: options.handle.socketDev, socketIno: options.handle.socketIno });
+					const current = await client.getAgent(options.handle.paneId, controller.signal);
+					if (stopped) return;
+					if (!current || !sameAgentBinding(current, options.handle)) { wake(); await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2); continue; }
+					const until = HERDR_AGENT_STATUS_VALUES.filter((status) => status !== current.status);
+					const observed = await client.waitForAgent(options.handle.paneId, until, serverTimeoutMs, controller.signal);
+					// A wait result merely schedules authoritative reconciliation; it never
+					// publishes terminal state, completion, cleanup, or absence itself.
+					wake();
+					if (stopped) return;
+					// The server must return the requested terminal binding and one of the
+					// requested transition states. Even a valid completion is rate-limited
+					// before another get/wait cycle to prevent immediate-result hot loops.
+					if (!observed || !sameAgentBinding(observed, options.handle) || !until.includes(observed.status)) {
+						await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2);
+					} else { delay = retryDelayMs; await sleep(retryDelayMs); }
+				} catch (error) {
+					if (stopped) return;
+					wake();
+					if (error instanceof HerdrRequestError && ["timeout", "agent_not_running", "agent_not_found"].includes(error.code)) {
+						delay = retryDelayMs; await sleep(retryDelayMs);
+					} else { await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2); }
+				}
+			}
+		} finally { running = false; activeHerdrAgentWaitObservers -= 1; }
+	})();
+	return { stop: () => { if (!stopped) { stopped = true; running = false; controller.abort(); } }, closed, isActive: () => running };
+}
+/** Events only wake a single coalesced authoritative reconciliation. Event
+ * payloads can establish relevance but never update a live binding or presence. */
 export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; reconnectDelayMs?: number; }): HerdrPaneSubscription {
 	let stopped = false; let healthy = false; let current: net.Socket | null = null; let reconciliation: Promise<void> | null = null; let reconciliationPending = false;
-	const wake = () => options.onWake?.();
+	const controller = new AbortController();
+	const wake = () => { if (!stopped) options.onWake?.(); };
 	const minDelay = Math.max(HERDR_RECONNECT_MIN_MS, options.reconnectDelayMs ?? HERDR_RECONNECT_MIN_MS);
-	const sleep = async (ms: number) => await new Promise<void>((resolve) => setTimeout(resolve, ms));
-	const requestReconcile = (hint?: unknown) => {
+	const sleep = async (ms: number) => await new Promise<void>((resolve) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = () => { if (timer) clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+		timer = setTimeout(finish, ms);
+		if (controller.signal.aborted) finish(); else controller.signal.addEventListener("abort", finish, { once: true });
+	});
+	const requestReconcile = () => {
+		if (stopped || controller.signal.aborted) return;
 		reconciliationPending = true;
 		if (reconciliation) return;
 		reconciliation = (async () => {
-			let nextHint = hint;
-			do { reconciliationPending = false; const pane = await reconcileHerdrPaneBinding(options.handle, nextHint); nextHint = undefined; await options.onReconcile(pane); } while (reconciliationPending && !stopped);
+			do {
+				reconciliationPending = false;
+				if (stopped || controller.signal.aborted) return;
+				const pane = await reconcileHerdrPaneBinding(options.handle, controller.signal);
+				if (stopped || controller.signal.aborted) return;
+				await options.onReconcile(pane);
+			} while (reconciliationPending && !stopped && !controller.signal.aborted);
 		})().catch(() => undefined).finally(() => { reconciliation = null; });
 	};
 	const closed = (async () => {
@@ -292,23 +422,26 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 						buffer = Buffer.concat([buffer, chunk]); if (buffer.length > HERDR_MAX_LINE_BYTES) return finish(new Error("Herdr subscription exceeded the strict wire limit."));
 						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; healthy = true; wake(); clearTimeout(ackTimer); delay = minDelay; requestReconcile(); continue; }
 							const data = isRecord(message.data) ? message.data : null;
-							// Herdr's pane.moved event carries the old public ID plus the
-							// complete new PaneInfo under data.pane. The latter is the
-							// authority that lets terminal_id survive a public-ID change.
+							// Event payloads only establish relevance. Every binding and presence
+							// decision below comes from a fresh pane.get or bounded pane.list.
 							const eventPane = data && (data.pane ?? data);
 							const moved = message.event === "pane.moved" && data?.previous_pane_id === options.handle.paneId
 								&& paneFromSnapshot(data.pane, options.handle.protocol)?.terminalId === options.handle.terminalId;
 							const samePane = data?.pane_id === options.handle.paneId
 								|| paneFromSnapshot(eventPane, options.handle.protocol)?.terminalId === options.handle.terminalId;
-							if (moved || samePane) { wake(); requestReconcile(eventPane); } }
+							if (moved || samePane) { wake(); requestReconcile(); } }
 					});
 					socket.once("error", finish); socket.once("close", () => { if (stopped) finish(); else finish(new Error("Herdr subscription disconnected.")); });
 				});
 			} catch { /* bounded retry; direct pane queries remain authority */ }
 			if (!stopped) { await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2); }
 		}
+		await Promise.resolve(reconciliation).catch(() => undefined);
 	})();
-	return { stop: () => { stopped = true; healthy = false; wake(); current?.destroy(); }, closed, isHealthy: () => healthy && !stopped };
+	return { stop: () => {
+		if (stopped) return;
+		stopped = true; healthy = false; reconciliationPending = false; controller.abort(); current?.destroy();
+	}, closed, isHealthy: () => healthy && !stopped };
 }
 
 export async function resolveHerdrCallerPane(env: NodeJS.ProcessEnv = process.env): Promise<HerdrPaneHandle | null> {
@@ -381,6 +514,122 @@ export async function createHerdrSplit(options: { cwd: string; wrapperPath: stri
 export async function createHerdrTab(options: { cwd: string; wrapperPath: string; tabLabel?: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; }): Promise<HerdrPaneHandle> {
 	return await createHerdrPane({ ...options, layout: "auto" });
 }
+export type ChildHerdrMetadataLifecycle = "ready" | "running" | "waiting" | "returning" | "failed";
+export interface ChildHerdrMetadataReporter {
+	report(lifecycle: ChildHerdrMetadataLifecycle): void;
+	/** Bounded best-effort source-scoped cleanup; it never changes agent authority. */
+	close(): Promise<void>;
+}
+const HERDR_CHILD_METADATA_TTL_MS = 120_000;
+const HERDR_CHILD_METADATA_CLOSE_TIMEOUT_MS = 250;
+const HERDR_CHILD_METADATA_SOURCE_PREFIX = "pi-subagent:";
+const HERDR_CHILD_METADATA_UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/u;
+const HERDR_CHILD_METADATA_STATE_LABELS = Object.freeze({ idle: "Ready", working: "Running", blocked: "Waiting", unknown: "Finished" });
+function safeChildMetadataText(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 80 && !HERDR_CHILD_METADATA_UNSAFE_TEXT.test(value) ? value : undefined;
+}
+function childMetadataSource(runId: string): string | undefined {
+	const source = `${HERDR_CHILD_METADATA_SOURCE_PREFIX}${runId}`;
+	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,67}$/.test(runId) && /^[A-Za-z0-9._:-]{1,80}$/.test(source) ? source : undefined;
+}
+type ChildMetadataPayload = Record<string, unknown>;
+/**
+ * Child-local diagnostic metadata never establishes or releases Herdr agent
+ * authority. It retains just one active request and one latest replacement.
+ */
+export function createChildHerdrMetadataReporter(options: { handle: HerdrPaneHandle; runId: string; title?: unknown; }): ChildHerdrMetadataReporter | null {
+	const source = childMetadataSource(options.runId);
+	if (!source || !isSocketGeneration(options.handle)) return null;
+	const title = safeChildMetadataText(options.title);
+	const runToken = options.runId.slice(0, 16);
+	if (!/^[A-Za-z0-9._-]{1,16}$/.test(runToken)) return null;
+	let sequence = 0;
+	let active: Promise<void> | null = null;
+	let pending: ChildMetadataPayload | null = null;
+	let closed = false;
+	let deadlineExpired = false;
+	let closeDeadline: number | null = null;
+	let closePromise: Promise<void> | null = null;
+	let closeTimer: ReturnType<typeof setTimeout> | null = null;
+	let resolveClose: (() => void) | null = null;
+	const controller = new AbortController();
+	const expireCloseDeadline = () => {
+		if (deadlineExpired || closeDeadline === null || performance.now() < closeDeadline) return false;
+		deadlineExpired = true;
+		pending = null;
+		controller.abort();
+		if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
+		resolveClose?.();
+		return true;
+	};
+	const next = () => {
+		sequence += 1;
+		return sequence;
+	};
+	const execute = async (payload: ChildMetadataPayload) => {
+		try {
+			if (expireCloseDeadline() || controller.signal.aborted) return;
+			// Keep all identity and protocol observations adjacent to this one
+			// mutation; classification can rebind a user-moved terminal by ID.
+			assertHerdrSocketGeneration(options.handle.socketPath, options.handle);
+			const client = new HerdrSocketClient(options.handle.socketPath, HERDR_DEFAULT_TIMEOUT_MS, { socketDev: options.handle.socketDev, socketIno: options.handle.socketIno });
+			await client.assertSupportedProtocol(options.handle.protocol, controller.signal);
+			if (expireCloseDeadline() || controller.signal.aborted) return;
+			const terminal = await classifyHerdrTerminal(options.handle, controller.signal);
+			if (expireCloseDeadline() || controller.signal.aborted || terminal.state !== "present") return;
+			await client.request("pane.report_metadata", { pane_id: terminal.handle.paneId, ...payload }, { mutation: true, signal: controller.signal });
+		} catch {
+			// Metadata is diagnostic-only. An aborted post-dispatch mutation is
+			// handled here and never retried; later lifecycle data has a new seq.
+		}
+	};
+	const pump = () => {
+		if (expireCloseDeadline() || deadlineExpired || controller.signal.aborted || active || !pending) return;
+		const payload = pending;
+		pending = null;
+		active = execute(payload).finally(() => { active = null; pump(); });
+		void active.catch(() => undefined);
+	};
+	const enqueue = (payload: ChildMetadataPayload) => { pending = payload; pump(); };
+	return {
+		report(lifecycle) {
+			if (closed) return;
+			enqueue({ source, applies_to_source: "herdr:pi", agent: "pi", seq: next(), ttl_ms: HERDR_CHILD_METADATA_TTL_MS,
+				...(title ? { title } : {}), display_agent: "Pi", state_labels: HERDR_CHILD_METADATA_STATE_LABELS, tokens: { run: runToken, lifecycle } });
+		},
+		async close() {
+			if (closePromise) return await closePromise;
+			closed = true;
+			// Record the absolute monotonic boundary before enqueuing the clear.
+			// `pump` and `execute` enforce it even if the timer callback is delayed.
+			closeDeadline = performance.now() + HERDR_CHILD_METADATA_CLOSE_TIMEOUT_MS;
+			closePromise = new Promise<void>((resolve) => { resolveClose = resolve; });
+			const enforceCloseDeadline = () => {
+				if (expireCloseDeadline() || closeDeadline === null) return;
+				closeTimer = setTimeout(enforceCloseDeadline, Math.max(0, closeDeadline - performance.now()));
+				closeTimer.unref?.();
+			};
+			closeTimer = setTimeout(enforceCloseDeadline, HERDR_CHILD_METADATA_CLOSE_TIMEOUT_MS);
+			closeTimer.unref?.();
+			enqueue({ source, applies_to_source: "herdr:pi", agent: "pi", seq: next(), ttl_ms: HERDR_CHILD_METADATA_TTL_MS,
+				clear_title: true, clear_display_agent: true, clear_state_labels: true, tokens: { run: null, lifecycle: null } });
+			const drain = async () => {
+				while (active || pending) {
+					if (expireCloseDeadline()) return;
+					if (active) await active;
+					else await Promise.resolve();
+				}
+				if (!expireCloseDeadline()) {
+					if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
+					resolveClose?.();
+				}
+			};
+			void drain();
+			return await closePromise;
+		},
+	};
+}
+
 export async function inspectHerdrPane(handle: HerdrPaneHandle): Promise<HerdrPaneSnapshot | undefined> {
 	const result = await classifyHerdrTerminal(handle);
 	return result.state === "present" ? { exists: true } : result.state === "absent" ? { exists: false } : undefined;
@@ -427,8 +676,15 @@ export async function interruptHerdrPane(handle: HerdrPaneHandle): Promise<boole
 export async function focusHerdrPane(handle: HerdrPaneHandle): Promise<boolean> {
 	const client = await revalidateHerdrMutationTarget(handle);
 	if (!client) return false;
-	await client.request("pane.focus", { pane_id: handle.paneId }, { mutation: true });
-	return true;
+	// Focus is user initiated, but it is still a one-way mutation: establish the
+	// current exact agent binding first, issue exactly one agent.focus, then use
+	// read-only terminal classification to confirm the target remains present.
+	const before = await client.getAgent(handle.paneId);
+	if (!before || !sameAgentBinding(before, handle)) return false;
+	const focused = await client.focusAgent(handle.paneId);
+	if (!focused || !focused.focused || !sameAgentBinding(focused, handle)) return false;
+	const terminal = await classifyHerdrTerminal(handle);
+	return terminal.state === "present" && terminal.handle.terminalId === before.terminalId;
 }
 export async function closeHerdrPane(handle: HerdrPaneHandle): Promise<boolean> {
 	const client = await revalidateHerdrMutationTarget(handle);

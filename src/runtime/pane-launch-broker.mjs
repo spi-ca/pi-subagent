@@ -145,6 +145,11 @@ async function classifyHerdrTarget(target) {
     if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return { state: "unknown" };
     const panes = result.panes.map((pane) => parseHerdrPane(pane, target.socketPath, target.protocol));
     if (panes.some((pane) => !pane)) return { state: "unknown" };
+    const paneIds = new Set(), terminalIds = new Set();
+    for (const pane of panes) {
+      if (paneIds.has(pane.paneId) || terminalIds.has(pane.terminalId)) return { state: "unknown" };
+      paneIds.add(pane.paneId); terminalIds.add(pane.terminalId);
+    }
     const matches = panes.filter((pane) => pane.terminalId === target.terminalId);
     if (matches.length === 0) return { state: "absent" };
     if (matches.length !== 1) return { state: "unknown" };

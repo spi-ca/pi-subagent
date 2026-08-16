@@ -8,7 +8,9 @@ import { parseHerdrEnvironment as parseSharedHerdrEnvironment } from "../../src/
 import {
 	HerdrSocketClient,
 	HerdrUnknownOutcomeError,
+	classifyHerdrTerminal,
 	closeHerdrPane,
+	createChildHerdrMetadataReporter,
 	createHerdrSplit,
 	createHerdrTab,
 	focusHerdrPane,
@@ -16,6 +18,7 @@ import {
 	inspectHerdrPaneForUx,
 	interruptHerdrPane,
 	isHerdrPublicId,
+	observeHerdrAgentWait,
 	parseHerdrEnvironment,
 	shellQuoteHerdrWrapper,
 	subscribeHerdrPane,
@@ -28,7 +31,9 @@ async function serverFor(handler: (request: Record<string, unknown>, socket: net
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-herdr-"));
 	roots.push(root);
 	const socketPath = path.join(root, "herdr.sock");
+	const sockets = new Set<net.Socket>();
 	const server = net.createServer((socket) => {
+		sockets.add(socket); socket.once("close", () => sockets.delete(socket));
 		let input = "";
 		socket.on("data", (chunk) => {
 			input += chunk.toString("utf8");
@@ -39,7 +44,10 @@ async function serverFor(handler: (request: Record<string, unknown>, socket: net
 	});
 	await new Promise<void>((resolve) => server.listen(socketPath, resolve));
 	fs.chmodSync(socketPath, 0o600);
-	return { socketPath, close: async () => await new Promise<void>((resolve) => server.close(() => resolve())) };
+	return { socketPath, close: async () => {
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	} };
 }
 
 const sourcePane = { workspace_id: "space one", tab_id: "tab/one", pane_id: "pane one", terminal_id: "term-one" };
@@ -121,7 +129,8 @@ describe("Herdr socket client", () => {
 		const fixture = await serverFor((request, socket) => {
 			calls.push(request.method as string);
 			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : request.method === "pane.get" ? { type: "pane_info", pane: moved }
-				: request.method === "pane.focus" ? { type: "pane_info", pane: moved } : { type: "pane_list", panes: [moved] };
+				: request.method === "agent.get" || request.method === "agent.focus" ? { type: "agent_info", agent: { ...moved, agent_status: "idle", focused: request.method === "agent.focus", revision: 1, state_change_seq: 1 } }
+				: { type: "pane_list", panes: [moved] };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: "child-tab", paneId: "child-pane", terminalId: moved.terminal_id, allocatedTabId: "child-tab", protocol: 20 as const };
@@ -130,7 +139,8 @@ describe("Herdr socket client", () => {
 		assert.equal(await focusHerdrPane(handle), true, "manual focus remains available after ownership transfer");
 		assert.equal(calls.includes("pane.send_keys"), false);
 		assert.equal(calls.includes("pane.close"), false);
-		assert.equal(calls.includes("pane.focus"), true);
+		assert.equal(calls.includes("agent.focus"), true);
+		assert.equal(calls.includes("pane.focus"), false);
 		await fixture.close();
 	});
 
@@ -177,14 +187,153 @@ describe("Herdr socket client", () => {
 
 	test("rejects every wrong response discriminator, never treating it as query or mutation success", async () => {
 		const cases: Array<[string, boolean]> = [
-			["ping", false], ["pane.get", false], ["pane.list", false], ["pane.split", true], ["pane.focus", true],
-			["pane.send_text", true], ["pane.send_keys", true], ["pane.close", true], ["layout.apply", true],
+			["ping", false], ["pane.get", false], ["pane.list", false], ["agent.get", false], ["agent.wait", false], ["pane.split", true], ["pane.focus", true], ["agent.focus", true],
+			["pane.send_text", true], ["pane.send_keys", true], ["pane.close", true], ["pane.report_metadata", true], ["layout.apply", true],
 		];
 		for (const [method, mutation] of cases) {
 			const fixture = await serverFor((request, socket) => socket.end(`${JSON.stringify({ id: request.id, result: { type: "wrong" } })}\n`));
 			await assert.rejects(new HerdrSocketClient(fixture.socketPath).request(method, {}, { mutation }), (error: unknown) => mutation ? error instanceof HerdrUnknownOutcomeError : error instanceof Error && error.name === "HerdrProtocolError");
 			await fixture.close();
 		}
+	});
+
+	test("reports bounded child metadata with exact protocol-19/20 params and source-scoped clear", async () => {
+		for (const protocol of [19, 20] as const) {
+			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+			const fixture = await serverFor((request, socket) => {
+				calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
+				const result = request.method === "ping" ? { type: "pong", protocol }
+					: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : { type: "ok" };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+			const reporter = createChildHerdrMetadataReporter({ handle: { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol }, runId: "run-123", title: "Worker" });
+			assert.ok(reporter);
+			reporter!.report("ready");
+			await reporter!.close();
+			const metadata = calls.filter((call) => call.method === "pane.report_metadata");
+			assert.deepEqual(metadata.map((call) => call.params), [
+				{ pane_id: sourcePane.pane_id, source: "pi-subagent:run-123", applies_to_source: "herdr:pi", agent: "pi", seq: 1, ttl_ms: 120000, title: "Worker", display_agent: "Pi", state_labels: { idle: "Ready", working: "Running", blocked: "Waiting", unknown: "Finished" }, tokens: { run: "run-123", lifecycle: "ready" } },
+				{ pane_id: sourcePane.pane_id, source: "pi-subagent:run-123", applies_to_source: "herdr:pi", agent: "pi", seq: 2, ttl_ms: 120000, clear_title: true, clear_display_agent: true, clear_state_labels: true, tokens: { run: null, lifecycle: null } },
+			]);
+			await fixture.close();
+		}
+	});
+
+	test("coalesces child metadata latest-write-wins and omits unsafe titles", async () => {
+		const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+		let releaseFirst!: () => void;
+		const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const fixture = await serverFor((request, socket) => {
+			calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
+			if (request.method === "pane.report_metadata" && calls.filter((call) => call.method === "pane.report_metadata").length === 1) {
+				void firstHeld.then(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`));
+				return;
+			}
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : { type: "ok" };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const reporter = createChildHerdrMetadataReporter({ handle, runId: "run-123", title: "bad\u202etitle" });
+		assert.ok(reporter);
+		reporter!.report("ready"); reporter!.report("running"); reporter!.report("waiting");
+		while (calls.filter((call) => call.method === "pane.report_metadata").length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+		releaseFirst();
+		for (let attempt = 0; attempt < 30 && calls.filter((call) => call.method === "pane.report_metadata").length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+		const metadata = calls.filter((call) => call.method === "pane.report_metadata");
+		assert.equal(metadata.length, 2);
+		assert.equal(metadata[0]!.params.title, undefined);
+		assert.equal((metadata[1]!.params.tokens as { lifecycle: string }).lifecycle, "waiting");
+		assert.deepEqual(metadata.map((call) => call.params.seq), [1, 3]);
+		await reporter!.close();
+		await fixture.close();
+	});
+
+	test("isolates failed child metadata writes without retrying their sequence", async () => {
+		const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+		let metadataAttempts = 0;
+		const fixture = await serverFor((request, socket) => {
+			calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
+			if (request.method === "pane.report_metadata" && ++metadataAttempts === 1) return socket.end(`${JSON.stringify({ id: request.id, result: { type: "wrong" } })}\n`);
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : { type: "ok" };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		const reporter = createChildHerdrMetadataReporter({ handle: { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }, runId: "run-123" });
+		assert.ok(reporter);
+		reporter!.report("ready");
+		while (metadataAttempts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+		reporter!.report("running");
+		for (let attempt = 0; attempt < 30 && metadataAttempts < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+		assert.equal(metadataAttempts, 2);
+		assert.deepEqual(calls.filter((call) => call.method === "pane.report_metadata").map((call) => call.params.seq), [1, 2]);
+		await reporter!.close();
+		await fixture.close();
+	});
+
+	test("bounds metadata close by aborting blackholed work without post-deadline requests", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-herdr-blackhole-"));
+		roots.push(root);
+		const socketPath = path.join(root, "herdr.sock");
+		const calls: string[] = [], sockets = new Set<net.Socket>();
+		const server = net.createServer((socket) => {
+			sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as Record<string, unknown>;
+				calls.push(request.method as string);
+				const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+					: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : null;
+				if (result) socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+				// pane.report_metadata deliberately blackholes after dispatch.
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const reporter = createChildHerdrMetadataReporter({ handle: { socketPath, ...socketGeneration(socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }, runId: "run-123" });
+		assert.ok(reporter); reporter!.report("running");
+		for (let attempt = 0; attempt < 100 && !calls.includes("pane.report_metadata"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+		assert.equal(calls.filter((method) => method === "pane.report_metadata").length, 1);
+		const started = Date.now(); await reporter!.close();
+		assert.ok(Date.now() - started < 400, "close uses an unref'd 250ms absolute deadline");
+		reporter!.report("failed"); await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.equal(calls.filter((method) => method === "pane.report_metadata").length, 1, "no request starts after close/deadline");
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	});
+
+	test("enforces the absolute metadata close deadline when a prior write settles before its timer runs", async () => {
+		const calls: string[] = [];
+		let releaseFirst!: () => void;
+		const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
+			if (request.method === "pane.report_metadata" && calls.filter((method) => method === "pane.report_metadata").length === 1) {
+				void firstHeld.then(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "ok" } })}\n`));
+				return;
+			}
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+				: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : { type: "ok" };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const reporter = createChildHerdrMetadataReporter({ handle, runId: "run-123" });
+		assert.ok(reporter);
+		reporter!.report("running");
+		while (calls.filter((method) => method === "pane.report_metadata").length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+		const now = Object.getOwnPropertyDescriptor(performance, "now")!;
+		try {
+			const closing = reporter!.close();
+			Object.defineProperty(performance, "now", { ...now, value: () => (now.value as () => number)() + 251 });
+			releaseFirst();
+			await closing;
+			assert.equal(calls.filter((method) => method === "pane.report_metadata").length, 1, "the queued clear cannot start after the monotonic deadline");
+		} finally {
+			Object.defineProperty(performance, "now", now);
+			await fixture.close();
+		}
+	});
+
+	test("does not create child metadata reporters for unsafe source identifiers", () => {
+		const handle = { socketPath: "/tmp/unused", socketDev: "1", socketIno: "1", workspaceId: "w", tabId: "t", paneId: "p", terminalId: "term", protocol: 20 as const };
+		assert.equal(createChildHerdrMetadataReporter({ handle, runId: "bad/run" }), null);
+		assert.equal(createChildHerdrMetadataReporter({ handle, runId: "x".repeat(70) }), null);
 	});
 
 	test("does not acknowledge an events subscription with a wrong discriminator", async () => {
@@ -256,15 +405,133 @@ describe("Herdr socket client", () => {
 		}
 	});
 
-	test("gates and revalidates exact Herdr focus before mutation", async () => {
+	test("uses strict protocol-19/20 AgentInfo reads and agent.focus without pane.focus fallback", async () => {
+		for (const protocol of [19, 20] as const) {
+			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+			const agent = { ...sourcePane, agent_status: "working", focused: false, revision: 4, state_change_seq: 9 };
+			const fixture = await serverFor((request, socket) => {
+				calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
+				const result = request.method === "ping" ? { type: "pong", protocol }
+					: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane }
+					: request.method === "agent.get" || request.method === "agent.focus" ? { type: "agent_info", agent: { ...agent, focused: request.method === "agent.focus" } }
+					: { type: "pane_list", panes: [sourcePane] };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+			assert.equal(await focusHerdrPane({ socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol }), true);
+			assert.deepEqual(calls.map((call) => call.method), ["ping", "pane.get", "agent.get", "agent.focus", "pane.get"]);
+			assert.deepEqual(calls.find((call) => call.method === "agent.get")?.params, { target: sourcePane.pane_id });
+			assert.deepEqual(calls.find((call) => call.method === "agent.focus")?.params, { target: sourcePane.pane_id });
+			assert.equal(calls.some((call) => call.method === "pane.focus"), false);
+			await fixture.close();
+		}
+	});
+
+	test("requires agent.focus to confirm focused true without retries", async () => {
 		const calls: string[] = [];
+		const agent = { ...sourcePane, agent_status: "idle", focused: false, revision: 1, state_change_seq: 1 };
 		const fixture = await serverFor((request, socket) => {
 			calls.push(request.method as string);
-			const result = request.method === "ping" ? { type: "pong", protocol: 20 } : { type: "pane_info", pane: sourcePane };
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+				: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane }
+				: request.method === "agent.get" ? { type: "agent_info", agent }
+				: { type: "agent_info", agent };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
-		assert.equal(await focusHerdrPane({ socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }), true);
-		assert.deepEqual(calls, ["ping", "pane.get", "pane.focus"]);
+		assert.equal(await focusHerdrPane({ socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 }), false);
+		assert.deepEqual(calls, ["ping", "pane.get", "agent.get", "agent.focus"]);
+		await fixture.close();
+	});
+
+	test("accepts omitted protocol-19 state_change_seq as its schema default", async () => {
+		const fixture = await serverFor((request, socket) => socket.end(`${JSON.stringify({ id: request.id, result: { type: "agent_info", agent: { ...sourcePane, agent_status: "idle", focused: false, revision: 1 } } })}\n`));
+		assert.equal((await new HerdrSocketClient(fixture.socketPath).getAgent(sourcePane.pane_id))?.stateChangeSeq, 0);
+		await fixture.close();
+	});
+
+	test("rejects malformed AgentInfo authority fields", async () => {
+		for (const agent of [
+			{ ...sourcePane, agent_status: "other", focused: false, revision: 1, state_change_seq: 1 },
+			{ ...sourcePane, agent_status: "idle", focused: "true", revision: 1, state_change_seq: 1 },
+			{ ...sourcePane, agent_status: "idle", focused: false, revision: -1, state_change_seq: 1 },
+			{ ...sourcePane, agent_status: "idle", focused: false, revision: 1, state_change_seq: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...sourcePane, agent_status: "idle", focused: false, revision: 1, state_change_seq: "not-a-number" },
+		]) {
+			const fixture = await serverFor((request, socket) => socket.end(`${JSON.stringify({ id: request.id, result: { type: "agent_info", agent } })}\n`));
+			assert.equal(await new HerdrSocketClient(fixture.socketPath).getAgent(sourcePane.pane_id), undefined);
+			await fixture.close();
+		}
+	});
+
+	test("agent wait is abort-aware, closes promptly, and never wakes after stop", async () => {
+		for (const protocol of [19, 20] as const) {
+			const calls: string[] = [];
+			let waitParams: Record<string, unknown> | undefined;
+			const agent = { ...sourcePane, agent_status: "working", focused: false, revision: 1, state_change_seq: 1 };
+			const fixture = await serverFor((request, socket) => {
+				calls.push(request.method as string);
+				if (request.method === "agent.wait") { waitParams = request.params as Record<string, unknown>; return; }
+				const result = request.method === "pane.get" ? { type: "pane_info", pane: sourcePane } : { type: "agent_info", agent };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+			const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol };
+			let wakes = 0;
+			const observer = observeHerdrAgentWait({ handle, onWake: () => { wakes += 1; }, serverTimeoutMs: 20, clientTimeoutMs: 30, retryDelayMs: 100 });
+			for (let attempt = 0; attempt < 40 && !waitParams; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			const started = Date.now(); observer.stop(); await observer.closed;
+			assert.ok(Date.now() - started < 100, "stop aborts the active wait rather than waiting for its timeout");
+			const stoppedWakes = wakes; await new Promise((resolve) => setTimeout(resolve, 40));
+			assert.equal(wakes, stoppedWakes);
+			assert.deepEqual(waitParams, { target: sourcePane.pane_id, until: ["idle", "blocked", "done", "unknown"], timeout_ms: 20 });
+			assert.equal(calls.includes("pane.focus"), false);
+			assert.equal(calls.includes("agent.focus"), false);
+			assert.ok(calls.includes("agent.wait"));
+			await fixture.close();
+		}
+	});
+
+	test("rate-limits immediate agent_not_running wait errors", async () => {
+		let waits = 0;
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "pane.get") return socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`);
+			if (request.method === "agent.get") return socket.end(`${JSON.stringify({ id: request.id, result: { type: "agent_info", agent: { ...sourcePane, agent_status: "working", focused: false, revision: 1, state_change_seq: 1 } } })}\n`);
+			waits += 1;
+			socket.end(`${JSON.stringify({ id: request.id, error: { code: "agent_not_running", message: "stopped" } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const observer = observeHerdrAgentWait({ handle, onWake: () => undefined, serverTimeoutMs: 20, clientTimeoutMs: 30, retryDelayMs: 100 });
+		await new Promise((resolve) => setTimeout(resolve, 180));
+		observer.stop(); await observer.closed;
+		assert.ok(waits >= 1 && waits <= 2, `expected no immediate hot loop, got ${waits} waits`);
+		await fixture.close();
+	});
+
+	test("caps agent wait observers process-wide without queueing a seventeenth", async () => {
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "pane.get") socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`);
+			else if (request.method === "agent.get") socket.end(`${JSON.stringify({ id: request.id, result: { type: "agent_info", agent: { ...sourcePane, agent_status: "working", focused: false, revision: 1, state_change_seq: 1 } } })}\n`);
+			// agent.wait deliberately remains pending until observer stop aborts it.
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const observers = Array.from({ length: 17 }, () => observeHerdrAgentWait({ handle: { ...handle }, onWake: () => undefined, serverTimeoutMs: 20, clientTimeoutMs: 30 }));
+		assert.equal(observers.filter((observer) => observer.isActive()).length, 16);
+		for (const observer of observers) observer.stop();
+		await Promise.all(observers.map((observer) => observer.closed));
+		await fixture.close();
+	});
+
+	test("does not continue from an aborted pane.get to pane.list", async () => {
+		const calls: string[] = [];
+		const controller = new AbortController();
+		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
+			if (request.method === "pane.get") {
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "moved" } })}\n`);
+				controller.abort();
+			}
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		assert.deepEqual(await classifyHerdrTerminal(handle, controller.signal), { state: "unknown" });
+		assert.deepEqual(calls, ["pane.get"]);
 		await fixture.close();
 	});
 
@@ -288,9 +555,12 @@ describe("Herdr socket client", () => {
 	});
 
 	test("treats zero, duplicate, malformed, and oversized fallback lists as unknown", async () => {
+		const unrelated = { ...sourcePane, pane_id: "unrelated-pane", terminal_id: "unrelated-terminal" };
 		const cases: Array<[string, unknown]> = [
-			["zero", []], ["duplicate", [sourcePane, { ...sourcePane, pane_id: "duplicate" }]], ["malformed", [{ pane_id: "missing-stable-id" }]],
-			["oversized", Array.from({ length: 129 }, () => sourcePane)],
+			["zero", []], ["duplicate", [sourcePane, { ...sourcePane, pane_id: "duplicate" }]],
+			["duplicate unrelated pane", [unrelated, { ...unrelated, terminal_id: "another-terminal" }]],
+			["duplicate unrelated terminal", [unrelated, { ...unrelated, pane_id: "another-pane" }]],
+			["malformed", [{ pane_id: "missing-stable-id" }]], ["oversized", Array.from({ length: 129 }, () => sourcePane)],
 		];
 		for (const protocol of [19, 20] as const) for (const [_name, panes] of cases) {
 			const fixture = await serverFor((request, socket) => {
@@ -329,18 +599,25 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 
-	test("rebinds a moved pane by terminal_id before reporting absence", async () => {
+	test("treats a moved event as a wakeup and rebinds only through pane_not_found then pane.list", async () => {
 		const moved = { ...sourcePane, workspace_id: "other workspace", tab_id: "other tab", pane_id: "new pane id" };
+		const calls: string[] = [];
 		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
 			if (request.method === "events.subscribe") {
 				assert.deepEqual((request.params as { subscriptions: Array<Record<string, unknown>> }).subscriptions.find((subscription) => subscription.type === "pane.agent_status_changed"), {
 					type: "pane.agent_status_changed", pane_id: sourcePane.pane_id,
 				});
 				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
-				setTimeout(() => socket.write(`${JSON.stringify({ data: { previous_pane_id: sourcePane.pane_id, pane: moved } })}\n`), 5);
+				setTimeout(() => socket.write(`${JSON.stringify({ event: "pane.moved", data: { previous_pane_id: sourcePane.pane_id, pane: moved } })}\n`), 5);
 				return;
 			}
-			socket.end(`${JSON.stringify({ id: request.id, result: { pane: (request.params as { pane_id: string }).pane_id === moved.pane_id ? moved : sourcePane } })}\n`);
+			if (request.method === "pane.get" && (request.params as { pane_id: string }).pane_id === sourcePane.pane_id) {
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "moved" } })}\n`);
+				return;
+			}
+			const result = request.method === "pane.get" ? { type: "pane_info", pane: moved } : { type: "pane_list", panes: [moved] };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
 		let reconciled = 0;
@@ -348,7 +625,26 @@ describe("Herdr socket client", () => {
 		await new Promise((resolve) => setTimeout(resolve, 40));
 		subscription.stop(); await subscription.closed;
 		assert.ok(reconciled >= 1);
+		assert.deepEqual(calls.slice(0, 3), ["events.subscribe", "pane.get", "pane.list"]);
 		assert.deepEqual({ workspaceId: handle.workspaceId, tabId: handle.tabId, paneId: handle.paneId }, { workspaceId: moved.workspace_id, tabId: moved.tab_id, paneId: moved.pane_id });
+		await fixture.close();
+	});
+
+	test("stops an in-flight subscription reconciliation before it can call back", async () => {
+		let resolvePaneGet!: () => void, callbacks = 0;
+		const paneGetHeld = new Promise<void>((resolve) => { resolvePaneGet = resolve; });
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "events.subscribe") return socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+			void paneGetHeld.then(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`));
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, onReconcile: () => { callbacks += 1; } });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		subscription.stop();
+		resolvePaneGet();
+		await subscription.closed;
+		assert.equal(callbacks, 0);
+		assert.deepEqual({ workspaceId: handle.workspaceId, tabId: handle.tabId, paneId: handle.paneId }, { workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id });
 		await fixture.close();
 	});
 

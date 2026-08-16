@@ -137,10 +137,10 @@ function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = pro
 
 const herdrSource = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-source", terminal_id: "herdr-source-terminal" };
 const herdrChild = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-child", terminal_id: "herdr-child-terminal" };
-type HerdrBrokerMode = "success" | "split-unknown" | "send-unknown" | "send-known" | "send-known-after-move" | "split-terminal-reuse" | "split-pane-reuse" | "source-moved" | "source-moved-current-pane-reuse" | `split-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}` | `send-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}`;
+type HerdrBrokerMode = "success" | "split-unknown" | "send-unknown" | "send-known" | "send-known-after-move" | "send-known-duplicate-unrelated" | "split-terminal-reuse" | "split-pane-reuse" | "source-moved" | "source-moved-current-pane-reuse" | `split-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}` | `send-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}`;
 async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protocol = 20) {
 	const socketPath = path.join(root, `herdr-${mode}.sock`), calls: string[] = [], requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-	let sourceGets = 0, tabCreated = false, reboundSourcePaneId: string | null = null, childClosed = false;
+	let sourceGets = 0, tabCreated = false, reboundSourcePaneId: string | null = null, childClosed = false, knownSendFailed = false;
 	const server = net.createServer((socket) => {
 		let input = "";
 		socket.on("data", (chunk: Buffer) => {
@@ -150,7 +150,15 @@ async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protoc
 			const request = JSON.parse(input.slice(0, newline)) as { id: string; method: string; params: Record<string, unknown> };
 			calls.push(request.method); requests.push({ method: request.method, params: request.params });
 			if (request.method === "pane.split" && mode === "split-unknown" || request.method === "pane.send_text" && mode === "send-unknown") { socket.destroy(); return; }
-			if (request.method === "pane.send_text" && (mode === "send-known" || mode === "send-known-after-move")) {
+			if (mode === "send-known-duplicate-unrelated" && knownSendFailed && request.method === "pane.get" && request.params.pane_id === herdrChild.pane_id) {
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "missing" } })}\n`); return;
+			}
+			if (mode === "send-known-duplicate-unrelated" && knownSendFailed && request.method === "pane.list") {
+				const unrelated = { ...herdrChild, pane_id: "unrelated-pane", terminal_id: "unrelated-terminal" };
+				socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_list", panes: [unrelated, { ...unrelated, terminal_id: "other-terminal" }] } })}\n`); return;
+			}
+			if (request.method === "pane.send_text" && (mode === "send-known" || mode === "send-known-after-move" || mode === "send-known-duplicate-unrelated")) {
+				knownSendFailed ||= mode === "send-known-duplicate-unrelated";
 				socket.end(`${JSON.stringify({ id: request.id, error: { code: "delivery_failed", message: "known delivery failure" } })}\n`); return;
 			}
 			const failure = request.method === "pane.split" ? mode.slice("split-".length) : request.method === "pane.send_text" ? mode.slice("send-".length) : null;
@@ -436,6 +444,21 @@ describe("pane launch broker", () => {
 				} finally { await server.close(); }
 			}
 		}
+	});
+
+	test("does not treat a duplicate unrelated Herdr list as target absence during rollback", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "send-known-duplicate-unrelated");
+		try {
+			const stateRoot = path.join(root, "state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const runId = "herdr-duplicate-unrelated", paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const broker = spawn(fs.realpathSync(process.execPath), await writeHerdrIntent(paths, runId, server.socketPath), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+			await waitForBrokerArtifact(paths.launchPath);
+			await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
+			assert.equal(await waitForExit(broker), 0);
+			assert.ok(await readBrokerJson(paths.residualRiskPath), "ambiguous global list retains recovery risk");
+			assert.equal(server.calls.includes("pane.close"), false, "unrelated duplicate rows cannot prove target absence or authorize rollback");
+		} finally { await server.close(); }
 	});
 
 	test("binds broker source and allocation authority to terminal identity across pane moves", async () => {

@@ -14,7 +14,7 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 - **백그라운드 실행** — 선택적 최상위 `background: true`가 호출을 즉시 반환시키고, 완료/실패/취소 결과는 나중에 자동 steer 메시지로 전달됩니다.
 - **실행 환경 자동 선택** — cmux, tmux, Herdr에서는 실제 interactive child Pi TUI를 엽니다. 기본 `auto`는 cmux의 shared right pane, tmux의 child별 detached window, Herdr의 focus를 옮기지 않는 child별 새 tab root pane을 사용합니다. `split`은 child별 오른쪽 split 호환 모드입니다.
 - **선택적 managed child profile** — `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`는 inherited extension을 끄고 nested delegation 및 interactive lifecycle에 필요한 extension만 명시적으로 로드합니다.
-- **Parent TUI 관리 UX** — `/subagents` 하나로 상태/preview/상세 진단, exact-ID 취소, negotiated cmux 또는 exact rebound Herdr focus, session keep와 durable promote를 제공하고 footer에 compact 집계를 표시합니다.
+- **Parent TUI 관리 UX** — `/subagents` 하나로 상태/preview/상세 진단, exact-ID 취소, negotiated cmux focus 또는 identity를 전후 검증하는 user-initiated Herdr focus, session keep와 durable promote를 제공하고 footer에 compact 집계를 표시합니다.
 - **선택적 generic presence** — root parent는 dependency 없이 `pi-presence:update:v1`/`pi-presence:remove:v1`을 발행하고 `pi-presence:ready:v1` 재발행 요청을 수신합니다. 설치된 `pi-cmux-presence`가 같은 Pi process에서 이를 선택적으로 소비할 수 있으며, presence는 observer 출력이고 lifecycle authority가 아닙니다.
 - **런타임 보호 장치** — 최대 위임 깊이와 순환 위임 방지로 재귀 실행 위험을 줄입니다.
 - **프로젝트 에이전트 신뢰 확인** — `.pi/agents`의 프로젝트 로컬 에이전트는 Pi가 현재 프로젝트를 trusted로 판정하거나 exact canonical root가 승인된 세션에서만 사용합니다.
@@ -242,4 +242,4 @@ MIT. 자세한 내용은 [`LICENSE`](LICENSE)와 [`NOTICE`](NOTICE)를 참고하
 
 ### Herdr 안전 경계
 
-Herdr 지원은 live mutating acceptance가 아니라 strict fake-socket 테스트로 검증됩니다. `auto`는 protocol 19/20의 workspace-scoped `layout.apply` 한 번으로 `tab_id` 없이 unfocused 새 tab의 root pane에 wrapper direct argv를 시작하고, strict `layout_apply.layout.root` 뒤 `pane.get` terminal binding만 수용합니다. `pane.send_text`로 command line을 입력·표시하지 않으며 gate rejection은 조용합니다. auto post-launch 취소는 인증된 child의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용하므로 parent는 `pane.send_keys`/`pane.close`/rollback/reaper mutation을 보내지 않습니다. auto-tab label과 title은 diagnostic-only이고 lifecycle authority는 generation-bound socket과 exact terminal identity입니다.
+Herdr 지원은 live mutation acceptance가 아니라 protocol 19/20 strict fake-socket 테스트로 검증됩니다. 공통 subset은 `agent.get`/`agent.wait`/`agent.focus`와 `pane.report_metadata`를 포함합니다. `auto`는 workspace-scoped `layout.apply` 한 번으로 `tab_id` 없이 unfocused 새 tab의 root pane에 wrapper direct argv를 시작하며, static `tab_label`은 이 생성 요청에서만 설정합니다. `split`은 기존 tab에 direct argv를 안전하게 넣을 수 없는 Herdr의 명시적 legacy `pane.split` + `pane.send_text` 경로이고, `auto`에서 fallback하지 않습니다. `agent.focus`는 user-initiated exact rebinding 뒤 한 번만 보내며 `pane.focus` fallback/retry가 없습니다. title과 child metadata는 별도 진단 정보이고 lifecycle authority는 generation-bound socket과 exact terminal identity입니다.

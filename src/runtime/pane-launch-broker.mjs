@@ -10,6 +10,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { createCmuxControlCommandRunner, getCmuxControlRequestManager } from "./cmux-control-adapter.mjs";
 import { TmuxControlClient, createTmuxControlCommandRunner } from "./tmux-control.mjs";
@@ -24,6 +25,99 @@ const isUuidString = (value) => typeof value === "string" && UUID.test(value);
 // Preserve backend UUID spelling, but never distinguish case aliases in authority checks.
 const cmuxIdsEqual = (left, right) => isUuidString(left) && isUuidString(right) && left.toLowerCase() === right.toLowerCase();
 const PANE = /^%(?:0|[1-9][0-9]*)$/;
+const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20]);
+const isHerdrProtocol = (value) => HERDR_SUPPORTED_PROTOCOLS.has(value);
+const HERDR_ID = /^[^\u0000-\u001f\u007f-\u009f]{1,256}$/u;
+const HERDR_MAX_LINE_BYTES = 256 * 1024;
+const HERDR_MAX_LISTED_PANES = 128;
+const isHerdrId = (value) => typeof value === "string" && Buffer.byteLength(value, "utf8") <= 256 && HERDR_ID.test(value);
+class HerdrUnknownOutcomeError extends Error {
+  constructor(method, message) { super(message); this.name = "HerdrUnknownOutcomeError"; this.method = method; this.unknownOutcome = true; }
+}
+class HerdrRequestError extends Error {
+  constructor(method, code, message) { super(message); this.name = "HerdrRequestError"; this.method = method; this.code = code; }
+}
+function isHerdrUnknownOutcome(error) { return error instanceof HerdrUnknownOutcomeError; }
+function herdrSource(value) {
+  return exact(value, ["socketPath", "workspaceId", "tabId", "sourcePaneId", "sourceTerminalId", "protocol"])
+    && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath) && path.normalize(value.socketPath) === value.socketPath
+    && isHerdrId(value.workspaceId) && isHerdrId(value.tabId) && isHerdrId(value.sourcePaneId) && isHerdrId(value.sourceTerminalId) && isHerdrProtocol(value.protocol);
+}
+function herdrTarget(value) {
+  return exact(value, ["socketPath", "workspaceId", "tabId", "paneId", "terminalId", "protocol"])
+    && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath) && path.normalize(value.socketPath) === value.socketPath
+    && [value.workspaceId, value.tabId, value.paneId, value.terminalId].every(isHerdrId) && isHerdrProtocol(value.protocol);
+}
+function strictHerdrSocket(socketPath) {
+  try { const stat = fsSync.lstatSync(socketPath); return stat.isSocket() && !stat.isSymbolicLink() && (typeof process.getuid !== "function" || stat.uid === process.getuid()) && (stat.mode & 0o077) === 0 ? stat : null; } catch { return null; }
+}
+async function herdrRequest(socketPath, method, params, mutation = false) {
+  const before = strictHerdrSocket(socketPath); if (!before) throw new Error("unsafe Herdr socket");
+  const id = `pi-subagent:${crypto.randomUUID()}`, line = `${JSON.stringify({ id, method, params })}\n`;
+  if (Buffer.byteLength(line, "utf8") > HERDR_MAX_LINE_BYTES) throw new Error("Herdr request exceeds the strict wire limit");
+  return await new Promise((resolve, reject) => {
+    let dispatched = false, settled = false, bytes = Buffer.alloc(0);
+    const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); socket.destroy(); error ? reject(error) : resolve(value); };
+    // After mutation dispatch, only a strict matching response is decisive.
+    // All transport/envelope failures retain typed uncertainty for the caller.
+    const unknown = (message) => mutation && dispatched ? new HerdrUnknownOutcomeError(method, message) : new Error(message);
+    const socket = net.createConnection({ path: socketPath });
+    const timer = setTimeout(() => finish(unknown("Herdr request timed out")), 5000);
+    socket.once("connect", () => {
+      try {
+        const after = strictHerdrSocket(socketPath);
+        if (!after || before.dev !== after.dev || before.ino !== after.ino) return finish(new Error("Herdr socket changed during connection"));
+        dispatched = true; socket.write(line, (error) => { if (error) finish(unknown(`Herdr request write failed: ${error.message}`)); });
+      } catch (error) { finish(unknown(error instanceof Error ? error.message : String(error))); }
+    });
+    socket.on("data", (chunk) => {
+      bytes = Buffer.concat([bytes, chunk]); if (bytes.length > HERDR_MAX_LINE_BYTES) return finish(unknown("Herdr response too large"));
+      const at = bytes.indexOf(10); if (at < 0) return;
+      if (at !== bytes.length - 1) return finish(unknown("Herdr response framing invalid"));
+      let response; try { response = JSON.parse(bytes.subarray(0, at).toString("utf8")); } catch { return finish(unknown("Herdr response malformed")); }
+      if (!response || typeof response !== "object" || Array.isArray(response) || response.id !== id) return finish(unknown("Herdr response binding mismatch"));
+      if (Object.keys(response).length === 2 && Object.hasOwn(response, "error") && response.error && typeof response.error === "object" && !Array.isArray(response.error)
+        && Object.keys(response.error).length === 2 && typeof response.error.code === "string" && typeof response.error.message === "string") return finish(new HerdrRequestError(method, response.error.code, response.error.message));
+      if (Object.keys(response).length !== 2 || !Object.hasOwn(response, "result") || !response.result || typeof response.result !== "object" || Array.isArray(response.result)
+        || mutation && typeof response.result.type !== "string") return finish(unknown("Herdr response envelope or result is invalid"));
+      finish(null, response.result);
+    });
+    socket.once("error", (error) => finish(unknown(error.message))); socket.once("end", () => { if (!settled) finish(unknown("Herdr closed the response before completion")); });
+  });
+}
+function parseHerdrPane(value, socketPath, protocol) {
+  const pane = value?.pane ?? value?.agent?.pane ?? value?.session?.pane ?? value;
+  return pane && typeof pane === "object" && !Array.isArray(pane) && isHerdrId(pane.workspace_id) && isHerdrId(pane.tab_id) && isHerdrId(pane.pane_id) && isHerdrId(pane.terminal_id) && isHerdrProtocol(protocol)
+    ? { mode: "herdr-pane", socketPath, workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol } : null;
+}
+async function assertHerdrProtocol(socketPath, expectedProtocol) {
+  const pong = await herdrRequest(socketPath, "ping", {});
+  if (!isHerdrProtocol(pong.protocol)) throw new Error("Herdr protocol must be one of 19 or 20");
+  if (expectedProtocol !== undefined && pong.protocol !== expectedProtocol) throw new Error(`Herdr protocol changed from ${expectedProtocol} to ${pong.protocol}`);
+  return pong.protocol;
+}
+/** A pane move changes public address, never the terminal identity we own. */
+async function revalidateHerdrTarget(target) {
+  await assertHerdrProtocol(target.socketPath, target.protocol);
+  try {
+    const observed = parseHerdrPane(await herdrRequest(target.socketPath, "pane.get", { pane_id: target.paneId }), target.socketPath, target.protocol);
+    if (observed?.terminalId === target.terminalId) {
+      target.workspaceId = observed.workspaceId; target.tabId = observed.tabId; target.paneId = observed.paneId;
+      return target;
+    }
+  } catch { /* a new bounded all-workspaces query may recover a moved pane */ }
+  try {
+    const result = await herdrRequest(target.socketPath, "pane.list", {});
+    if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return null;
+    const panes = result.panes.map((pane) => parseHerdrPane(pane, target.socketPath, target.protocol));
+    if (panes.some((pane) => !pane)) return null;
+    const matches = panes.filter((pane) => pane.terminalId === target.terminalId);
+    if (matches.length !== 1) return null;
+    const observed = matches[0];
+    target.workspaceId = observed.workspaceId; target.tabId = observed.tabId; target.paneId = observed.paneId;
+    return target;
+  } catch { return null; }
+}
 const SESSION = /^\$(?:0|[1-9][0-9]*)$/;
 const WINDOW = /^@(?:0|[1-9][0-9]*)$/;
 const PID = /^[1-9][0-9]*$/;
@@ -300,7 +394,8 @@ function intent(value) {
     || tmuxControlV3 && (value.transport !== "tmux-control-v1" || !artifactPathEquals(value.transportGatePath, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.transportGateDigest))) return null;
   const sourceValid = value.terminalMode === "cmux-pane"
     ? exact(value.source, ["workspaceId", "sourceSurfaceId"]) && isUuidString(value.source.workspaceId) && isUuidString(value.source.sourceSurfaceId)
-    : value.terminalMode === "tmux-pane" && tmuxSource(value.source);
+    : value.terminalMode === "tmux-pane" ? tmuxSource(value.source)
+      : value.terminalMode === "herdr-pane" && herdrSource(value.source);
   if (!sourceValid) return null;
   // New tmux authority is always generation-bound. Generation-less V2
   // records remain parseable diagnostics in the parent, but this broker must
@@ -354,6 +449,7 @@ function allocation(value, runId) {
   if (!exact(value, hasLayout ? [...baseKeys, "layout", "placement", "container", ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys])) return null;
   if (value.version === 3 && (value.terminalMode !== "tmux-pane" || value.transport !== "tmux-control-v1" || typeof value.intentDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.intentDigest))) return null;
   if (requiresControl && (!value.control || value.control.transport !== "cmux-control-v2" || !isStableSemverAtLeast(value.control.appVersion, MINIMUM_CMUX_VERSION))) return null;
+  if (value.terminalMode === "herdr-pane") return !hasLayout && herdrTarget(value.target) ? value : null;
   if (value.terminalMode === "cmux-pane" && exact(value.target, ["workspaceId", "surfaceId", "paneId"]) && isUuidString(value.target.workspaceId) && isUuidString(value.target.surfaceId) && isUuidString(value.target.paneId)) {
     if (!hasLayout) return value;
     return cmuxAllocatedContainer(value.container)
@@ -374,17 +470,24 @@ function launch(value, runId, terminalMode) {
     && artifactPathEquals(value.allocationPath, "allocation.json") && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.ownership === "parent-owned" && Number.isFinite(value.committedAt) && value.committedAt > 0 ? value : null;
 }
 function gate(value, runId, terminalMode) {
-  return value && exact(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"]) && value.version === protocolVersion && value.runId === runId && value.terminalMode === terminalMode && artifactPathEquals(value.launchPath, "launch.json") && Number.isFinite(value.publishedAt) && value.publishedAt > 0 ? value : null;
+  const base = value && value.version === protocolVersion && value.runId === runId && value.terminalMode === terminalMode && artifactPathEquals(value.launchPath, "launch.json") && Number.isFinite(value.publishedAt) && value.publishedAt > 0;
+  if (!base) return null;
+  if (terminalMode === "herdr-pane") return exact(value, ["version", "runId", "terminalMode", "protocol", "launchPath", "publishedAt"]) && isHerdrProtocol(value.protocol) ? value : null;
+  return exact(value, ["version", "runId", "terminalMode", "launchPath", "publishedAt"]) ? value : null;
 }
 function targetFromAllocation(value) {
   return value.terminalMode === "cmux-pane"
     ? { mode: "cmux-pane", workspaceId: value.target.workspaceId, surfaceId: value.target.surfaceId, paneId: value.target.paneId }
-    : { mode: "tmux-pane", socketPath: value.target.socketPath, serverPid: value.target.serverPid, paneId: value.target.paneId, panePid: value.target.panePid, generation: value.target.generation };
+    : value.terminalMode === "herdr-pane"
+      ? { mode: "herdr-pane", ...value.target }
+      : { mode: "tmux-pane", socketPath: value.target.socketPath, serverPid: value.target.serverPid, paneId: value.target.paneId, panePid: value.target.panePid, generation: value.target.generation };
 }
 function sameTarget(left, right) {
   return left.mode === right.mode && (left.mode === "cmux-pane"
     ? cmuxIdsEqual(left.workspaceId, right.workspaceId) && cmuxIdsEqual(left.surfaceId, right.surfaceId) && cmuxIdsEqual(left.paneId, right.paneId)
-    : left.socketPath === right.socketPath && left.serverPid === right.serverPid && left.paneId === right.paneId && left.panePid === right.panePid && sameTmuxGeneration(left.generation, right.generation));
+    : left.mode === "herdr-pane"
+      ? left.socketPath === right.socketPath && left.workspaceId === right.workspaceId && left.tabId === right.tabId && left.paneId === right.paneId && left.terminalId === right.terminalId && left.protocol === right.protocol
+      : left.socketPath === right.socketPath && left.serverPid === right.serverPid && left.paneId === right.paneId && left.panePid === right.panePid && sameTmuxGeneration(left.generation, right.generation));
 }
 function isTmuxSourceTarget(intentRecord, target) {
   // Pane IDs are the backend's allocation identity. A recycled or changed PID
@@ -395,12 +498,19 @@ function isTmuxSourceTarget(intentRecord, target) {
 function isSourceTarget(intentRecord, target) {
   return intentRecord?.terminalMode === "cmux-pane"
     ? target?.mode === "cmux-pane" && cmuxIdsEqual(target.workspaceId, intentRecord.source.workspaceId) && cmuxIdsEqual(target.surfaceId, intentRecord.source.sourceSurfaceId)
-    : isTmuxSourceTarget(intentRecord, target);
+    : intentRecord?.terminalMode === "herdr-pane"
+      ? target?.mode === "herdr-pane" && target.socketPath === intentRecord.source.socketPath && target.protocol === intentRecord.source.protocol && target.terminalId === intentRecord.source.sourceTerminalId
+      : isTmuxSourceTarget(intentRecord, target);
 }
 function allocationMatchesIntentSource(intentRecord, allocationRecord) {
   if (!intentRecord || !allocationRecord || intentRecord.terminalMode !== allocationRecord.terminalMode) return false;
   const layoutIntent = Object.hasOwn(intentRecord, "layout"), layoutAllocation = Object.hasOwn(allocationRecord, "layout");
   if (layoutIntent !== layoutAllocation) return false;
+  if (intentRecord.terminalMode === "herdr-pane") {
+    return !layoutIntent && allocationRecord.target.socketPath === intentRecord.source.socketPath
+      && allocationRecord.target.workspaceId === intentRecord.source.workspaceId && allocationRecord.target.tabId === intentRecord.source.tabId
+      && allocationRecord.target.protocol === intentRecord.source.protocol && allocationRecord.target.terminalId !== intentRecord.source.sourceTerminalId;
+  }
   if (intentRecord.terminalMode === "cmux-pane") {
     if (!legacyCmuxHarness && (!intentRecord.control || !allocationRecord.control || JSON.stringify(intentRecord.control) !== JSON.stringify(allocationRecord.control))) return false;
     const sourceMatches = cmuxIdsEqual(allocationRecord.target.workspaceId, intentRecord.source.workspaceId)
@@ -467,10 +577,11 @@ function validStateDependencies(allocationRecord, decisionRecord, launchRecord, 
   if (decisionRecord?.kind === "cancel" && (launchRecord || gateRecord)) return false;
   if (launchRecord && (!allocationRecord || decisionRecord?.kind !== "commit" || launchRecord.terminalMode !== allocationRecord.terminalMode)) return false;
   if (gateRecord && (!launchRecord || !allocationRecord || decisionRecord?.kind !== "commit" || gateRecord.terminalMode !== allocationRecord.terminalMode || gateRecord.terminalMode !== launchRecord.terminalMode)) return false;
+  if (allocationRecord?.terminalMode === "herdr-pane" && gateRecord?.terminalMode === "herdr-pane" && gateRecord.protocol !== allocationRecord.target.protocol) return false;
   return true;
 }
 async function residualRisk(runId) {
-  recordPhase0LiveTelemetry(backendMode === "tmux-pane" ? "tmux" : "cmux", "residualRecovery", 1, "broker");
+  recordPhase0LiveTelemetry(backendMode === "tmux-pane" ? "tmux" : backendMode === "herdr-pane" ? "herdr" : "cmux", "residualRecovery", 1, "broker");
   await immutable(p("residual-risk.json"), { version: protocolVersion, runId, reason: "possible-unrecorded-allocation", recordedAt: now() }).catch(() => {});
 }
 async function status(runId, phase, errorCode) {
@@ -481,10 +592,24 @@ async function status(runId, phase, errorCode) {
   await replace(p("broker-status.json"), value).catch(() => {});
 }
 async function riskAndFail(runId) { await residualRisk(runId); await status(runId, "failed", "possible-unrecorded-allocation"); }
+async function recordLaunchDeliveryUnknown(runId) {
+  // Allocation is already immutable and exact: retain it for bounded parent /
+  // reaper reconciliation instead of conflating it with an unknown split.
+  await immutable(p("launch-delivery-unknown.json"), { version: protocolVersion, runId, terminalMode: "herdr-pane", allocationPath: p("allocation.json"), recordedAt: now() });
+  await status(runId, "failed", "launch-delivery-unknown");
+}
 async function rollback(target, intentRecord) {
   // A backend response that aliases the immutable source is never rollback
   // authority, even if its other fingerprint fields happen to match.
   if (isSourceTarget(intentRecord, target)) return false;
+  if (target.mode === "herdr-pane") {
+    // The protocol gate and stable-terminal rebinding are immediately before
+    // the close mutation; an old pane_id after pane.moved is never authority.
+    const current = await revalidateHerdrTarget(target);
+    if (!current) return false;
+    await herdrRequest(current.socketPath, "pane.close", { pane_id: current.paneId }, true);
+    return parseHerdrPane(await herdrRequest(current.socketPath, "pane.get", { pane_id: current.paneId }).catch(() => ({ pane: null })), current.socketPath, current.protocol) === null;
+  }
   if (target.mode === "cmux-pane") {
     // A surface can move workspaces. Establish both presence and its current
     // canonical workspace from one strict global topology before mutating.
@@ -612,6 +737,26 @@ async function allocateCmux(i) {
     mode: "cmux-pane", workspaceId: value.workspace_id, surfaceId: value.surface_id, paneId: value.pane_id,
     ...(result.code !== 0 ? { allocationFailed: true, allocationError: result.stderr || result.stdout || "cmux allocation failed" } : {}),
   };
+}
+async function allocateHerdr(i) {
+  // Intent protocol binding and this preflight prevent an older/incompatible
+  // server from ever observing a split mutation. Repeat at the boundary.
+  await assertHerdrProtocol(i.source.socketPath, i.source.protocol);
+  const sourceResponse = await herdrRequest(i.source.socketPath, "pane.get", { pane_id: i.source.sourcePaneId });
+  const source = parseHerdrPane(sourceResponse, i.source.socketPath, i.source.protocol);
+  if (!source || source.workspaceId !== i.source.workspaceId || source.tabId !== i.source.tabId
+    || source.paneId !== i.source.sourcePaneId || source.terminalId !== i.source.sourceTerminalId) throw new Error("Herdr source binding changed before allocation");
+  await assertHerdrProtocol(i.source.socketPath, i.source.protocol);
+  const current = parseHerdrPane(await herdrRequest(i.source.socketPath, "pane.get", { pane_id: source.paneId }), i.source.socketPath, i.source.protocol);
+  // The immutable terminal identity, not the public pane address, is the
+  // authority revalidated immediately before the split mutation.
+  if (!current || current.terminalId !== i.source.sourceTerminalId || current.workspaceId !== source.workspaceId || current.tabId !== source.tabId) throw new Error("Herdr source binding changed immediately before allocation");
+  const split = await herdrRequest(i.source.socketPath, "pane.split", { target_pane_id: current.paneId, direction: "right", cwd: path.dirname(i.childSessionFile), focus: false }, true);
+  const target = parseHerdrPane(split, i.source.socketPath, i.source.protocol);
+  if (!target || target.workspaceId !== source.workspaceId || target.tabId !== source.tabId || target.terminalId === i.source.sourceTerminalId) {
+    throw new HerdrUnknownOutcomeError("pane.split", "Herdr pane.split did not return an exact new terminal binding");
+  }
+  return target;
 }
 function socketArgs(socket) { return socket ? ["-S", socket] : []; }
 async function safeTmuxShellHome() {
@@ -849,11 +994,12 @@ async function main() {
     process.kill(process.pid, "SIGSTOP");
   }
   let target;
-  try { target = i.terminalMode === "cmux-pane" ? await allocateCmux(i) : await allocateTmux(i); } catch (error) {
+  try { target = i.terminalMode === "cmux-pane" ? await allocateCmux(i) : i.terminalMode === "herdr-pane" ? await allocateHerdr(i) : await allocateTmux(i); } catch (error) {
     if (process.env.PI_SUBAGENT_ACCEPTANCE_HARNESS === "1") console.error(`[pi-subagent acceptance broker] allocation failed: ${error instanceof Error ? error.message : "unknown"}`);
     // Successful allocation with no canonical identity cannot be safely
     // rediscovered. Keep the intent/status for manual recovery.
-    if (error?.message === "tmux possible-unrecorded-allocation" || error?.message === "tmux allocation reused source pane" || error?.message === "tmux split changed source container" || error?.message === "cmux possible-unrecorded-allocation" || error?.message === "cmux allocation reused source surface") await riskAndFail(i.runId);
+    if (isHerdrUnknownOutcome(error)
+      || error?.message === "tmux possible-unrecorded-allocation" || error?.message === "tmux allocation reused source pane" || error?.message === "tmux split changed source container" || error?.message === "cmux possible-unrecorded-allocation" || error?.message === "cmux allocation reused source surface") await riskAndFail(i.runId);
     else await status(i.runId, "failed", "allocation-failed");
     return;
   }
@@ -861,10 +1007,12 @@ async function main() {
     ? { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
       ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "cmux-pane", workspaceId: target.workspaceId, paneId: target.paneId }, control: i.control } : {}),
       target: { workspaceId: target.workspaceId, surfaceId: target.surfaceId, paneId: target.paneId }, allocatedAt: now() }
-    : { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
-      ...(protocolVersion === 3 ? { transport: "tmux-control-v1", intentDigest: intentArtifact.digest } : {}),
-      ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "tmux-window", socketPath: target.socketPath, serverPid: target.serverPid, sessionId: target.sessionId, windowId: target.windowId, paneId: target.paneId, panePid: target.panePid, generation: target.generation } } : {}),
-      target: { socketPath: target.socketPath, serverPid: target.serverPid, paneId: target.paneId, panePid: target.panePid, generation: target.generation }, allocatedAt: now() };
+    : i.terminalMode === "herdr-pane"
+      ? { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode, target: { socketPath: target.socketPath, workspaceId: target.workspaceId, tabId: target.tabId, paneId: target.paneId, terminalId: target.terminalId, protocol: target.protocol }, allocatedAt: now() }
+      : { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
+        ...(protocolVersion === 3 ? { transport: "tmux-control-v1", intentDigest: intentArtifact.digest } : {}),
+        ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "tmux-window", socketPath: target.socketPath, serverPid: target.serverPid, sessionId: target.sessionId, windowId: target.windowId, paneId: target.paneId, panePid: target.panePid, generation: target.generation } } : {}),
+        target: { socketPath: target.socketPath, serverPid: target.serverPid, paneId: target.paneId, panePid: target.panePid, generation: target.generation }, allocatedAt: now() };
   if (!allocationMatchesIntentSource(i, candidate)) {
     // A target equal to the source is parent-owned and must never be closed.
     if (!isSourceTarget(i, target)) {
@@ -965,6 +1113,36 @@ async function main() {
     await riskAndFail(i.runId); return;
   }
   await status(i.runId, "committed");
+  if (i.terminalMode === "herdr-pane") {
+    const outcome = await launchHerdrAfterGate(i, target);
+    // An unknown send_text delivery may already have exec'd the wrapper. Keep
+    // its exact durable allocation for reaper/parent reconciliation; never
+    // replay the command or close a potentially running child.
+    if (outcome === "unknown") await recordLaunchDeliveryUnknown(i.runId);
+    else if (outcome !== "launched") {
+      if (!await rollback(target, i)) await riskAndFail(i.runId);
+      else await status(i.runId, "failed", "commit-failed");
+    }
+  }
+}
+async function launchHerdrAfterGate(i, target) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const [rawDecision, rawAllocation, rawLaunch, rawGate] = await Promise.all([readExact(p("decision.json")), readExact(p("allocation.json")), readExact(p("launch.json")), readExact(p("launch.gate"))]);
+    const d = decision(rawDecision, i.runId), a = allocation(rawAllocation, i.runId), l = launch(rawLaunch, i.runId, i.terminalMode), g = gate(rawGate, i.runId, i.terminalMode);
+    if ((rawDecision && !d) || (rawAllocation && !a) || (rawLaunch && !l) || (rawGate && !g) || d?.kind === "cancel") return "not-launched";
+    if (d?.kind === "commit" && a && l && g && validStateDependencies(a, d, l, g) && allocationMatchesIntentSource(i, a) && g.protocol === target.protocol && sameTarget(target, targetFromAllocation(a))) {
+      // Gate and rebind again at the final mutation boundary. A positive
+      // response is still required; unknown delivery is recorded separately.
+      let current;
+      try { current = await revalidateHerdrTarget(target); } catch { return "not-launched"; }
+      if (!current) return "not-launched";
+      try { await herdrRequest(current.socketPath, "pane.send_text", { pane_id: current.paneId, text: `exec ${shellQuote(p("cmux-wrapper.sh"))}\n` }, true); return "launched"; }
+      catch (error) { return isHerdrUnknownOutcome(error) ? "unknown" : "not-launched"; }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return "not-launched";
 }
 async function verifyCmuxGateTarget(a) {
   // cmux assigns the new pane's identity. Do not reuse the source pane ids

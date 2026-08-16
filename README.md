@@ -163,11 +163,14 @@ CLI > 환경 변수 > 신뢰된 프로젝트 파일 > 전역 파일 > 내장 기
 
 ### 실행 환경
 
-확장이 현재 환경을 보고 다음 우선순위로 자동 선택합니다.
+`PI_SUBAGENT_TERMINAL_MODE`가 정확한 값이면 auto-detection보다 항상 우선합니다. 지정하지 않았을 때 확장이 현재 환경을 보고 다음 순서로 자동 선택합니다.
 
 - cmux 내부: `cmux-pane` — 기본 `auto`에서는 root sibling이 하나의 새 오른쪽 pane 안의 surface를 공유하고, nested descendant는 정확한 source pane에 surface로 쌓입니다.
-- tmux 내부: `tmux-pane` — 기본 `auto`에서는 child마다 같은 session의 detached window를 사용합니다.
+- Herdr 내부: `herdr-pane` — cmux가 아니고 owner-only Unix socket의 exact workspace/tab/pane binding이 검증될 때 child별 오른쪽 split을 만듭니다. 설치된 Herdr v0.8.0의 protocol 19와 preview protocol 20의 공통 socket subset을 지원합니다.
+- tmux 내부: `tmux-pane` — cmux와 Herdr가 모두 아니면 child마다 같은 session의 detached window를 사용합니다.
 - 그 외 환경: `inline`
+
+따라서 명시적 `PI_SUBAGENT_TERMINAL_MODE`가 항상 최우선이고, 자동 감지는 **cmux > Herdr > tmux > inline** 순입니다. Herdr 식별자가 불완전하거나 검증되지 않으면 tmux 또는 inline으로 안전하게 계속합니다.
 
 ![Runtime execution modes and layout](docs/diagram/runtime-execution-modes.png)
 
@@ -175,7 +178,7 @@ _2x PNG · [SVG](docs/diagram/runtime-execution-modes.svg) · [Mermaid source](d
 
 `pi-cmux`는 위 실행 환경 선택이나 child surface lifecycle에 필요하지 않은 선택적 workflow UX 확장입니다. 설치하지 않아도 cmux child Pi TUI, 결과 반환, 취소와 cleanup이 동작합니다. `pi-cmux`의 child별 sidebar·command/review workflow가 필요하면 해당 package를 사용하고, root Pi와 subagent 집계의 socket-only status/progress/attention만 필요하면 별도 `pi-cmux-presence`를 선택할 수 있습니다. 차이와 검증 방법은 [`pi-cmux` 연동 가이드](docs/pi-cmux-integration.md)와 [`pi-cmux-presence` 연동](docs/pi-cmux-presence-integration.md)을 참고하세요.
 
-`--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`로 바꿀 수 있습니다. CLI > 환경 변수 > 기본 `auto` 순이며 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
+`PI_SUBAGENT_TERMINAL_MODE=inline|cmux-pane|tmux-pane|herdr-pane`는 terminal mode의 유일한 명시적 override이며, Windows에서는 무시되고 항상 `inline`입니다. `--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`는 별도 layout 설정으로 CLI > 환경 변수 > 기본 `auto` 순입니다. 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
 
 interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달하고 정확한 surface/pane만 닫습니다. parent 취소 또는 session shutdown은 parent-owned target에 Escape를 보낸 뒤 exact surface/pane을 닫습니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
 

@@ -1,4 +1,4 @@
-export type Phase0LiveTelemetryBackend = "cmux" | "tmux";
+export type Phase0LiveTelemetryBackend = "cmux" | "tmux" | "herdr";
 export type Phase0LiveTelemetryMetric = "backendRequests" | "backendSpawns" | "requestBacklogHighWater" | "lineBacklogHighWater" | "byteBacklogHighWater" | "controlDisconnects" | "reconnects" | "unknownOutcomes" | "exactSnapshots" | "exactCleanupMutations" | "residualRecovery" | "persistentClientCreates" | "persistentClientRestarts" | "healthyPeriodicStatusQueries" | "notificationToReconcileLatencyMs" | "lifecycleCompletionLatencyMs";
 export const PHASE0_LIVE_TELEMETRY_DIR_ENV: "PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_DIR";
 export const PHASE0_LIVE_TELEMETRY_CAPABILITY_ENV: "PI_SUBAGENT_PHASE0_LIVE_TELEMETRY_CAPABILITY";

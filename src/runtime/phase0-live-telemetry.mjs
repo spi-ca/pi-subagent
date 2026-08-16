@@ -76,7 +76,7 @@ function finalize() {
 }
 /** Synchronous, bounded telemetry is intentionally active only in the explicit live benchmark. */
 export function recordPhase0LiveTelemetry(backend, metric, value = 1, reason) {
-  if ((backend !== "cmux" && backend !== "tmux") || !METRIC_SET.has(metric) || !Number.isFinite(value) || value < 0 || (reason !== undefined && (typeof reason !== "string" || !/^[a-z0-9._-]{1,64}$/i.test(reason)))) return false;
+  if ((backend !== "cmux" && backend !== "tmux" && backend !== "herdr") || !METRIC_SET.has(metric) || !Number.isFinite(value) || value < 0 || (reason !== undefined && (typeof reason !== "string" || !/^[a-z0-9._-]{1,64}$/i.test(reason)))) return false;
   const target = initialize();
   if (!target || target.ended || !initializeMetricPresence(target, backend)) return false;
   const wrote = emit(target, { version: 1, type: "counter", pid: process.pid, backend, metric, value, ...(reason ? { reason } : {}) });

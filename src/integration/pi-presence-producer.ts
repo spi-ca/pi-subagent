@@ -325,8 +325,8 @@ export class PiSubagentPresenceProducer {
    * declared generic v1 usage fields. This is observer-only and deliberately
    * does not accept partial updates or infer context usage.
    */
-  recordFinalUsage(invocationId: unknown, usage: unknown): boolean {
-    if (this.sessionId === null || typeof invocationId !== "string" || !safeText(invocationId)) return false;
+  recordFinalUsage(invocationId: unknown, generation: unknown, usage: unknown): boolean {
+    if (this.sessionId === null || generation !== this.generation || typeof invocationId !== "string" || !safeText(invocationId)) return false;
     if (this.usageInvocationIds.has(invocationId) || this.usageInvocationIds.size >= MAX_REMEMBERED_TERMINALS) return false;
     if (!usage || typeof usage !== "object") return false;
     const value = usage as { totalTokens?: unknown; cost?: { total?: unknown } };

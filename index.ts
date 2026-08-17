@@ -1611,7 +1611,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               // accounting, before the terminal UX publication it observes.
               // Background snapshots deliberately compact usage, so this
               // callback carries the private pre-compaction aggregate.
-              presenceProducer?.recordFinalUsage?.(finalizedJob.id, finalizedUsage);
+              presenceProducer?.recordFinalUsage?.(finalizedJob.id, uxGeneration, finalizedUsage);
               if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
               else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
               else uxRegistry.fail(finalizedJob.id, uxGeneration);
@@ -1647,7 +1647,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           updateUxFromPartial(uxRun.id, uxGeneration, result);
           // Record before the terminal UX transition so its v1 update carries
           // the finalized aggregate without exposing accounting in tool DTOs.
-          presenceProducer?.recordFinalUsage?.(uxRun.id, result.usage);
+          presenceProducer?.recordFinalUsage?.(uxRun.id, uxGeneration, result.usage);
           if (foregroundController.signal.aborted) {
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
           }

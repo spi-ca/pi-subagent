@@ -49,6 +49,14 @@ function updateWithEveryOptionalField(sessionId: string, sequence: number) {
   };
 }
 
+function updateForSource(sessionId: string, sourceId: string, sequence: number) {
+  return {
+    version: 1, sessionId, generation: 0, sequence,
+    source: { id: sourceId, label: sourceId, kind: "agent-group" },
+    state: "running", counts: { active: 1, completed: 0, failed: 0 },
+  };
+}
+
 function eventBus() {
   const events: Event[] = [];
   const listeners = new Map<string, Set<(payload: unknown) => void>>();
@@ -152,6 +160,22 @@ describe("presence V1 frozen consumer compatibility fixtures", () => {
     test(`${profile.name} independently accepts the deterministic consumer-first handshake and lifecycle`, () => assertLifecycle(profile, "consumer-first"));
     test(`${profile.name} independently accepts the deterministic producer-first handshake, replay, and lifecycle`, () => assertLifecycle(profile, "producer-first"));
   }
+
+  test("frozen consumer contracts retain both consumers' 64-source fence budget at saturation", () => {
+    const sessionId = "source-limit-session";
+    for (const profile of fixture.profiles) {
+      const consumer = createFrozenConsumerContract(profile.name);
+      for (let index = 0; index < 64; index += 1) {
+        assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, updateForSource(sessionId, `source-${index}`, 1), sessionId), true, `${profile.name}: source ${index} fills its shared budget`);
+      }
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, updateForSource(sessionId, "source-overflow", 1), sessionId), false, `${profile.name}: 65th source is rejected`);
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, updateForSource(sessionId, "source-0", 2), sessionId), true, `${profile.name}: retained source fence remains updatable at capacity`);
+      assert.equal(consumer.accept(PI_PRESENCE_REMOVE_EVENT, { version: 1, sessionId, generation: 0, sequence: 1, source: { id: "unknown-remove" } }, sessionId), false, `${profile.name}: unknown remove does not allocate a source fence`);
+      assert.equal(consumer.accept(PI_PRESENCE_REMOVE_EVENT, { version: 1, sessionId, generation: 0, sequence: 3, source: { id: "source-0" } }, sessionId), true, `${profile.name}: known source can be removed`);
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, updateForSource(sessionId, "source-0", 4), sessionId), true, `${profile.name}: removed source retains an updatable fence`);
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, updateForSource(sessionId, "source-overflow", 2), sessionId), false, `${profile.name}: removal does not release a fence slot to a new source`);
+    }
+  });
 
   test("frozen consumer contracts accept all valid optional update fields and reject malformed optional fields", () => {
     const sessionId = "optional-field-session";

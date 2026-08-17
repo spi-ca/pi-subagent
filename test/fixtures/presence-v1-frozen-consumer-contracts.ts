@@ -26,6 +26,8 @@ type SummaryFence = Fence & { readonly kind: "update" | "remove" };
 const MAX_TEXT = 96;
 const MAX_COUNT = 1_000_000;
 const MAX_METRIC = 1_000_000_000_000;
+/** Frozen from both current V1 consumers' PresenceEventRegistry source budget. */
+const MAX_SOURCES = 64;
 const MAX_ACTIVE = 8;
 const STATES = new Set(["idle", "waiting", "running", "success", "error", "cancelled"]);
 const ATTENTION = new Set(["none", "info", "success", "error"]);
@@ -197,6 +199,7 @@ class ConsumerModel implements FrozenConsumerContract {
 
   private acceptFence(next: AcceptedUpdate): boolean {
     const previous = this.fences.get(next.sourceId);
+    if (!previous && this.fences.size >= MAX_SOURCES) return false;
     if (previous && !advances(next, previous)) return false;
     this.fences.set(next.sourceId, { generation: next.generation, sequence: next.sequence });
     return true;

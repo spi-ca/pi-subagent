@@ -256,7 +256,10 @@ export class PiSubagentPresenceProducer {
   private sequence = 0;
   private current: PiPresenceUpdate | null = null;
   private readonly terminalIds = new Set<string>();
+  /** Finalized invocation IDs fence accounting against duplicate completion callbacks. */
+  private readonly usageInvocationIds = new Set<string>();
   private terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
+  private presenceUsage = { tokens: 0, cost: 0 };
   private lastTerminal: TerminalStatus | null = null;
   private unsubscribeReady: (() => void) | null = null;
   private cmuxStatusConsumerSeen = false;
@@ -284,7 +287,9 @@ export class PiSubagentPresenceProducer {
     this.sequence = 0;
     this.current = null;
     this.terminalIds.clear();
+    this.usageInvocationIds.clear();
     this.terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
+    this.presenceUsage = { tokens: 0, cost: 0 };
     this.lastTerminal = null;
     this.cmuxStatusConsumerSeen = false;
     this.presenceRemoveCapabilityDetected = false;
@@ -311,6 +316,31 @@ export class PiSubagentPresenceProducer {
     this.requestingReady = false;
     this.settlementDeferred = false;
     this.terminalIds.clear();
+    this.usageInvocationIds.clear();
+    this.presenceUsage = { tokens: 0, cost: 0 };
+  }
+
+  /**
+   * Project one finalized invocation's internal accounting to the already
+   * declared generic v1 usage fields. This is observer-only and deliberately
+   * does not accept partial updates or infer context usage.
+   */
+  recordFinalUsage(invocationId: unknown, usage: unknown): boolean {
+    if (this.sessionId === null || typeof invocationId !== "string" || !safeText(invocationId)) return false;
+    if (this.usageInvocationIds.has(invocationId) || this.usageInvocationIds.size >= MAX_REMEMBERED_TERMINALS) return false;
+    if (!usage || typeof usage !== "object") return false;
+    const value = usage as { totalTokens?: unknown; cost?: { total?: unknown } };
+    const tokens = value.totalTokens;
+    const cost = value.cost?.total;
+    if (!metric(tokens) || !metric(cost)) return false;
+    const nextTokens = this.presenceUsage.tokens + tokens;
+    const nextCost = this.presenceUsage.cost + cost;
+    // Never emit a malformed over-bound aggregate; retain the current safe
+    // value rather than partially accepting a finalized invocation.
+    if (!metric(nextTokens) || !metric(nextCost)) return false;
+    this.usageInvocationIds.add(invocationId);
+    this.presenceUsage = { tokens: nextTokens, cost: nextCost };
+    return true;
   }
 
   publish(snapshot: SubagentUxRegistrySnapshot): boolean {
@@ -405,6 +435,7 @@ export class PiSubagentPresenceProducer {
       version: 1, sessionId: this.sessionId, generation: this.generation, sequence: this.nextSequence(), source: PI_SUBAGENT_PRESENCE_SOURCE, state,
       counts: { active, completed, failed, queued, cancelled, total: clamp(active + queued + completed + failed + cancelled) },
       ...(progressTotal > 0 ? { progress: { value: Math.min(1, progressCompleted / progressTotal), label: `Subagents ${progressCompleted}/${progressTotal}` } } : {}),
+      ...(this.presenceUsage.tokens > 0 || this.presenceUsage.cost > 0 ? { usage: { ...this.presenceUsage } } : {}),
       attention,
     };
     const parsed = parsePiPresenceUpdate(event);

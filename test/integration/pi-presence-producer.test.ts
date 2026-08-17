@@ -619,6 +619,29 @@ describe("pi presence producer wire contract", () => {
     assert.equal(emitted[0].counts.active, 2);
   });
 
+  test("projects each finalized accounting record once into cumulative v1 usage", () => {
+    const emitted: any[] = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => { if (channel === PI_PRESENCE_UPDATE_EVENT) emitted.push(payload); },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    const first = { totalTokens: 7, cost: { total: 0.25 } };
+    const second = { totalTokens: 3, cost: { total: 0.5 } };
+    assert.equal(producer.recordFinalUsage("foreground-1", first), true);
+    assert.equal(producer.recordFinalUsage("foreground-1", first), false, "duplicate finalization cannot double-count");
+    assert.equal(producer.recordFinalUsage("background-1", second), true);
+    assert.equal(producer.recordFinalUsage("invalid", { totalTokens: Number.POSITIVE_INFINITY, cost: { total: 1 } }), false);
+    producer.publish(snapshot(0, [completed("foreground-1")]));
+    assert.deepEqual(emitted[0].usage, { tokens: 10, cost: 0.75 });
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.deepEqual(emitted[1].usage, { tokens: 10, cost: 0.75 }, "replay uses the retained aggregate without recounting");
+    producer.startSession("session-2", 1);
+    assert.equal(producer.recordFinalUsage("foreground-1", first), true, "dedupe is session-local");
+    producer.publish(snapshot(1, [completed("session-2-done")]));
+    assert.deepEqual(emitted.at(-1)?.usage, { tokens: 7, cost: 0.25 });
+  });
+
   test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {
     const emitted: any[] = [];
     const producer = createPiSubagentPresenceProducer({

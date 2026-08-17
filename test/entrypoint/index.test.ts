@@ -46,6 +46,7 @@ mock.module("../../src/integration/pi-presence-producer", () => ({
     stop: () => undefined,
     publish: () => { presenceLifecycleCalls.push("publish"); return true; },
     beginAgentRun: () => presenceLifecycleCalls.push("begin"),
+    recordFinalUsage: () => { presenceLifecycleCalls.push("usage"); return true; },
     settle: () => presenceLifecycleCalls.push("settle"),
     isPresenceRemoveCapabilityDetected: () => presenceRemoveCapabilityDetected,
   }),

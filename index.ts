@@ -49,7 +49,7 @@ import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, for
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { getResultSummaryText } from "./src/core/runner-events.js";
-import { emptyAccountingUsage, finalizeForegroundUsage } from "./src/core/accounting-usage.js";
+import { emptyAccountingUsage, finalizeForegroundUsage, type AccountingUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
 import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, subscribeInteractiveRunChanges, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
@@ -226,7 +226,7 @@ function startBackgroundJob(
   limits: SubagentLimits,
   sessionToken: number,
   sessionFence: BackgroundJobSessionFence,
-  onSettled?: (job: BackgroundJobRecord) => void,
+  onSettled?: (job: BackgroundJobRecord, usage: AccountingUsage | undefined) => void,
 ): void {
   if (!sessionFence.isCurrent(sessionToken)) return;
   pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
@@ -244,8 +244,8 @@ function startBackgroundJob(
         outputMaxBytes: limits.backgroundOutputMaxBytes,
         maxCompletedJobs: limits.backgroundHistoryLimit,
         completedTtlMs: limits.backgroundHistoryTtlMs,
-        onFinalized: (finalizedJob) => {
-          onSettled?.(finalizedJob);
+        onFinalized: (finalizedJob, finalizedUsage) => {
+          onSettled?.(finalizedJob, finalizedUsage);
           notifyBackgroundJobResult(pi, finalizedJob);
         },
       });
@@ -260,8 +260,8 @@ function startBackgroundJob(
         outputMaxBytes: limits.backgroundOutputMaxBytes,
         maxCompletedJobs: limits.backgroundHistoryLimit,
         completedTtlMs: limits.backgroundHistoryTtlMs,
-        onFinalized: (finalizedJob) => {
-          onSettled?.(finalizedJob);
+        onFinalized: (finalizedJob, finalizedUsage) => {
+          onSettled?.(finalizedJob, finalizedUsage);
           notifyBackgroundJobResult(pi, finalizedJob);
         },
       });
@@ -1605,8 +1605,13 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             limits,
             backgroundSessionFence.capture(),
             backgroundSessionFence,
-            (finalizedJob) => {
+            (finalizedJob, finalizedUsage) => {
               updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
+              // The generic presence producer receives only finalized internal
+              // accounting, before the terminal UX publication it observes.
+              // Background snapshots deliberately compact usage, so this
+              // callback carries the private pre-compaction aggregate.
+              presenceProducer?.recordFinalUsage?.(finalizedJob.id, finalizedUsage);
               if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
               else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
               else uxRegistry.fail(finalizedJob.id, uxGeneration);
@@ -1640,6 +1645,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         try {
           const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false, uxRun.id));
           updateUxFromPartial(uxRun.id, uxGeneration, result);
+          // Record before the terminal UX transition so its v1 update carries
+          // the finalized aggregate without exposing accounting in tool DTOs.
+          presenceProducer?.recordFinalUsage?.(uxRun.id, result.usage);
           if (foregroundController.signal.aborted) {
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
           }

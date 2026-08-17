@@ -307,6 +307,11 @@ export function isPiCmuxPresenceCmuxStatusReady(value: unknown): boolean {
   return ready?.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("cmux-status");
 }
 
+/** V1 cmux consumes update/remove only; summary remains for other capable consumers. */
+function isPiCmuxPresenceConsumer(ready: PiPresenceReady): boolean {
+  return ready.consumer?.id === "pi-cmux-presence";
+}
+
 export interface PiSubagentPresenceProducerOptions {
   readonly emit: (channel: string, payload: unknown) => void;
   readonly on?: (channel: string, handler: (payload: unknown) => void) => (() => void);
@@ -512,7 +517,11 @@ export class PiSubagentPresenceProducer {
     if (!this.presenceRemoveCapabilityDetected && ready.consumer?.capabilities.includes("presence-remove-v1")) {
       this.presenceRemoveCapabilityDetected = true;
     }
-    const summaryAdvertised = ready.consumer?.capabilities.includes("presence-summary-v1") === true;
+    // The fixed V1 cmux consumer neither advertises nor consumes summary:v1.
+    // Do not let an incompatible cmux advertisement enable its optional
+    // companion; other valid consumers retain capability-gated support.
+    const summaryAdvertised = !isPiCmuxPresenceConsumer(ready)
+      && ready.consumer?.capabilities.includes("presence-summary-v1") === true;
     if (summaryAdvertised) this.presenceSummaryCapabilityDetected = true;
     if (!this.cmuxStatusConsumerSeen && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("cmux-status")) {
       this.cmuxStatusConsumerSeen = true;

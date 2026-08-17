@@ -30,9 +30,9 @@
 | `pi-presence:update:v1` | 현재 subagent aggregate snapshot |
 | `pi-presence:remove:v1` | retained observer state 철회 |
 | `pi-presence:ready:v1` | load-order 독립 discovery, capability advertisement와 replay 요청 |
-| `pi-presence:summary:v1` | capability-gated bounded active/waiting/terminal companion |
+| `pi-presence:summary:v1` | non-cmux capability-gated bounded active/waiting/terminal companion |
 
-이 채널은 cmux 또는 Herdr socket을 직접 호출하지 않는다. `pi-herdr-presence`는 package dependency 없이 같은 Pi process에서 이를 선택적으로 소비할 수 있다.
+이 채널은 cmux 또는 Herdr socket을 직접 호출하지 않는다. `pi-herdr-presence`는 package dependency 없이 같은 Pi process에서 이를 선택적으로 소비할 수 있다. fixed V1 `pi-cmux-presence`는 `summary:v1`을 소비·광고하지 않으므로, producer는 그 exact consumer ID의 `presence-summary-v1` capability 주장으로 summary를 활성화하지 않는다; 다른 capable consumer의 선택 summary 지원은 유지한다.
 
 ### 개별 Herdr child pane metadata
 

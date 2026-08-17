@@ -28,6 +28,7 @@
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 subagent 사용량 회계 설계
 - [`pi-cmux-integration.md`](./pi-cmux-integration.md) — 선택적 `pi-cmux` UX 연동 가이드
 - [`pi-cmux-presence-integration.md`](./pi-cmux-presence-integration.md) — 선택적 `pi-cmux-presence` presence 연동
+- [`pi-herdr-presence-integration.md`](./pi-herdr-presence-integration.md) — `pi-subagent` 관점의 Herdr presence 연동 상태, 남은 교차 검증과 완료 기준
 - [`tmux-window-naming-design.md`](./tmux-window-naming-design.md) — stable tmux window 이름과 pane title 역할 분리(좁은 범위 구현 완료)
 
 ## 참고 자료

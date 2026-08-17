@@ -53,6 +53,7 @@ import {
   type CmuxSurfaceIdentity,
 } from "./cmux.js";
 import {
+  classifyHerdrTerminal,
   closeHerdrPane,
   inspectHerdrPane,
   interruptHerdrPane,
@@ -62,6 +63,7 @@ import {
   resolveHerdrCallerPane,
   subscribeHerdrPane,
   type HerdrPaneHandle,
+  type HerdrTerminalClassification,
   type HerdrPaneSubscription,
   type HerdrAgentWaitObserver,
 } from "./herdr.js";
@@ -435,6 +437,13 @@ const TREE_PERMIT_DETACH_RETRY_MS = 100;
 /** Durable promotion has a distinct outcome from a rejected request: an
  * unreadable or malformed immutable marker revokes parent cleanup authority. */
 export type InteractivePromotionOutcome = "promoted" | "already-promoted" | "ownership-unknown" | "rejected";
+export interface HerdrRunPresentationDiagnostics {
+  /** Event transport only; never feeds lifecycle or cleanup decisions. */
+  transport: "unknown" | "healthy" | "reconnecting";
+  /** Compared with the immutable initial terminal binding, never display IDs. */
+  target: "current" | "moved" | "absent" | "unknown";
+  orphanRisk: "none" | "possible";
+}
 export interface InteractiveRunUxSnapshot {
   runId: string;
   /** Process-local parent invocation correlation; never persisted or emitted. */
@@ -447,6 +456,8 @@ export interface InteractiveRunUxSnapshot {
   startedAt: number;
   updatedAt: number;
   preview?: string;
+  /** Presentation-only Herdr stream/reconcile diagnosis. */
+  herdr?: HerdrRunPresentationDiagnostics;
 }
 
 interface ActiveInteractiveRun {
@@ -464,6 +475,8 @@ interface ActiveInteractiveRun {
   startedAt: number;
   updatedAt: number;
   preview?: string;
+  /** Retains initial identity only for moved/current presentation comparison. */
+  herdr?: HerdrRunPresentationDiagnostics & { initialTerminalId: string; initialWorkspaceId: string; initialTabId: string; initialPaneId: string };
   surfaceTitle: string;
   focusSupported: boolean;
   generation: number;
@@ -569,8 +582,14 @@ type SharedHerdrListener = {
   handle: HerdrPaneHandle;
   stopped: boolean;
   onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void;
+  /** Read-only reconciliation result for presentation only; never lifecycle authority. */
+  onReconcileTarget?: (terminal: HerdrTerminalClassification) => void;
   onWake?: () => void;
   onHealthChange?: (healthy: boolean) => void;
+  reconciliation: Promise<void> | null;
+  reconciliationPending: boolean;
+  /** Invalidates a result begun before a newer event or health transition. */
+  classificationEpoch: number;
 };
 type SharedHerdrTransport = {
   listeners: Set<SharedHerdrListener>;
@@ -601,6 +620,31 @@ function sharedHerdrSelectorPaneIds(transport: SharedHerdrTransport): string[] {
 function deliverSharedHerdr(transport: SharedHerdrTransport, callback: (listener: SharedHerdrListener) => void): void {
   for (const listener of transport.listeners) if (!listener.stopped) { try { callback(listener); } catch { /* Event hints never own lifecycle. */ } }
 }
+/**
+ * Event and transport health only wake this read-only diagnostic reconciliation.
+ * Clone the mutable live binding so diagnostics cannot rebind a lifecycle target.
+ */
+function reconcileSharedHerdrListener(listener: SharedHerdrListener): void {
+  if (listener.stopped) return;
+  listener.reconciliationPending = true;
+  const classificationEpoch = ++listener.classificationEpoch;
+  if (listener.reconciliation) return;
+  listener.reconciliation = (async () => {
+    listener.reconciliationPending = false;
+    if (listener.stopped) return;
+    const terminal: HerdrTerminalClassification = await classifyHerdrTerminal({ ...listener.handle });
+    // A later event or transport transition requires its own fresh read. Do
+    // not restore presentation from an in-flight pre-transition result.
+    if (listener.stopped || classificationEpoch !== listener.classificationEpoch) return;
+    try { listener.onReconcileTarget?.(terminal); } catch { /* Diagnostics never own lifecycle. */ }
+    // Preserve the existing wake callback contract while keeping its result
+    // isolated from lifecycle authority and the live binding.
+    try { await listener.onReconcile(terminal.state === "present" ? terminal.handle : undefined); } catch { /* Wake observers are non-authoritative. */ }
+  })().finally(() => {
+    listener.reconciliation = null;
+    if (listener.reconciliationPending && !listener.stopped) reconcileSharedHerdrListener(listener);
+  });
+}
 /** Reconfiguration is microtask-coalesced, then strictly serial: the old stream
  * is fully drained before a union-selector replacement may connect. */
 function scheduleSharedHerdrTransport(key: string, transport: SharedHerdrTransport): void {
@@ -617,7 +661,12 @@ function scheduleSharedHerdrTransport(key: string, transport: SharedHerdrTranspo
       transport.subscription = null;
       transport.healthy = null;
       const epoch = ++transport.epoch;
-      deliverSharedHerdr(transport, (listener) => listener.onHealthChange?.(false));
+      deliverSharedHerdr(transport, (listener) => {
+        // Reconfiguration has no replacement classification yet; reject any
+        // result still in flight from the stream being drained.
+        listener.classificationEpoch += 1;
+        listener.onHealthChange?.(false);
+      });
       if (previous) {
         previous.stop();
         await previous.closed.catch(() => undefined);
@@ -638,19 +687,32 @@ function scheduleSharedHerdrTransport(key: string, transport: SharedHerdrTranspo
         wakeOnEvent: false,
         onWake: () => {
           if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
-          deliverSharedHerdr(transport, (listener) => listener.onWake?.());
+          deliverSharedHerdr(transport, (listener) => {
+            listener.onWake?.();
+            // Failed reconnect attempts are also wake evidence, not target
+            // evidence. Reconciliation turns an unavailable/ambiguous read
+            // into unknown without trusting transport state.
+            reconcileSharedHerdrListener(listener);
+          });
         },
         onHealthChange: (healthy) => {
           if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
           transport.healthy = healthy;
-          deliverSharedHerdr(transport, (listener) => listener.onHealthChange?.(healthy));
+          deliverSharedHerdr(transport, (listener) => {
+            listener.onHealthChange?.(healthy);
+            // Initial health and every successful reconnect merely wake the
+            // coalesced authoritative read; health itself carries no target.
+            if (healthy) reconcileSharedHerdrListener(listener);
+          });
         },
         onEvent: (event, data) => {
           if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
           deliverSharedHerdr(transport, (listener) => {
             if (!sharedHerdrEventMatches(listener.handle, event, data)) return;
             listener.onWake?.();
-            void listener.onReconcile(listener.handle);
+            // The payload establishes relevance only. Target state comes from
+            // classifyHerdrTerminal's fresh pane.get/pane.list read.
+            reconcileSharedHerdrListener(listener);
           });
         },
       });
@@ -660,16 +722,19 @@ function scheduleSharedHerdrTransport(key: string, transport: SharedHerdrTranspo
     });
   });
 }
-function subscribeSharedHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
+function subscribeSharedHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onReconcileTarget?: (terminal: HerdrTerminalClassification) => void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
   const key = sharedHerdrTransportKey(options.handle);
   let transport = sharedHerdrTransports.get(key);
   if (!transport) {
     transport = { listeners: new Set(), subscription: null, healthy: null, selectorSignature: "", epoch: 0, stopped: false, reconfigureScheduled: false, reconfigure: Promise.resolve() };
     sharedHerdrTransports.set(key, transport);
   }
-  const listener: SharedHerdrListener = { ...options, stopped: false };
+  const listener: SharedHerdrListener = { ...options, stopped: false, reconciliation: null, reconciliationPending: false, classificationEpoch: 0 };
   transport.listeners.add(listener);
   scheduleSharedHerdrTransport(key, transport);
+  // Joining an already healthy shared selector does not necessarily trigger a
+  // reconnect, but this listener still needs its mandatory initial read.
+  if (transport.healthy === true) reconcileSharedHerdrListener(listener);
   let closed = false;
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
@@ -699,7 +764,7 @@ function subscribeSharedHerdrPane(options: { handle: HerdrPaneHandle; onReconcil
 }
 
 /** Test-only seam for endpoint-sharing transport verification. */
-export function subscribeSharedHerdrPaneForTest(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
+export function subscribeSharedHerdrPaneForTest(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onReconcileTarget?: (terminal: HerdrTerminalClassification) => void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
   return subscribeSharedHerdrPane(options);
 }
 
@@ -1380,11 +1445,55 @@ function interactiveSnapshot(run: ActiveInteractiveRun): InteractiveRunUxSnapsho
     startedAt: run.startedAt,
     updatedAt: run.updatedAt,
     ...(run.preview ? { preview: run.preview } : {}),
+    ...(run.herdr ? { herdr: Object.freeze({ transport: run.herdr.transport, target: run.herdr.target, orphanRisk: run.herdr.orphanRisk }) } : {}),
   });
 }
 
 export function listInteractiveRunUxSnapshots(): readonly InteractiveRunUxSnapshot[] {
   return Object.freeze(Array.from(activeInteractiveRuns.values()).sort((a, b) => a.startedAt - b.startedAt || a.runId.localeCompare(b.runId)).map(interactiveSnapshot));
+}
+/** Presentation updates are called only from shared transport callbacks or monitor teardown. */
+function updateHerdrRunPresentation(runId: string, update: Partial<HerdrRunPresentationDiagnostics>, terminal?: HerdrTerminalClassification): void {
+  const run = activeInteractiveRuns.get(runId);
+  if (!run?.herdr) return;
+  const target = terminal === undefined ? update.target
+    : terminal.state === "absent" ? "absent"
+      : terminal.state === "unknown" ? "unknown"
+      : terminal.handle.workspaceId === run.herdr.initialWorkspaceId && terminal.handle.tabId === run.herdr.initialTabId
+        && terminal.handle.paneId === run.herdr.initialPaneId && terminal.handle.terminalId === run.herdr.initialTerminalId ? "current" : "moved";
+  const next = { ...run.herdr, ...update, ...(target ? { target } : {}) };
+  next.orphanRisk = next.transport === "healthy" && next.target === "current" ? "none" : "possible";
+  if (next.transport === run.herdr.transport && next.target === run.herdr.target && next.orphanRisk === run.herdr.orphanRisk) return;
+  run.herdr = next;
+  run.updatedAt = Date.now();
+  notifyInteractiveRunChanges();
+}
+
+/** A transport transition invalidates any prior target classification. */
+function updateHerdrRunTransportPresentation(runId: string, healthy: boolean): void {
+  // A newly acknowledged stream, including a successful reconnect, proves
+  // only transport health. Do not retain a prior current/moved target until
+  // this stream's fresh read-only classification completes.
+  updateHerdrRunPresentation(runId, { transport: healthy ? "healthy" : "reconnecting", target: "unknown", orphanRisk: "possible" });
+}
+
+/** A stopped monitor has no transport or target proof for a retained run. */
+function markRetainedHerdrRunPresentationUnavailable(runId: string, targetConfirmedAbsent: boolean): void {
+  if (targetConfirmedAbsent) return;
+  updateHerdrRunTransportPresentation(runId, false);
+}
+
+/** Test seam for the transport-to-classification presentation boundary. */
+export function updateHerdrRunTransportPresentationForTest(runId: string, healthy: boolean): void {
+  updateHerdrRunTransportPresentation(runId, healthy);
+}
+/** Test seam for the read-only presentation classification result. */
+export function updateHerdrRunPresentationClassificationForTest(runId: string, terminal: HerdrTerminalClassification): void {
+  updateHerdrRunPresentation(runId, {}, terminal);
+}
+/** Test seam for the monitor-finally presentation downgrade. */
+export function markRetainedHerdrRunPresentationUnavailableForTest(runId: string, targetConfirmedAbsent = false): void {
+  markRetainedHerdrRunPresentationUnavailable(runId, targetConfirmedAbsent);
 }
 
 export function updateInteractiveRunPreview(runId: string, value: unknown): void {
@@ -1943,6 +2052,13 @@ export function registerCommittedInteractiveRun(
     surfaceTitle: buildChildRuntimeTitle(run.agent ?? "unknown", run.runId, run.depth),
     focusSupported: run.focusSupported ?? typeof run.backend.focus === "function", generation: run.generation,
     ownership: "managed", startedAt: now, updatedAt: now, operation: Promise.resolve(),
+    ...(run.handle.mode === "herdr-pane" ? { herdr: {
+      // A healthy event subscription is not target proof. The first target
+      // diagnosis remains unknown until its read-only reconciliation succeeds.
+      transport: "unknown" as const, target: "unknown" as const, orphanRisk: "possible" as const,
+      initialTerminalId: run.handle.native.terminalId, initialWorkspaceId: run.handle.native.workspaceId,
+      initialTabId: run.handle.native.tabId, initialPaneId: run.handle.native.paneId,
+    } } : {}),
     ...(run.treePermitLease ? { treePermitLease: run.treePermitLease } : {}),
     ...(run.sessionIdentity ? { sessionIdentity: run.sessionIdentity } : {}),
     ...(run.sessionResultStartOffset !== undefined ? { sessionResultStartOffset: run.sessionResultStartOffset } : {}),
@@ -6635,9 +6751,15 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       herdrAgentWaitFallback = createHerdrAgentWaitFallback({ handle: herdrHandle, onWake: signalHerdrWake });
       herdrSubscription = subscribeSharedHerdrPane({
         handle: herdrHandle,
+        // All of these are presentation/wake hooks. They never determine
+        // completion, cleanup, target authority, or fallback ownership.
         onReconcile: () => signalHerdrWake(),
+        onReconcileTarget: (terminal) => updateHerdrRunPresentation(runId, {}, terminal),
         onWake: signalHerdrWake,
-        onHealthChange: (healthy) => herdrAgentWaitFallback?.sync(healthy),
+        onHealthChange: (healthy) => {
+          herdrAgentWaitFallback?.sync(healthy);
+          updateHerdrRunTransportPresentation(runId, healthy);
+        },
       });
     }
     const releaseAfterCompletionWinner = async (completion: CompletionRecord): Promise<boolean> => {
@@ -7608,6 +7730,11 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     stoppedHerdrSubscription?.stop();
     herdrSubscription = null;
     await stoppedHerdrSubscription?.closed.catch(() => undefined);
+    // If the target was not proven absent and unregistered at a winner site,
+    // the retained registry entry must not present its stopped monitor as live.
+    if (stoppedHerdrSubscription && committedRunId) {
+      markRetainedHerdrRunPresentationUnavailable(committedRunId, targetConfirmedAbsent);
+    }
     signalHerdrWake();
     await stopLeaseWriterAndDrain();
     if (lifecycleRunId) lifecycleEventServer?.terminalRun(lifecycleRunId);

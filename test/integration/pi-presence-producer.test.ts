@@ -379,7 +379,7 @@ describe("pi presence producer wire contract", () => {
     assert.equal(hints, 1);
   });
 
-  test("detects the passive remove capability only from the valid same-session cmux ready advertisement", () => {
+  test("detects the passive remove capability from any valid same-session consumer advertisement", () => {
     const listeners = new Map<string, (value: unknown) => void>();
     let hints = 0;
     const producer = createPiSubagentPresenceProducer({
@@ -391,21 +391,21 @@ describe("pi presence producer wire contract", () => {
 
     producer.startSession("session-1", 0);
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-cmux-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-herdr-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["cmux-status"]));
     listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["cmux-status"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: "presence-remove-v1" } });
+    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-herdr-presence", capabilities: "presence-remove-v1" } });
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
     assert.equal(hints, 1, "cmux-status retains its one-shot callback behavior");
 
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
-    assert.equal(hints, 1);
+    assert.equal(hints, 1, "Herdr capability must not trigger cmux routing");
 
     producer.startSession("session-2", 1);
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    producer.handleReady(ready("session-2", "pi-cmux-presence", ["presence-remove-v1"]));
+    producer.handleReady(ready("session-2", "future-consumer", ["presence-remove-v1"]));
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
     producer.stop();
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
@@ -617,6 +617,30 @@ describe("pi presence producer wire contract", () => {
     producer.startSession("session-1", 0);
     producer.publish(snapshot(0, [], [{ id: "origin", status: "running" }]));
     assert.equal(emitted[0].counts.active, 2);
+  });
+
+  test("projects each finalized accounting record once into cumulative v1 usage", () => {
+    const emitted: any[] = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => { if (channel === PI_PRESENCE_UPDATE_EVENT) emitted.push(payload); },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    const first = { totalTokens: 7, cost: { total: 0.25 } };
+    const second = { totalTokens: 3, cost: { total: 0.5 } };
+    assert.equal(producer.recordFinalUsage("foreground-1", 0, first), true);
+    assert.equal(producer.recordFinalUsage("foreground-1", 0, first), false, "duplicate finalization cannot double-count");
+    assert.equal(producer.recordFinalUsage("background-1", 0, second), true);
+    assert.equal(producer.recordFinalUsage("invalid", 0, { totalTokens: Number.POSITIVE_INFINITY, cost: { total: 1 } }), false);
+    producer.publish(snapshot(0, [completed("foreground-1")]));
+    assert.deepEqual(emitted[0].usage, { tokens: 10, cost: 0.75 });
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    assert.deepEqual(emitted[1].usage, { tokens: 10, cost: 0.75 }, "replay uses the retained aggregate without recounting");
+    producer.startSession("session-2", 1);
+    assert.equal(producer.recordFinalUsage("stale-foreground", 0, first), false, "a prior session generation cannot contaminate the new aggregate");
+    assert.equal(producer.recordFinalUsage("foreground-1", 1, first), true, "dedupe is session-local");
+    producer.publish(snapshot(1, [completed("session-2-done")]));
+    assert.deepEqual(emitted.at(-1)?.usage, { tokens: 7, cost: 0.25 });
   });
 
   test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {

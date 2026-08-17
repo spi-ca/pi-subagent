@@ -22,6 +22,7 @@ import {
 	parseAllocationRecordV2,
 	parseCompletionRecord,
 	parseCompletionAuthority,
+	parseCancellationFence,
 	parseCompletionFence,
 	parseCompletionFenceAck,
 	parseCompletionRecordV2,
@@ -30,6 +31,7 @@ import {
 	parseLaunchGateV2,
 	parseLaunchIntentV2,
 	parseLaunchDeliveryUnknownV2,
+	isValidHerdrTabLabel,
 	hasAllocationIntentSourceBinding,
 	hasValidV2StateDependencies,
 	parseLaunchRecord,
@@ -68,6 +70,11 @@ afterEach(async () => {
 });
 
 describe("run protocol", () => {
+	test("uses exact Herdr tab-label run-id binding for dotted run IDs", () => {
+		assert.equal(isValidHerdrTabLabel("pi-subagent:run.id:agent", "run.id"), true);
+		assert.equal(isValidHerdrTabLabel("pi-subagent:runXid:agent", "run.id"), false);
+	});
+
 	test("creates private state and run directories without allowing path traversal", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
 		tempDirs.push(root);
@@ -148,6 +155,7 @@ describe("run protocol", () => {
 		await fs.promises.mkdir(marked, { mode: 0o700 });
 		await fs.promises.writeFile(path.join(marked, STATE_ROOT_MARKER_NAME), JSON.stringify({ version: 1, kind: "pi-subagent-state-root" }), { mode: 0o600 });
 		await fs.promises.mkdir(unsafe, { mode: 0o770 });
+		await fs.promises.chmod(unsafe, 0o770);
 		await fs.promises.writeFile(path.join(unsafe, "legacy.json"), "legacy", { mode: 0o600 });
 		await fs.promises.mkdir(publishing, { mode: 0o700 });
 		await fs.promises.writeFile(path.join(publishing, `.${STATE_ROOT_MARKER_NAME}.42.abcdef.tmp`), "pending", { mode: 0o600 });
@@ -336,13 +344,19 @@ describe("run protocol", () => {
 		assert.equal(sameOwnershipTransfer(request, parseOwnershipTransferAck({ ...ack, child: { pid: 99, startedAt: 14 } }, "transfer-run")!), false);
 	});
 
-	test("strictly binds private completion fence and acknowledgement records to run nonce", () => {
+	test("strictly binds private completion, cancellation, and acknowledgement fence records", () => {
 		const nonce = "a".repeat(64);
 		const fence = { version: 1, kind: "completion-fence", runId: "fence-run", nonce, publishedAt: 1 } as const;
+		const cancellation = { version: 1, kind: "cancellation-fence", runId: "fence-run", childPid: 12, childStartedAt: 34, claimedAt: 56 } as const;
 		const ack = { version: 1, kind: "completion-fence-ack", runId: "fence-run", nonce, acknowledgedAt: 2 } as const;
 		assert.deepEqual(parseCompletionFence(fence, "fence-run", nonce), fence);
 		assert.deepEqual(parseCompletionFenceAck(ack, "fence-run", nonce), ack);
+		assert.deepEqual(parseCancellationFence(cancellation, "fence-run"), cancellation);
 		assert.equal(parseCompletionFence({ ...fence, nonce: "b".repeat(64) }, "fence-run", nonce), null);
+		for (const malformed of [
+			{ ...cancellation, extra: true }, { ...cancellation, childPid: 0 }, { ...cancellation, childStartedAt: 0 }, { ...cancellation, childStartedAt: 1.5 },
+			{ ...cancellation, claimedAt: 0 }, { ...cancellation, claimedAt: 1.5 }, { ...cancellation, runId: "other" },
+		]) assert.equal(parseCancellationFence(malformed, "fence-run"), null);
 		assert.equal(parseCompletionFenceAck({ ...ack, extra: true }, "fence-run", nonce), null);
 		assert.equal(parseCompletionFenceAck({ ...ack, acknowledgedAt: 0 }, "fence-run", nonce), null);
 	});
@@ -452,8 +466,8 @@ describe("run protocol", () => {
 		const legacyAllocation = parseAllocationRecordV2({ ...tmuxAllocation, target: legacyTarget }, "r");
 		assert.ok(legacyIntent && legacyAllocation, "generation-less V2 records remain parser-compatible diagnostics");
 		assert.equal(hasAllocationIntentSourceBinding(legacyIntent, legacyAllocation), false);
-		const herdrIntent = { ...cmuxIntent, terminalMode: "herdr-pane" as const, source: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 as const }, backendPath: "/usr/bin/bun" };
-		const herdrAllocation = { version: 2 as const, runId: "r", terminalMode: "herdr-pane" as const, target: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 as const }, allocatedAt: 1 };
+		const herdrIntent = { ...cmuxIntent, terminalMode: "herdr-pane" as const, source: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 as const, generation: { socketDev: "1", socketIno: "2" } }, backendPath: "/usr/bin/bun" };
+		const herdrAllocation = { version: 2 as const, runId: "r", terminalMode: "herdr-pane" as const, target: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 as const, generation: { socketDev: "1", socketIno: "2" } }, allocatedAt: 1 };
 		for (const protocol of [19, 20] as const) {
 			const intent = { ...herdrIntent, source: { ...herdrIntent.source, protocol } };
 			const allocation = { ...herdrAllocation, target: { ...herdrAllocation.target, protocol } };
@@ -465,7 +479,7 @@ describe("run protocol", () => {
 		assert.equal(parseLaunchIntentV2({ ...herdrIntent, source: { ...herdrIntent.source, protocol: 21 } }, "r"), null);
 		assert.deepEqual(parseAllocationRecordV2(herdrAllocation, "r"), herdrAllocation);
 		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, herdrAllocation), true);
-		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, paneId: herdrIntent.source.sourcePaneId } }), true, "pane address is not source identity");
+		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, paneId: herdrIntent.source.sourcePaneId } }), false, "a source pane alias is never allocation authority");
 		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, terminalId: "source-terminal" } }), false);
 		assert.equal(hasAllocationIntentSourceBinding(herdrIntent, { ...herdrAllocation, target: { ...herdrAllocation.target, protocol: 19 } }), false);
 		assert.equal(parseAllocationRecordV2({ ...herdrAllocation, target: { ...herdrAllocation.target, terminalId: "bad\nterminal" } }, "r"), null);
@@ -492,6 +506,13 @@ describe("run protocol", () => {
 			version: 2, runId: "layout", terminalMode: "tmux-pane", layout: placement === "tmux-split" ? "split" : "auto", placement,
 			container: { kind: "tmux-window", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId, windowId, paneId: tmuxTarget.paneId, panePid: tmuxTarget.panePid, generation: tmuxSource.generation }, target: tmuxTarget, allocatedAt: 1,
 		});
+		const herdrSource = { socketPath: "/tmp/herdr.sock", workspaceId: "herdr-workspace", tabId: "parent-tab", sourcePaneId: "source-pane", sourceTerminalId: "source-terminal", protocol: 20 as const, generation: { socketDev: "1", socketIno: "2" } };
+		const herdrBase = { ...cmuxBase, terminalMode: "herdr-pane", source: herdrSource, backendPath: "/usr/bin/herdr", workingDirectory: "/tmp/layout-workspace" };
+		const herdrTarget = { socketPath: herdrSource.socketPath, workspaceId: herdrSource.workspaceId, tabId: "child-tab", paneId: "child-pane", terminalId: "child-terminal", protocol: 20 as const, generation: herdrSource.generation };
+		const herdrAllocation = (layout: "auto" | "split", placement: "herdr-new-tab" | "herdr-split", tabId = placement === "herdr-new-tab" ? herdrTarget.tabId : herdrSource.tabId) => ({
+			version: 2, runId: "layout", terminalMode: "herdr-pane", layout, placement,
+			container: { kind: "herdr-tab", workspaceId: herdrSource.workspaceId, tabId }, target: { ...herdrTarget, tabId }, allocatedAt: 1,
+		});
 		const valid = [
 			[{ ...cmuxBase, layout: "auto", placement: "cmux-split", container: { kind: "cmux-source", ...cmuxSource } }, cmuxAllocation("auto", "cmux-split")],
 			[{ ...cmuxBase, layout: "split", placement: "cmux-split", container: { kind: "cmux-source", ...cmuxSource } }, cmuxAllocation("split", "cmux-split")],
@@ -499,6 +520,8 @@ describe("run protocol", () => {
 			[{ ...cmuxBase, layout: "auto", placement: "cmux-new-surface", container: { kind: "cmux-source-pane", ...cmuxSource, paneId: cmuxTarget.paneId } }, cmuxAllocation("auto", "cmux-new-surface")],
 			[{ ...tmuxBase, layout: "split", placement: "tmux-split", container: { kind: "tmux-source-pane", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId: "$1", windowId: "@1", paneId: tmuxSource.sourcePaneId, panePid: tmuxSource.sourcePanePid, generation: tmuxSource.generation } }, tmuxAllocation("tmux-split")],
 			[{ ...tmuxBase, layout: "auto", placement: "tmux-new-window", windowLabel: buildTmuxWindowLabel("agent", "layout"), container: { kind: "tmux-session", socketPath: tmuxSource.socketPath, serverPid: tmuxSource.serverPid, sessionId: "$1", sourceWindowId: "@1", generation: tmuxSource.generation } }, tmuxAllocation("tmux-new-window")],
+			[{ ...herdrBase, layout: "split", placement: "herdr-split", container: { kind: "herdr-source", workspaceId: herdrSource.workspaceId, tabId: herdrSource.tabId, paneId: herdrSource.sourcePaneId, terminalId: herdrSource.sourceTerminalId } }, herdrAllocation("split", "herdr-split")],
+			[{ ...herdrBase, layout: "auto", placement: "herdr-new-tab", tabLabel: "pi-subagent:layout:agent", container: { kind: "herdr-workspace", workspaceId: herdrSource.workspaceId } }, herdrAllocation("auto", "herdr-new-tab")],
 		] as const;
 		for (const [intentRecord, allocationRecord] of valid) {
 			const intent = parseLaunchIntentV2(intentRecord, "layout");

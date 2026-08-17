@@ -1,19 +1,45 @@
 flowchart LR
   E[현재 terminal 환경]
-  D{backend 감지}
-  I[inline<br/>child process]
-  C[cmux pane<br/>auto shared pane과 surface tabs]
-  T[tmux pane<br/>auto detached child windows]
+  O{유효한 명시적<br/>terminal override?}
+  F[지정 mode<br/>inline · cmux-pane · herdr-pane · tmux-pane]
+  C{canonical cmux<br/>identity?}
+  H{Herdr 환경·socket·IDs<br/>모두 유효?}
+  T{canonical tmux<br/>identity?}
+  I[inline child process<br/>taskCwd ?? cwd]
+  CM[cmux pane<br/>shared-pane / split policy]
+  HA{Herdr layout}
+  HT[auto: workspace-scoped layout.apply 1회<br/>tab_id 없음 · focus false<br/>root pane direct wrapper argv]
+  HG[strict layout_apply.layout.root<br/>→ pane.get terminal binding]
+  HS[split: source 오른쪽 strict child pane<br/>pane.split → legacy pane.send_text]
+  TM[tmux pane<br/>auto detached window / split]
+  B[interactive bootstrap<br/>trusted filesystem-root cwd]
+  G[gate 뒤 wrapper가 validated<br/>effective task/workspace cwd로 이동]
   IR[interactive result path<br/>session JSONL과 durable completion]
   IO[inline result path<br/>stdout JSON events]
   R[동일한 public 결과 계약]
 
-  E --> D
-  D -->|canonical cmux identity| C
-  D -->|canonical tmux identity| T
-  D -->|그 외 또는 Windows| I
-  C --> IR
-  T --> IR
+  E --> O
+  O -->|yes| F
+  O -->|no: cmux 먼저 검사| C
+  C -->|yes| CM
+  C -->|no: Herdr 다음 검사| H
+  H -->|yes| HA
+  H -->|no: tmux 다음 검사| T
+  T -->|yes| TM
+  T -->|no 또는 Windows| I
+  HA -->|auto| HT
+  HT --> HG
+  HA -->|explicit split| HS
+  F -->|inline| I
+  F -->|cmux-pane| CM
+  F -->|herdr-pane| HA
+  F -->|tmux-pane| TM
+  CM --> B
+  HG --> B
+  HS --> B
+  TM --> B
+  B --> G
+  G --> IR
   I --> IO
   IR --> R
   IO --> R

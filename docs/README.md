@@ -21,8 +21,8 @@
 세부 근거는 [`development.md`의 개발 설계 문서 목록](./development.md#개발-설계-문서)을
 참고하세요.
 
-- [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — cmux/tmux 기반 실제 Pi TUI 전환 설계
-- [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — 다중 subagent interactive pane layout(`auto`/`split`) 설계
+- [`cmux-pi-tui-design.md`](./cmux-pi-tui-design.md) — cmux/tmux/Herdr 기반 실제 Pi TUI 전환 설계와 Herdr fail-closed 점검
+- [`interactive-pane-layout-design.md`](./interactive-pane-layout-design.md) — cmux/tmux/Herdr 다중 subagent interactive pane layout(`auto`/`split`) 설계
 - [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md) — interactive subagent runtime transport 성능 개선 설계
 - [`pi-subagent-hot-path-performance-design.md`](./pi-subagent-hot-path-performance-design.md) — 내부 hot-path 성능 개선 설계(위 transport 문서의 companion)
 - [`pi-081-usage-accounting-design.md`](./pi-081-usage-accounting-design.md) — Pi 0.81 subagent 사용량 회계 설계

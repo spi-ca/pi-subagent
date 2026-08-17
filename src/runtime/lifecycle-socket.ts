@@ -17,6 +17,7 @@ const NONTERMINAL_BUFFER_LIMIT_BYTES = 8 * 1024;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const EVENT_TYPES = new Set(["agent-started", "agent-ended", "agent-settled", "completion-ready", "shutdown", "heartbeat"]);
+const CONTROL_TYPES = new Set(["abort"]);
 
 export interface LifecycleEvent {
 	version: 1;
@@ -33,6 +34,8 @@ interface RunRegistration {
 	socket: net.Socket | null;
 	lastSequence: number;
 	lastHeartbeatAt: number;
+	controlSequence: number;
+	controlAcknowledged: number;
 	waiters: Set<() => void>;
 }
 
@@ -131,7 +134,7 @@ export class LifecycleEventServer {
 	registerRun(runId: string): string {
 		if (this.closed || !RUN_ID_PATTERN.test(runId) || this.runs.has(runId)) throw new Error("Invalid or duplicate lifecycle run registration.");
 		const token = crypto.randomBytes(32).toString("base64url");
-		this.runs.set(runId, { token, active: false, terminal: false, socket: null, lastSequence: 0, lastHeartbeatAt: performance.now(), waiters: new Set() });
+		this.runs.set(runId, { token, active: false, terminal: false, socket: null, lastSequence: 0, lastHeartbeatAt: performance.now(), controlSequence: 0, controlAcknowledged: 0, waiters: new Set() });
 		return token;
 	}
 
@@ -155,6 +158,22 @@ export class LifecycleEventServer {
 
 	lastHeartbeat(runId: string): number | null { return this.runs.get(runId)?.lastHeartbeatAt ?? null; }
 	isConnected(runId: string): boolean { return Boolean(this.runs.get(runId)?.socket); }
+	isAbortAcknowledged(runId: string): boolean {
+		const run = this.runs.get(runId);
+		return Boolean(run && run.controlSequence > 0 && run.controlAcknowledged === run.controlSequence);
+	}
+	/** One bounded, authenticated, idempotent parent-to-child abort request. */
+	requestAbort(runId: string): boolean {
+		const run = this.runs.get(runId);
+		if (!run?.active || run.terminal || !run.socket || run.socket.destroyed) return false;
+		if (run.controlSequence > 0 && run.controlAcknowledged === run.controlSequence) return true;
+		if (run.controlSequence > run.controlAcknowledged) return true;
+		const sequence = ++run.controlSequence;
+		const frame = `${JSON.stringify({ version: VERSION, type: "control", command: "abort", runId, sequence })}\n`;
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || run.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) { run.socket.destroy(); return false; }
+		run.socket.write(frame);
+		return true;
+	}
 
 	async waitForEvent(runId: string, timeoutMs: number): Promise<void> {
 		const run = this.runs.get(runId);
@@ -205,8 +224,20 @@ export class LifecycleEventServer {
 						|| !crypto.timingSafeEqual(Buffer.from(run.token), Buffer.from(value.token))) { fail(); return; }
 					authenticated = { runId: value.runId, run };
 					run.socket = socket;
+					const helloAck = `${JSON.stringify({ version: VERSION, type: "hello-ack", runId: value.runId, sequence: 0 })}\n`;
+					if (Buffer.byteLength(helloAck) > MAX_FRAME_BYTES || socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) { fail(); return; }
+					socket.write(helloAck);
 					clearTimeout(helloTimer);
 					if (run.active) this.notify(run);
+					continue;
+				}
+				if (exactKeys(value, ["version", "type", "runId", "sequence", "controlSequence"])
+					&& value.version === VERSION && value.type === "control-ack" && value.runId === authenticated.runId
+					&& Number.isSafeInteger(value.sequence) && value.sequence === authenticated.run.lastSequence + 1
+					&& Number.isSafeInteger(value.controlSequence) && value.controlSequence === authenticated.run.controlSequence) {
+					authenticated.run.lastSequence = value.sequence as number;
+					authenticated.run.controlAcknowledged = value.controlSequence as number;
+					if (authenticated.run.active) this.notify(authenticated.run);
 					continue;
 				}
 				if (!exactKeys(value, ["version", "type", "runId", "sequence"]) || value.version !== VERSION
@@ -281,7 +312,33 @@ export class LifecycleEventClient {
 	private sequence = 0;
 	private heartbeat: NodeJS.Timeout | null = null;
 	private usable = true;
+	private controlSequence = 0;
+	private controlHandler: ((command: "abort") => Promise<void> | void) | null = null;
+	private readonly pendingControls: Array<{ command: "abort"; sequence: number }> = [];
+	private controlDraining = false;
 	private constructor(private readonly socket: net.Socket, private readonly runId: string) {}
+
+	setControlHandler(handler: (command: "abort") => Promise<void> | void): void {
+		this.controlHandler = handler;
+		void this.drainControls();
+	}
+
+	/** Frames are sequenced at receipt, but acknowledgement follows a successful handler only. */
+	private async drainControls(): Promise<void> {
+		if (this.controlDraining || !this.controlHandler || !this.usable) return;
+		this.controlDraining = true;
+		try {
+			while (this.usable && this.pendingControls.length > 0) {
+				const handler = this.controlHandler;
+				if (!handler) return;
+				const control = this.pendingControls[0]!;
+				try { await handler(control.command); }
+				catch { return; } // Never ACK an absent or failed handler.
+				this.pendingControls.shift();
+				if (!this.sendControlAck(control.sequence)) return;
+			}
+		} finally { this.controlDraining = false; }
+	}
 
 	static async connectFromEnvironment(env: NodeJS.ProcessEnv, statePath: string): Promise<LifecycleEventClient | null> {
 		const socketPath = env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]?.trim();
@@ -301,14 +358,48 @@ export class LifecycleEventClient {
 			const hello = { version: VERSION, type: "hello", runId, token, childPid: process.pid, sequence: 0 };
 			const helloFrame = `${JSON.stringify(hello)}\n`;
 			if (Buffer.byteLength(helloFrame) > MAX_FRAME_BYTES || socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) throw new Error("Lifecycle hello buffer is unavailable.");
-			socket.write(helloFrame);
 			const client = new LifecycleEventClient(socket, runId);
-			socket.on("error", () => { client.usable = false; });
-			socket.on("close", () => { client.usable = false; if (client.heartbeat) clearInterval(client.heartbeat); });
+			let inbound = Buffer.alloc(0), acknowledged = false;
+			let resolveHello!: () => void, rejectHello!: (error: Error) => void;
+			const helloAcknowledged = new Promise<void>((resolve, reject) => { resolveHello = resolve; rejectHello = reject; });
+			const rejectProtocol = () => { client.usable = false; rejectHello(new Error("Lifecycle hello acknowledgement is invalid.")); socket.destroy(); };
+			const helloTimer = setTimeout(() => rejectProtocol(), HELLO_TIMEOUT_MS);
+			helloTimer.unref?.();
+			socket.on("data", (chunk: Buffer) => {
+				inbound = Buffer.concat([inbound, chunk]);
+				if (inbound.length > MAX_FRAME_BYTES + 1) { rejectProtocol(); return; }
+				for (;;) {
+					const lf = inbound.indexOf(0x0a); if (lf < 0) break;
+					const value = parseLine(inbound.subarray(0, lf)); inbound = inbound.subarray(lf + 1);
+					if (!acknowledged) {
+						if (!value || !exactKeys(value, ["version", "type", "runId", "sequence"])
+							|| value.version !== VERSION || value.type !== "hello-ack" || value.runId !== runId || value.sequence !== 0) { rejectProtocol(); return; }
+						acknowledged = true; clearTimeout(helloTimer); resolveHello(); continue;
+					}
+					if (!value || !exactKeys(value, ["version", "type", "command", "runId", "sequence"])
+						|| value.version !== VERSION || value.type !== "control" || !CONTROL_TYPES.has(value.command as string)
+						|| value.runId !== runId || !Number.isSafeInteger(value.sequence) || value.sequence !== client.controlSequence + 1) { rejectProtocol(); return; }
+					client.controlSequence = value.sequence as number;
+					client.pendingControls.push({ command: value.command as "abort", sequence: client.controlSequence });
+					void client.drainControls();
+				}
+			});
+			socket.on("error", () => { client.usable = false; if (!acknowledged) rejectHello(new Error("Lifecycle socket failed before hello acknowledgement.")); });
+			socket.on("close", () => { client.usable = false; if (!acknowledged) rejectHello(new Error("Lifecycle socket closed before hello acknowledgement.")); if (client.heartbeat) clearInterval(client.heartbeat); });
+			socket.write(helloFrame);
+			await helloAcknowledged;
 			client.heartbeat = setInterval(() => client.send("heartbeat"), 1000);
 			client.heartbeat.unref?.();
 			return client;
 		} catch { socket.destroy(); return null; }
+	}
+
+	private sendControlAck(controlSequence: number): boolean {
+		if (!this.usable || this.socket.destroyed || !Number.isSafeInteger(controlSequence) || controlSequence < 1) return false;
+		this.sequence += 1;
+		const frame = `${JSON.stringify({ version: VERSION, type: "control-ack", runId: this.runId, sequence: this.sequence, controlSequence })}\n`;
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) { this.usable = false; this.socket.destroy(); return false; }
+		this.socket.write(frame); return true;
 	}
 
 	send(type: "agent-started" | "agent-ended" | "agent-settled" | "completion-ready" | "shutdown" | "heartbeat"): boolean {

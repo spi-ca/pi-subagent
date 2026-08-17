@@ -117,6 +117,7 @@ describe("background job helpers", () => {
     const fence = new BackgroundJobSessionFence();
     const token = fence.startSession();
     const job = createBackgroundJobRecord({ id: "usage-hidden", mode: "parallel" });
+    let finalizedUsage: unknown;
     const finalized = finalizeBackgroundJobForSession({
       job,
       result: {
@@ -126,10 +127,11 @@ describe("background job helpers", () => {
       sessionToken: token,
       isSessionCurrent: (candidate) => fence.isCurrent(candidate),
       registry,
-      onFinalized: () => undefined,
+      onFinalized: (_job, usage) => { finalizedUsage = usage; },
     });
 
     assert.equal(finalized, true);
+    assert.equal((finalizedUsage as { totalTokens?: number } | undefined)?.totalTokens, 7, "only the internal finalized callback receives accounting");
     for (let index = 0; index < 2; index++) {
       const snapshot = getBackgroundJobSnapshot(job.id, registry);
       assert.ok(snapshot);

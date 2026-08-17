@@ -31,8 +31,10 @@ import {
 	isUsableParentLease,
 	isParentProcessIdentityAlive,
 	classifyParentProcessIdentity,
+	parseCancellationFence,
 	parseCompletionFence,
 	parseCompletionFenceAck,
+	parseAllocationRecordV2,
 	hasV3FailureBoundaryCapability,
 	hasV3MetadataTailSuccessBoundaryCapability,
 	parseParentLease,
@@ -58,6 +60,7 @@ import { verifyAndAcknowledgeForkBootstrap } from "./fork-source-ownership.js";
 import { adoptTreePermitAuthority, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_ROOT_ENV } from "./tree-permit-authority.js";
 import { computeLegacySessionCompletionBoundary, computeSessionCompletionBoundary, computeSessionFailureBoundary } from "./completion-v3.js";
 import { LifecycleEventClient } from "./lifecycle-socket.js";
+import { createChildHerdrMetadataReporter, parseHerdrEnvironment, type ChildHerdrMetadataReporter, type HerdrPaneHandle } from "./herdr.js";
 import { capturePhase0LiveProofClientEnv, MAX_PHASE0_LIVE_PROOF_RELEASE_WINDOW_MS, parsePhase0LiveProofReleaseDeadline, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, Phase0LiveProofClient } from "./phase0-live-proof.js";
 
 interface BridgeConfig {
@@ -87,6 +90,11 @@ interface BridgeConfig {
 interface LastAssistantStatus {
 	stopReason?: string;
 	hasText: boolean;
+}
+
+/** A parent cancellation winner is not a completion fence and never awaits ACK. */
+class CancellationFenceEncounteredError extends Error {
+	constructor() { super("cancellation fence won"); this.name = "CancellationFenceEncounteredError"; }
 }
 
 const SUBAGENT_MANAGED_TITLE_ENV = "PI_SUBAGENT_MANAGED_TITLE";
@@ -185,6 +193,26 @@ function resolveBridgeConfig(env: NodeJS.ProcessEnv): BridgeConfig | null {
 		leaseStaleMs: parsePositiveInt(env[SUBAGENT_LEASE_STALE_MS_ENV], DEFAULT_PARENT_LEASE_STALE_MS, 100),
 		leaseCheckMs: parsePositiveInt(env[SUBAGENT_LEASE_CHECK_MS_ENV], DEFAULT_PARENT_LEASE_RENEW_MS, 20),
 	};
+}
+
+async function createBoundChildHerdrMetadataReporter(
+	config: BridgeConfig,
+	title: string | null,
+	factory: ((handle: HerdrPaneHandle, runId: string, title: string | null) => ChildHerdrMetadataReporter | null) | undefined,
+): Promise<ChildHerdrMetadataReporter | null> {
+	try {
+		const allocation = parseAllocationRecordV2(await readBoundedPrivateJson(config.allocationPath, { requireSingleLineTerminated: true }), config.runId);
+		const configured = parseHerdrEnvironment(process.env);
+		if (!allocation || allocation.terminalMode !== "herdr-pane" || !allocation.target.generation || !configured
+			|| configured.socketPath !== allocation.target.socketPath || configured.workspaceId !== allocation.target.workspaceId
+			|| configured.tabId !== allocation.target.tabId || configured.paneId !== allocation.target.paneId) return null;
+		const handle: HerdrPaneHandle = {
+			socketPath: allocation.target.socketPath, workspaceId: allocation.target.workspaceId, tabId: allocation.target.tabId,
+			paneId: allocation.target.paneId, terminalId: allocation.target.terminalId, protocol: allocation.target.protocol,
+			socketDev: allocation.target.generation.socketDev, socketIno: allocation.target.generation.socketIno,
+		};
+		return (factory ?? ((bound, runId, managedTitle) => createChildHerdrMetadataReporter({ handle: bound, runId, title: managedTitle })))(handle, config.runId, title);
+	} catch { return null; }
 }
 
 function getLastAssistantStatus(messages: unknown): LastAssistantStatus {
@@ -395,6 +423,8 @@ export function registerChildBridge(
 		beforePromotionAckPublication?: () => Promise<void>;
 		/** Test seam for transient exact inherited tree-permit release failures. */
 		releaseInheritedTreePermit?: () => Promise<boolean>;
+		/** Test-only reporter factory; production always binds allocation plus Herdr env. */
+		createHerdrMetadataReporter?: (handle: HerdrPaneHandle, runId: string, title: string | null) => ChildHerdrMetadataReporter | null;
 	} = {},
 ): void {
 	const forkBootstrapPath = process.env[SUBAGENT_FORK_BOOTSTRAP_PATH_ENV];
@@ -455,6 +485,7 @@ export function registerChildBridge(
 	let lastAssistant: LastAssistantStatus = { hasText: false };
 	let writeChain = Promise.resolve();
 	let lifecycleClient: LifecycleEventClient | null = null;
+	let herdrMetadataReporter: ChildHerdrMetadataReporter | null = null;
 	let acknowledgementReconciliationTimer: NodeJS.Timeout | undefined;
 	let ownership: RunOwnership = config.ownership;
 	const monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
@@ -515,8 +546,14 @@ export function registerChildBridge(
 		};
 		let published: ReturnType<typeof parseCompletionFence>;
 		try {
-			published = parseCompletionFence(await beforeAckDeadline(async () => await (options.readCompletionFence
-				?? ((filePath: string) => readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true })))(config.completionFencePath!)), config.runId, config.completionFenceNonce);
+			const rawFence = await beforeAckDeadline(async () => await (options.readCompletionFence
+				?? ((filePath: string) => readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true })))(config.completionFencePath!));
+			const cancellation = parseCancellationFence(rawFence, config.runId);
+			if (cancellation) {
+				if (cancellation.childPid === process.pid && cancellation.childStartedAt === childStartedAt) throw new CancellationFenceEncounteredError();
+				throw new Error("cancellation fence conflicts with this child identity");
+			}
+			published = parseCompletionFence(rawFence, config.runId, config.completionFenceNonce);
 		} catch (error) {
 			if (parentIsExactlyDead() && error instanceof Error && error.message === "completion fence acknowledgement deadline expired") return;
 			throw error;
@@ -576,7 +613,12 @@ export function registerChildBridge(
 		};
 		try {
 			await publishCompletionFenceAndWaitForAck(fromChecker);
-		} catch {
+		} catch (error) {
+			if (error instanceof CancellationFenceEncounteredError) {
+				// The parent already won the shared fence. Do not publish/await an ACK;
+				// make one bounded boundary-less aborted settlement instead.
+				return await publishFailure("aborted", "surface-closed", "cancellation-fence", false);
+			}
 			// A failed handshake is deliberately boundary-less: no live callback may
 			// be treated as included when the parent could not prove its ACK.
 			return await publishFailure("failed", "bridge-error", "completion-fence-unverified", false);
@@ -619,7 +661,9 @@ export function registerChildBridge(
 		fromChecker = false,
 	) => {
 		if (terminal) return;
-		setRuntimeTitle(ctx, status === "completed" ? "returning" : status === "failed" ? "failed" : "waiting");
+		const metadataLifecycle = status === "completed" ? "returning" : status === "failed" ? "failed" : "waiting";
+		setRuntimeTitle(ctx, metadataLifecycle);
+		herdrMetadataReporter?.report(metadataLifecycle);
 		terminal = true;
 		stopChecker();
 		// The checker cannot await itself. Its raw I/O has already completed and
@@ -901,9 +945,20 @@ export function registerChildBridge(
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (!await rejectUnverifiedBootstrap(ctx)) return;
+		// The private allocation and inherited initial Herdr identity bind this
+		// optional diagnostics channel; failure simply leaves it unavailable.
+		herdrMetadataReporter = await createBoundChildHerdrMetadataReporter(config, runtimeTitle, options.createHerdrMetadataReporter);
 		setRuntimeTitle(ctx, "ready");
+		herdrMetadataReporter?.report("ready");
 		await phase0ProofClient?.start();
 		lifecycleClient = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath).catch(() => null);
+		lifecycleClient?.setControlHandler(async (command) => {
+			if (command !== "abort" || terminal) return;
+			// Authenticated parent control is cooperative: the bridge owns the
+			// child abort, durable completion, and session shutdown in that order.
+			ctx.abort();
+			await finish(ctx, "aborted", "parent-control", "surface-closed");
+		});
 		await writeState("idle", "session_start").catch(reportBridgeError);
 		await startChecker(ctx, monotonicNow()).catch(reportBridgeError); // initial check is a hard gate
 		if (!terminal) scheduleChecker(ctx); // an initial orphan must not create a timer
@@ -911,12 +966,14 @@ export function registerChildBridge(
 	pi.on("agent_start", async (_event, ctx) => {
 		if (!await rejectUnverifiedBootstrap(ctx)) return;
 		setRuntimeTitle(ctx, "running");
+		herdrMetadataReporter?.report("running");
 		agentStarted = true;
 		lifecycleClient?.send("agent-started");
 		await writeState("running", "agent_start").catch(reportBridgeError);
 	});
 	pi.on("agent_end", async (event, ctx) => {
 		setRuntimeTitle(ctx, "waiting");
+		herdrMetadataReporter?.report("waiting");
 		lastAssistant = getLastAssistantStatus(event.messages);
 		// This is diagnostics only: it has no bearing on FIFO release, provider
 		// proof acceptance, or normal child completion. The client refuses this
@@ -930,6 +987,7 @@ export function registerChildBridge(
 		lifecycleClient?.send("agent-settled");
 		if (lastAssistant.stopReason === "aborted") {
 			setRuntimeTitle(ctx, "waiting");
+			herdrMetadataReporter?.report("waiting");
 			await writeState("idle", "agent_settled:aborted").catch(reportBridgeError);
 			return;
 		}
@@ -948,6 +1006,8 @@ export function registerChildBridge(
 		lifecycleClient?.close();
 		lifecycleClient = null;
 		phase0ProofClient?.close();
+		await herdrMetadataReporter?.close();
+		herdrMetadataReporter = null;
 		await writeState("shutdown", "session_shutdown").catch(reportBridgeError);
 	});
 }

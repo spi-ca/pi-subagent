@@ -72,6 +72,45 @@ describe("private lifecycle socket", () => {
 		client.close();
 	});
 
+	test("retries an abort unavailable before connect and sends only one command after acknowledgement", async () => {
+		const fixture = await setup("control-run");
+		assert.equal(fixture.server.requestAbort(fixture.runId), false, "an early request remains retryable until the child connects");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		let aborts = 0;
+		client.setControlHandler(async () => { aborts += 1; });
+		for (let attempt = 0; attempt < 20 && !fixture.server.isConnected(fixture.runId); attempt += 1) await delay(5);
+		assert.equal(fixture.server.isAbortAcknowledged(fixture.runId), false);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true, "a pending request is idempotent");
+		for (let attempt = 0; attempt < 20 && aborts !== 1; attempt += 1) await delay(5);
+		assert.equal(aborts, 1);
+		for (let attempt = 0; attempt < 20 && !fixture.server.isAbortAcknowledged(fixture.runId); attempt += 1) await delay(5);
+		assert.equal(fixture.server.isAbortAcknowledged(fixture.runId), true);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true, "acknowledged abort is never replayed as another control frame");
+		await delay(10);
+		assert.equal(aborts, 1);
+		client.close();
+	});
+
+	test("queues an early abort until a handler succeeds and never acknowledges a failed handler", async () => {
+		const fixture = await setup("queued-control");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		for (let attempt = 0; attempt < 20 && !fixture.server.isConnected(fixture.runId); attempt += 1) await delay(5);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true);
+		await delay(20);
+		let attempts = 0;
+		client.setControlHandler(async () => { attempts += 1; throw new Error("reject"); });
+		await delay(20);
+		assert.equal(attempts, 1);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true, "failed handler leaves the unacknowledged control pending");
+		client.setControlHandler(async () => { attempts += 1; });
+		for (let attempt = 0; attempt < 20 && attempts < 2; attempt += 1) await delay(5);
+		assert.equal(attempts, 2);
+		client.close();
+	});
+
 	test("rejects wrong tokens, replayed sequences, unknown frames, and oversized pre-auth input", async () => {
 		const fixture = await setup("raw-run");
 		const connect = () => new Promise<net.Socket>((resolve, reject) => {
@@ -98,6 +137,19 @@ describe("private lifecycle socket", () => {
 		const oversized = await connect();
 		oversized.write("x".repeat(4098));
 		await waitClosed(oversized);
+	});
+
+	test("requires a strict server hello acknowledgement before exposing a client", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-lifecycle-rogue-")); roots.push(root);
+		await fs.promises.chmod(root, 0o700);
+		const socketPath = path.join(root, "events.sock"), tokenPath = path.join(root, "lifecycle-token"), statePath = path.join(root, "state.json");
+		await fs.promises.writeFile(tokenPath, `${"a".repeat(43)}\n`, { mode: 0o600 });
+		const rogue = net.createServer((socket) => socket.once("data", () => socket.end(`${JSON.stringify({ version: 1, type: "control", command: "abort", runId: "rogue-run", sequence: 1 })}\n`)));
+		await new Promise<void>((resolve) => rogue.listen(socketPath, resolve));
+		await fs.promises.chmod(socketPath, 0o600);
+		try {
+			assert.equal(await LifecycleEventClient.connectFromEnvironment({ PI_SUBAGENT_RUN_ID: "rogue-run", [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: tokenPath }, statePath), null);
+		} finally { await new Promise<void>((resolve) => rogue.close(() => resolve())); }
 	});
 
 	test("fails closed for unsafe token artifacts and preserves no capability environment", async () => {

@@ -464,7 +464,8 @@ export function finalizeBackgroundJobForSession(options: {
   maxCompletedJobs?: number;
   completedTtlMs?: number;
   now?: number;
-  onFinalized: (job: BackgroundJobRecord) => void;
+  /** Internal-only pre-compaction accounting; never stored in job snapshots. */
+  onFinalized: (job: BackgroundJobRecord, usage: AccountingUsage | undefined) => void;
 }): boolean {
   if (!options.isSessionCurrent(options.sessionToken)) return false;
 
@@ -490,7 +491,7 @@ export function finalizeBackgroundJobForSession(options: {
     completedTtlMs: options.completedTtlMs,
     now: options.now,
   });
-  options.onFinalized(job);
+  options.onFinalized(job, result?.usage);
   return true;
 }
 

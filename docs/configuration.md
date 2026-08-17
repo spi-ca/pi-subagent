@@ -203,16 +203,16 @@ PI_SUBAGENT_PANE_LAYOUT must be exactly "auto" or "split" (received ...).
 
 해석된 값은 child 환경의 `PI_SUBAGENT_PANE_LAYOUT`로 명시적으로 전달되므로 nested child도 부모의 정책을 그대로 상속합니다.
 
-| 값 | cmux | tmux |
-| --- | --- | --- |
-| `auto` (기본) | root sibling은 새 오른쪽 shared pane 하나의 surface를 공유합니다. nested descendant는 정확한 source pane에 surface로 쌓입니다. | child마다 parent와 같은 session의 detached window 하나를 만듭니다. |
-| `split` | child마다 source surface 오른쪽에 split합니다. | child마다 source pane 오른쪽에 split합니다. |
+| 값 | cmux | tmux | Herdr |
+| --- | --- | --- | --- |
+| `auto` (기본) | root sibling은 새 오른쪽 shared pane 하나의 surface를 공유합니다. nested descendant는 정확한 source pane에 surface로 쌓입니다. | child마다 parent와 같은 session의 detached window 하나를 만듭니다. | child마다 unfocused 새 tab 하나를 만들고 그 tab의 root pane에서 실행합니다. |
+| `split` | child마다 source surface 오른쪽에 split합니다. | child마다 source pane 오른쪽에 split합니다. | child마다 source pane 오른쪽에 split합니다. |
 
 ![Interactive layout coordination](./diagram/interactive-layout-coordination.png)
 
 _2x PNG · [SVG](./diagram/interactive-layout-coordination.svg) · [Mermaid source](./diagram/interactive-layout-coordination.mmd)_
 
-`auto`의 cmux는 source root별 process-global coordinator가 foreground/background launch를 직렬화합니다. detached V2 broker만 pre-commit allocation과 durable `allocation.json` publish를 수행하며, coordinator는 commit 뒤 strict layout record와 정확히 일치하는 allocation만 adopt/release합니다. 종료·취소·reaper는 shared pane, tmux window 또는 session container를 넓게 닫지 않고 child의 정확한 surface/pane만 대상으로 합니다.
+`auto`의 cmux는 source root별 process-global coordinator가 foreground/background launch를 직렬화합니다. detached V2 broker만 pre-commit allocation과 durable `allocation.json` publish를 수행하며, coordinator는 commit 뒤 strict layout record와 정확히 일치하는 allocation만 adopt/release합니다. Herdr `auto`는 immutable source와 일치하는 workspace-scoped `layout.apply` 한 번만 보내며, `tab_id` 없이 `focus: false`와 root pane의 direct exact wrapper argv를 지정합니다. protocol 19/20 공통 strict `layout_apply.layout.root` 응답을 수용한 뒤 `pane.get`으로 terminal binding을 확정하고, label/list diff로 allocation을 재발견하지 않습니다. `split`은 immutable source의 workspace/tab/pane/terminal request 전체가 일치해야 합니다. 종료·취소·reaper는 shared pane, tmux window, Herdr tab 또는 session container를 넓게 닫지 않고 child의 정확한 surface/pane만 대상으로 합니다. auto Herdr terminal이 원래 할당된 child tab 밖으로 이동하면 소유권 이전/recovery 상태로 보존하고 destructive cleanup을 하지 않습니다.
 
 ### cmux pane
 
@@ -235,7 +235,13 @@ managed child의 출력·지시는 항상 untrusted로 취급하지만, child �
 
 ### Herdr pane
 
-`herdr-pane`는 Herdr CLI를 실행하지 않습니다. 설치된 Herdr `v0.8.0`의 protocol **19**와 preview의 protocol **20**만 지원하며, `ping`으로 협상한 실제 revision을 durable intent·allocation·launch gate에 모두 기록합니다. 이후 split, launch delivery, focus, interrupt, close 직전에는 같은 revision을 다시 확인합니다. broker runtime의 executable provenance만 durable intent에 기록하고, owner-only Unix socket으로 두 revision의 공통 subset인 `pane.get`/`pane.split`/`pane.send_text`/`pane.send_keys`/`pane.focus`/`pane.close`를 처리합니다. protocol 20 전용 field나 method는 protocol 19에 보내지 않으며, 그 밖의 revision은 거부합니다. split 응답의 workspace/tab/pane/terminal binding을 정확히 기록한 뒤 commit과 launch gate를 기다리고, `events.subscribe`는 wake-up hint로만 사용합니다. 모든 lifecycle 판단은 `pane.get`으로 재확인하며 timeout·disconnect 뒤 mutation을 replay하지 않습니다. cancellation, focus, close, promotion/reaper는 exact recorded target만 대상으로 합니다. Herdr은 child별 split만 지원하므로 `auto`/`split` layout 설정은 Herdr placement를 바꾸지 않습니다.
+`herdr-pane`는 `HERDR_SOCKET_PATH`의 owner-only Unix socket에 직접 연결하며 Herdr CLI나 별도 supervisor process를 실행하지 않습니다. 설치된 Herdr `v0.8.0`의 protocol **19**와 preview의 protocol **20**만 지원하며, `ping`으로 협상한 실제 revision을 durable intent·allocation·launch gate에 모두 기록합니다. 이후 allocation, launch delivery, focus, interrupt, close 직전에는 같은 revision을 다시 확인합니다. broker runtime의 executable provenance만 durable intent에 기록하고, owner-only Unix socket으로 두 revision의 공통 subset인 `pane.get`/`pane.list`/`layout.apply`/`pane.split`/`pane.send_text`/`pane.send_keys`/`pane.close`, `agent.get`/`agent.wait`/`agent.focus`, `pane.report_metadata`를 처리합니다. `pane.focus`는 manual focus에 사용하지 않습니다. protocol 20 전용 field나 method는 protocol 19에 보내지 않으며, 그 밖의 revision은 거부합니다.
+
+`auto`는 immutable source workspace와 정확히 일치하는 `layout.apply` 한 번으로 unfocused 새 tab과 root pane을 만듭니다. 요청에는 `tab_id`가 없고 root pane은 trusted filesystem root를 `cwd`로 하며 wrapper의 direct exact argv를 받습니다. strict `layout_apply.layout.root`를 확인한 뒤 같은 root pane을 `pane.get`으로 조회해 terminal binding을 확정합니다. 따라서 auto는 `pane.send_text`로 명령을 입력하지 않고 별도 tab 생성 RPC도 사용하지 않습니다. wrapper는 gate를 통과한 뒤에만 validated effective task/workspace `cwd`로 이동해 Pi를 시작하므로, gate 전 프로젝트 `bunfig.toml`/Bun preload가 broker나 verifier에 적용되지 않습니다. allocation/gate 거부는 조용히 끝납니다.
+
+`split`은 immutable source의 workspace/tab/pane/terminal과 정확히 일치하는 request만 source pane 오른쪽에 보내는 명시적 legacy 호환 경로이며, wrapper delivery에 `pane.send_text`를 사용합니다. 그래서 이 경로는 command text 비표시나 atomic terminal binding을 보장하지 않습니다. 어느 allocation도 immutable source pane ID, terminal ID 또는 직전에 terminal identity로 rebound한 current pane ID를 재사용하면 수용하지 않습니다. 이 binding, socket owner/mode/inode 또는 protocol 검증이 실패하면 다른 backend나 inline으로 fallback하지 않고 fail-closed합니다. `events.subscribe`는 wake-up hint로만 사용하고 label/list topology diff로 allocation을 재발견하지 않습니다. 모든 lifecycle 판단은 `pane.get`으로 재확인하며 timeout·disconnect 뒤 mutation을 replay하지 않습니다.
+
+Herdr `auto`/new-tab의 post-launch cancel은 child bridge의 인증된 cooperative `ctx.abort()`/`ctx.shutdown()`을 먼저 요청합니다. 이것이 bounded grace 안에 끝나지 않으면 parent는 completion과 원자적으로 경쟁해 이긴 immutable cancellation fence, ownership, durable exact child PID/start tuple을 다시 검증한 경우에만 그 **exact PID**에 `SIGTERM` 후 event/deadline 기반 grace와 `SIGKILL`을 사용합니다. process group·descendant 종료는 하지 않습니다. parent는 계속 `pane.send_keys`, `pane.close`, `tab.close`, `agent.send-keys`, rollback 또는 reaper mutation을 보내지 않습니다. child가 present/unknown/hung이면 recovery/manual cleanup 상태로 보존하고 late watcher를 유지하며, complete bounded `pane.list`에 terminal match가 없을 때만 absence로 retire합니다. `events.subscribe` physical stream은 socket `dev`/`ino` generation·protocol마다 process-local 하나만 유지하고, listener별 relevant event만 in-memory fan-out합니다. completed retire watcher는 최초 reconciliation 뒤 relevant event와 매 disconnect/reconnect(반복 실패 포함) wake에서만 fresh authoritative `pane.get`/bounded `pane.list` reconciliation을 수행하고 이전 5초 backend polling을 하지 않습니다. `agent.wait`는 event stream이 disconnect/unhealthy일 때만 쓰는 degraded fallback으로, degraded run당 concurrent observer와 in-flight wait 하나, current status를 제외한 상태와 긴 bounded 30초 server wait/31초 client wait을 process 전체 최대 16개로 관찰합니다. completed auto watcher도 최대 16개이고 cap 밖 후보는 registry recovery로 보존합니다. confirmed absence 뒤 secret scrub 또는 run artifact removal이 실패하면 generation·winner·ownership과 두 absence proof를 재검증하는 유한 backoff cleanup retry만 수행합니다. event와 wait은 completion·cleanup·absence authority가 아닙니다. `split`의 cancellation, focus, close, promotion/reaper는 exact recorded target만 대상으로 합니다. auto child terminal이 할당된 tab 밖으로 이동해도 manual focus는 socket/protocol·terminal rebind 뒤 exact `agent.get`, 한 번의 `agent.focus`, read-only identity post-check로만 가능하며 `pane.focus` fallback/retry는 없습니다. expected-terminal CAS가 없어서 read→mutation race는 남으며 이 focus는 user-initiated UX에 한정됩니다.
 
 ### tmux pane
 
@@ -339,3 +345,7 @@ Pi의 boolean 프로젝트 신뢰 상태를 broad prefix 신뢰로 사용하지 
 - `PI_SUBAGENT_PANE_LAYOUT` — interactive pane layout의 상속된 resolved policy. 사용자 설정은 `auto` 또는 `split`의 정확한 소문자 값만 허용하며, CLI `--subagent-pane-layout`가 이 환경 변수보다 우선합니다.
 
 다른 확장이 위임된 하위 에이전트 프로세스 안에서 실행 중인지 확인해야 한다면 `PI_SUBAGENT_DEPTH`를 확인하세요. `PI_SUBAGENT_DEPTH > 0`이면 "이 Pi 프로세스는 하위 에이전트"로 취급하면 됩니다.
+
+#### Herdr 권한과 진단
+
+Herdr의 durable source 및 allocation record는 owner-only socket의 10진수 `dev`/`ino` generation에 결속됩니다. 교체된 socket, generation이 없는 legacy record, malformed list 응답, 실패한 요청 또는 잘못된 strict result discriminator는 **unknown**이며 launch·interrupt·close 또는 부재 보고를 허용하지 않습니다. 일치하는 `terminal_id`가 하나도 없는 유효하고 범위가 제한된 전역 `pane.list`만 부재를 증명합니다. `auto`는 범위가 제한된 printable `pi-subagent:<run-id>:<agent>` `tab_label`을 `layout.apply` 생성 요청에서만 설정합니다. dynamic OSC title과 child `pane.report_metadata`는 이 static label과 분리된 diagnostic-only 정보이며 container·lifecycle authority가 아닙니다. child metadata는 source `pi-subagent:<run-id>`, `herdr:pi`에만 적용, 단조 `seq`, 120초 TTL을 사용하고 active 하나와 latest pending 하나만 LWW로 유지합니다. clear도 같은 source에만 적용하며 text는 redaction/bounds를 거칩니다. unknown outcome은 retry하지 않고 TTL이 불확실성을 만료시킵니다. 이 내부 socket presentation은 public `subagent` input/result schema와 `pi-presence` v1 protocol을 바꾸지 않습니다. `tab.rename`이나 `tab.close`는 호출하지 않습니다.

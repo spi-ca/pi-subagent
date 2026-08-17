@@ -82,6 +82,8 @@ async function setupBridge(runId: string, options: {
 	expectedParent?: { pid: number; startedAt: number };
 	failureBoundaryCapability?: boolean;
 	metadataTailSuccessBoundaryCapability?: boolean;
+	herdrMetadataReporter?: { report(lifecycle: "ready" | "running" | "waiting" | "returning" | "failed"): void; close(): Promise<void> };
+	herdrEnvMismatch?: boolean;
 } = {}) {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-bridge-"));
 	tempDirs.push(root);
@@ -116,6 +118,15 @@ async function setupBridge(runId: string, options: {
 	if (options.title === undefined) delete process.env.PI_SUBAGENT_MANAGED_TITLE;
 	else process.env.PI_SUBAGENT_MANAGED_TITLE = options.title;
 	await fs.promises.writeFile(paths.childSessionPath, `${JSON.stringify({ type: "message", id: `entry-${runId}`, timestamp: new Date().toISOString(), message: assistant("stop") })}\n`, { mode: 0o600 });
+	if (options.herdrMetadataReporter) {
+		await atomicWriteJson(paths.allocationPath, {
+			version: 2, runId, terminalMode: "herdr-pane",
+			target: { socketPath: "/tmp/herdr-child.sock", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", protocol: 20, generation: { socketDev: "1", socketIno: "1" } }, allocatedAt: 1,
+		});
+		Object.assign(process.env, { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr-child.sock", HERDR_WORKSPACE_ID: options.herdrEnvMismatch ? "other" : "workspace", HERDR_TAB_ID: "tab", HERDR_PANE_ID: "pane" });
+	} else {
+		for (const name of ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"]) delete process.env[name];
+	}
 	await atomicWriteJson(paths.parentLeasePath, {
 		version: RUN_PROTOCOL_VERSION,
 		runId,
@@ -136,7 +147,10 @@ async function setupBridge(runId: string, options: {
 		registerCommand(name: string, command: { handler: (args: string, ctx: any) => any }) { commands.set(name, command); },
 		registerTool(tool: any) { tools.set(tool.name, tool); },
 	};
-	registerChildBridge(pi as any, options);
+	registerChildBridge(pi as any, {
+		...options,
+		createHerdrMetadataReporter: options.herdrMetadataReporter ? () => options.herdrMetadataReporter! : undefined,
+	});
 	const lifecycle = { aborted: false, shutdown: false };
 	const titles: string[] = [];
 	const notifications: Array<{ message: string; level: string }> = [];
@@ -390,6 +404,29 @@ describe("child lifecycle bridge", () => {
 		assert.deepEqual(noSuffixRoom.titles, []);
 	});
 
+	test("reports Herdr lifecycle independently of UI titles and clears on shutdown", async () => {
+		const reports: string[] = [];
+		let closes = 0;
+		const reporter = { report: (lifecycle: "ready" | "running" | "waiting" | "returning" | "failed") => { reports.push(lifecycle); }, close: async () => { closes += 1; } };
+		const bridge = await setupBridge("run-herdr-metadata-lifecycle", { hasUI: false, herdrMetadataReporter: reporter });
+		await bridge.emit("session_start"); await bridge.emit("agent_start");
+		await bridge.emit("agent_end", { messages: [assistant("stop")] }); await bridge.emit("agent_settled");
+		await bridge.emit("session_shutdown");
+		assert.deepEqual(reports, ["ready", "running", "waiting", "returning"]);
+		assert.equal(closes, 1);
+		assert.deepEqual(bridge.titles, []);
+	});
+
+	test("disables Herdr metadata when inherited identity disagrees with allocation", async () => {
+		let reports = 0;
+		const bridge = await setupBridge("run-herdr-metadata-mismatch", {
+			herdrEnvMismatch: true,
+			herdrMetadataReporter: { report: () => { reports += 1; }, close: async () => undefined },
+		});
+		await bridge.emit("session_start"); await bridge.emit("agent_start");
+		assert.equal(reports, 0);
+	});
+
 	test("waits for an exact completion-fence ACK before capturing completion", async () => {
 		const bridge = await setupBridge("run-completion-fence", { completionFence: true });
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
@@ -399,6 +436,22 @@ describe("child lifecycle bridge", () => {
 		await publishImmutableJson(bridge.paths.completionFenceAckPath, { version: 1, kind: "completion-fence-ack", runId: "run-completion-fence", nonce: "d".repeat(64), acknowledgedAt: Date.now() });
 		await settled;
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence")?.status, "completed");
+	});
+
+	test("settles an exact cancellation fence as aborted without waiting for a completion ACK", async () => {
+		const runId = "run-cancellation-fence";
+		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100 });
+		await publishImmutableJson(bridge.paths.completionFencePath, {
+			version: 1, kind: "cancellation-fence", runId, childPid: process.pid,
+			childStartedAt: getCurrentProcessStartedAt()!, claimedAt: Date.now(),
+		});
+		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		const started = Date.now();
+		await bridge.emit("agent_settled");
+		assert.ok(Date.now() - started < 100, "a cancellation winner never waits for completion-fence ACK");
+		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
+		assert.equal(completion?.status, "aborted");
+		assert.equal(completionError(completion), "surface-closed");
 	});
 
 	test("falls back boundary-less when a live parent does not ACK before the fence deadline", async () => {

@@ -30,6 +30,18 @@ const isHerdrProtocol = (value) => HERDR_SUPPORTED_PROTOCOLS.has(value);
 const HERDR_ID = /^[^\u0000-\u001f\u007f-\u009f]{1,256}$/u;
 const HERDR_MAX_LINE_BYTES = 256 * 1024;
 const HERDR_MAX_LISTED_PANES = 128;
+// ResponseResult is a tagged union. A matching request ID alone never proves
+// query authority, absence, or mutation success.
+const HERDR_RESULT_TYPES = Object.freeze({
+  ping: "pong", "pane.get": "pane_info", "pane.list": "pane_list",
+  "pane.split": "pane_info", "pane.focus": "pane_info",
+  "pane.send_text": "ok", "pane.send_keys": "ok", "pane.close": "ok",
+  "layout.apply": "layout_apply",
+});
+let currentHerdrGeneration = null;
+const herdrGeneration = (value) => exact(value, ["socketDev", "socketIno"])
+  && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev) && /^(?:0|[1-9][0-9]*)$/.test(value.socketIno);
+const sameHerdrGeneration = (left, right) => Boolean(left && right && left.socketDev === right.socketDev && left.socketIno === right.socketIno);
 const isHerdrId = (value) => typeof value === "string" && Buffer.byteLength(value, "utf8") <= 256 && HERDR_ID.test(value);
 class HerdrUnknownOutcomeError extends Error {
   constructor(method, message) { super(message); this.name = "HerdrUnknownOutcomeError"; this.method = method; this.unknownOutcome = true; }
@@ -39,20 +51,25 @@ class HerdrRequestError extends Error {
 }
 function isHerdrUnknownOutcome(error) { return error instanceof HerdrUnknownOutcomeError; }
 function herdrSource(value) {
-  return exact(value, ["socketPath", "workspaceId", "tabId", "sourcePaneId", "sourceTerminalId", "protocol"])
+  return exact(value, ["socketPath", "workspaceId", "tabId", "sourcePaneId", "sourceTerminalId", "protocol", "generation"])
     && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath) && path.normalize(value.socketPath) === value.socketPath
-    && isHerdrId(value.workspaceId) && isHerdrId(value.tabId) && isHerdrId(value.sourcePaneId) && isHerdrId(value.sourceTerminalId) && isHerdrProtocol(value.protocol);
+    && isHerdrId(value.workspaceId) && isHerdrId(value.tabId) && isHerdrId(value.sourcePaneId) && isHerdrId(value.sourceTerminalId) && isHerdrProtocol(value.protocol) && herdrGeneration(value.generation);
 }
 function herdrTarget(value) {
-  return exact(value, ["socketPath", "workspaceId", "tabId", "paneId", "terminalId", "protocol"])
+  return exact(value, ["socketPath", "workspaceId", "tabId", "paneId", "terminalId", "protocol", "generation"])
     && typeof value.socketPath === "string" && path.isAbsolute(value.socketPath) && path.normalize(value.socketPath) === value.socketPath
-    && [value.workspaceId, value.tabId, value.paneId, value.terminalId].every(isHerdrId) && isHerdrProtocol(value.protocol);
+    && [value.workspaceId, value.tabId, value.paneId, value.terminalId].every(isHerdrId) && isHerdrProtocol(value.protocol) && herdrGeneration(value.generation);
 }
 function strictHerdrSocket(socketPath) {
-  try { const stat = fsSync.lstatSync(socketPath); return stat.isSocket() && !stat.isSymbolicLink() && (typeof process.getuid !== "function" || stat.uid === process.getuid()) && (stat.mode & 0o077) === 0 ? stat : null; } catch { return null; }
+  try {
+    const stat = fsSync.lstatSync(socketPath, { bigint: true });
+    if (!stat.isSocket() || stat.isSymbolicLink() || (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid())) || (stat.mode & 0o077n) !== 0n) return null;
+    const generation = { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() };
+    return !currentHerdrGeneration || sameHerdrGeneration(generation, currentHerdrGeneration) ? stat : null;
+  } catch { return null; }
 }
 async function herdrRequest(socketPath, method, params, mutation = false) {
-  const before = strictHerdrSocket(socketPath); if (!before) throw new Error("unsafe Herdr socket");
+  const before = strictHerdrSocket(socketPath); if (!before) throw new Error("unsafe or replaced Herdr socket");
   const id = `pi-subagent:${crypto.randomUUID()}`, line = `${JSON.stringify({ id, method, params })}\n`;
   if (Buffer.byteLength(line, "utf8") > HERDR_MAX_LINE_BYTES) throw new Error("Herdr request exceeds the strict wire limit");
   return await new Promise((resolve, reject) => {
@@ -78,8 +95,9 @@ async function herdrRequest(socketPath, method, params, mutation = false) {
       if (!response || typeof response !== "object" || Array.isArray(response) || response.id !== id) return finish(unknown("Herdr response binding mismatch"));
       if (Object.keys(response).length === 2 && Object.hasOwn(response, "error") && response.error && typeof response.error === "object" && !Array.isArray(response.error)
         && Object.keys(response.error).length === 2 && typeof response.error.code === "string" && typeof response.error.message === "string") return finish(new HerdrRequestError(method, response.error.code, response.error.message));
+      const expectedType = HERDR_RESULT_TYPES[method];
       if (Object.keys(response).length !== 2 || !Object.hasOwn(response, "result") || !response.result || typeof response.result !== "object" || Array.isArray(response.result)
-        || mutation && typeof response.result.type !== "string") return finish(unknown("Herdr response envelope or result is invalid"));
+        || expectedType !== undefined && response.result.type !== expectedType) return finish(unknown("Herdr response envelope or result discriminator is invalid"));
       finish(null, response.result);
     });
     socket.once("error", (error) => finish(unknown(error.message))); socket.once("end", () => { if (!settled) finish(unknown("Herdr closed the response before completion")); });
@@ -90,33 +108,60 @@ function parseHerdrPane(value, socketPath, protocol) {
   return pane && typeof pane === "object" && !Array.isArray(pane) && isHerdrId(pane.workspace_id) && isHerdrId(pane.tab_id) && isHerdrId(pane.pane_id) && isHerdrId(pane.terminal_id) && isHerdrProtocol(protocol)
     ? { mode: "herdr-pane", socketPath, workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol } : null;
 }
+function parseHerdrLayoutAppliedRootPane(value, workspaceId, sourceTabId, wrapperPath, cwd) {
+  const layout = value?.layout, root = layout?.root;
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.type !== "layout_apply" || !layout || typeof layout !== "object" || Array.isArray(layout)
+    || layout.workspace_id !== workspaceId || !isHerdrId(layout.tab_id) || layout.tab_id === sourceTabId || !isHerdrId(layout.focused_pane_id)
+    || !root || typeof root !== "object" || Array.isArray(root) || root.type !== "pane" || !isHerdrId(root.pane_id)
+    || root.pane_id !== layout.focused_pane_id || root.cwd !== cwd || !Array.isArray(root.command) || root.command.length !== 1 || root.command[0] !== wrapperPath) return null;
+  return { tabId: layout.tab_id, paneId: root.pane_id };
+}
+// No inherited startup hook or dynamic-loader state may reach the direct root.
+// This deliberately contains no credentials or caller-provided values.
+const HERDR_DIRECT_STARTUP_ENV = Object.freeze({
+  BASH_ENV: "", ENV: "", NODE_OPTIONS: "", NODE_PATH: "", BUN_OPTIONS: "",
+  LD_PRELOAD: "", LD_LIBRARY_PATH: "", LD_AUDIT: "", DYLD_INSERT_LIBRARIES: "",
+  DYLD_LIBRARY_PATH: "", DYLD_FRAMEWORK_PATH: "",
+});
 async function assertHerdrProtocol(socketPath, expectedProtocol) {
   const pong = await herdrRequest(socketPath, "ping", {});
   if (!isHerdrProtocol(pong.protocol)) throw new Error("Herdr protocol must be one of 19 or 20");
   if (expectedProtocol !== undefined && pong.protocol !== expectedProtocol) throw new Error(`Herdr protocol changed from ${expectedProtocol} to ${pong.protocol}`);
   return pong.protocol;
 }
-/** A pane move changes public address, never the terminal identity we own. */
-async function revalidateHerdrTarget(target) {
-  await assertHerdrProtocol(target.socketPath, target.protocol);
+/** Explicit terminal state: only a complete bounded zero-match list proves absence. */
+async function classifyHerdrTarget(target) {
+  if (!herdrGeneration(target.generation) || !sameHerdrGeneration(target.generation, currentHerdrGeneration)) return { state: "unknown" };
+  try { await assertHerdrProtocol(target.socketPath, target.protocol); } catch { return { state: "unknown" }; }
   try {
     const observed = parseHerdrPane(await herdrRequest(target.socketPath, "pane.get", { pane_id: target.paneId }), target.socketPath, target.protocol);
     if (observed?.terminalId === target.terminalId) {
       target.workspaceId = observed.workspaceId; target.tabId = observed.tabId; target.paneId = observed.paneId;
-      return target;
+      return { state: "present", target };
     }
-  } catch { /* a new bounded all-workspaces query may recover a moved pane */ }
+  } catch { /* a complete global list is the only absence proof */ }
   try {
     const result = await herdrRequest(target.socketPath, "pane.list", {});
-    if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return null;
+    if (!Array.isArray(result.panes) || result.panes.length > HERDR_MAX_LISTED_PANES) return { state: "unknown" };
     const panes = result.panes.map((pane) => parseHerdrPane(pane, target.socketPath, target.protocol));
-    if (panes.some((pane) => !pane)) return null;
+    if (panes.some((pane) => !pane)) return { state: "unknown" };
+    const paneIds = new Set(), terminalIds = new Set();
+    for (const pane of panes) {
+      if (paneIds.has(pane.paneId) || terminalIds.has(pane.terminalId)) return { state: "unknown" };
+      paneIds.add(pane.paneId); terminalIds.add(pane.terminalId);
+    }
     const matches = panes.filter((pane) => pane.terminalId === target.terminalId);
-    if (matches.length !== 1) return null;
+    if (matches.length === 0) return { state: "absent" };
+    if (matches.length !== 1) return { state: "unknown" };
     const observed = matches[0];
     target.workspaceId = observed.workspaceId; target.tabId = observed.tabId; target.paneId = observed.paneId;
-    return target;
-  } catch { return null; }
+    return { state: "present", target };
+  } catch { return { state: "unknown" }; }
+}
+/** A pane move changes public address, never the terminal identity we own. */
+async function revalidateHerdrTarget(target) {
+  const result = await classifyHerdrTarget(target);
+  return result.state === "present" ? result.target : null;
 }
 const SESSION = /^\$(?:0|[1-9][0-9]*)$/;
 const WINDOW = /^@(?:0|[1-9][0-9]*)$/;
@@ -176,16 +221,17 @@ function hasConsistentArgv() {
   // --project-root is accepted as an ignored compatibility argument from
   // parent processes loaded before executable path-policy removal.
   const valueFlags = new Set(["--run-dir", "--nonce", "--runtime", "--runtime-interpreter", "--backend", "--wrapper", "--project-root"]);
-  let verifyGateCount = 0, acceptanceCheckpointCount = 0, acceptancePostallocationCheckpointCount = 0;
+  let verifyGateCount = 0, verifyHerdrDirectGateCount = 0, acceptanceCheckpointCount = 0, acceptancePostallocationCheckpointCount = 0;
   for (let index = 2; index < process.argv.length; index += 1) {
     const value = process.argv[index];
     if (value === "--verify-gate") { verifyGateCount += 1; continue; }
+    if (value === "--verify-herdr-direct-gate") { verifyHerdrDirectGateCount += 1; continue; }
     if (value === "--acceptance-preallocation-checkpoint") { acceptanceCheckpointCount += 1; continue; }
     if (value === "--acceptance-postallocation-checkpoint") { acceptancePostallocationCheckpointCount += 1; continue; }
     if (!valueFlags.has(value) || index + 1 >= process.argv.length || process.argv[index + 1].startsWith("--")) return false;
     index += 1;
   }
-  return verifyGateCount <= 1 && acceptanceCheckpointCount <= 1 && acceptancePostallocationCheckpointCount <= 1;
+  return verifyGateCount <= 1 && verifyHerdrDirectGateCount <= 1 && acceptanceCheckpointCount <= 1 && acceptancePostallocationCheckpointCount <= 1;
 }
 function singleArg(name) {
   const positions = process.argv.flatMap((value, index) => value === name ? [index] : []);
@@ -197,7 +243,7 @@ const expectedNonce = singleArg("--nonce");
 const expectedRuntime = singleArg("--runtime");
 const expectedRuntimeInterpreter = singleArg("--runtime-interpreter");
 const expectedBackend = singleArg("--backend");
-if (!runDir || !path.isAbsolute(runDir) || !expectedNonce || !/^[A-Za-z0-9_-]{32,256}$/.test(expectedNonce) || !expectedRuntime || !expectedRuntimeInterpreter || !expectedBackend) process.exit(2);
+if (!runDir || !path.isAbsolute(runDir) || path.normalize(runDir) !== runDir || !expectedNonce || !/^[A-Za-z0-9_-]{32,256}$/.test(expectedNonce) || !expectedRuntime || !expectedRuntimeInterpreter || !expectedBackend) process.exit(2);
 function regularFile(candidate, executable) {
   try {
     const resolved = fsSync.realpathSync(candidate), file = fsSync.statSync(resolved);
@@ -227,6 +273,11 @@ const cmuxBrokerOptions = { broker: true,
 const brokerEntrypoint = regularFile(path.resolve(process.argv[1] || ""), false);
 if (!brokerRuntime || !brokerInterpreter || !backendPath || !brokerEntrypoint || !regularFile(process.execPath, true)) process.exit(2);
 const rootDir = path.dirname(runDir);
+// Bun discovers bunfig.toml from cwd. The state root is configurable and can
+// sit below a project, so every broker/verifier bootstrap starts at the
+// immutable filesystem root; wrappers only use runDir after the gate.
+const bootstrapCwd = path.parse(runDir).root;
+if (!path.isAbsolute(bootstrapCwd) || path.normalize(bootstrapCwd) !== bootstrapCwd) process.exit(2);
 const p = (name) => path.join(runDir, name);
 const json = (value) => `${JSON.stringify(value)}\n`;
 const now = () => Date.now();
@@ -313,7 +364,7 @@ async function replace(file, value) {
 async function command(bin, args, timeoutMs = 0) {
   if (bin === backendPath && (!backendMode || regularFile(backendPath, true) !== backendPath)) return { code: 1, stdout: "", stderr: "backend executable is no longer available" };
   return await new Promise((resolve) => {
-    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], shell: false, env: commandEnv }); let stdout = "", stderr = "", settled = false;
+    const child = spawn(bin, args, { cwd: bootstrapCwd, stdio: ["ignore", "pipe", "pipe"], shell: false, env: commandEnv }); let stdout = "", stderr = "", settled = false;
     let dispatched = false;
     const finish = (code, extra = "") => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr: stderr || extra, dispatched }); };
     const append = (prior, chunk) => (prior + chunk.toString()).slice(0, 64 * 1024);
@@ -359,6 +410,16 @@ function tmuxSourceContainer(value) {
     && Number.isSafeInteger(value.panePid) && value.panePid > 0
     && (value.generation === undefined || tmuxGeneration(value.generation));
 }
+function herdrSourceContainer(value) {
+  return exact(value, ["kind", "workspaceId", "tabId", "paneId", "terminalId"])
+    && value.kind === "herdr-source" && [value.workspaceId, value.tabId, value.paneId, value.terminalId].every(isHerdrId);
+}
+function herdrWorkspaceContainer(value) {
+  return exact(value, ["kind", "workspaceId"]) && value.kind === "herdr-workspace" && isHerdrId(value.workspaceId);
+}
+function herdrTabContainer(value) {
+  return exact(value, ["kind", "workspaceId", "tabId"]) && value.kind === "herdr-tab" && isHerdrId(value.workspaceId) && isHerdrId(value.tabId);
+}
 function tmuxSessionContainer(value) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).every((key) => ["kind", "socketPath", "serverPid", "sessionId", "sourceWindowId", "generation"].includes(key))
@@ -371,9 +432,9 @@ function tmuxSessionContainer(value) {
 }
 function intent(value) {
   const tmuxControlV3 = value?.version === 3 && value?.terminalMode === "tmux-pane";
-  const base = value && (value.version === 2 || tmuxControlV3) && typeof value.runId === "string" && value.runId === path.basename(runDir) && typeof value.parentSessionId === "string" && value.parentSessionId && Number.isSafeInteger(value.parentPid) && value.parentPid > 0 && Number.isFinite(value.parentStartedAt) && value.parentStartedAt > 0 && Number.isFinite(value.createdAt) && value.createdAt > 0 && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && value.brokerNonce === expectedNonce && value.runtimePath === brokerRuntime && value.runtimeInterpreterPath === brokerInterpreter && value.backendPath === backendPath && value.brokerEntrypoint === brokerEntrypoint;
+  const base = value && (value.version === 2 || tmuxControlV3) && typeof value.runId === "string" && value.runId === path.basename(runDir) && typeof value.parentSessionId === "string" && value.parentSessionId && Number.isSafeInteger(value.parentPid) && value.parentPid > 0 && Number.isFinite(value.parentStartedAt) && value.parentStartedAt > 0 && Number.isFinite(value.createdAt) && value.createdAt > 0 && artifactPathEquals(value.childSessionFile, "child-session.jsonl") && (value.workingDirectory === undefined || typeof value.workingDirectory === "string" && path.isAbsolute(value.workingDirectory) && path.normalize(value.workingDirectory) === value.workingDirectory) && value.brokerNonce === expectedNonce && value.runtimePath === brokerRuntime && value.runtimeInterpreterPath === brokerInterpreter && value.backendPath === backendPath && value.brokerEntrypoint === brokerEntrypoint;
   if (!base) return null;
-  const baseKeys = ["version", "runId", ...(Object.hasOwn(value, "parentRunId") ? ["parentRunId"] : []), "parentSessionId", "parentPid", "parentStartedAt", "terminalMode", "source", "childSessionFile", "createdAt", "brokerNonce", "runtimePath", "runtimeInterpreterPath", "backendPath", "brokerEntrypoint"];
+  const baseKeys = ["version", "runId", ...(Object.hasOwn(value, "parentRunId") ? ["parentRunId"] : []), "parentSessionId", "parentPid", "parentStartedAt", "terminalMode", "source", "childSessionFile", ...(Object.hasOwn(value, "workingDirectory") ? ["workingDirectory"] : []), "createdAt", "brokerNonce", "runtimePath", "runtimeInterpreterPath", "backendPath", "brokerEntrypoint"];
   if (Object.hasOwn(value, "parentRunId") && (typeof value.parentRunId !== "string" || !value.parentRunId)) return null;
   const layoutKeys = ["layout", "placement", "container"];
   const hasLayout = layoutKeys.some((key) => Object.hasOwn(value, key));
@@ -387,9 +448,18 @@ function intent(value) {
   const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
   const transportKeys = tmuxControlV3 ? ["transport", "transportGatePath", "transportGateDigest"] : [];
   const tmuxNewWindow = value.terminalMode === "tmux-pane" && value.placement === "tmux-new-window";
-  const expected = hasLayout ? [...baseKeys, ...layoutKeys, ...(tmuxNewWindow ? ["windowLabel"] : []), ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys];
+  const herdrAutoTab = value.terminalMode === "herdr-pane" && value.placement === "herdr-new-tab";
+  const validHerdrTabLabel = (label) => {
+    if (typeof value.runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.runId)
+      || typeof label !== "string" || Buffer.byteLength(label, "utf8") > 128) return false;
+    const prefix = `pi-subagent:${value.runId}:`, suffix = label.slice(prefix.length);
+    return label.startsWith(prefix) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(suffix);
+  };
+  const expected = hasLayout ? [...baseKeys, ...layoutKeys, ...(tmuxNewWindow ? ["windowLabel"] : []), ...(herdrAutoTab ? ["tabLabel"] : []), ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys];
   if (!exact(value, expected) || hasLayout && !layoutKeys.every((key) => Object.hasOwn(value, key))
     || tmuxNewWindow && !isValidTmuxWindowLabel(value.windowLabel, value.runId)
+    || herdrAutoTab && !validHerdrTabLabel(value.tabLabel)
+    || value.terminalMode === "herdr-pane" && hasLayout && typeof value.workingDirectory !== "string"
     || value.terminalMode === "cmux-pane" && ((!hasLayout && !legacyCmuxHarness) || requiresControl && !control(value.control))
     || tmuxControlV3 && (value.transport !== "tmux-control-v1" || !artifactPathEquals(value.transportGatePath, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.transportGateDigest))) return null;
   const sourceValid = value.terminalMode === "cmux-pane"
@@ -413,6 +483,10 @@ function intent(value) {
   if (value.placement === "tmux-new-window" && value.layout === "auto" && tmuxSessionContainer(value.container)
     && tmuxGeneration(value.container.generation) && sameTmuxGeneration(value.source.generation, value.container.generation)
     && value.container.socketPath === value.source.socketPath && value.container.serverPid === value.source.serverPid) return value;
+  if (value.terminalMode === "herdr-pane") {
+    if (value.placement === "herdr-split" && value.layout === "split" && herdrSourceContainer(value.container)) return value;
+    if (value.placement === "herdr-new-tab" && value.layout === "auto" && herdrWorkspaceContainer(value.container)) return value;
+  }
   return null;
 }
 function decision(value, runId) {
@@ -449,7 +523,12 @@ function allocation(value, runId) {
   if (!exact(value, hasLayout ? [...baseKeys, "layout", "placement", "container", ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys])) return null;
   if (value.version === 3 && (value.terminalMode !== "tmux-pane" || value.transport !== "tmux-control-v1" || typeof value.intentDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.intentDigest))) return null;
   if (requiresControl && (!value.control || value.control.transport !== "cmux-control-v2" || !isStableSemverAtLeast(value.control.appVersion, MINIMUM_CMUX_VERSION))) return null;
-  if (value.terminalMode === "herdr-pane") return !hasLayout && herdrTarget(value.target) ? value : null;
+  if (value.terminalMode === "herdr-pane") {
+    if (!herdrTarget(value.target)) return null;
+    return !hasLayout ? value : herdrTabContainer(value.container)
+      && ((value.placement === "herdr-split" && value.layout === "split") || (value.placement === "herdr-new-tab" && value.layout === "auto"))
+      && value.container.workspaceId === value.target.workspaceId && value.container.tabId === value.target.tabId ? value : null;
+  }
   if (value.terminalMode === "cmux-pane" && exact(value.target, ["workspaceId", "surfaceId", "paneId"]) && isUuidString(value.target.workspaceId) && isUuidString(value.target.surfaceId) && isUuidString(value.target.paneId)) {
     if (!hasLayout) return value;
     return cmuxAllocatedContainer(value.container)
@@ -479,14 +558,17 @@ function targetFromAllocation(value) {
   return value.terminalMode === "cmux-pane"
     ? { mode: "cmux-pane", workspaceId: value.target.workspaceId, surfaceId: value.target.surfaceId, paneId: value.target.paneId }
     : value.terminalMode === "herdr-pane"
-      ? { mode: "herdr-pane", ...value.target }
+      // Revalidation mutates a target's current address. Keep the original
+      // auto-tab provenance beside it so later rollback cannot mistake a
+      // user-moved terminal's destination for broker-owned container space.
+      ? { mode: "herdr-pane", ...value.target, ...(value.placement === "herdr-new-tab" ? { allocatedTabId: value.container.tabId } : {}) }
       : { mode: "tmux-pane", socketPath: value.target.socketPath, serverPid: value.target.serverPid, paneId: value.target.paneId, panePid: value.target.panePid, generation: value.target.generation };
 }
 function sameTarget(left, right) {
   return left.mode === right.mode && (left.mode === "cmux-pane"
     ? cmuxIdsEqual(left.workspaceId, right.workspaceId) && cmuxIdsEqual(left.surfaceId, right.surfaceId) && cmuxIdsEqual(left.paneId, right.paneId)
     : left.mode === "herdr-pane"
-      ? left.socketPath === right.socketPath && left.workspaceId === right.workspaceId && left.tabId === right.tabId && left.paneId === right.paneId && left.terminalId === right.terminalId && left.protocol === right.protocol
+      ? left.socketPath === right.socketPath && left.workspaceId === right.workspaceId && left.tabId === right.tabId && left.paneId === right.paneId && left.terminalId === right.terminalId && left.protocol === right.protocol && sameHerdrGeneration(left.generation, right.generation)
       : left.socketPath === right.socketPath && left.serverPid === right.serverPid && left.paneId === right.paneId && left.panePid === right.panePid && sameTmuxGeneration(left.generation, right.generation));
 }
 function isTmuxSourceTarget(intentRecord, target) {
@@ -499,7 +581,7 @@ function isSourceTarget(intentRecord, target) {
   return intentRecord?.terminalMode === "cmux-pane"
     ? target?.mode === "cmux-pane" && cmuxIdsEqual(target.workspaceId, intentRecord.source.workspaceId) && cmuxIdsEqual(target.surfaceId, intentRecord.source.sourceSurfaceId)
     : intentRecord?.terminalMode === "herdr-pane"
-      ? target?.mode === "herdr-pane" && target.socketPath === intentRecord.source.socketPath && target.protocol === intentRecord.source.protocol && target.terminalId === intentRecord.source.sourceTerminalId
+      ? target?.mode === "herdr-pane" && target.socketPath === intentRecord.source.socketPath && target.protocol === intentRecord.source.protocol && sameHerdrGeneration(target.generation, intentRecord.source.generation) && target.terminalId === intentRecord.source.sourceTerminalId
       : isTmuxSourceTarget(intentRecord, target);
 }
 function allocationMatchesIntentSource(intentRecord, allocationRecord) {
@@ -507,9 +589,22 @@ function allocationMatchesIntentSource(intentRecord, allocationRecord) {
   const layoutIntent = Object.hasOwn(intentRecord, "layout"), layoutAllocation = Object.hasOwn(allocationRecord, "layout");
   if (layoutIntent !== layoutAllocation) return false;
   if (intentRecord.terminalMode === "herdr-pane") {
-    return !layoutIntent && allocationRecord.target.socketPath === intentRecord.source.socketPath
-      && allocationRecord.target.workspaceId === intentRecord.source.workspaceId && allocationRecord.target.tabId === intentRecord.source.tabId
-      && allocationRecord.target.protocol === intentRecord.source.protocol && allocationRecord.target.terminalId !== intentRecord.source.sourceTerminalId;
+    const sourceMatches = sameHerdrGeneration(intentRecord.source.generation, allocationRecord.target.generation)
+      && allocationRecord.target.socketPath === intentRecord.source.socketPath
+      && allocationRecord.target.workspaceId === intentRecord.source.workspaceId
+      && allocationRecord.target.protocol === intentRecord.source.protocol
+      && allocationRecord.target.paneId !== intentRecord.source.sourcePaneId
+      && allocationRecord.target.terminalId !== intentRecord.source.sourceTerminalId;
+    if (!layoutIntent) return sourceMatches && allocationRecord.target.tabId === intentRecord.source.tabId;
+    if (!sourceMatches || intentRecord.layout !== allocationRecord.layout || intentRecord.placement !== allocationRecord.placement
+      || !herdrTabContainer(allocationRecord.container) || allocationRecord.container.workspaceId !== allocationRecord.target.workspaceId
+      || allocationRecord.container.tabId !== allocationRecord.target.tabId) return false;
+    return intentRecord.container.kind === "herdr-source"
+      ? intentRecord.container.workspaceId === intentRecord.source.workspaceId && intentRecord.container.tabId === intentRecord.source.tabId
+        && intentRecord.container.paneId === intentRecord.source.sourcePaneId && intentRecord.container.terminalId === intentRecord.source.sourceTerminalId
+        && allocationRecord.target.tabId === intentRecord.source.tabId
+      : intentRecord.container.kind === "herdr-workspace" && intentRecord.container.workspaceId === intentRecord.source.workspaceId
+        && allocationRecord.target.tabId !== intentRecord.source.tabId;
   }
   if (intentRecord.terminalMode === "cmux-pane") {
     if (!legacyCmuxHarness && (!intentRecord.control || !allocationRecord.control || JSON.stringify(intentRecord.control) !== JSON.stringify(allocationRecord.control))) return false;
@@ -603,12 +698,17 @@ async function rollback(target, intentRecord) {
   // authority, even if its other fingerprint fields happen to match.
   if (isSourceTarget(intentRecord, target)) return false;
   if (target.mode === "herdr-pane") {
-    // The protocol gate and stable-terminal rebinding are immediately before
-    // the close mutation; an old pane_id after pane.moved is never authority.
-    const current = await revalidateHerdrTarget(target);
-    if (!current) return false;
+    // Direct auto layout is already executing a gate-closed wrapper. It is
+    // never rollback authority after layout.apply, including known failures.
+    if (intentRecord?.placement === "herdr-new-tab") return false;
+    const allocatedTabId = target.allocatedTabId;
+    const classified = await classifyHerdrTarget(target);
+    if (classified.state === "absent") return true;
+    if (classified.state !== "present") return false;
+    const current = classified.target;
+    if (intentRecord?.placement === "herdr-new-tab" && (!isHerdrId(allocatedTabId) || current.tabId !== allocatedTabId)) return false;
     await herdrRequest(current.socketPath, "pane.close", { pane_id: current.paneId }, true);
-    return parseHerdrPane(await herdrRequest(current.socketPath, "pane.get", { pane_id: current.paneId }).catch(() => ({ pane: null })), current.socketPath, current.protocol) === null;
+    return (await classifyHerdrTarget(current)).state === "absent";
   }
   if (target.mode === "cmux-pane") {
     // A surface can move workspaces. Establish both presence and its current
@@ -717,7 +817,7 @@ async function allocateCmux(i) {
     }
   }
   if (split) args = ["--json", "--id-format", "both", "new-split", "right", "--workspace", i.source.workspaceId, "--surface", i.source.sourceSurfaceId, "--focus", "false"];
-  else args = ["--json", "--id-format", "both", "new-surface", "--type", "terminal", "--workspace", i.container.workspaceId, "--pane", requestedPaneId, "--working-directory", path.dirname(i.childSessionFile), "--focus", "false"];
+  else args = ["--json", "--id-format", "both", "new-surface", "--type", "terminal", "--workspace", i.container.workspaceId, "--pane", requestedPaneId, "--working-directory", bootstrapCwd, "--focus", "false"];
   const result = await cmuxCommand(args);
   const value = cmuxResponseValue(result.stdout);
   const exact = value && isUuidString(value.workspace_id) && isUuidString(value.surface_id) && isUuidString(value.pane_id)
@@ -739,8 +839,30 @@ async function allocateCmux(i) {
   };
 }
 async function allocateHerdr(i) {
+  // Production broker authority is generation-bound before any request; old
+  // generation-less records may be retained by parent diagnostics but cannot run here.
+  if (!herdrGeneration(i.source.generation)) throw new Error("Herdr intent lacks socket generation authority");
+  currentHerdrGeneration = i.source.generation;
+  // Layout containers are immutable requests, not hints from the currently
+  // rebound source pane. Reject a stale/cross-container request before either
+  // allocation mutation can be dispatched.
+  const layout = Object.hasOwn(i, "layout");
+  const autoTab = layout && i.placement === "herdr-new-tab";
+  // The intent binds the caller-selected final Pi cwd, but allocation starts
+  // at the filesystem root. The gated wrapper performs the final cd only
+  // after broker verification, before Pi starts.
+  const wrapperPath = p("cmux-wrapper.sh");
+  if (layout && (!i.workingDirectory || !path.isAbsolute(i.workingDirectory) || path.normalize(i.workingDirectory) !== i.workingDirectory)) throw new Error("Herdr direct layout intent lacks a normalized working directory");
+  if (layout && autoTab) {
+    if (i.container.workspaceId !== i.source.workspaceId) throw new Error("Herdr workspace container changed before allocation");
+  } else if (layout && i.placement === "herdr-split") {
+    if (i.container.workspaceId !== i.source.workspaceId || i.container.tabId !== i.source.tabId
+      || i.container.paneId !== i.source.sourcePaneId || i.container.terminalId !== i.source.sourceTerminalId) throw new Error("Herdr source container changed before allocation");
+  } else if (layout) {
+    throw new Error("Herdr layout intent is invalid");
+  }
   // Intent protocol binding and this preflight prevent an older/incompatible
-  // server from ever observing a split mutation. Repeat at the boundary.
+  // server from ever observing a mutation. Repeat at the boundary.
   await assertHerdrProtocol(i.source.socketPath, i.source.protocol);
   const sourceResponse = await herdrRequest(i.source.socketPath, "pane.get", { pane_id: i.source.sourcePaneId });
   const source = parseHerdrPane(sourceResponse, i.source.socketPath, i.source.protocol);
@@ -751,12 +873,37 @@ async function allocateHerdr(i) {
   // The immutable terminal identity, not the public pane address, is the
   // authority revalidated immediately before the split mutation.
   if (!current || current.terminalId !== i.source.sourceTerminalId || current.workspaceId !== source.workspaceId || current.tabId !== source.tabId) throw new Error("Herdr source binding changed immediately before allocation");
-  const split = await herdrRequest(i.source.socketPath, "pane.split", { target_pane_id: current.paneId, direction: "right", cwd: path.dirname(i.childSessionFile), focus: false }, true);
-  const target = parseHerdrPane(split, i.source.socketPath, i.source.protocol);
-  if (!target || target.workspaceId !== source.workspaceId || target.tabId !== source.tabId || target.terminalId === i.source.sourceTerminalId) {
-    throw new HerdrUnknownOutcomeError("pane.split", "Herdr pane.split did not return an exact new terminal binding");
+  const method = autoTab ? "layout.apply" : "pane.split";
+  let result;
+  try {
+    result = await herdrRequest(i.source.socketPath, method, autoTab
+      // No tab_id is sent: this is exactly one workspace-scoped new tab/root
+      // pane and its direct argv starts the private wrapper behind its gate.
+      ? { workspace_id: current.workspaceId, focus: false, tab_label: i.tabLabel, root: { type: "pane", cwd: bootstrapCwd, command: [wrapperPath], env: HERDR_DIRECT_STARTUP_ENV } }
+      : { target_pane_id: current.paneId, direction: "right", cwd: bootstrapCwd, focus: false }, true);
+  } catch (error) {
+    if (autoTab) throw isHerdrUnknownOutcome(error) ? error : new HerdrUnknownOutcomeError(method, `Herdr ${method} dispatch outcome is unknown`);
+    throw error;
   }
-  return target;
+  let target = null;
+  try {
+    if (autoTab) {
+      const root = parseHerdrLayoutAppliedRootPane(result, current.workspaceId, current.tabId, wrapperPath, bootstrapCwd);
+      if (root) {
+        const observed = parseHerdrPane(await herdrRequest(i.source.socketPath, "pane.get", { pane_id: root.paneId }), i.source.socketPath, i.source.protocol);
+        target = observed && observed.workspaceId === current.workspaceId && observed.tabId === root.tabId && observed.paneId === root.paneId ? observed : null;
+      }
+    } else target = parseHerdrPane(result, i.source.socketPath, i.source.protocol);
+  } catch (error) {
+    throw isHerdrUnknownOutcome(error) ? error : new HerdrUnknownOutcomeError(method, `Herdr ${method} post-dispatch verification failed`);
+  }
+  if (!target || target.workspaceId !== source.workspaceId || (autoTab ? target.tabId === source.tabId : target.tabId !== source.tabId)
+    || target.paneId === i.source.sourcePaneId || target.paneId === current.paneId || target.terminalId === i.source.sourceTerminalId) {
+    throw new HerdrUnknownOutcomeError(method, `Herdr ${method} did not return an exact new terminal binding`);
+  }
+  // Preserve the auto tab allocation as immutable provenance. The target
+  // object itself is intentionally rebound in place by later lifecycle probes.
+  return autoTab ? { ...target, generation: i.source.generation, allocatedTabId: target.tabId } : { ...target, generation: i.source.generation };
 }
 function socketArgs(socket) { return socket ? ["-S", socket] : []; }
 async function safeTmuxShellHome() {
@@ -843,8 +990,8 @@ async function allocateTmux(i) {
   ];
   const launch = ["/usr/bin/env", ...stagedArgs];
   const allocationArgs = layout && i.placement === "tmux-new-window"
-    ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", i.windowLabel, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
-    : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{pane_pid}", "-t", source.sourcePaneId, "-c", path.dirname(i.childSessionFile), ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
+    ? [...socket, "new-window", "-d", "-P", "-F", "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}", "-t", `${request.sessionId}:`, "-n", i.windowLabel, "-c", bootstrapCwd, ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch]
+    : [...socket, "split-window", "-h", "-d", "-P", "-F", layout ? "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}" : "#{pane_id}|#{pane_pid}", "-t", source.sourcePaneId, "-c", bootstrapCwd, ...paneEnvironment.flatMap((entry) => ["-e", entry]), ...launch];
   const result = await runTmux(allocationArgs);
   // A complete response stays rollback authority even on nonzero. Parse it
   // before status handling; malformed nonzero output never authorizes mutation.
@@ -1008,7 +1155,9 @@ async function main() {
       ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "cmux-pane", workspaceId: target.workspaceId, paneId: target.paneId }, control: i.control } : {}),
       target: { workspaceId: target.workspaceId, surfaceId: target.surfaceId, paneId: target.paneId }, allocatedAt: now() }
     : i.terminalMode === "herdr-pane"
-      ? { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode, target: { socketPath: target.socketPath, workspaceId: target.workspaceId, tabId: target.tabId, paneId: target.paneId, terminalId: target.terminalId, protocol: target.protocol }, allocatedAt: now() }
+      ? { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
+        ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "herdr-tab", workspaceId: target.workspaceId, tabId: target.tabId } } : {}),
+        target: { socketPath: target.socketPath, workspaceId: target.workspaceId, tabId: target.tabId, paneId: target.paneId, terminalId: target.terminalId, protocol: target.protocol, generation: target.generation }, allocatedAt: now() }
       : { version: protocolVersion, runId: i.runId, terminalMode: i.terminalMode,
         ...(protocolVersion === 3 ? { transport: "tmux-control-v1", intentDigest: intentArtifact.digest } : {}),
         ...(Object.hasOwn(i, "layout") ? { layout: i.layout, placement: i.placement, container: { kind: "tmux-window", socketPath: target.socketPath, serverPid: target.serverPid, sessionId: target.sessionId, windowId: target.windowId, paneId: target.paneId, panePid: target.panePid, generation: target.generation } } : {}),
@@ -1113,7 +1262,7 @@ async function main() {
     await riskAndFail(i.runId); return;
   }
   await status(i.runId, "committed");
-  if (i.terminalMode === "herdr-pane") {
+  if (i.terminalMode === "herdr-pane" && i.placement !== "herdr-new-tab") {
     const outcome = await launchHerdrAfterGate(i, target);
     // An unknown send_text delivery may already have exec'd the wrapper. Keep
     // its exact durable allocation for reaper/parent reconciliation; never
@@ -1231,9 +1380,54 @@ async function verifyGate() {
   }
   process.exitCode = 0;
 }
+async function verifyHerdrDirectGate() {
+  // Called by the directly-started private wrapper before it sources secrets,
+  // changes cwd, writes a title, or starts Pi. Every rejection is quiet.
+  try { await validateRunAuthority(); } catch { return; }
+  const i = intent(await readExact(p("launch-intent.json")));
+  if (!i || i.terminalMode !== "herdr-pane" || i.placement !== "herdr-new-tab") return;
+  currentHerdrGeneration = i.source.generation;
+  const wrapperAt = process.argv.indexOf("--wrapper"), wrapper = wrapperAt >= 0 ? process.argv[wrapperAt + 1] : null;
+  if (!wrapper || path.resolve(wrapper) !== p("cmux-wrapper.sh") || regularFile(wrapper, true) !== wrapper) return;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const [rawDecision, rawAllocation, rawLaunch, rawGate] = await Promise.all([
+      readExact(p("decision.json")), readExact(p("allocation.json")), readExact(p("launch.json")), readExact(p("launch.gate")),
+    ]);
+    const d = decision(rawDecision, i.runId), a = allocation(rawAllocation, i.runId), l = launch(rawLaunch, i.runId, i.terminalMode), g = gate(rawGate, i.runId, i.terminalMode);
+    if ((rawDecision && !d) || (rawAllocation && !a) || (rawLaunch && !l) || (rawGate && !g) || d?.kind === "cancel") return;
+    if (d?.kind === "commit" && a && l && g && validStateDependencies(a, d, l, g)
+      && allocationMatchesIntentSource(i, a) && g.protocol === i.source.protocol) {
+      // The direct root inherited these values from Herdr. Bind all of them to
+      // the committed allocation immediately before the real wrapper starts.
+      if (process.env.HERDR_ENV !== "1" || process.env.HERDR_SOCKET_PATH !== a.target.socketPath
+        || process.env.HERDR_WORKSPACE_ID !== a.target.workspaceId || process.env.HERDR_TAB_ID !== a.target.tabId
+        || process.env.HERDR_PANE_ID !== a.target.paneId || !herdrGeneration(a.target.generation)) return;
+      currentHerdrGeneration = a.target.generation;
+      try {
+        if (!strictHerdrSocket(a.target.socketPath) || !sameHerdrGeneration(a.target.generation, i.source.generation)
+          || await assertHerdrProtocol(a.target.socketPath, a.target.protocol) !== a.target.protocol) return;
+        const inherited = { mode: "herdr-pane", socketPath: process.env.HERDR_SOCKET_PATH, workspaceId: process.env.HERDR_WORKSPACE_ID,
+          tabId: process.env.HERDR_TAB_ID, paneId: process.env.HERDR_PANE_ID, terminalId: a.target.terminalId, protocol: a.target.protocol, generation: a.target.generation };
+        if (!sameTarget(inherited, targetFromAllocation(a))) return;
+        const pane = parseHerdrPane(await herdrRequest(a.target.socketPath, "pane.get", { pane_id: a.target.paneId }), a.target.socketPath, a.target.protocol);
+        if (!pane || pane.workspaceId !== a.target.workspaceId || pane.tabId !== a.target.tabId || pane.paneId !== a.target.paneId || pane.terminalId !== a.target.terminalId) return;
+      } catch { return; }
+      const { spawn: launch } = await import("node:child_process");
+      const herdrEnv = { HERDR_ENV: "1", HERDR_SOCKET_PATH: a.target.socketPath, HERDR_WORKSPACE_ID: a.target.workspaceId,
+        HERDR_TAB_ID: a.target.tabId, HERDR_PANE_ID: a.target.paneId };
+      const child = launch(wrapper, ["--pi-subagent-herdr-gate-ok"], { cwd: runDir, stdio: "inherit", shell: false, env: { ...commandEnv, ...herdrEnv } });
+      child.once("exit", (code) => process.exit(code ?? 1));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 const verifyGateMode = process.argv.includes("--verify-gate");
+const verifyHerdrDirectGateMode = process.argv.includes("--verify-herdr-direct-gate");
 try {
-  if (verifyGateMode) await verifyGate(); else await main();
+  if (verifyHerdrDirectGateMode) await verifyHerdrDirectGate();
+  else if (verifyGateMode) await verifyGate(); else await main();
 } finally {
   cmuxManager?.close();
   tmuxManager?.close();
@@ -1241,4 +1435,4 @@ try {
 // The allocation broker is a one-shot process. Explicit exit prevents a
 // transport implementation detail from extending its lifetime; all durable
 // publications above are awaited and fsync-complete before this point.
-if (!verifyGateMode) process.exit(process.exitCode ?? 0);
+if (!verifyGateMode && !verifyHerdrDirectGateMode) process.exit(process.exitCode ?? 0);

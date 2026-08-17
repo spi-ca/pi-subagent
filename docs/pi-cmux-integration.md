@@ -112,7 +112,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 | --- | --- | --- |
 | `pi-subagent:dashboard:v1` | session/generation/monotonic sequence envelope, bounded counts 및 최대 64개 active item | parent dashboard 상태 |
 | `pi-subagent:aggregate-completed:v1` | 같은 envelope와 terminal invocation 요약 | 완료·실패·취소 집계 알림 |
-| `pi-subagent:detached:v1` | 같은 envelope, run ID, agent, `cmux-pane`/`tmux-pane`, detachment time | 새 durable promotion 알림 |
+| `pi-subagent:detached:v1` | 같은 envelope, run ID, agent, `cmux-pane`/`tmux-pane`/`herdr-pane`, detachment time | 새 durable promotion 알림 |
 
 모든 payload는 `version: 1`, `sessionId`, `generation`, 증가하는 `sequence`, `emittedAt`을 가지며 task, prompt, path, credential, raw output을 포함하지 않는다. publisher는 terminal invocation 기억을 256개로, detached notification을 run별 한 번으로 제한한다. consumer는 exact shape와 envelope를 검증하고 세션·generation이 다르거나 sequence가 뒤로 가는 event를 버려야 한다.
 
@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 dashboard/aggregate/detached를 변환한 channel이 아니며 root parent(depth `0`)에서만 동작한다. producer는 idle에서는 열지 않고 active·queued·새 terminal 집계에서 열며, parent `agent_settled`의 quiescent aggregate에서 remove한다. remove는 cancellation·surface cleanup 권한이 아니다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, 철회, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
+root `pi-subagent`는 별도로 `pi-presence:update:v1`을 발행하고 `pi-presence:remove:v1`으로 retained observer 상태를 철회하며 `pi-presence:ready:v1` replay 요청을 수신한다. 이는 Herdr의 내부 socket `agent.*` 또는 child `pane.report_metadata` presentation 채널과도, dashboard/aggregate/detached를 변환한 channel과도 별개이며 root parent(depth `0`)에서만 동작한다. producer는 idle에서는 열지 않고 active·queued·새 terminal 집계에서 열며, parent `agent_settled`의 quiescent aggregate에서 remove한다. remove는 cancellation·surface cleanup 권한이 아니다. 설치·로드된 `pi-cmux-presence`는 같은 process에서 이를 선택적으로 소비할 수 있고, `pi-cmux`와 함께 설치해도 된다. 어느 consumer도 producer의 lifecycle authority나 package dependency가 되지 않는다. wire contract, source 식별자, replay attention, 철회, progress·terminal count 계산과 observer 경계는 [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)이 canonical 설명이다.
 
 ## 5. 권장 운영 정책
 
@@ -251,7 +251,7 @@ slash command는 하나만 등록한다. session-local foreground/background inv
 /subagents doctor            probe 없는 integration 진단
 /subagents cancel <full-id>   foreground/background invocation 취소
 /subagents details <full-id>  invocation 또는 interactive run 상세
-/subagents focus <run-id>     negotiated cmux surface.focus로 exact target focus
+/subagents focus <run-id>     negotiated cmux 또는 전후 identity를 검증하는 user-initiated Herdr focus
 /subagents keep <run-id>      session shutdown까지 surface 보존
 /subagents promote <run-id>   durable user ownership으로 승격
 ```
@@ -264,7 +264,7 @@ slash command는 하나만 등록한다. session-local foreground/background inv
   worker · ✓ completed · 12s · <invocation-id>
 ```
 
-현재 구현은 별도의 sanitized session-local UX registry와 exact interactive authority registry를 사용하며 Pi의 `registerCommand()`, `ctx.ui.select()`, `ctx.ui.notify()`, `ctx.ui.confirm()`, `setStatus()`만 사용한다. doctor는 새 CLI/control handshake/topology probe를 실행하지 않고 현재 환경 identity, scheduler 수치, active interactive authority 수와 Pi registry provenance만 보고한다. `details`와 ownership action만 선택한 exact run의 기존 generation-bound backend를 검사한다. promotion marker authority가 불확실하면 `details`/list에 run을 계속 보존하고 local cleanup을 revoke한다. cmux focus는 negotiated `surface.focus`가 있을 때만 persistent control-v2로 수행하고 tmux focus는 안전한 caller-client authority가 없어 fail-closed한다. production cmux CLI fallback은 없다. subcommand completion은 UI 편의이며 LLM tool schema에 추가하지 않는다.
+현재 구현은 별도의 sanitized session-local UX registry와 exact interactive authority registry를 사용하며 Pi의 `registerCommand()`, `ctx.ui.select()`, `ctx.ui.notify()`, `ctx.ui.confirm()`, `setStatus()`만 사용한다. doctor는 새 CLI/control handshake/topology probe를 실행하지 않고 cmux/Herdr/tmux 현재 환경 identity, scheduler 수치, active interactive authority 수와 Pi registry provenance만 보고한다. control readiness는 doctor가 아니라 각 interactive launch에서 검증한다. `details`와 ownership action만 선택한 exact run의 기존 generation-bound backend를 검사한다. Herdr `auto`는 shared pane/window이 아니라 child별 unfocused 새 tab root pane이고, cancellation 뒤 present/unknown/hung terminal은 recovery/manual cleanup과 late watcher를 유지한다. promotion marker authority가 불확실하면 `details`/list에 run을 계속 보존하고 local cleanup을 revoke한다. cmux focus는 negotiated `surface.focus`가 있을 때만 persistent control-v2로 수행하고, Herdr focus는 protocol-gated exact rebound pane만 사용하며, tmux focus는 안전한 caller-client authority가 없어 fail-closed한다. production cmux CLI fallback은 없다. subcommand completion은 UI 편의이며 LLM tool schema에 추가하지 않는다.
 
 #### parent compact status와 public event (구현됨)
 
@@ -321,12 +321,12 @@ reviewer [depth=2;run=39bc730e] · returning
 
 현재 구현은 다음 항목만 확인한다.
 
-- canonical cmux identity 유효성 또는 tmux 환경에 따른 현재 terminal mode
+- cmux/Herdr/tmux 환경 identity 유효성과 우선순위에 따른 현재 terminal mode
 - 현재 interactive layout과 child launch policy
 - process-local scheduler의 `maxActive` (active/queued count는 표시 가능한 경우만; durable tree authority/cap은 진단하지 않음)
 - active interactive cleanup authority 수
 - Pi tool/command registry provenance에서 확인 가능한 `pi-cmux` metadata
-- production launch에서 control-v2 readiness를 검증한다는 사실(doctor 자체는 probe하지 않음)
+- control readiness는 doctor probe가 아니라 각 interactive launch에서 검증한다는 사실
 
 doctor 자체는 probe-free다. surface별 존재/exit/title 상태와 keep/promote ownership은 `/subagents details <run-id>`가 exact active authority를 통해 별도로 진단한다.
 

@@ -82,7 +82,7 @@ remove를 모르는 이전 consumer는 event를 구독하지 않아 무시하므
 bun test test/integration/pi-presence-producer.test.ts
 ```
 
-`bun run ci`는 type check와 전체 테스트를 실행한다. 이 focused/unit 범위와 baseline CI는 별도 `pi-cmux-presence` package의 소비 구현이나 live cmux E2E 조합을 증명하지 않는다.
+`bun run ci`는 type check와 file isolation 전체 테스트를 실행한다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다. 이 focused/unit 범위와 baseline CI는 별도 `pi-cmux-presence` package의 소비 구현이나 live cmux E2E 조합을 증명하지 않는다.
 
 별도 opt-in 교차 smoke는 다음처럼 실행한다.
 

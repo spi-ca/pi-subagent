@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -58,6 +59,7 @@ import {
 	CmuxSourcePreflightError,
 	beginInteractiveShutdownForSession,
 	canStartInteractiveRun,
+	createHerdrAgentWaitFallback,
 	createInteractiveResultMutationQueueForTest,
 	cmuxEventsAuthorityKeyForTest,
 	isCmuxTopologyMutationEventForTest,
@@ -67,10 +69,15 @@ import {
 	publishInteractiveLaunchGate,
 	shutdownActiveInteractiveRuns,
 	subscribeInteractiveRunChanges,
+	watchCompletedHerdrDirectRunForRetirementForTest,
+	watchDetachedInteractiveRunForRetirementForTest,
+	terminateExactUnixChildForTest,
+	terminateAuthorizedHerdrChildForTest,
+	subscribeSharedHerdrPaneForTest,
 } from "../../src/runtime/runner";
 import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
 import { buildTmuxPaneSnapshotArgs, buildTmuxServerPidArgs, readTmuxPaneTitle } from "../../src/runtime/tmux";
-import type { InteractivePaneBackend } from "../../src/runtime/interactive-pane";
+import { herdrInteractivePaneBackend, type InteractivePaneBackend } from "../../src/runtime/interactive-pane";
 import { acquireTmuxControlLease, snapshotTmuxControlPoolForTest } from "../../src/runtime/tmux-control-pool";
 import {
 	SUBAGENT_CHILD_SESSION_PATH_ENV,
@@ -84,6 +91,9 @@ import {
 	prepareRunArtifactPaths,
 	removeRunArtifacts,
 	getCurrentProcessStartedAt,
+	parseCancellationFence,
+	publishImmutableJson,
+	readJsonFile,
 } from "../../src/runtime/run-protocol";
 import { SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV } from "../../src/runtime/lifecycle-socket";
 import { computeSessionCompletionBoundary, computeSessionFailureBoundary, getSessionFileIdentity, setSessionVerificationBufferLimitForTesting } from "../../src/runtime/completion-v3";
@@ -102,6 +112,145 @@ const agent = {
 };
 
 describe("interactive pane runner preparation", () => {
+	test("escalates a Herdr child only after exact identity and authority revalidation", async () => {
+		const calls: string[] = [];
+		const escalation = await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 0,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => "live",
+			signal: (_pid, signal) => { calls.push(signal); return true; },
+			sleep: async () => undefined,
+		});
+		if (process.platform === "win32") {
+			assert.equal(escalation, false, "Windows never uses Unix process signals");
+			assert.deepEqual(calls, []);
+			return;
+		}
+		assert.equal(escalation, true);
+		assert.deepEqual(calls, ["SIGTERM", "SIGKILL"]);
+
+		for (const status of ["dead", "unknown"] as const) {
+			const rejected: string[] = [];
+			assert.equal(await terminateExactUnixChildForTest({
+				processId: 42, expectedStartedAt: 7, termGraceMs: 0,
+				isStillAuthorized: async () => true, classifyIdentity: () => status,
+				signal: (_pid, signal) => { rejected.push(signal); return true; }, sleep: async () => undefined,
+			}), false, status);
+			assert.deepEqual(rejected, [], `${status} identity must not receive a signal`);
+		}
+
+		const completionWon: string[] = [];
+		let authorizationChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 100,
+			isStillAuthorized: async () => ++authorizationChecks === 1,
+			classifyIdentity: () => "live",
+			signal: (_pid, signal) => { completionWon.push(signal); return true; }, sleep: async () => undefined,
+		}), false);
+		assert.deepEqual(completionWon, ["SIGTERM"], "an ownership or exact-state change during grace blocks SIGKILL");
+
+		const childExited: string[] = [], graceSleeps: number[] = [];
+		let identityChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 100,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => ++identityChecks === 1 ? "live" : "dead",
+			signal: (_pid, signal) => { childExited.push(signal); return true; }, sleep: async (milliseconds) => { graceSleeps.push(milliseconds); },
+		}), true);
+		assert.deepEqual(childExited, ["SIGTERM"], "a child death after the immutable cancellation winner is bounded success");
+		assert.deepEqual(graceSleeps, [100], "SIGTERM grace uses one deadline rather than periodic polling");
+
+		const wakeExited: string[] = [], wakeSleeps: number[] = [];
+		let wakeIdentityChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 1_000,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => ++wakeIdentityChecks === 1 ? "live" : "dead",
+			signal: (_pid, signal) => { wakeExited.push(signal); return true; },
+			waitForWake: async () => undefined,
+			sleep: async (milliseconds) => { wakeSleeps.push(milliseconds); },
+		}), true);
+		assert.deepEqual(wakeExited, ["SIGTERM"], "an early relevant wake observes exact child exit without SIGKILL");
+		assert.deepEqual(wakeSleeps, [], "an event wake does not start a fixed-interval grace poll");
+	});
+
+	test("registered Herdr cancellation elects one immutable fence winner before exact-PID signals", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-cancel-fence-"));
+		const runId = "herdr-cancel-fence", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+		try {
+			await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 0, updatedAt: 1, phase: "running", childPid: 42, childStartedAt: 7 })}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			const signals: string[] = [];
+			const outcome = await terminateAuthorizedHerdrChildForTest(runId, {
+				termGraceMs: 0, classifyIdentity: () => "live", sleep: async () => undefined,
+				signal: (_pid, signal) => { signals.push(signal); return true; },
+			});
+			if (process.platform === "win32") {
+				assert.equal(outcome, "revoked"); assert.deepEqual(signals, []);
+			} else {
+				assert.equal(outcome, "terminated");
+				assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+				assert.equal(parseCancellationFence(await readJsonFile(paths.completionFencePath), runId)?.childPid, 42);
+			}
+			unregisterCommittedInteractiveRun(runId, true);
+			await fs.promises.rm(paths.completionFencePath, { force: true });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			await publishImmutableJson(paths.completionFencePath, { version: 1, kind: "completion-fence", runId, nonce: "a".repeat(64), publishedAt: 1 });
+			assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "completion-won");
+			await fs.promises.rm(paths.completionFencePath, { force: true });
+			for (const artifact of ["not-json\n", JSON.stringify({ version: 1, kind: "cancellation-fence", runId, childPid: 99, childStartedAt: 7, claimedAt: 1 }) + "\n"]) {
+				await fs.promises.writeFile(paths.completionFencePath, artifact, { mode: 0o600 });
+				assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "revoked");
+				await fs.promises.rm(paths.completionFencePath, { force: true });
+			}
+			await fs.promises.mkdir(paths.completionFencePath);
+			assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "revoked");
+			await fs.promises.rm(paths.completionFencePath, { recursive: true, force: true });
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("shares one Herdr selector socket, serially reconfigures its pane union, and fans an underscore status event only to its pane", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-shared-"));
+		const socketPath = path.join(root, "herdr.sock");
+		let subscriptions = 0, openSockets = 0, maxOpenSockets = 0;
+		const selectorSets: string[][] = [];
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane-a", terminal_id: "terminal-a" };
+		const server = net.createServer((socket) => {
+			openSockets += 1; maxOpenSockets = Math.max(maxOpenSockets, openSockets);
+			socket.once("close", () => { openSockets -= 1; });
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string; params?: { subscriptions?: Array<{ type?: string; pane_id?: string }> } };
+				if (request.method !== "events.subscribe") { socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`); return; }
+				subscriptions += 1;
+				selectorSets.push((request.params?.subscriptions ?? []).filter((item) => item.type === "pane.agent_status_changed").map((item) => item.pane_id!).sort());
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				if (selectorSets.at(-1)?.includes("pane-b")) setTimeout(() => socket.write(`${JSON.stringify({ event: "pane_agent_status_changed", data: { pane_id: "pane-b", workspace_id: "workspace", agent_status: "working" } })}\n`), 1);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
+		let firstReconciles = 0, secondReconciles = 0;
+		const first = subscribeSharedHerdrPaneForTest({ handle, onReconcile: () => { firstReconciles += 1; } });
+		for (let attempt = 0; attempt < 40 && subscriptions !== 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		const second = subscribeSharedHerdrPaneForTest({ handle: { ...handle, paneId: "pane-b", terminalId: "terminal-b" }, onReconcile: () => { secondReconciles += 1; } });
+		for (let attempt = 0; attempt < 80 && (subscriptions !== 2 || secondReconciles !== 1); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(subscriptions, 2, "one serial replacement carries the changed selector union");
+		assert.deepEqual(selectorSets, [["pane-a"], ["pane-a", "pane-b"]]);
+		assert.equal(maxOpenSockets, 1, "replacement waits for the old physical stream to drain");
+		assert.equal(firstReconciles, 0, "pane-b status does not fan out to pane-a");
+		assert.equal(secondReconciles, 1);
+		first.stop(); second.stop(); await Promise.all([first.closed, second.closed]); await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	});
+
 	test("notifies interactive registry observers immediately and after successful shutdown removal", async () => {
 		await shutdownActiveInteractiveRuns();
 		await resetInteractiveShutdownForSession();
@@ -138,6 +287,516 @@ describe("interactive pane runner preparation", () => {
 			unregisterCommittedInteractiveRun(runId, true);
 			await resetInteractiveShutdownForSession();
 		}
+	});
+
+	test("active cleanup does not interrupt or close an auto Herdr child moved outside its allocated tab", async () => {
+		await shutdownActiveInteractiveRuns();
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-active-herdr-"));
+		const socketPath = path.join(root, "herdr.sock");
+		const moved = { workspace_id: "workspace", tab_id: "user-tab", pane_id: "moved-child", terminal_id: "child-terminal" };
+		const calls: string[] = [];
+		const server = net.createServer((socket) => socket.once("data", (chunk) => {
+			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+			calls.push(request.method);
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+				: request.method === "pane.get" ? { type: "pane_info", pane: moved } : { type: "ok" };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		}));
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+		fs.chmodSync(socketPath, 0o600);
+		const runId = "active-herdr-tab-moved";
+		const handle = { mode: "herdr-pane" as const, native: { socketPath, socketDev: BigInt(fs.lstatSync(socketPath).dev).toString(), socketIno: BigInt(fs.lstatSync(socketPath).ino).toString(), workspaceId: moved.workspace_id, tabId: "allocated-tab", paneId: "allocated-child", terminalId: moved.terminal_id, allocatedTabId: "allocated-tab", protocol: 20 as const } };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend: herdrInteractivePaneBackend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			await shutdownActiveInteractiveRuns();
+			assert.equal(calls.includes("pane.send_keys"), false);
+			assert.equal(calls.includes("pane.close"), false);
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("runner Herdr fallback keeps healthy subscriptions wait-free and drains one degraded observer on recovery", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-fallback-"));
+		const socketPath = path.join(root, "herdr.sock");
+		const calls: string[] = [];
+		let subscriptionSocket: net.Socket | undefined;
+		const sockets = new Set<net.Socket>();
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane", terminal_id: "terminal" };
+		const server = net.createServer((socket) => {
+			sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+				calls.push(request.method);
+				if (request.method === "events.subscribe") {
+					subscriptionSocket = socket;
+					socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+					return;
+				}
+				if (request.method === "agent.wait") return;
+				const result = request.method === "pane.get" ? { type: "pane_info", pane }
+					: { type: "agent_info", agent: { ...pane, agent_status: "working", focused: false, revision: 1, state_change_seq: 1 } };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+		fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
+		const fallback = createHerdrAgentWaitFallback({ handle, onWake: () => undefined });
+		const subscription = (await import("../../src/runtime/herdr")).subscribeHerdrPane({
+			handle, onReconcile: () => undefined, onHealthChange: (healthy) => fallback.sync(healthy),
+		});
+		const waitFor = async (condition: () => boolean) => {
+			for (let attempt = 0; attempt < 100 && !condition(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.ok(condition(), "timed out waiting for Herdr observer state");
+		};
+		try {
+			await waitFor(() => subscription.isHealthy());
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			assert.equal(calls.filter((method) => method === "agent.wait").length, 0, "healthy events.subscribe must not start agent.wait");
+			subscriptionSocket!.destroy();
+			await waitFor(() => calls.filter((method) => method === "agent.wait").length === 1);
+			await waitFor(() => subscription.isHealthy());
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			assert.equal(calls.filter((method) => method === "agent.wait").length, 1, "recovery must drain rather than race-restart the degraded observer");
+			assert.equal(calls.some((method) => ["pane.close", "tab.close", "pane.send_keys", "agent.send-keys"].includes(method)), false);
+		} finally {
+			subscription.stop();
+			await fallback.stopAndDrain();
+			await subscription.closed;
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retires an auto Herdr tab only after read-only absence without a pane mutation", async () => {
+		await resetInteractiveShutdownForSession();
+		const runId = "herdr-direct-absence";
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		let closes = 0, inspections = 0;
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => { inspections += 1; return { exists: false }; }, interrupt: async () => { throw new Error("must not send keys"); }, close: async () => { closes += 1; return false; } };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(await releaseRegisteredInteractiveRun(runId), true);
+			assert.equal(inspections, 1);
+			assert.equal(closes, 0);
+		} finally { unregisterCommittedInteractiveRun(runId, true); await resetInteractiveShutdownForSession(); }
+	});
+
+	test("finalizes detached retirement after reset cancels observation at the deletion boundary", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-detached-reset-retirement-"));
+		const runId = "detached-reset-retirement", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: false }), interrupt: async () => false, close: async () => false };
+		const originalAccess = fs.promises.access;
+		let pauseAccess = true, enteredAbsenceBoundary!: () => void, releaseAccess!: () => void;
+		const absenceBoundary = new Promise<void>((resolve) => { enteredAbsenceBoundary = resolve; });
+		const accessRelease = new Promise<void>((resolve) => { releaseAccess = resolve; });
+		(fs.promises as { access: typeof fs.promises.access }).access = async (target, mode) => {
+			if (target === paths.runDir && pauseAccess) {
+				pauseAccess = false;
+				enteredAbsenceBoundary();
+				await accessRelease;
+			}
+			return await originalAccess(target, mode);
+		};
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchDetachedInteractiveRunForRetirementForTest(runId), true);
+			await absenceBoundary;
+			assert.equal(fs.existsSync(paths.runDir), false, "artifact removal completed before the final registry fence");
+			let resetSettled = false;
+			const reset = resetInteractiveShutdownForSession().then(() => { resetSettled = true; });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(resetSettled, false, "reset waits for the serialized cleanup boundary");
+			releaseAccess();
+			await reset;
+			assert.equal(listActiveInteractiveRunIds().includes(runId), false, "no active detached entry points to the deleted run directory");
+		} finally {
+			(fs.promises as { access: typeof fs.promises.access }).access = originalAccess;
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retires a completed direct Herdr run only after two read-only absences and safe artifact removal", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-late-herdr-retirement-"));
+		const runId = "late-herdr-completion";
+		const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		let inspections = 0, closes = 0;
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => { inspections += 1; return { exists: false }; }, interrupt: async () => { throw new Error("must not send keys"); }, close: async () => { closes += 1; return false; } };
+		try {
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			for (let attempt = 0; attempt < 100 && listActiveInteractiveRunIds().includes(runId); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(listActiveInteractiveRunIds().includes(runId), false);
+			assert.ok(inspections >= 2, "both absence probes are required");
+			assert.equal(closes, 0);
+			assert.equal(fs.existsSync(paths.runDir), false);
+		} finally { unregisterCommittedInteractiveRun(runId, true); await fs.promises.rm(root, { recursive: true, force: true }); await resetInteractiveShutdownForSession(); }
+	});
+
+	test("uses a finite cleanup-only retry after confirmed Herdr absence", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-cleanup-retry-"));
+		const runId = "late-herdr-cleanup-retry", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		let inspections = 0, removals = 0;
+		const originalRm = fs.promises.rm;
+		(fs.promises as { rm: typeof fs.promises.rm }).rm = async (target, options) => {
+			if (target === paths.runDir) {
+				removals += 1;
+				if (removals === 1) {
+					// Simulate recursive rm deleting its durable authority before its
+					// first failure is reported.
+					await originalRm(paths.completionPath, { force: true });
+					throw Object.assign(new Error("planned partial cleanup failure"), { code: "EACCES" });
+				}
+			}
+			return await originalRm(target, options);
+		};
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => { inspections += 1; return { exists: false }; }, interrupt: async () => false, close: async () => false };
+		const waitFor = async (condition: () => boolean) => {
+			for (let attempt = 0; attempt < 100 && !condition(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.ok(condition(), "timed out waiting for bounded cleanup retry");
+		};
+		try {
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			await fs.promises.writeFile(paths.taskPath, "sensitive\n", { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			await waitFor(() => removals === 1);
+			assert.equal(fs.existsSync(paths.completionPath), false, "the first recursive cleanup failure removed durable authority");
+			assert.equal(listActiveInteractiveRunIds().includes(runId), true, "the committed cleanup is still draining");
+			await waitFor(() => !listActiveInteractiveRunIds().includes(runId));
+			assert.equal(removals, 2, "the finite in-operation retry completes without reopening authority");
+			assert.equal(inspections, 2, "post-commit retry never polls Herdr again");
+		} finally {
+			(fs.promises as { rm: typeof fs.promises.rm }).rm = originalRm;
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("finalizes completed Herdr retirement after reset cancels observation at the deletion boundary", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-reset-retirement-"));
+		const runId = "late-herdr-reset-retirement", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: false }), interrupt: async () => false, close: async () => false };
+		const originalRm = fs.promises.rm;
+		let pauseRemoval = true, enteredCleanupBoundary!: () => void, releaseRemoval!: () => void;
+		const cleanupBoundary = new Promise<void>((resolve) => { enteredCleanupBoundary = resolve; });
+		const removalRelease = new Promise<void>((resolve) => { releaseRemoval = resolve; });
+		(fs.promises as { rm: typeof fs.promises.rm }).rm = async (target, options) => {
+			if (target === paths.runDir && pauseRemoval) {
+				pauseRemoval = false;
+				enteredCleanupBoundary();
+				await removalRelease;
+			}
+			return await originalRm(target, options);
+		};
+		try {
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			await cleanupBoundary;
+			const resetGeneration = getInteractiveShutdownGenerationForTest() + 1;
+			let resetSettled = false;
+			const reset = resetInteractiveShutdownForSession().then(() => { resetSettled = true; });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(resetSettled, false, "reset waits for committed recursive cleanup");
+			assert.equal(getInteractiveShutdownGenerationForTest(), resetGeneration);
+			assert.equal(canStartInteractiveRun(resetGeneration), false, "the new generation remains fenced while cleanup drains");
+			releaseRemoval();
+			await reset;
+			assert.equal(canStartInteractiveRun(resetGeneration), true, "the new generation opens only after cleanup drains");
+			assert.equal(listActiveInteractiveRunIds().includes(runId), false, "a reset cannot strand an active entry after cleanup commitment");
+		} finally {
+			(fs.promises as { rm: typeof fs.promises.rm }).rm = originalRm;
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("drains a committed cleanup retry during reset without reopening artifact authority", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-retry-drain-"));
+		const runId = "late-herdr-retry-drain", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: false }), interrupt: async () => false, close: async () => false };
+		const originalRm = fs.promises.rm;
+		let attempts = 0, enteredRetry!: () => void, releaseRetry!: () => void;
+		const retryEntered = new Promise<void>((resolve) => { enteredRetry = resolve; });
+		const retryRelease = new Promise<void>((resolve) => { releaseRetry = resolve; });
+		(fs.promises as { rm: typeof fs.promises.rm }).rm = async (target, options) => {
+			if (target === paths.runDir) {
+				attempts += 1;
+				if (attempts === 1) throw Object.assign(new Error("planned cleanup failure"), { code: "EACCES" });
+				if (attempts === 2) { enteredRetry(); await retryRelease; }
+			}
+			return await originalRm(target, options);
+		};
+		try {
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			await retryEntered;
+			let resetSettled = false;
+			const reset = resetInteractiveShutdownForSession().then(() => { resetSettled = true; });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(resetSettled, false, "reset drains the committed retry rather than cancelling it");
+			releaseRetry();
+			await reset;
+			assert.equal(attempts, 2, "the second in-operation cleanup retry completed without a backend reconciliation");
+			assert.equal(listActiveInteractiveRunIds().includes(runId), false);
+		} finally {
+			(fs.promises as { rm: typeof fs.promises.rm }).rm = originalRm;
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("releases completed Herdr watcher capacity after finite cleanup retries are exhausted", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-retry-exhaustion-"));
+		const completionFor = (runId: string) => ({ version: 2 as const, runId, status: "completed" as const, completedAt: 1 });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const originalRm = fs.promises.rm;
+		const attempts = new Map<string, number>();
+		const paths = [] as Awaited<ReturnType<typeof prepareRunArtifactPaths>>[];
+		(fs.promises as { rm: typeof fs.promises.rm }).rm = async (target, options) => {
+			const matched = paths.find((candidate) => candidate.runDir === target);
+			if (matched) {
+				attempts.set(matched.runDir, (attempts.get(matched.runDir) ?? 0) + 1);
+				throw Object.assign(new Error("planned cleanup failure"), { code: "EACCES" });
+			}
+			return await originalRm(target, options);
+		};
+		try {
+			for (let index = 0; index < 16; index += 1) {
+				const runId = `exhausted-herdr-${index}`, runPaths = await prepareRunArtifactPaths({ rootDir: root, runId }), completion = completionFor(runId);
+				paths.push(runPaths);
+				await fs.promises.writeFile(runPaths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+				const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+					inspect: async () => ({ exists: false }), interrupt: async () => false, close: async () => false };
+				assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths: runPaths, generation: getInteractiveShutdownGenerationForTest() }), true);
+				assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			}
+			for (let wait = 0; wait < 300 && (attempts.size !== 16 || [...attempts.values()].some((count) => count !== 3)); wait += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(attempts.size, 16);
+			assert.ok([...attempts.values()].every((count) => count === 3), "initial cleanup plus the two configured retries is the complete budget");
+			const recoveredRunId = "recovered-herdr-watcher", recoveredPaths = await prepareRunArtifactPaths({ rootDir: root, runId: recoveredRunId }), recoveredCompletion = completionFor(recoveredRunId);
+			paths.push(recoveredPaths);
+			await fs.promises.writeFile(recoveredPaths.completionPath, `${JSON.stringify(recoveredCompletion)}\n`, { mode: 0o600 });
+			const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+				inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+			assert.equal(registerCommittedInteractiveRun({ runId: recoveredRunId, backend, handle, paths: recoveredPaths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			for (let wait = 0; wait < 100 && !watchCompletedHerdrDirectRunForRetirementForTest(recoveredRunId, recoveredCompletion); wait += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(recoveredRunId, recoveredCompletion), true, "exhausted watcher drains free a cap slot");
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.ok([...attempts.values()].every((count) => count === 3), "exhausted watchers perform no later cleanup attempts");
+			unregisterCommittedInteractiveRun(recoveredRunId, true);
+		} finally {
+			(fs.promises as { rm: typeof fs.promises.rm }).rm = originalRm;
+			for (const runPaths of paths) unregisterCommittedInteractiveRun(path.basename(runPaths.runDir), true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains draining completed Herdr watchers in the 16-watcher cap", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-watcher-cap-"));
+		const blocked: Array<() => void> = [];
+		const entered = new Set<string>();
+		const completionFor = (runId: string) => ({ version: 2 as const, runId, status: "completed" as const, completedAt: 1 });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const paths = [] as Awaited<ReturnType<typeof prepareRunArtifactPaths>>[];
+		try {
+			for (let index = 0; index < 16; index += 1) {
+				const runId = `draining-herdr-${index}`, runPaths = await prepareRunArtifactPaths({ rootDir: root, runId }), completion = completionFor(runId);
+				paths.push(runPaths);
+				await fs.promises.writeFile(runPaths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+				const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+					inspect: async () => await new Promise<{ exists: false }>((resolve) => { entered.add(runId); blocked.push(() => resolve({ exists: false })); }), interrupt: async () => false, close: async () => false };
+				assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths: runPaths, generation: getInteractiveShutdownGenerationForTest() }), true);
+				assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			}
+			for (let attempt = 0; attempt < 100 && entered.size < 16; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.equal(entered.size, 16);
+			for (let index = 0; index < 16; index += 1) unregisterCommittedInteractiveRun(`draining-herdr-${index}`, true);
+			const runId = "seventeenth-draining-herdr", runPaths = await prepareRunArtifactPaths({ rootDir: root, runId }), completion = completionFor(runId);
+			paths.push(runPaths);
+			await fs.promises.writeFile(runPaths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths: runPaths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), false, "draining watchers retain their process-wide cap slots");
+			unregisterCommittedInteractiveRun(runId, true);
+		} finally {
+			for (const resolve of blocked) resolve();
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("does not retire a direct Herdr completion watcher for changed authority, malformed authority, present, or unknown targets", async () => {
+		await resetInteractiveShutdownForSession();
+		for (const [label, inspection, artifact] of [
+			["changed", { exists: false } as const, { version: 2, runId: "different", status: "completed", completedAt: 1 }],
+			["malformed", { exists: false } as const, { invalid: true }],
+			["present", { exists: true } as const, null],
+			["unknown", undefined, null],
+		] as const) {
+			const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), `pi-subagent-late-herdr-${label}-`));
+			const runId = `late-herdr-${label}`, paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+			const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+			const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+			let inspections = 0;
+			const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle, inspect: async () => { inspections += 1; return inspection; }, interrupt: async () => false, close: async () => { throw new Error("must not close"); } };
+			try {
+				await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(artifact ?? completion)}\n`, { mode: 0o600 });
+				assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+				assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+				await new Promise((resolve) => setTimeout(resolve, 30));
+				assert.equal(listActiveInteractiveRunIds().includes(runId), true, label);
+				assert.equal(fs.existsSync(paths.runDir), true, label);
+				if (label === "present" || label === "unknown") assert.ok(inspections >= 1, `${label} watcher has an initial authoritative reconciliation`);
+			} finally { unregisterCommittedInteractiveRun(runId, true); await fs.promises.rm(root, { recursive: true, force: true }); }
+		}
+		await resetInteractiveShutdownForSession();
+	});
+
+	test("completed Herdr watcher reconciles only on bounded events and reconnects, never by idle polling", { timeout: 8_000 }, async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-events-"));
+		const socketPath = path.join(root, "herdr.sock");
+		const runId = "late-herdr-event-driven";
+		const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane", terminal_id: "terminal" };
+		const calls: string[] = [];
+		let subscriptions = 0;
+		let stream: net.Socket | undefined;
+		const sockets = new Set<net.Socket>();
+		const server = net.createServer((socket) => {
+			sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+				calls.push(request.method);
+				if (request.method === "events.subscribe") {
+					subscriptions += 1; stream = socket;
+					socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+					return;
+				}
+				socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+		fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, allocatedTabId: pane.tab_id, protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		let inspections = 0, holdNextReconciliation = false, enteredHeldReconciliation!: () => void, releaseHeldReconciliation!: () => void;
+		const heldReconciliationEntered = new Promise<void>((resolve) => { enteredHeldReconciliation = resolve; });
+		const heldReconciliation = new Promise<void>((resolve) => { releaseHeldReconciliation = resolve; });
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => {
+				inspections += 1;
+				if (holdNextReconciliation) { holdNextReconciliation = false; enteredHeldReconciliation(); await heldReconciliation; }
+				return { exists: true };
+			}, interrupt: async () => { throw new Error("auto Herdr cleanup must not send keys"); }, close: async () => { throw new Error("auto Herdr cleanup must not close"); } };
+		const waitFor = async (condition: () => boolean) => {
+			for (let attempt = 0; attempt < 120 && !condition(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+			assert.ok(condition(), "timed out waiting for completed Herdr watcher");
+		};
+		try {
+			await fs.promises.writeFile(paths.completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
+			await waitFor(() => subscriptions === 1 && inspections >= 1);
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			const idleInspections = inspections;
+			const idleRequests = calls.length;
+			await new Promise((resolve) => setTimeout(resolve, 5_100));
+			assert.equal(inspections, idleInspections, "idle completion watching must not retain the former 5s backend polling loop");
+			assert.equal(calls.length, idleRequests, "idle event stream must not issue pane.get or pane.list");
+			const assertBoundedEvent = async (frame: Record<string, unknown>, label: string) => {
+				const before = inspections;
+				stream!.write(`${JSON.stringify(frame)}\n`);
+				await waitFor(() => inspections > before);
+				await new Promise((resolve) => setTimeout(resolve, 80));
+				assert.ok(inspections <= before + 2, `${label} has bounded coalesced reconciliation`);
+			};
+			await assertBoundedEvent({ event: "pane_updated", data: { pane } }, "relevant pane event");
+			await assertBoundedEvent({ event: "tab_closed", data: { workspace_id: pane.workspace_id, tab_id: pane.tab_id } }, "relevant tab event");
+			await assertBoundedEvent({ event: "workspace_closed", data: { workspace_id: pane.workspace_id } }, "relevant workspace event");
+			const beforeReconnect = inspections;
+			stream!.destroy();
+			await waitFor(() => subscriptions === 2 && inspections > beforeReconnect);
+			assert.ok(inspections <= beforeReconnect + 5, "disconnect/reconnect reconciliation remains bounded");
+			assert.equal(calls.includes("agent.wait"), false);
+			assert.equal(calls.some((method) => ["pane.close", "tab.close", "pane.send_keys", "agent.send-keys"].includes(method)), false);
+			holdNextReconciliation = true;
+			stream!.write(`${JSON.stringify({ event: "pane_updated", data: { pane } })}\n`);
+			await heldReconciliationEntered;
+			let resetSettled = false;
+			const reset = resetInteractiveShutdownForSession().then(() => { resetSettled = true; });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(resetSettled, false, "reset waits for an already-started watcher reconciliation outside the fence");
+			releaseHeldReconciliation();
+			await reset;
+			const requestsAtReset = calls.length;
+			await new Promise((resolve) => setTimeout(resolve, 120));
+			assert.equal(calls.length, requestsAtReset, "session reset drains the subscription without a post-stop reconnect or request");
+		} finally {
+			await resetInteractiveShutdownForSession();
+			unregisterCommittedInteractiveRun(runId, true);
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains auto Herdr recovery when bounded read-only retirement finds a present or unknown target", { timeout: 8_000 }, async () => {
+		await resetInteractiveShutdownForSession();
+		for (const [label, snapshot] of [["present", { exists: true }], ["unknown", undefined]] as const) {
+			const runId = `herdr-direct-${label}`;
+			const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+			let closes = 0;
+			const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+				inspect: async () => snapshot, interrupt: async () => false, close: async () => { closes += 1; return false; } };
+			try {
+				assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+				assert.equal(await releaseRegisteredInteractiveRun(runId), false, label);
+				assert.equal(closes, 0, label);
+				assert.equal(listActiveInteractiveRunIds().includes(runId), true, label);
+			} finally { unregisterCommittedInteractiveRun(runId, true); }
+		}
+		await resetInteractiveShutdownForSession();
 	});
 
 	test("resolves pane layout with CLI precedence and rejects invalid values", () => {
@@ -533,7 +1192,7 @@ describe("interactive pane runner preparation", () => {
 		}
 	});
 
-	test("keeps the child TUI attached directly to the terminal", () => {
+	test("keeps the gated child TUI attached directly to the terminal and changes to its effective cwd", () => {
 		const script = buildInteractivePaneWrapperScript({
 			effectiveCwd: "/tmp/project",
 			childCommand: ["pi", "--session", "/tmp/run/child-session.jsonl", "@/tmp/run/task.md"],
@@ -552,6 +1211,37 @@ describe("interactive pane runner preparation", () => {
 		assert.match(script, /trap finish_subagent_runtime EXIT/);
 		assert.match(script, /\/bin\/rm -rf '\/tmp\/run\/auth overlay'/);
 		assert.match(script, /printf '\\033\]2;%s\\007' 'worker \[depth=1;run=12345678\] · queued'/);
+	});
+
+	test("runs the post-gate wrapper from private state but enters the effective workspace before its child", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-wrapper-cwd-"));
+		try {
+			const runDir = path.join(root, "state", "run"), workspace = path.join(root, "project", "workspace"), marker = path.join(root, "cwd");
+			await fs.promises.mkdir(runDir, { recursive: true }); await fs.promises.mkdir(workspace, { recursive: true });
+			const wrapper = path.join(runDir, "wrapper.sh");
+			await fs.promises.writeFile(wrapper, buildInteractivePaneWrapperScript({
+				effectiveCwd: workspace, childCommand: ["/bin/sh", "-c", `pwd > ${JSON.stringify(marker)}`], exportedEnv: {}, wrapperStatusPath: path.join(runDir, "status"),
+			}), { mode: 0o700 });
+			const exitCode = await new Promise<number>((resolve, reject) => {
+				const child = spawn("/bin/bash", [wrapper], { cwd: runDir, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1));
+			});
+			assert.equal(exitCode, 0);
+			assert.equal((await fs.promises.readFile(marker, "utf8")).trim(), workspace);
+		} finally { await fs.promises.rm(root, { recursive: true, force: true }); }
+	});
+
+	test("checks the Herdr direct durable gate before secrets, cwd, title, or permits", () => {
+		const script = buildInteractivePaneWrapperScript({
+			effectiveCwd: "/tmp/project", childCommand: ["/bin/true"], exportedEnv: {}, secretEnvPath: "/tmp/run/secret-env.sh",
+			wrapperStatusPath: "/tmp/run/status", surfaceTitle: "worker [depth=1;run=gate]", treePermitBootstrapPath: "/tmp/run/permit",
+			herdrDirectGate: { runtime: "/usr/bin/node", entrypoint: "/tmp/run/broker.mjs", runDir: "/tmp/run", nonce: "a".repeat(43), runtimeInterpreter: "/usr/bin/node", backend: "/usr/bin/node" },
+		});
+		const gate = script.indexOf("--verify-herdr-direct-gate");
+		assert.ok(gate >= 0);
+		assert.ok(gate < script.indexOf("secret-env.sh"));
+		assert.ok(gate < script.indexOf("cd '/tmp/project'"));
+		assert.ok(gate < script.indexOf("printf '\\033]2;%s\\007'"));
+		assert.ok(gate < script.lastIndexOf("/tmp/run/permit"));
 	});
 
 	test("stops the interactive wrapper before Pi startup until tree permit continuation", async () => {
@@ -1447,6 +2137,41 @@ describe("interactive pane runner preparation", () => {
 		await resetInteractiveShutdownForSession();
 		assert.equal(canStartInteractiveRun(captured), false);
 		assert.equal(canStartInteractiveRun(getInteractiveShutdownGenerationForTest()), true);
+	});
+
+	test("does not reopen a reset generation when a newer shutdown arrives during watcher drain", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reset-fence-drain-"));
+		const runId = "reset-fence-drain", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const handle = { mode: "cmux-pane" as const, native: { workspaceId: "workspace", surfaceId: "surface" } };
+		let enteredInspect!: () => void, releaseInspect!: () => void;
+		const inspectEntered = new Promise<void>((resolve) => { enteredInspect = resolve; });
+		const inspectRelease = new Promise<void>((resolve) => { releaseInspect = resolve; });
+		const backend = { mode: "cmux-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => { enteredInspect(); await inspectRelease; return { exists: false }; }, interrupt: async () => false, close: async () => false };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			assert.equal(watchDetachedInteractiveRunForRetirementForTest(runId), true);
+			await inspectEntered;
+			const resetGeneration = getInteractiveShutdownGenerationForTest() + 1;
+			const reset = resetInteractiveShutdownForSession();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(getInteractiveShutdownGenerationForTest(), resetGeneration);
+			assert.equal(canStartInteractiveRun(resetGeneration), false, "reset keeps its new generation fenced during drain");
+			const shutdown = beginInteractiveShutdownForSession();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			const shutdownGeneration = getInteractiveShutdownGenerationForTest();
+			assert.equal(shutdownGeneration, resetGeneration + 1, "newer shutdown supersedes the draining reset");
+			assert.equal(canStartInteractiveRun(shutdownGeneration), false);
+			releaseInspect();
+			await Promise.all([reset, shutdown]);
+			assert.equal(canStartInteractiveRun(shutdownGeneration), false, "the superseded reset must not reopen a newer shutdown");
+		} finally {
+			releaseInspect?.();
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("serializes a paused live drain with completion replay and skips later drains", async () => {

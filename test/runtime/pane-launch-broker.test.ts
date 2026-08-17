@@ -137,10 +137,10 @@ function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = pro
 
 const herdrSource = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-source", terminal_id: "herdr-source-terminal" };
 const herdrChild = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-child", terminal_id: "herdr-child-terminal" };
-type HerdrBrokerMode = "success" | "split-unknown" | "send-unknown" | "split-terminal-reuse" | "source-moved" | `split-${"malformed" | "oversized" | "wrong-id"}` | `send-${"malformed" | "oversized" | "wrong-id"}`;
+type HerdrBrokerMode = "success" | "split-unknown" | "layout-unknown" | "send-unknown" | "send-known" | "send-known-after-move" | "send-known-duplicate-unrelated" | "split-terminal-reuse" | "split-pane-reuse" | "source-moved" | "source-moved-current-pane-reuse" | `split-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}` | `send-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}`;
 async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protocol = 20) {
 	const socketPath = path.join(root, `herdr-${mode}.sock`), calls: string[] = [], requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-	let sourceGets = 0;
+	let sourceGets = 0, tabCreated = false, reboundSourcePaneId: string | null = null, childClosed = false, knownSendFailed = false;
 	const server = net.createServer((socket) => {
 		let input = "";
 		socket.on("data", (chunk: Buffer) => {
@@ -149,18 +149,42 @@ async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protoc
 			if (newline < 0) return;
 			const request = JSON.parse(input.slice(0, newline)) as { id: string; method: string; params: Record<string, unknown> };
 			calls.push(request.method); requests.push({ method: request.method, params: request.params });
-			if (request.method === "pane.split" && mode === "split-unknown" || request.method === "pane.send_text" && mode === "send-unknown") { socket.destroy(); return; }
+			if ((request.method === "pane.split" && mode === "split-unknown") || (request.method === "layout.apply" && mode === "layout-unknown") || (request.method === "pane.send_text" && mode === "send-unknown")) { socket.destroy(); return; }
+			if (mode === "send-known-duplicate-unrelated" && knownSendFailed && request.method === "pane.get" && request.params.pane_id === herdrChild.pane_id) {
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "missing" } })}\n`); return;
+			}
+			if (mode === "send-known-duplicate-unrelated" && knownSendFailed && request.method === "pane.list") {
+				const unrelated = { ...herdrChild, pane_id: "unrelated-pane", terminal_id: "unrelated-terminal" };
+				socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_list", panes: [unrelated, { ...unrelated, terminal_id: "other-terminal" }] } })}\n`); return;
+			}
+			if (request.method === "pane.send_text" && (mode === "send-known" || mode === "send-known-after-move" || mode === "send-known-duplicate-unrelated")) {
+				knownSendFailed ||= mode === "send-known-duplicate-unrelated";
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "delivery_failed", message: "known delivery failure" } })}\n`); return;
+			}
 			const failure = request.method === "pane.split" ? mode.slice("split-".length) : request.method === "pane.send_text" ? mode.slice("send-".length) : null;
 			if (failure === "malformed") { socket.end("{not-json}\n"); return; }
 			if (failure === "oversized") { socket.end("x".repeat(256 * 1024 + 1)); return; }
 			if (failure === "wrong-id") { socket.end(`${JSON.stringify({ id: "wrong", result: { type: "ok" } })}\n`); return; }
+			if (failure === "wrong-type") { socket.end(`${JSON.stringify({ id: request.id, result: { type: request.method === "pane.split" ? "ok" : "pane_info", pane: herdrChild } })}\n`); return; }
+			if (request.method === "layout.apply") tabCreated = true;
+			if (request.method === "pane.close") childClosed = true;
+			if (request.method === "pane.get" && childClosed && request.params.pane_id === herdrChild.pane_id) {
+				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "closed" } })}\n`); return;
+			}
 			const pane = request.method === "pane.get"
-				? request.params.pane_id === herdrChild.pane_id ? herdrChild : (++sourceGets === 2 && mode === "source-moved" ? { ...herdrSource, pane_id: "herdr-source-moved" } : herdrSource)
+				? request.params.pane_id === herdrChild.pane_id ? (tabCreated ? { ...herdrChild, tab_id: "herdr-child-tab" } : herdrChild)
+					: (++sourceGets === 2 && (mode === "source-moved" || mode === "source-moved-current-pane-reuse")
+						? (reboundSourcePaneId = "herdr-source-moved", { ...herdrSource, pane_id: reboundSourcePaneId }) : herdrSource)
 				: request.method === "pane.split" && mode === "split-terminal-reuse" ? { ...herdrChild, terminal_id: herdrSource.terminal_id }
-					: herdrChild;
+					: request.method === "pane.split" && mode === "split-pane-reuse" ? { ...herdrChild, pane_id: herdrSource.pane_id }
+						: request.method === "pane.split" && mode === "source-moved-current-pane-reuse" ? { ...herdrChild, pane_id: reboundSourcePaneId! }
+							: herdrChild;
+			const directLayout = request.params.root as { command?: unknown; cwd?: unknown; env?: unknown } | undefined;
+			const rootPaneId = mode === "source-moved-current-pane-reuse" ? reboundSourcePaneId! : herdrChild.pane_id;
 			const result = request.method === "ping" ? { type: "pong", protocol }
-				: request.method === "pane.get" || request.method === "pane.split" ? { type: "pane_info", pane }
-					: { type: "ok" };
+				: request.method === "layout.apply" ? { type: "layout_apply", layout: { workspace_id: herdrSource.workspace_id, tab_id: "herdr-child-tab", focused_pane_id: rootPaneId, root: { type: "pane", pane_id: rootPaneId, command: directLayout?.command, cwd: directLayout?.cwd, env: directLayout?.env } } }
+					: request.method === "pane.get" || request.method === "pane.split" ? { type: "pane_info", pane }
+						: { type: "ok" };
 			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 		});
 	});
@@ -168,12 +192,15 @@ async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protoc
 	fs.chmodSync(socketPath, 0o600);
 	return { socketPath, calls, requests, close: async () => await new Promise<void>((resolve) => server.close(() => resolve())) };
 }
-async function writeHerdrIntent(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, socketPath: string, protocol = 20): Promise<string[]> {
+async function writeHerdrIntent(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, socketPath: string, protocol = 20, layout: "auto" | "split" | undefined = undefined, container?: Record<string, string>, tabLabel?: string, workingDirectory = paths.runDir): Promise<string[]> {
 	const nonce = "h".repeat(43), broker = path.resolve("src/runtime/pane-launch-broker.mjs"), runtime = fs.realpathSync(process.execPath);
+	const stat = fs.lstatSync(socketPath, { bigint: true }), generation = { socketDev: stat.dev.toString(), socketIno: stat.ino.toString() };
 	await writePrivateFile(paths.launchIntentPath, `${JSON.stringify({
 		version: 2, runId, parentSessionId: "p", parentPid: process.pid, parentStartedAt: 1, terminalMode: "herdr-pane",
-		source: { socketPath, workspaceId: herdrSource.workspace_id, tabId: herdrSource.tab_id, sourcePaneId: herdrSource.pane_id, sourceTerminalId: herdrSource.terminal_id, protocol },
-		childSessionFile: paths.childSessionPath, createdAt: 1, brokerNonce: nonce, runtimePath: runtime, runtimeInterpreterPath: runtime, backendPath: runtime, brokerEntrypoint: fs.realpathSync(broker),
+		source: { socketPath, workspaceId: herdrSource.workspace_id, tabId: herdrSource.tab_id, sourcePaneId: herdrSource.pane_id, sourceTerminalId: herdrSource.terminal_id, protocol, generation },
+		...(layout === "auto" ? { layout, placement: "herdr-new-tab", tabLabel: tabLabel ?? `pi-subagent:${runId}:agent`, container: container ?? { kind: "herdr-workspace", workspaceId: herdrSource.workspace_id } }
+			: layout === "split" ? { layout, placement: "herdr-split", container: container ?? { kind: "herdr-source", workspaceId: herdrSource.workspace_id, tabId: herdrSource.tab_id, paneId: herdrSource.pane_id, terminalId: herdrSource.terminal_id } } : {}),
+		childSessionFile: paths.childSessionPath, workingDirectory, createdAt: 1, brokerNonce: nonce, runtimePath: runtime, runtimeInterpreterPath: runtime, backendPath: runtime, brokerEntrypoint: fs.realpathSync(broker),
 	})}\n`);
 	return [broker, "--run-dir", paths.runDir, "--nonce", nonce, "--runtime", runtime, "--runtime-interpreter", runtime, "--backend", runtime];
 }
@@ -232,6 +259,154 @@ describe("pane launch broker", () => {
 		}
 	});
 
+	test("retains Herdr auto layout response loss as residual risk without retry, discovery, or destructive recovery", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "layout-unknown");
+		try {
+			const stateRoot = path.join(root, "state-layout-unknown"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "herdr-layout-unknown" });
+			assert.equal(await run(await writeHerdrIntent(paths, "herdr-layout-unknown", server.socketPath, 20, "auto"), process.env, paths.runDir), 0);
+			assert.deepEqual(await readBrokerJson(paths.residualRiskPath), {
+				version: 2, runId: "herdr-layout-unknown", reason: "possible-unrecorded-allocation",
+				recordedAt: (await readBrokerJson(paths.residualRiskPath) as { recordedAt: number }).recordedAt,
+			});
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "possible-unrecorded-allocation");
+			assert.deepEqual(server.calls.filter((method) => method === "layout.apply"), ["layout.apply"], "never retry an ambiguous creation");
+			assert.equal(server.calls.includes("pane.list"), false, "tab labels cannot safely rediscover an allocation");
+			assert.equal(server.calls.some((method) => method === "pane.close" || method === "pane.send_keys" || method === "pane.send_text"), false);
+		} finally { await server.close(); }
+	});
+
+	test("allocates auto Herdr children with one direct layout.apply and records the exact root-pane tab", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "success");
+		try {
+			const stateRoot = path.join(root, "state-tab"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "herdr-auto-tab" });
+			const broker = spawn(fs.realpathSync(process.execPath), await writeHerdrIntent(paths, "herdr-auto-tab", server.socketPath, 20, "auto"), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+			assert.equal(await waitForExit(broker), 0);
+			assert.equal(server.calls.includes("pane.split"), false);
+			assert.deepEqual(server.requests.find((request) => request.method === "layout.apply")?.params, { workspace_id: herdrSource.workspace_id, focus: false, tab_label: "pi-subagent:herdr-auto-tab:agent", root: { type: "pane", cwd: path.parse(paths.runDir).root, command: [paths.wrapperPath], env: { BASH_ENV: "", ENV: "", NODE_OPTIONS: "", NODE_PATH: "", BUN_OPTIONS: "", LD_PRELOAD: "", LD_LIBRARY_PATH: "", LD_AUDIT: "", DYLD_INSERT_LIBRARIES: "", DYLD_LIBRARY_PATH: "", DYLD_FRAMEWORK_PATH: "" } } });
+			assert.equal(server.calls.some((method) => method === "pane.send_text" || method === "pane.close" || method === "pane.send_keys"), false);
+			assert.deepEqual((await readBrokerJson(paths.allocationPath) as { placement?: string; container?: { tabId?: string } }), { version: 2, runId: "herdr-auto-tab", terminalMode: "herdr-pane", layout: "auto", placement: "herdr-new-tab", container: { kind: "herdr-tab", workspaceId: herdrSource.workspace_id, tabId: "herdr-child-tab" }, target: { socketPath: server.socketPath, workspaceId: herdrSource.workspace_id, tabId: "herdr-child-tab", paneId: herdrChild.pane_id, terminalId: herdrChild.terminal_id, protocol: 20, generation: { socketDev: fs.lstatSync(server.socketPath, { bigint: true }).dev.toString(), socketIno: fs.lstatSync(server.socketPath, { bigint: true }).ino.toString() } }, allocatedAt: (await readBrokerJson(paths.allocationPath) as { allocatedAt: number }).allocatedAt });
+		} finally { await server.close(); }
+	});
+
+	test("keeps Herdr auto and split bootstrap cwd private while the wrapper owns the persisted task working directory", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const taskCwd = path.join(root, "workspace", "task");
+		await fs.promises.mkdir(taskCwd, { recursive: true, mode: 0o700 });
+		for (const layout of ["auto", "split"] as const) {
+			const serverRoot = path.join(root, layout); await fs.promises.mkdir(serverRoot, { mode: 0o700 });
+			const server = await fakeHerdrBrokerServer(serverRoot, "success");
+			try {
+				const stateRoot = path.join(root, `state-task-cwd-${layout}`);
+				await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+				const runId = `herdr-task-cwd-${layout}`;
+				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+				const args = await writeHerdrIntent(paths, runId, server.socketPath, 20, layout, undefined, undefined, taskCwd);
+				if (layout === "auto") {
+					assert.equal(await run(args, process.env, paths.runDir), 0);
+				} else {
+					const broker = spawn(fs.realpathSync(process.execPath), args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+					await waitForBrokerArtifact(paths.launchPath);
+					await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
+					assert.equal(await waitForExit(broker), 0);
+				}
+				const request = server.requests.find((candidate) => candidate.method === (layout === "auto" ? "layout.apply" : "pane.split"));
+				const cwd = layout === "auto" ? (request?.params.root as { cwd?: string } | undefined)?.cwd : request?.params.cwd;
+				assert.equal(cwd, path.parse(paths.runDir).root, layout);
+				assert.notEqual(cwd, taskCwd, layout);
+			} finally { await server.close(); }
+		}
+	});
+
+	test("requires a persisted working directory before any Herdr layout allocation", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "success");
+		try {
+			const stateRoot = path.join(root, "state-missing-cwd"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "herdr-missing-cwd" });
+			const args = await writeHerdrIntent(paths, "herdr-missing-cwd", server.socketPath, 20, "split");
+			const intent = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
+			delete intent.workingDirectory;
+			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`);
+			assert.equal(await run(args, process.env, paths.runDir), 0);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "intent-invalid");
+			assert.equal(server.calls.includes("pane.split"), false);
+		} finally { await server.close(); }
+	});
+
+	test("rejects a dotted Herdr run ID label with a non-exact prefix before allocation", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "success");
+		try {
+			const runId = "herdr.run.id", stateRoot = path.join(root, "state-dotted"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			assert.equal(await run(await writeHerdrIntent(paths, runId, server.socketPath, 20, "auto", undefined, "pi-subagent:herdrXrunXid:agent"), process.env, paths.runDir), 0);
+			assert.equal(server.calls.includes("layout.apply"), false);
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+		} finally { await server.close(); }
+	});
+
+	test("never sends text or closes an auto direct-layout child after its gate", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const runtime = fs.realpathSync(process.execPath);
+		for (const [mode, expectedClose] of [["send-known", false], ["send-known-after-move", false]] as const) {
+			const server = await fakeHerdrBrokerServer(root, mode);
+			try {
+				const stateRoot = path.join(root, `state-${mode}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-${mode}` });
+				const broker = spawn(runtime, await writeHerdrIntent(paths, `herdr-${mode}`, server.socketPath, 20, "auto"), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+				assert.equal(await waitForExit(broker), 0);
+				const closes = server.requests.filter((request) => request.method === "pane.close");
+				assert.equal(closes.length, expectedClose ? 1 : 0, mode);
+				if (expectedClose) assert.deepEqual(closes[0]!.params, { pane_id: herdrChild.pane_id });
+				else assert.equal(await readBrokerJson(paths.residualRiskPath), null);
+			} finally { await server.close(); }
+		}
+	});
+
+	test("rejects mismatched immutable Herdr layout containers before allocation mutations", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const mutations = new Set(["layout.apply", "pane.split"]);
+		const cases: Array<{ name: string; layout: "auto" | "split"; container: Record<string, string> }> = [
+			{ name: "auto workspace", layout: "auto", container: { kind: "herdr-workspace", workspaceId: "other-workspace" } },
+			...(["workspaceId", "tabId", "paneId", "terminalId"] as const).map((field) => ({
+				name: `split ${field}`,
+				layout: "split" as const,
+				container: { kind: "herdr-source", workspaceId: herdrSource.workspace_id, tabId: herdrSource.tab_id, paneId: herdrSource.pane_id, terminalId: herdrSource.terminal_id, [field]: `other-${field}` },
+			})),
+		];
+		for (const fixture of cases) {
+			const server = await fakeHerdrBrokerServer(root, "success");
+			try {
+				const stateRoot = path.join(root, `state-container-${fixture.name.replaceAll(" ", "-")}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-container-${fixture.name.replaceAll(" ", "-")}` });
+				assert.equal(await run(await writeHerdrIntent(paths, `herdr-container-${fixture.name.replaceAll(" ", "-")}`, server.socketPath, 20, fixture.layout, fixture.container), process.env, paths.runDir), 0);
+				assert.equal(server.calls.filter((method) => mutations.has(method)).length, 0, fixture.name);
+				assert.equal(await readBrokerJson(paths.allocationPath), null);
+			} finally { await server.close(); }
+		}
+	});
+
+	test("rejects Herdr targets that alias a freshly rebound source pane for auto tabs and splits", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		for (const layout of ["auto", "split"] as const) {
+			const server = await fakeHerdrBrokerServer(root, "source-moved-current-pane-reuse");
+			try {
+				const stateRoot = path.join(root, `state-current-pane-${layout}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-current-pane-${layout}` });
+				assert.equal(await run(await writeHerdrIntent(paths, `herdr-current-pane-${layout}`, server.socketPath, 20, layout), process.env, paths.runDir), 0);
+				assert.ok(await readBrokerJson(paths.residualRiskPath), layout);
+				assert.equal(await readBrokerJson(paths.allocationPath), null);
+				assert.equal(server.calls.includes(layout === "auto" ? "layout.apply" : "pane.split"), true);
+				assert.equal(server.calls.includes("pane.close"), false, "an aliased current pane is never rollback authority");
+			} finally { await server.close(); }
+		}
+	});
+
 	test("records the negotiated protocol 19 and 20 in Herdr allocation and gate authority", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const runtime = fs.realpathSync(process.execPath);
@@ -265,7 +440,7 @@ describe("pane launch broker", () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const runtime = fs.realpathSync(process.execPath);
 		for (const operation of ["split", "send"] as const) {
-			for (const failure of ["malformed", "oversized", "wrong-id"] as const) {
+			for (const failure of ["malformed", "oversized", "wrong-id", "wrong-type"] as const) {
 				const mode: HerdrBrokerMode = `${operation}-${failure}`;
 				const server = await fakeHerdrBrokerServer(root, mode);
 				try {
@@ -290,19 +465,34 @@ describe("pane launch broker", () => {
 		}
 	});
 
+	test("does not treat a duplicate unrelated Herdr list as target absence during rollback", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "send-known-duplicate-unrelated");
+		try {
+			const stateRoot = path.join(root, "state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const runId = "herdr-duplicate-unrelated", paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const broker = spawn(fs.realpathSync(process.execPath), await writeHerdrIntent(paths, runId, server.socketPath), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+			await waitForBrokerArtifact(paths.launchPath);
+			await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
+			assert.equal(await waitForExit(broker), 0);
+			assert.ok(await readBrokerJson(paths.residualRiskPath), "ambiguous global list retains recovery risk");
+			assert.equal(server.calls.includes("pane.close"), false, "unrelated duplicate rows cannot prove target absence or authorize rollback");
+		} finally { await server.close(); }
+	});
+
 	test("binds broker source and allocation authority to terminal identity across pane moves", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const runtime = fs.realpathSync(process.execPath);
-		for (const mode of ["split-terminal-reuse", "source-moved"] as const) {
+		for (const mode of ["split-terminal-reuse", "split-pane-reuse", "source-moved"] as const) {
 			const server = await fakeHerdrBrokerServer(root, mode);
 			try {
 				const stateRoot = path.join(root, `state-${mode}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-${mode}` });
 				const args = await writeHerdrIntent(paths, `herdr-${mode}`, server.socketPath);
-				if (mode === "split-terminal-reuse") {
+				if (mode === "split-terminal-reuse" || mode === "split-pane-reuse") {
 					assert.equal(await run(args, process.env, paths.runDir, runtime), 0);
 					assert.ok(await readBrokerJson(paths.residualRiskPath));
-					assert.equal(server.calls.includes("pane.close"), false, "a source-terminal alias is never rollback authority");
+					assert.equal(server.calls.includes("pane.close"), false, "a source pane or terminal alias is never rollback authority");
 					continue;
 				}
 				const broker = spawn(runtime, args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
@@ -955,20 +1145,51 @@ describe("pane launch broker", () => {
 		assert.equal(fs.existsSync(marker), false);
 	});
 
-	test("private broker cwd prevents a project bunfig preload from running", async () => {
+	test("filesystem-root broker bootstrap prevents a project-ancestry bunfig preload before gate", async () => {
 		if (!process.versions.bun) return;
 		const project = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-project-")); tempDirs.push(project);
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(root);
+		const stateRoot = path.join(project, ".pi-state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 		const marker = path.join(project, "bunfig-preload-ran");
 		await fs.promises.writeFile(path.join(project, "bunfig.toml"), "preload = ['./preload.ts']\n");
 		await fs.promises.writeFile(path.join(project, "preload.ts"), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'ran');\n`);
-		// The broker is started from its private runDir, not this project, so
-		// Bun cannot discover this project bunfig preload.
-		const backend = await nativeMock(project), paths = await prepareRunArtifactPaths({ rootDir: root, runId: "malicious-cwd" });
+		const backend = await nativeMock(project), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "malicious-cwd" });
 		const args = await writeCommittedGate(paths, "malicious-cwd", backend, { gateMode: "tmux-pane" });
 		await writePrivateExecutableFile(paths.wrapperPath, "#!/bin/sh\nexit 1\n");
-		assert.equal(await run([...args, "--verify-gate", "--wrapper", paths.wrapperPath], process.env, paths.runDir), 0);
+		// This matches the parent detached spawn: PI_SUBAGENT_RUN_STATE_DIR and
+		// its runDir are below the hostile project, but Bun starts at '/'.
+		assert.equal(await run([...args, "--verify-gate", "--wrapper", paths.wrapperPath], { ...process.env, PI_SUBAGENT_RUN_STATE_DIR: stateRoot }, path.parse(paths.runDir).root), 0);
 		assert.equal(fs.existsSync(marker), false);
+	});
+
+	test("keeps cmux and tmux staged verifier cwd private despite a diagnostic working directory", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-private-verifier-cwd-")); tempDirs.push(root);
+		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
+		const taskCwd = path.join(root, "project"); await fs.promises.mkdir(taskCwd, { mode: 0o700 });
+
+		const cmuxLog = path.join(root, "cmux.log"), cmuxBackend = await nativeCmuxLayoutMock(root, cmuxLog);
+		const cmuxPaths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "cmux-private-verifier-cwd" });
+		const cmuxArgs = await writeIntent(cmuxPaths, "cmux-private-verifier-cwd", cmuxBackend);
+		const cmuxIntent = await readBrokerJson(cmuxPaths.launchIntentPath) as Record<string, unknown>;
+		Object.assign(cmuxIntent, { layout: "auto", placement: "cmux-new-surface", container: { kind: "cmux-pane", workspaceId, paneId }, workingDirectory: taskCwd });
+		await fs.promises.unlink(cmuxPaths.launchIntentPath); await writePrivateFile(cmuxPaths.launchIntentPath, `${JSON.stringify(cmuxIntent)}\n`);
+		assert.equal(await run(cmuxArgs, process.env, cmuxPaths.runDir), 0);
+		assert.match(await fs.promises.readFile(cmuxLog, "utf8"), new RegExp(`new-surface.*--working-directory ${path.parse(cmuxPaths.runDir).root}`));
+
+		for (const layout of ["split", "auto"] as const) {
+			const log = path.join(root, `tmux-${layout}.log`), backend = await nativeTmuxMock(root, "/bin/sh", log, layout === "auto" ? "$1|@3|%2|789" : "$1|@2|%2|789", 0, layout === "auto" ? "$1|@2|%1|456" : "%1|$1|@2|456");
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `tmux-private-verifier-cwd-${layout}` });
+			const args = await writeTmuxIntent(paths, `tmux-private-verifier-cwd-${layout}`, backend);
+			const intent = await readBrokerJson(paths.launchIntentPath) as Record<string, unknown>;
+			Object.assign(intent, layout === "auto"
+				? { layout, placement: "tmux-new-window", windowLabel: buildTmuxWindowLabel("agent", `tmux-private-verifier-cwd-${layout}`), container: tmuxSessionContainer(intent), workingDirectory: taskCwd }
+				: { layout, placement: "tmux-split", container: tmuxSourceContainer(intent), workingDirectory: taskCwd });
+			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(intent)}\n`);
+			const exitCode = await run(args, process.env, paths.runDir);
+			assert.equal(exitCode, 0, `${layout}: ${JSON.stringify(await readBrokerJson(paths.brokerStatusPath))}`);
+			const output = await fs.promises.readFile(log, "utf8");
+			const command = output.split("\n").find((line) => line.includes(layout === "auto" ? "new-window" : "split-window"));
+			assert.match(command!, new RegExp(`-c ${path.parse(paths.runDir).root}`), `${layout}: ${output}`);
+		}
 	});
 
 	test("binds layout tmux split allocation to the requested source container", async () => {
@@ -1230,7 +1451,7 @@ describe("pane launch broker", () => {
 			const commands = await fs.promises.readFile(log, "utf8");
 			assert.equal((commands.match(/tree --all/g) ?? []).length, 1);
 			assert.match(commands, /tree --all/);
-			assert.match(commands, new RegExp(`new-surface --type terminal --workspace ${workspaceId} --pane ${targetPane} --working-directory ${path.dirname(paths.childSessionPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --focus false`));
+			assert.match(commands, new RegExp(`new-surface --type terminal --workspace ${workspaceId} --pane ${targetPane} --working-directory ${path.parse(paths.runDir).root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} --focus false`));
 			assert.equal(commands.indexOf("tree --all") < commands.indexOf("new-surface"), true);
 		}
 	});

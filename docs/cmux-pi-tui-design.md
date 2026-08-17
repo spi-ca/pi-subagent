@@ -1,10 +1,10 @@
-# cmux/tmux 기반 실제 Pi TUI 설계 및 구현
+# cmux/tmux/Herdr 기반 실제 Pi TUI 설계 및 구현
 
-> **상태:** 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. live cmux crash/reaper E2E는 2026-07-20, live tmux crash/reaper E2E는 2026-07-21 각각 별개의 최종 harness run으로 **PASS**했다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
+> **상태:** 정적 harness, unit, package 검증 기준은 실행 가능 **GO**다. Herdr 지원은 현재 strict fake-socket/broker·protocol test 범위다. live cmux crash/reaper E2E는 2026-07-20, live tmux crash/reaper E2E는 2026-07-21 각각 별개의 최종 harness run으로 **PASS**했다. 이 historical acceptance는 cmux/tmux만의 주장이다. platform zombie의 liveness 판정은 parser/reaper 단위 테스트가 별도로 보장된다.
 >
-> **Authority:** interactive pane layout 구현도 완료됐다. 배치 정책, coordinator/broker 책임 분리와 live layout smoke 증거는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md)가 authoritative하다.
+> **Authority:** 구현 동작의 source of truth는 `src/`와 해당 테스트다. [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md)는 배치 정책, coordinator/broker 책임 분리와 layout evidence 범위를 정의하며, Herdr는 현재 strict fake-socket/broker·protocol test 증거만 가진다.
 
-이 문서는 subagent 실행 화면을 legacy Zellij JSONL/FIFO renderer에서 실제 Pi TUI로 전환한 설계와 현재 구현을 기록한다. 파일명은 최초 cmux 설계에서 유래했지만, 현재 구현은 cmux와 tmux를 같은 interactive-pane lifecycle로 지원한다.
+이 문서는 subagent 실행 화면을 legacy Zellij JSONL/FIFO renderer에서 실제 Pi TUI로 전환한 설계와 현재 구현을 기록한다. 파일명은 최초 cmux 설계에서 유래했지만, 현재 구현은 cmux, tmux, Herdr를 같은 parent-owned interactive-pane lifecycle로 지원한다.
 
 ## 1. 결론
 
@@ -23,15 +23,15 @@ TMUX + TMUX_PANE                   → tmux-pane
 그 외                              → inline
 ```
 
-`cmux-pane`과 `tmux-pane`은 같은 실행 모델을 사용한다.
+`cmux-pane`, `tmux-pane`, `herdr-pane`은 같은 parent-owned interactive lifecycle 모델을 사용한다. Herdr `auto`는 focus를 바꾸지 않는 child별 새 tab의 strict root pane을 할당하고, `split`은 기존 오른쪽 split 호환 경로를 사용한다.
 
 - 별도 terminal pane/surface에서 실제 interactive `pi` 실행
 - child stdout을 부모 결과 channel로 사용하지 않음
 - native Pi session JSONL에서 assistant message와 usage 수집
 - child bridge extension이 lifecycle state와 typed completion sidecar 기록
-- interactive child는 첫 정상 `agent_settled`에서 결과를 반환하고 정확한 pane/surface를 정리
+- interactive child는 첫 정상 `agent_settled`에서 결과를 반환; cmux/tmux과 Herdr `split`만 정확한 pane/surface를 정리
 - parent lease와 startup reaper로 orphan 정리
-- parent session shutdown과 명시적 취소에서 Escape 후 pane 종료
+- cmux/tmux과 Herdr `split`은 parent session shutdown/명시적 취소에서 Escape 후 pane 종료; Herdr `auto`는 authenticated child의 cooperative shutdown과 read-only recovery만 사용
 
 Zellij 지원은 제거했다. 함께 삭제된 구성은 다음과 같다.
 
@@ -78,7 +78,7 @@ result channel    = child session JSONL
 control channel   = state / completion / parent lease sidecar
 ```
 
-이 분리로 cmux와 tmux의 차이는 terminal command에만 남는다.
+이 분리로 cmux, tmux, Herdr의 차이는 terminal allocation/lifecycle command에만 남는다.
 
 ## 3. 전체 구조
 
@@ -91,7 +91,7 @@ runAgent()
   └─ interactive pane
       ├─ preflight: available runtime / backend / broker entrypoint
       ├─ detached launch broker
-      ├─ backend: cmux | tmux
+      ├─ backend: cmux | tmux | Herdr
       ├─ private run directory 생성
       ├─ fresh child session 생성
       ├─ wrapper 생성
@@ -114,8 +114,8 @@ interactive child pi
 
 | 파일 | 책임 |
 |---|---|
-| `src/runtime/interactive-pane.ts` | backend-neutral contract와 cmux/tmux adapter binding |
-| `src/runtime/interactive-layout.ts` | process-global coordinator, strict `auto`/`split` policy 해석, cmux placement 직렬화와 exact allocation adopt/release |
+| `src/runtime/interactive-pane.ts` | backend-neutral contract와 cmux/tmux/Herdr adapter binding |
+| `src/runtime/interactive-layout.ts` | process-global coordinator, strict `auto`/`split` policy 해석, cmux placement 직렬화와 exact allocation adopt/release; Herdr는 strict tab/split request를 직접 사용 |
 | `src/runtime/pane-launch-broker.mjs` | Node built-in만 사용하는 detached V2 allocation·commit broker와 tmux staged-gate verifier |
 | `src/runtime/cmux.ts` | cmux command, split parsing, inspect, Escape, close |
 | `src/runtime/tmux.ts` | tmux identity, split, inspect, Escape, kill-pane |
@@ -132,7 +132,7 @@ interactive child pi
 
 ```ts
 interface InteractivePaneBackend {
-  mode: "cmux-pane" | "tmux-pane";
+  mode: "cmux-pane" | "tmux-pane" | "herdr-pane";
   availabilityError(env?): string | null;
   launch(options): Promise<InteractivePaneHandle>;
   inspect(handle): Promise<InteractivePaneSnapshot | undefined>;
@@ -146,10 +146,11 @@ handle은 backend identity를 보존하는 discriminated union이다.
 ```ts
 type InteractivePaneHandle =
   | { mode: "cmux-pane"; native: CmuxSurfaceHandle }
-  | { mode: "tmux-pane"; native: TmuxPaneHandle };
+  | { mode: "tmux-pane"; native: TmuxPaneHandle }
+  | { mode: "herdr-pane"; native: HerdrPaneHandle };
 ```
 
-snapshot 의미는 두 backend에서 동일하다.
+snapshot 의미는 세 backend에서 동일하다.
 
 ```ts
 interface InteractivePaneSnapshot {
@@ -164,9 +165,9 @@ interface InteractivePaneSnapshot {
 
 ### 5.1 환경 identity
 
-현재 V2는 `CMUX_WORKSPACE_ID`와 `CMUX_SURFACE_ID`에서 앞뒤 공백을 먼저 제거한 값이 모두 canonical UUID일 때만 cmux mode를 선택한다. trim한 두 값은 `/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`를 통과해야 하며, trim 뒤 부분 값·`*_ref`·malformed 값은 identity가 아니다. workspace만 있거나 surface만 있거나 UUID가 malformed이면 자동 감지는 tmux 조건을 다시 평가한 뒤 inline으로 처리한다. cmux와 tmux identity가 모두 유효하면 cmux를 우선한다.
+현재 V2는 `CMUX_WORKSPACE_ID`와 `CMUX_SURFACE_ID`에서 앞뒤 공백을 먼저 제거한 값이 모두 canonical UUID일 때만 cmux mode를 선택한다. trim한 두 값은 `/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i`를 통과해야 하며, trim 뒤 부분 값·`*_ref`·malformed 값은 identity가 아니다. workspace만 있거나 surface만 있거나 UUID가 malformed이면 자동 감지는 Herdr, tmux 조건을 차례로 다시 평가한 뒤 inline으로 처리한다. 유효한 cmux/Herdr/tmux identity가 함께 있으면 cmux, Herdr, tmux 순으로 우선한다.
 
-`win32`에서는 `getDefaultTerminalModeFromEnv()`가 환경 값과 무관하게 `inline`을 반환한다. 명시적으로 `cmux-pane` 또는 `tmux-pane`을 요청한 경우에도 backend `availabilityError()`는 Windows interactive backend unavailable 오류를 반환한다. 따라서 Windows에서 intent, allocation 또는 broker spawn을 시작하지 않는다.
+`win32`에서는 `getDefaultTerminalModeFromEnv()`가 환경 값과 무관하게 `inline`을 반환한다. 명시적으로 `cmux-pane`, `tmux-pane` 또는 `herdr-pane`을 요청한 경우에도 backend `availabilityError()`는 Windows interactive backend unavailable 오류를 반환한다. 따라서 Windows에서 intent, allocation 또는 broker spawn을 시작하지 않는다.
 
 ### 5.2 Direct control-v2 production allocation
 
@@ -248,7 +249,7 @@ authoritative 조회는 terminal screen을 scrape하거나 title을 포함하지
 
 ### 6.4 cmux와의 의미 차이 제거
 
-공통 runner에서 다음 전이는 동일하다.
+cmux/tmux 및 Herdr `split`의 공통 runner 전이는 다음과 같다.
 
 - launch 실패 → 실행 오류
 - inspect 일시 실패 → 제한 횟수 재시도
@@ -256,6 +257,8 @@ authoritative 조회는 terminal screen을 scrape하거나 title을 포함하지
 - completion 발견 → final session drain 후 pane close
 - parent abort → Escape, grace period, close
 - stale lease → orphan completion 기록 후 close
+
+Herdr `auto`는 direct root child에 `ctx.abort()`/`ctx.shutdown()` cooperative request만 전달한다. parent/reaper는 `pane.send_keys`/`pane.close`/rollback으로 terminal을 mutate하지 않으며, present/unknown/hung은 late watcher와 manual recovery로 retain하고 confirmed absence에서만 retire한다.
 
 ## 7. Interactive child 실행
 
@@ -319,7 +322,7 @@ V2는 detached broker가 pane allocation과 commit 전 rollback을 소유하는 
 |---|---|---|
 | `launch-intent.json` | parent | immutable; source identity, child session 및 broker 실행 authority |
 | `broker-claim.json` | broker | immutable; nonce를 가진 첫 broker만 allocation할 수 있게 하는 claim fence |
-| `allocation.json` | broker | immutable; allocation 직후의 exact cmux/tmux target authority |
+| `allocation.json` | broker | immutable; allocation 직후의 exact cmux/tmux/Herdr target authority |
 | `decision.json` | parent 또는 broker | immutable; cancel 또는 commit 중 하나만 first-writer-wins로 확정 |
 | `launch.json` | broker | immutable; commit 뒤 parent-owned launch record |
 | `launch.gate` | parent | immutable; committed launch 뒤 child start를 허가하는 one-way gate |
@@ -341,7 +344,7 @@ Immutable JSON은 정확히 하나의 UTF-8 object와 마지막 `\n`이며, same
 
 모든 parser는 unknown field, cross-run path, run ID/backend mismatch, non-finite timestamp, 잘못된 canonical ID를 거부한다. cmux ID는 canonical UUID, tmux pane ID는 `/^%(?:0|[1-9][0-9]*)$/`여야 한다.
 
-legacy V2 intent/allocation record는 layout key가 **전혀 없는** 별도 exact branch이며 `split` placement로 해석한다. layout-aware intent/allocation은 backend/source/container/target binding을 모두 만족하는 strict discriminated union(`LayoutModeV2`, backend별 container type, `LayoutPlacementRequestV2`, `LayoutAllocationFieldsV2`)이어야 한다. 이 union의 정확한 branch와 binding 규칙은 [다중 subagent interactive pane layout 설계 10.1절](./interactive-pane-layout-design.md#101-backward-compatible-strict-v2-layout-schema-migration)이 authoritative하며, 전체 base field·legacy branch·모든 parser 조건의 canonical source는 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts)다. commit path는 this-run `allocation.json` 및 planned `launch.json`의 exact absolute path여야 하고, launch에는 `ownership: "parent-owned"`가 필요하다. `state.json`과 `parent-lease.json`은 V2로 재정의하지 않으며 앞서 설명한 V1 schema/replaceable write를 유지한다.
+legacy V2 intent/allocation record는 layout key가 **전혀 없는** 별도 exact branch이며 `split` placement로 해석한다. layout-aware intent/allocation은 backend/source/container/target binding을 모두 만족하는 strict discriminated union(`LayoutModeV2`, backend별 container type, `LayoutPlacementRequestV2`, `LayoutAllocationFieldsV2`)이어야 한다. Herdr `auto` request workspace와 `split` request의 workspace/tab/pane/terminal은 immutable source와 정확히 일치해야 하며, target은 immutable 또는 rebound source pane alias가 아니어야 한다. 이 union의 정책·branch 설명은 [다중 subagent interactive pane layout 설계 11.1절](./interactive-pane-layout-design.md#111-backward-compatible-strict-v2-layout-schema-migration)을 따른다. 실제 parser source of truth는 parent/reaper의 [`src/runtime/run-protocol.ts`](../src/runtime/run-protocol.ts)와 detached broker의 [`src/runtime/pane-launch-broker.mjs`](../src/runtime/pane-launch-broker.mjs)에 각각 있으며, 두 구현의 binding은 `test/runtime/run-protocol.test.ts`와 `test/runtime/pane-launch-broker.test.ts`가 검증한다. commit path는 this-run `allocation.json` 및 planned `launch.json`의 exact absolute path여야 하고, launch에는 `ownership: "parent-owned"`가 필요하다. `state.json`과 `parent-lease.json`은 V2로 재정의하지 않으며 앞서 설명한 V1 schema/replaceable write를 유지한다.
 
 특히 preflight에서 runtime/backend/entrypoint를 찾지 못하거나 실행할 수 없으면 **artifact-free pre-artifact error**다. parent는 task, prompt, session, lease, `broker-status.json`, intent를 만들거나 broker를 spawn하지 않고 interactive 실행 오류를 반환한다. 따라서 obsolete `runtime-unavailable` status variant는 V2 contract에 없다.
 
@@ -357,9 +360,11 @@ Runtime resolver 순서는 다음과 같다.
 
 cmux production lifecycle은 identified app의 authenticated control socket v2를 직접 사용하며 `CMUX_BUNDLED_CLI_PATH` 또는 `PATH`의 cmux CLI를 resolve하거나 fallback하지 않는다. tmux는 비어 있지 않은 `TMUX_BIN`을 먼저 사용하고, 비어 있거나 미설정일 때만 `PATH`의 `tmux`를 사용한다. 명시한 경로가 regular executable로 resolve되지 않으면 PATH로 조용히 fallback하지 않는다. 빈 설정값은 미설정과 같아서 fallback을 유지한다. resolver는 regular file인지와 실행 가능한지만 확인하고 `realpath`로 얻은 canonical absolute path를 intent에 기록한다. symlink, shebang/script, project-local path, user-owned 또는 writable ancestor, macOS application path는 provenance·owner·ancestor·native magic·codesign 정책으로 거부하지 않는다. interactive executable `PATH`는 사용자가 명시적으로 선택한 trust boundary다. broker spawn과 parent lifecycle은 선택한 runtime, concrete interpreter, broker entrypoint 및 해당 backend의 full executable generation을 재검증하며, reaper도 기록된 backend/control authority generation이 달라지면 사용하지 않는다.
 
-Broker 및 backend command는 resolver가 사용한 명시적 `PATH`, `HOME`, `TMPDIR`, `TERM`과 현재 backend identity에 필요한 `CMUX_*` 또는 `TMUX*`만 가진 최소 환경으로 시작한다. tmux에서는 raw 또는 relative caller 값이 아니라 resolver가 확정한 canonical absolute `TMUX_BIN`을 broker, staged verifier와 private child/nested bootstrap에 다시 기록한다. 이 PATH 보존은 선택된 `#!/usr/bin/env bun|node` runtime/backend shim이 같은 interpreter를 찾도록 하기 위한 것이며, `NODE_OPTIONS`, `NODE_PATH`, `BUN_OPTIONS`, shell loader hook과 임의 proxy/auth 환경은 replay하지 않는다. broker의 working directory는 private run directory다. tmux 3.7의 다중 argv `split-window` 형태로 `/usr/bin/env -i ... <broker runtime> <args>`를 직접 exec하므로 사용자가 구성한 `default-shell`은 staged verifier 시작에 전혀 실행되지 않는다. native `env`가 tmux server 환경을 지운 뒤에만 Bun/Node 또는 script interpreter가 시작한다. verifier는 exec로 보존된 자신의 PID가 immutable allocation의 pane PID와 같은지 확인하고 exact socket/server/pane topology를 재검증한 뒤, wrapper에 검증된 `TMUX`/`TMUX_PANE`만 명시적으로 제공한다. wrapper는 private explicit environment를 source한 뒤 삭제하고, 새 pane이 주입한 multiplexer identity/cwd는 덮어쓰지 않는다.
+Broker 및 verifier command는 trusted filesystem root를 `cwd`로 하여 resolver가 사용한 명시적 `PATH`, `HOME`, `TMPDIR`, `TERM`과 현재 backend identity에 필요한 `CMUX_*` 또는 `TMUX*`만 가진 최소 환경으로 시작한다. Herdr direct-root launch도 같은 filesystem-root bootstrap을 사용한다. 따라서 project-local `bunfig.toml` 또는 Bun preload는 gate 전 broker/verifier에 적용될 수 없다. wrapper만 gate를 통과한 뒤 validated effective task/workspace `cwd`로 이동하고 Pi를 시작한다. inline mode는 별도 broker가 없으므로 처음부터 `taskCwd ?? cwd`를 직접 사용한다.
 
-Windows에서는 automatic mode가 `inline`이며 명시적 cmux/tmux backend는 unavailable 오류를 반환한다. intent/allocation/broker spawn을 시작하지 않는다.
+tmux에서는 raw 또는 relative caller 값이 아니라 resolver가 확정한 canonical absolute `TMUX_BIN`을 broker, staged verifier와 private child/nested bootstrap에 다시 기록한다. 이 PATH 보존은 선택된 `#!/usr/bin/env bun|node` runtime/backend shim이 같은 interpreter를 찾도록 하기 위한 것이며, `NODE_OPTIONS`, `NODE_PATH`, `BUN_OPTIONS`, shell loader hook과 임의 proxy/auth 환경은 replay하지 않는다. tmux 3.7의 다중 argv `split-window` 형태로 `/usr/bin/env -i ... <broker runtime> <args>`를 직접 exec하므로 사용자가 구성한 `default-shell`은 staged verifier 시작에 전혀 실행되지 않는다. native `env`가 tmux server 환경을 지운 뒤에만 Bun/Node 또는 script interpreter가 시작한다. verifier는 exec로 보존된 자신의 PID가 immutable allocation의 pane PID와 같은지 확인하고 exact socket/server/pane topology를 재검증한 뒤, wrapper에 검증된 `TMUX`/`TMUX_PANE`만 명시적으로 제공한다. wrapper는 private explicit environment를 source한 뒤 삭제하고, 새 pane이 주입한 multiplexer identity/cwd는 덮어쓰지 않는다.
+
+Windows에서는 automatic mode가 `inline`이며 명시적 cmux/tmux/Herdr backend는 unavailable 오류를 반환한다. intent/allocation/broker spawn을 시작하지 않는다.
 
 ### 8.5 Allocation-first broker sequence
 
@@ -369,10 +374,10 @@ _2x PNG · [SVG](./diagram/broker-allocation-sequence.svg) · [Mermaid source](.
 
 1. Parent preflight가 성공한 뒤 private inputs와 V1 state/lease를 준비하고 immutable intent를 publish한다. broker는 `detached: true`, `stdio: "ignore"`, `unref()`로 spawn된다.
 2. Broker는 valid intent와 decision 부재를 확인하고 immutable `broker-claim.json`을 먼저 publish한다. 이 claim fence가 duplicate broker의 allocation을 막는다. 이어 `ready` status를 쓴다.
-3. Broker가 strict placement를 allocation한다. cmux root 첫 `auto` allocation과 `split` 호환 모드는 empty split을 만들고, 이후 root sibling/nested `auto` allocation은 검증된 pane에 exact `new-surface`를 만든다. layout-aware tmux `split`과 `auto`는 각각 `split-window -P`와 same-session `new-window -d -P`에서 strict `session_id|window_id|pane_id|pane_pid` 응답으로 staged gate verifier를 직접 실행한다. tmux는 placement에 필요한 socket, server, session 또는 source pane identity를 재검증한다.
-4. **Allocation command 응답을 받은 뒤, cancel winner를 읽거나 rollback하기 전에 broker는 exact `allocation.json`을 immutable publish한다.** cancel이 이미 있었어도 durable exact authority를 먼저 남기므로 rollback 실패/중단은 reaper가 복구할 수 있다. canonical identity를 얻지 못한 cmux 응답 또는 invalid tmux allocation 응답은 `residual-risk.json`과 `possible-unrecorded-allocation` status로 retained risk가 된다.
+3. Broker가 strict placement를 allocation한다. cmux root 첫 `auto` allocation과 `split` 호환 모드는 empty split을 만들고, 이후 root sibling/nested `auto` allocation은 검증된 pane에 exact `new-surface`를 만든다. layout-aware tmux `split`과 `auto`는 각각 `split-window -P`와 same-session `new-window -d -P`에서 strict `session_id|window_id|pane_id|pane_pid` 응답으로 staged gate verifier를 직접 실행한다. Herdr `auto`는 immutable workspace request에 `tab_id` 없이 unfocused `layout.apply`를 한 번 보내 trusted filesystem-root `cwd`의 root pane에 wrapper direct argv를 배치하고, strict `layout_apply.layout.root` 뒤 `pane.get` terminal binding을 요구한다. `split`은 immutable workspace/tab/pane/terminal request의 `pane.split`을 사용한다. tmux와 Herdr는 placement에 필요한 source identity를 mutation 직전에 재검증한다.
+4. **Allocation command 응답을 받은 뒤, cancel winner를 읽거나 rollback하기 전에 broker는 exact `allocation.json`을 immutable publish한다.** cancel이 이미 있었어도 durable exact authority를 먼저 남기므로 rollback 실패/중단은 reaper가 복구할 수 있다. canonical identity를 얻지 못한 cmux 응답, invalid tmux allocation 응답 또는 source/current pane alias를 반환한 Herdr mutation 응답은 `residual-risk.json`과 `possible-unrecorded-allocation` status로 retained risk가 된다.
 5. Broker와 parent는 `decision.json`의 commit/cancel을 경쟁해 publish한다. cancel winner면 broker는 durable exact target만 rollback하고 launch/gate/respawn/child start를 만들지 않는다. commit winner면 ownership은 즉시 parent로 넘어간다; broker는 `launch.json`, `committed` status를 publish한 뒤 종료한다.
-6. Parent는 commit과 allocation을 읽자마자 exact handle을 active registry에 넣는다. `launch.json`이 보일 때까지 reconcile한 다음 gate를 publish한다. cmux는 이 gate 뒤 parent가 sanitized `surface.respawn` RPC를 실행한다. tmux staged verifier는 gate, intent, allocation, committed launch, own pane/server fingerprint를 검증한 경우에만 wrapper를 exec한다. invalid/missing gate는 최대 30초 대기 후 child 없이 exit한다.
+6. Parent는 commit과 allocation을 읽자마자 exact handle을 active registry에 넣는다. `launch.json`이 보일 때까지 reconcile한 다음 gate를 publish한다. cmux는 이 gate 뒤 parent가 sanitized `surface.respawn` RPC를 실행한다. tmux staged verifier와 Herdr broker는 각각 gate, intent, allocation, committed launch 및 exact target binding을 검증한 경우에만 wrapper를 exec 또는 deliver한다. invalid/missing gate는 최대 30초 대기 후 child 없이 exit한다.
 
 `ready`는 success authority가 아니다. `decision.json(kind: "commit")`은 `launch.json`보다 먼저 보일 수 있으며, 이때도 parent가 cleanup ownership을 받는다. Broker decision timeout은 spawn 뒤 시작하는 **총 30초** window다. 그 안에서 `ready` 또는 decision이 처음 5초 안에 보이지 않으면 parent는 ready-timeout cancel을 시도한다. 이는 5초 후 별도의 30초 window를 추가하는 두 단계 timeout이 아니다.
 
@@ -420,10 +425,11 @@ startup reaper는 observer record를 publish한 뒤에도 legacy boundary-less f
 
 completion fence/ACK 순서, `CompletionRecordV3` strict schema(성공/child-failure/observer-failure union과 capability 협상), boundary-less failure 처리, prefix replay 한도(`64 MiB`/`8 MiB`/`100,000` entry)와 tree-wide permit·process-local scheduler slot 구분의 authoritative 설명은 [Interactive subagent runtime 성능 개선 설계 6.4절](./interactive-runtime-performance-design.md#64-completionrecordv3-migration과-순서)을 따른다. child bridge memory-only socket heartbeat의 약 12초 stale 판정은 같은 문서 [6.5절](./interactive-runtime-performance-design.md#65-disconnect와-heartbeat)을 따른다. 이와 별개로 child bridge의 parent-lease 감시는 약 2초 주기로 lease를 갱신하고 약 12초 stale threshold로 부모의 비정상 종료를 판정하며, 이 parent-lease 값의 근거는 [설정의 cmux pane](./configuration.md#cmux-pane)과 `src/runtime/run-protocol.ts`의 `DEFAULT_PARENT_LEASE_RENEW_MS`/`DEFAULT_PARENT_LEASE_STALE_MS`다.
 
-## 10. cmux/tmux production paths
+## 10. cmux/tmux/Herdr production paths
 
 - **cmux:** broker는 strict placement의 exact immutable source/workspace/pane 관계와 control-v2 canonical UUID response만 allocation authority로 사용하고 durable allocation/commit/launch를 만든다. parent gate 뒤 같은 socket/app generation의 `surface.respawn`을 실행한다. known `*_ref`는 검증 후 버리고 unknown/malformed response와 cross-workspace/pane response는 residual risk이며 rollback authority가 아니다.
 - **tmux:** layout-aware broker는 `tmux-split`의 `split-window -P`와 `tmux-new-window`의 `new-window -d -P`에서 strict `session_id|window_id|pane_id|pane_pid` response로 allocation한다. staged verifier는 gate validation뿐 아니라 session/window binding, own pane ID/PID, server PID, socket fingerprint를 확인한다. Parent/reaper interrupt/kill도 winning fingerprint에 묶여 pane ID reuse를 종료하지 않는다.
+- **Herdr:** broker는 owner-only socket과 protocol 19/20 binding을 재검증한 뒤 `auto`의 exact workspace-scoped `layout.apply` 하나 또는 `split`의 exact source workspace/tab/pane/terminal `pane.split`만 dispatch한다. auto request에는 `tab_id`가 없고 `focus: false`, one root pane 및 direct exact wrapper argv가 있으며, static `tab_label`은 이 생성 요청에서만 설정한다. strict `layout_apply.layout.root`와 이어지는 `pane.get` terminal binding이 아니면 unknown으로 retain한다. auto는 `pane.send_text`를 쓰지 않아 command line을 typed/display하지 않고 gate rejection은 조용하다. existing tab split의 direct argv delivery가 안전하지 않아 `split`만 opt-in legacy `pane.send_text` delivery를 사용하며 `auto` fallback은 없다. auto post-launch cancellation은 authenticated child `ctx.abort()`/`ctx.shutdown()`의 cooperative path뿐이며 parent `pane.send_keys`/`pane.close`, rollback 및 reaper mutation은 금지된다. present/unknown/hung child는 recovery/manual cleanup과 late watcher를 유지하고 complete bounded `pane.list`의 zero terminal match에서만 retire한다. `events.subscribe`와 bounded `agent.wait`는 fresh `pane.get`/bounded `pane.list` reconciliation wakeup일 뿐 completion·cleanup·absence authority가 아니다. manual focus는 user-initiated로 socket/protocol·terminal rebind, `agent.get`, 정확히 한 번의 `agent.focus`, read-only identity post-check 순이며 `pane.focus` fallback/retry가 없다. expected-terminal CAS가 없으므로 read→mutation residual race는 남는다. dynamic OSC title과 child `pane.report_metadata`는 separate diagnostic-only channel이고 lifecycle authority는 socket generation과 exact terminal identity다.
 
 ### 10.1 현재 구현의 추가 correctness 경계
 
@@ -431,12 +437,24 @@ completion fence/ACK 순서, `CompletionRecordV3` strict schema(성공/child-fai
 - broker는 allocation 전의 complete global topology를 source authority와 novelty baseline으로 함께 기록한다. 새 target은 source와 alias가 아니고 pre-mutation topology에 없다는 증거가 있어야 하며, 그렇지 않으면 target을 adopt·rollback하지 않고 residual risk로 남긴다.
 - tmux staged verifier는 allocated pane process가 runtime을 직접 실행한 경우 또는 한 겹의 non-`exec` wrapper가 만든 직접 child인 경우만 PID/PPID로 허용한다. 그 뒤에도 exact socket, server PID, pane ID, pane PID fingerprint를 모두 재검증한다.
 - tmux topology와 pane 목록은 모든 row를 strict하게 parse한다. malformed·duplicate·unrelated ambiguity는 absence나 mutation authority가 아니며, source pane ID와 같은 response는 PID가 달라도 alias로 거부한다.
+- Herdr layout request는 immutable source container에 묶인다. `auto` workspace 또는 `split`의 workspace/tab/pane/terminal이 다르면 `layout.apply`/`pane.split` 전에 fail-closed하며, mutation response의 immutable/current source pane alias는 unknown outcome으로 retain한다.
 
-직접 근거는 `src/runtime/cmux.ts`, `src/runtime/pane-launch-broker.mjs` 및 `test/runtime/cmux.test.ts`, `test/runtime/tmux.test.ts`, `test/runtime/pane-launch-broker.test.ts`다.
+직접 근거는 `src/runtime/cmux.ts`, `src/runtime/herdr.ts`, `src/runtime/pane-launch-broker.mjs` 및 `test/runtime/cmux.test.ts`, `test/runtime/tmux.test.ts`, `test/runtime/herdr.test.ts`, `test/runtime/pane-launch-broker.test.ts`다. Herdr 근거는 protocol 19/20 strict fake sockets와 현재 non-mutating protocol-19 `agent.get`/`agent.wait` smoke까지이며, live focus 또는 metadata mutation acceptance는 주장하지 않는다.
+
+### 10.2 Herdr fail-closed 점검
+
+Herdr pane mode가 시작되지 않거나 자동 cleanup이 보류되면 fallback하거나 ID를 추측하지 않는다. 다음 순서로 **현재 Herdr pane 안에서** 확인한다.
+
+1. `HERDR_ENV=1`과 `HERDR_SOCKET_PATH`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`를 함께 확인한다. 빈 값, 상대 경로, 정규화되지 않은 경로(`//`, `..`) 또는 다른 pane/tab의 ID 조합은 거부된다. 예: `env | grep '^HERDR_'`로 실제 child shell의 값을 보고, 임의로 다른 pane의 값을 export하지 않는다.
+2. socket은 symlink가 아닌 Unix-domain socket이며 현재 UID 소유이고 group/other permission이 없어야 한다. Linux에서는 `stat -Lc '%F %u %a %n' "$HERDR_SOCKET_PATH"`, macOS에서는 `stat -Lf '%HT %u %Lp %N' "$HERDR_SOCKET_PATH"`로 확인한다. 기대값은 socket, 현재 UID, mode의 group/other bit `0`이다. 소유자나 mode가 다르면 `chmod`로 공유 socket을 완화하지 말고 Herdr를 해당 사용자 세션에서 다시 시작한다.
+3. `pane.get(HERDR_PANE_ID)`의 workspace/tab/pane은 위 세 환경 변수와 정확히 일치해야 한다. pane을 이동했거나 shell 환경이 오래되었으면 해당 terminal에서 새 shell을 열어 Herdr가 주입한 정확한 환경을 다시 받고 재시도한다.
+4. `ping` protocol은 정확히 `19` 또는 `20`이어야 하며 run 중 바뀌면 fail-closed한다. 서버를 업그레이드/재시작한 뒤에는 기존 run을 재사용하지 말고 새 delegation을 시작한다. `18`, `21` 또는 누락된 protocol에 대한 강제 호환/fallback은 지원하지 않는다.
+
+이 점검은 `src/runtime/herdr.ts`와 detached broker의 `src/runtime/pane-launch-broker.mjs`가 수행하는 binding과 같으며, socket/환경/protocol 중 하나라도 확인할 수 없으면 user-owned pane을 close하지 않고 recovery metadata를 retain하는 것이 의도된 결과다.
 
 ## 11. 구현 검증 상태
 
-`bun test --pass-with-no-tests`의 현재 unit scope에는 `test/runtime/pane-launch-broker.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/interactive-reaper.test.ts`, `test/runtime/runner-interactive.test.ts`가 포함된다. 표의 **부분**은 assertion 또는 mock/process 단위의 직접 증거는 있지만, 실제 parent→broker→backend 전체 흐름, live backend, crash point 또는 packaged install 증거가 없다는 뜻이다.
+`bun test --isolate --pass-with-no-tests`의 현재 unit scope에는 `test/runtime/pane-launch-broker.test.ts`, `test/runtime/run-protocol.test.ts`, `test/runtime/interactive-reaper.test.ts`, `test/runtime/runner-interactive.test.ts`가 포함된다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다. 표의 **부분**은 assertion 또는 mock/process 단위의 직접 증거는 있지만, 실제 parent→broker→backend 전체 흐름, live backend, crash point 또는 packaged install 증거가 없다는 뜻이다.
 
 | 항목 | 구현 | 단위 테스트 상태 | live backend | package/acceptance |
 |---|---:|---:|---:|---:|
@@ -445,7 +463,8 @@ completion fence/ACK 순서, `CompletionRecordV3` strict schema(성공/child-fai
 | allocation-first durable authority와 cancel rollback | ✓ | 부분 — mock backend process에서 exact allocation/rollback 확인, live cancellation 미검증 | — | — |
 | cmux allocation → commit/gate → sanitized respawn | ✓ | 부분 — adapter·verifier 단위, parent full-flow 미검증 | — | — |
 | layout-aware tmux `session_id|window_id|pane_id|pane_pid`, staged gate/fingerprint verifier | ✓ | 부분 — args/schema/mock process 단위, live gate lifecycle 미검증 | — | — |
-| tmux `auto` detached same-session window layout과 exact cleanup | ✓ | 부분 — layout/protocol/adapter 단위 범위 | PASS — 2026-07-20 limited smoke | 3 top-level + parent/2 nested; 상세 evidence는 [`interactive-pane-layout-design.md` 19절](./interactive-pane-layout-design.md#19-live-layout-smoke-기록) |
+| tmux `auto` detached same-session window layout과 exact cleanup | ✓ | 부분 — layout/protocol/adapter 단위 범위 | PASS — 2026-07-20 limited smoke | 3 top-level + parent/2 nested; 상세 evidence는 [`interactive-pane-layout-design.md` 20절](./interactive-pane-layout-design.md#20-live-layout-smoke-기록) |
+| Herdr protocol 19/20 agent observation/focus/metadata | ✓ | ✓ — strict fake socket; `agent.get`/`agent.wait` current smoke는 protocol 19 non-mutating | — | live focus/metadata mutation 미주장 |
 | V2/V3 dependency matrix, completion fence/replay, reaper transcript retention | ✓ | ✓ — protocol, bridge, tail, runner/reaper 단위 범위 | — | — |
 | artifact-free executable preflight와 minimal bootstrap | ✓ | 부분 — resolver/minimal-env 단위, full invocation의 artifact-free 관찰 미검증 | — | — |
 | deterministic parent `SIGKILL` pre-allocation checkpoint | ✓ — harness-only argv+environment gate 뒤 ready에서 broker SIGSTOP | 부분 — fixture/checkpoint safety guards | cmux/tmux PASS | cmux `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`; tmux `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df` |
@@ -457,7 +476,7 @@ completion fence/ACK 순서, `CompletionRecordV3` strict schema(성공/child-fai
 
 ```bash
 bun run check
-bun test --pass-with-no-tests
+bun test --isolate --pass-with-no-tests
 bun run ci
 bun pm pack --dry-run
 
@@ -563,12 +582,12 @@ PI_SUBAGENT_PACKAGE_ACCEPTANCE=1 bun run acceptance:package -- --keep
 
 ## 13. Layout 완료 상태와 운영상 제한
 
-- interactive run은 parent-owned 고정 lifecycle로 첫 정상 `agent_settled` 뒤 결과를 반환하고 child의 exact surface/pane을 닫는다.
+- interactive run은 parent-owned 고정 lifecycle로 첫 정상 `agent_settled` 뒤 결과를 반환한다. cmux/tmux과 Herdr `split`은 child의 exact surface/pane을 닫지만, Herdr `auto`는 cooperative child shutdown 뒤 confirmed absence에서만 retire한다.
 - `--subagent-pane-layout auto|split`과 `PI_SUBAGENT_PANE_LAYOUT`은 CLI > 환경 변수 > 기본 `auto` 순으로 해석된다. 값은 정확히 소문자 `auto` 또는 `split`이어야 하며 resolved policy는 child에 상속된다.
-- `auto`에서 cmux root sibling은 process-global coordinator가 직렬화해 새 오른쪽 shared pane 하나의 surface를 공유한다. nested descendant는 정확한 source pane에 surface로 쌓인다. tmux는 child별 같은-session detached window를 사용한다.
-- `split`은 cmux/tmux 모두 child별 기존 오른쪽 split을 유지하는 명시적 호환 모드다.
-- coordinator는 process-local placement state만 가진다. detached V2 broker가 유일한 pre-commit allocator이고 strict layout record를 durable publish한다. cmux와 tmux는 서로 독립된 process-local abort-aware FIFO topology lock으로 source preflight·allocation·gate handoff와 exact close/absence inspection을 각각 직렬화한다. session shutdown generation/gate fence는 그대로 유지한다.
-- lifecycle은 child의 exact surface/pane만 Escape·close/kill한다. cmux shared pane, tmux window/session 또는 caller container를 넓게 닫지 않는다.
-- cmux/tmux backend launch 실패 시 inline으로 자동 fallback하지 않으며 diagnostic retention 시간은 사용자 설정으로 노출하지 않는다.
+- `auto`에서 cmux root sibling은 process-global coordinator가 직렬화해 새 오른쪽 shared pane 하나의 surface를 공유한다. nested descendant는 정확한 source pane에 surface로 쌓인다. tmux는 child별 같은-session detached window를 사용하며, Herdr는 parent focus를 유지한 child별 새 tab의 strict root pane을 사용한다.
+- `split`은 cmux/tmux/Herdr 모두 child별 기존 오른쪽 split을 유지하는 명시적 호환 모드다. Herdr는 existing tab에 direct argv를 안전하게 전달할 수 없어 `pane.split` 뒤 `pane.send_text`를 쓰며 `auto`에서 fallback하지 않는다.
+- coordinator는 process-local placement state만 가진다. detached V2 broker가 유일한 pre-commit allocator이고 strict layout record를 durable publish한다. cmux와 tmux는 서로 독립된 process-local abort-aware FIFO topology lock으로 source preflight·allocation·gate handoff와 exact close/absence inspection을 각각 직렬화한다. Herdr는 immutable request container와 exact target rebinding을 broker가 직접 검증한다. session shutdown generation/gate fence는 그대로 유지한다.
+- cmux/tmux과 Herdr `split` lifecycle은 child의 exact surface/pane만 Escape·close/kill한다. Herdr `auto`는 parent mutation 없이 cooperative child shutdown·read-only watcher만 사용한다. 어느 경로도 cmux shared pane, tmux window/session, Herdr tab 또는 caller container를 넓게 닫지 않는다.
+- cmux/tmux/Herdr backend launch 실패 시 inline으로 자동 fallback하지 않으며 diagnostic retention 시간은 사용자 설정으로 노출하지 않는다.
 
-cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#19-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke도 2026-07-23 tmux와 cmux에서 **PASS**했지만, title 형식 변경 전 historical evidence다. 현재 agent/depth/run base와 `queued` barrier를 사용하는 title smoke는 harness만 갱신됐으며 live 재실행 통과를 주장하지 않는다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.
+cmux와 tmux live layout smoke의 기록·제한 범위는 [다중 subagent interactive pane layout 설계](./interactive-pane-layout-design.md#20-live-layout-smoke-기록)를 따른다. 두 layout smoke는 2026-07-20에 **PASS**했고 production wrapper의 실제 initial/lifecycle title smoke도 2026-07-23 tmux와 cmux에서 **PASS**했지만, title 형식 변경 전 historical evidence다. 현재 agent/depth/run base와 `queued` barrier를 사용하는 title smoke는 harness만 갱신됐으며 live 재실행 통과를 주장하지 않는다. deterministic fake-adapter full `runAgent` E2E는 completion/cancel/external close/shutdown/reload를 검증하며, opt-in manual `workflow_dispatch` live CI가 tmux와 명시적 self-hosted cmux job을 제공한다. public detached ownership schema도 구현됐다. 후속 검토 후보는 configurable pane direction/size와 실패 session retention 설정이다. Linux/macOS private lifecycle socket, strict `CompletionRecordV3`, healthy cmux inspect polling 제거 및 gated `tmux -C` control transport는 구현됐으며, schema v4 two-tier Phase 0 live capture와 최종 source verification은 [`interactive-runtime-performance-design.md`](./interactive-runtime-performance-design.md)를 따른다. 완료 capture는 관찰됐지만, 문서 변경 뒤에는 source-bound fixture를 재생성하고 두 current-source verifier를 모두 통과하기 전까지 현재 fixture를 최종 검증으로 주장하지 않는다. socket event는 hint이고 durable completion, 약 2초 lease 및 exact-target cleanup authority는 유지된다.

@@ -11,7 +11,7 @@ allowlists) for delegation targets.
 `pi-subagent` is a Pi extension package that lets a Pi coding agent delegate
 tasks to specialized subagents: single calls, parallel batches, and
 sequential chains, with explicit control over context handoff (`spawn` vs
-`fork`) and execution environment (inline, tmux, cmux).
+`fork`) and execution environment (inline, cmux, tmux, Herdr).
 
 ## Runtime
 
@@ -28,9 +28,11 @@ bun run ci
 ```
 
 `bun run ci` runs `bun run check` (type check via `tsc --noEmit`) followed by
-`bun test --pass-with-no-tests`, and is the required check before treating a
-change as verified. `bun run test` and `bun run check` also exist
-individually as defined in `package.json`. Live/acceptance/benchmark scripts
+`bun run test` (`bun test --isolate --pass-with-no-tests`), and is the required
+check before treating a change as verified. File isolation is required because
+tests intentionally use file-global Bun mocks and process globals. `bun run
+test` and `bun run check` also exist individually as defined in `package.json`.
+Live/acceptance/benchmark scripts
 (`acceptance:*`, `benchmark:*`) are opt-in and gated by explicit environment
 variables; see [`docs/development.md`](docs/development.md) before running
 them.
@@ -55,7 +57,7 @@ them.
 
 | Doc | Use For |
 |-----|---------|
-| [`docs/development.md`](docs/development.md) | Setup, verification commands, project structure, design-doc index |
+| [`docs/development.md`](docs/development.md) | Setup, verification commands, project structure, and cmux/tmux/Herdr design-doc index |
 | [`docs/configuration.md`](docs/configuration.md) | User-facing settings and environment variables |
 | [`docs/usage.md`](docs/usage.md) | How to invoke subagent delegation from Pi |
 | [`docs/agents.md`](docs/agents.md) | How package users author subagent definition files |

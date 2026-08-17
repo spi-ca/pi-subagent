@@ -125,6 +125,28 @@ describe("pi presence producer wire contract", () => {
     assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 2, "removed state cannot replay a stale summary");
   });
 
+  test("keeps summary incompatible with the fixed V1 cmux consumer while retaining it for other capable consumers", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
+
+    producer.handleReady({
+      version: 1, sessionId: "session-1",
+      consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status", "presence-summary-v1"] },
+    });
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 0);
+
+    producer.handleReady({
+      version: 1, sessionId: "session-1",
+      consumer: { id: "other-presence", capabilities: ["presence-summary-v1"] },
+    });
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 1);
+  });
+
   test("keeps summary on its associated generic update sequence through synchronous capability advertisement and replay", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     let producer: ReturnType<typeof createPiSubagentPresenceProducer>;

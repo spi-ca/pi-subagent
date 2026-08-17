@@ -26,6 +26,8 @@ const HERDR_RECONNECT_MAX_MS = 5_000;
 const HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS = 30_000;
 const HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS = 31_000;
 const HERDR_AGENT_WAIT_MAX_OBSERVERS = 16;
+/** One shared stream admits no more selector panes than the bounded fallback. */
+export const HERDR_MAX_SUBSCRIPTION_PANES = HERDR_AGENT_WAIT_MAX_OBSERVERS;
 /** A reconciliation list must remain a bounded recovery operation. */
 const HERDR_MAX_LISTED_PANES = 128;
 /** Every consumed Herdr response has the schema's exact tagged-union arm. */
@@ -378,7 +380,11 @@ export function observeHerdrAgentWait(options: { handle: HerdrPaneHandle; onWake
 }
 /** Events only wake a single coalesced authoritative reconciliation. Event
  * payloads can establish relevance but never update a live binding or presence. */
-export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; reconnectDelayMs?: number; }): HerdrPaneSubscription {
+export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; /** Diagnostic/event transport hook; payloads are never lifecycle authority. */ onEvent?: (event: string, data: Record<string, unknown> | null) => void; /** Shared transports fan out event relevance themselves and must not reconcile/wake the seed handle. */ reconcileOnEvent?: boolean; wakeOnEvent?: boolean; /** Strict bounded union for a shared stream. Omitted means this handle only. */ selectorPaneIds?: readonly string[]; reconnectDelayMs?: number; }): HerdrPaneSubscription {
+	const selectorPaneIds = options.selectorPaneIds ? [...new Set(options.selectorPaneIds)].sort() : [options.handle.paneId];
+	if (selectorPaneIds.length === 0 || selectorPaneIds.length > HERDR_MAX_SUBSCRIPTION_PANES || selectorPaneIds.some((paneId) => !isHerdrPublicId(paneId))) {
+		throw new Error("Herdr subscription selectors must be unique bounded pane IDs.");
+	}
 	let stopped = false; let healthy: boolean | null = null; let current: net.Socket | null = null; let reconciliation: Promise<void> | null = null; let reconciliationPending = false;
 	const controller = new AbortController();
 	const wake = () => { if (!stopped) options.onWake?.(); };
@@ -430,22 +436,23 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 					let ackTimer: ReturnType<typeof setTimeout> | undefined;
 					socket.once("connect", () => { clearTimeout(connectTimer); ackTimer = setTimeout(() => finish(new Error("Herdr subscription acknowledgement timed out.")), HERDR_SUBSCRIBE_ACK_TIMEOUT_MS); socket.write(`${JSON.stringify({ id, method: "events.subscribe", params: { subscriptions: [
 						{ type: "pane.closed" }, { type: "pane.exited" }, { type: "pane.updated" }, { type: "pane.moved" },
-						{ type: "pane.agent_status_changed", pane_id: options.handle.paneId }, { type: "tab.closed" }, { type: "workspace.closed" },
+						...selectorPaneIds.map((paneId) => ({ type: "pane.agent_status_changed", pane_id: paneId })), { type: "tab.closed" }, { type: "workspace.closed" },
 					] } })}\n`, (error) => { if (error) finish(error); }); });
 					socket.on("data", (chunk: Buffer) => {
 						buffer = Buffer.concat([buffer, chunk]); if (buffer.length > HERDR_MAX_LINE_BYTES) return finish(new Error("Herdr subscription exceeded the strict wire limit."));
-						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; setHealthy(true); clearTimeout(ackTimer); delay = minDelay; requestReconcile(); continue; }
+						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; setHealthy(true); clearTimeout(ackTimer); delay = minDelay; if (options.reconcileOnEvent !== false) requestReconcile(); continue; }
 							const data = isRecord(message.data) ? message.data : null;
+							if (typeof message.event === "string") options.onEvent?.(message.event, data);
 							// Event payloads only establish relevance. Every binding and presence
 							// decision below comes from a fresh pane.get or bounded pane.list.
 							const eventPane = data && (data.pane ?? data);
-							const moved = message.event === "pane.moved" && data?.previous_pane_id === options.handle.paneId
+							const moved = message.event === "pane_moved" && data?.previous_pane_id === options.handle.paneId
 								&& paneFromSnapshot(data.pane, options.handle.protocol)?.terminalId === options.handle.terminalId;
 							const samePane = data?.pane_id === options.handle.paneId
 								|| paneFromSnapshot(eventPane, options.handle.protocol)?.terminalId === options.handle.terminalId;
-							const tabClosed = message.event === "tab.closed" && data?.workspace_id === options.handle.workspaceId && data.tab_id === options.handle.tabId;
-							const workspaceClosed = message.event === "workspace.closed" && data?.workspace_id === options.handle.workspaceId;
-							if (moved || samePane || tabClosed || workspaceClosed) { wake(); requestReconcile(); } }
+							const tabClosed = message.event === "tab_closed" && data?.workspace_id === options.handle.workspaceId && data.tab_id === options.handle.tabId;
+							const workspaceClosed = message.event === "workspace_closed" && data?.workspace_id === options.handle.workspaceId;
+							if (moved || samePane || tabClosed || workspaceClosed) { if (options.wakeOnEvent !== false) wake(); if (options.reconcileOnEvent !== false) requestReconcile(); } }
 					});
 					socket.once("error", finish); socket.once("close", () => { if (stopped) finish(); else finish(new Error("Herdr subscription disconnected.")); });
 				});

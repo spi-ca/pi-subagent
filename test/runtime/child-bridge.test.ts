@@ -438,6 +438,22 @@ describe("child lifecycle bridge", () => {
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence")?.status, "completed");
 	});
 
+	test("settles an exact cancellation fence as aborted without waiting for a completion ACK", async () => {
+		const runId = "run-cancellation-fence";
+		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100 });
+		await publishImmutableJson(bridge.paths.completionFencePath, {
+			version: 1, kind: "cancellation-fence", runId, childPid: process.pid,
+			childStartedAt: getCurrentProcessStartedAt()!, claimedAt: Date.now(),
+		});
+		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		const started = Date.now();
+		await bridge.emit("agent_settled");
+		assert.ok(Date.now() - started < 100, "a cancellation winner never waits for completion-fence ACK");
+		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
+		assert.equal(completion?.status, "aborted");
+		assert.equal(completionError(completion), "surface-closed");
+	});
+
 	test("falls back boundary-less when a live parent does not ACK before the fence deadline", async () => {
 		const bridge = await setupBridge("run-completion-fence-stale-lease", { completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true });
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });

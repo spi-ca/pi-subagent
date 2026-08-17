@@ -71,6 +71,9 @@ import {
 	subscribeInteractiveRunChanges,
 	watchCompletedHerdrDirectRunForRetirementForTest,
 	watchDetachedInteractiveRunForRetirementForTest,
+	terminateExactUnixChildForTest,
+	terminateAuthorizedHerdrChildForTest,
+	subscribeSharedHerdrPaneForTest,
 } from "../../src/runtime/runner";
 import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
 import { buildTmuxPaneSnapshotArgs, buildTmuxServerPidArgs, readTmuxPaneTitle } from "../../src/runtime/tmux";
@@ -88,6 +91,9 @@ import {
 	prepareRunArtifactPaths,
 	removeRunArtifacts,
 	getCurrentProcessStartedAt,
+	parseCancellationFence,
+	publishImmutableJson,
+	readJsonFile,
 } from "../../src/runtime/run-protocol";
 import { SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV } from "../../src/runtime/lifecycle-socket";
 import { computeSessionCompletionBoundary, computeSessionFailureBoundary, getSessionFileIdentity, setSessionVerificationBufferLimitForTesting } from "../../src/runtime/completion-v3";
@@ -106,6 +112,145 @@ const agent = {
 };
 
 describe("interactive pane runner preparation", () => {
+	test("escalates a Herdr child only after exact identity and authority revalidation", async () => {
+		const calls: string[] = [];
+		const escalation = await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 0,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => "live",
+			signal: (_pid, signal) => { calls.push(signal); return true; },
+			sleep: async () => undefined,
+		});
+		if (process.platform === "win32") {
+			assert.equal(escalation, false, "Windows never uses Unix process signals");
+			assert.deepEqual(calls, []);
+			return;
+		}
+		assert.equal(escalation, true);
+		assert.deepEqual(calls, ["SIGTERM", "SIGKILL"]);
+
+		for (const status of ["dead", "unknown"] as const) {
+			const rejected: string[] = [];
+			assert.equal(await terminateExactUnixChildForTest({
+				processId: 42, expectedStartedAt: 7, termGraceMs: 0,
+				isStillAuthorized: async () => true, classifyIdentity: () => status,
+				signal: (_pid, signal) => { rejected.push(signal); return true; }, sleep: async () => undefined,
+			}), false, status);
+			assert.deepEqual(rejected, [], `${status} identity must not receive a signal`);
+		}
+
+		const completionWon: string[] = [];
+		let authorizationChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 100,
+			isStillAuthorized: async () => ++authorizationChecks === 1,
+			classifyIdentity: () => "live",
+			signal: (_pid, signal) => { completionWon.push(signal); return true; }, sleep: async () => undefined,
+		}), false);
+		assert.deepEqual(completionWon, ["SIGTERM"], "an ownership or exact-state change during grace blocks SIGKILL");
+
+		const childExited: string[] = [], graceSleeps: number[] = [];
+		let identityChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 100,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => ++identityChecks === 1 ? "live" : "dead",
+			signal: (_pid, signal) => { childExited.push(signal); return true; }, sleep: async (milliseconds) => { graceSleeps.push(milliseconds); },
+		}), true);
+		assert.deepEqual(childExited, ["SIGTERM"], "a child death after the immutable cancellation winner is bounded success");
+		assert.deepEqual(graceSleeps, [100], "SIGTERM grace uses one deadline rather than periodic polling");
+
+		const wakeExited: string[] = [], wakeSleeps: number[] = [];
+		let wakeIdentityChecks = 0;
+		assert.equal(await terminateExactUnixChildForTest({
+			processId: 42, expectedStartedAt: 7, termGraceMs: 1_000,
+			isStillAuthorized: async () => true,
+			classifyIdentity: () => ++wakeIdentityChecks === 1 ? "live" : "dead",
+			signal: (_pid, signal) => { wakeExited.push(signal); return true; },
+			waitForWake: async () => undefined,
+			sleep: async (milliseconds) => { wakeSleeps.push(milliseconds); },
+		}), true);
+		assert.deepEqual(wakeExited, ["SIGTERM"], "an early relevant wake observes exact child exit without SIGKILL");
+		assert.deepEqual(wakeSleeps, [], "an event wake does not start a fixed-interval grace poll");
+	});
+
+	test("registered Herdr cancellation elects one immutable fence winner before exact-PID signals", async () => {
+		await resetInteractiveShutdownForSession();
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-cancel-fence-"));
+		const runId = "herdr-cancel-fence", paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+		try {
+			await fs.promises.writeFile(paths.statePath, `${JSON.stringify({ version: 1, runId, sequence: 0, updatedAt: 1, phase: "running", childPid: 42, childStartedAt: 7 })}\n`, { mode: 0o600 });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			const signals: string[] = [];
+			const outcome = await terminateAuthorizedHerdrChildForTest(runId, {
+				termGraceMs: 0, classifyIdentity: () => "live", sleep: async () => undefined,
+				signal: (_pid, signal) => { signals.push(signal); return true; },
+			});
+			if (process.platform === "win32") {
+				assert.equal(outcome, "revoked"); assert.deepEqual(signals, []);
+			} else {
+				assert.equal(outcome, "terminated");
+				assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+				assert.equal(parseCancellationFence(await readJsonFile(paths.completionFencePath), runId)?.childPid, 42);
+			}
+			unregisterCommittedInteractiveRun(runId, true);
+			await fs.promises.rm(paths.completionFencePath, { force: true });
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
+			await publishImmutableJson(paths.completionFencePath, { version: 1, kind: "completion-fence", runId, nonce: "a".repeat(64), publishedAt: 1 });
+			assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "completion-won");
+			await fs.promises.rm(paths.completionFencePath, { force: true });
+			for (const artifact of ["not-json\n", JSON.stringify({ version: 1, kind: "cancellation-fence", runId, childPid: 99, childStartedAt: 7, claimedAt: 1 }) + "\n"]) {
+				await fs.promises.writeFile(paths.completionFencePath, artifact, { mode: 0o600 });
+				assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "revoked");
+				await fs.promises.rm(paths.completionFencePath, { force: true });
+			}
+			await fs.promises.mkdir(paths.completionFencePath);
+			assert.equal(await terminateAuthorizedHerdrChildForTest(runId, { termGraceMs: 0, classifyIdentity: () => "live", signal: () => { throw new Error("must not signal"); } }), "revoked");
+			await fs.promises.rm(paths.completionFencePath, { recursive: true, force: true });
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("shares one Herdr selector socket, serially reconfigures its pane union, and fans an underscore status event only to its pane", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-shared-"));
+		const socketPath = path.join(root, "herdr.sock");
+		let subscriptions = 0, openSockets = 0, maxOpenSockets = 0;
+		const selectorSets: string[][] = [];
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane-a", terminal_id: "terminal-a" };
+		const server = net.createServer((socket) => {
+			openSockets += 1; maxOpenSockets = Math.max(maxOpenSockets, openSockets);
+			socket.once("close", () => { openSockets -= 1; });
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string; params?: { subscriptions?: Array<{ type?: string; pane_id?: string }> } };
+				if (request.method !== "events.subscribe") { socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`); return; }
+				subscriptions += 1;
+				selectorSets.push((request.params?.subscriptions ?? []).filter((item) => item.type === "pane.agent_status_changed").map((item) => item.pane_id!).sort());
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				if (selectorSets.at(-1)?.includes("pane-b")) setTimeout(() => socket.write(`${JSON.stringify({ event: "pane_agent_status_changed", data: { pane_id: "pane-b", workspace_id: "workspace", agent_status: "working" } })}\n`), 1);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
+		let firstReconciles = 0, secondReconciles = 0;
+		const first = subscribeSharedHerdrPaneForTest({ handle, onReconcile: () => { firstReconciles += 1; } });
+		for (let attempt = 0; attempt < 40 && subscriptions !== 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		const second = subscribeSharedHerdrPaneForTest({ handle: { ...handle, paneId: "pane-b", terminalId: "terminal-b" }, onReconcile: () => { secondReconciles += 1; } });
+		for (let attempt = 0; attempt < 80 && (subscriptions !== 2 || secondReconciles !== 1); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(subscriptions, 2, "one serial replacement carries the changed selector union");
+		assert.deepEqual(selectorSets, [["pane-a"], ["pane-a", "pane-b"]]);
+		assert.equal(maxOpenSockets, 1, "replacement waits for the old physical stream to drain");
+		assert.equal(firstReconciles, 0, "pane-b status does not fan out to pane-a");
+		assert.equal(secondReconciles, 1);
+		first.stop(); second.stop(); await Promise.all([first.closed, second.closed]); await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	});
+
 	test("notifies interactive registry observers immediately and after successful shutdown removal", async () => {
 		await shutdownActiveInteractiveRuns();
 		await resetInteractiveShutdownForSession();
@@ -606,9 +751,9 @@ describe("interactive pane runner preparation", () => {
 				await new Promise((resolve) => setTimeout(resolve, 80));
 				assert.ok(inspections <= before + 2, `${label} has bounded coalesced reconciliation`);
 			};
-			await assertBoundedEvent({ event: "pane.updated", data: { pane } }, "relevant pane event");
-			await assertBoundedEvent({ event: "tab.closed", data: { workspace_id: pane.workspace_id, tab_id: pane.tab_id } }, "relevant tab event");
-			await assertBoundedEvent({ event: "workspace.closed", data: { workspace_id: pane.workspace_id } }, "relevant workspace event");
+			await assertBoundedEvent({ event: "pane_updated", data: { pane } }, "relevant pane event");
+			await assertBoundedEvent({ event: "tab_closed", data: { workspace_id: pane.workspace_id, tab_id: pane.tab_id } }, "relevant tab event");
+			await assertBoundedEvent({ event: "workspace_closed", data: { workspace_id: pane.workspace_id } }, "relevant workspace event");
 			const beforeReconnect = inspections;
 			stream!.destroy();
 			await waitFor(() => subscriptions === 2 && inspections > beforeReconnect);
@@ -616,7 +761,7 @@ describe("interactive pane runner preparation", () => {
 			assert.equal(calls.includes("agent.wait"), false);
 			assert.equal(calls.some((method) => ["pane.close", "tab.close", "pane.send_keys", "agent.send-keys"].includes(method)), false);
 			holdNextReconciliation = true;
-			stream!.write(`${JSON.stringify({ event: "pane.updated", data: { pane } })}\n`);
+			stream!.write(`${JSON.stringify({ event: "pane_updated", data: { pane } })}\n`);
 			await heldReconciliationEntered;
 			let resetSettled = false;
 			const reset = resetInteractiveShutdownForSession().then(() => { resetSettled = true; });

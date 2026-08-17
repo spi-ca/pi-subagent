@@ -353,7 +353,10 @@ export class PiSubagentPresenceProducer {
     if (this.requestingReady && payload === this.locallyEmittedReadyRequest) return;
     const ready = parsePiPresenceReady(payload);
     if (!ready || ready.sessionId !== this.sessionId) return;
-    if (!this.presenceRemoveCapabilityDetected && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("presence-remove-v1")) {
+    // Removal is a backend-neutral v1 consumer capability. Consumer identity
+    // only selects the cmux UI-routing hint below; pi-herdr-presence and future
+    // valid consumers must be reflected by the diagnostic as well.
+    if (!this.presenceRemoveCapabilityDetected && ready.consumer?.capabilities.includes("presence-remove-v1")) {
       this.presenceRemoveCapabilityDetected = true;
     }
     if (!this.cmuxStatusConsumerSeen && ready.consumer?.id === "pi-cmux-presence" && ready.consumer.capabilities.includes("cmux-status")) {

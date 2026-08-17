@@ -22,6 +22,7 @@ import {
 	parseAllocationRecordV2,
 	parseCompletionRecord,
 	parseCompletionAuthority,
+	parseCancellationFence,
 	parseCompletionFence,
 	parseCompletionFenceAck,
 	parseCompletionRecordV2,
@@ -343,13 +344,19 @@ describe("run protocol", () => {
 		assert.equal(sameOwnershipTransfer(request, parseOwnershipTransferAck({ ...ack, child: { pid: 99, startedAt: 14 } }, "transfer-run")!), false);
 	});
 
-	test("strictly binds private completion fence and acknowledgement records to run nonce", () => {
+	test("strictly binds private completion, cancellation, and acknowledgement fence records", () => {
 		const nonce = "a".repeat(64);
 		const fence = { version: 1, kind: "completion-fence", runId: "fence-run", nonce, publishedAt: 1 } as const;
+		const cancellation = { version: 1, kind: "cancellation-fence", runId: "fence-run", childPid: 12, childStartedAt: 34, claimedAt: 56 } as const;
 		const ack = { version: 1, kind: "completion-fence-ack", runId: "fence-run", nonce, acknowledgedAt: 2 } as const;
 		assert.deepEqual(parseCompletionFence(fence, "fence-run", nonce), fence);
 		assert.deepEqual(parseCompletionFenceAck(ack, "fence-run", nonce), ack);
+		assert.deepEqual(parseCancellationFence(cancellation, "fence-run"), cancellation);
 		assert.equal(parseCompletionFence({ ...fence, nonce: "b".repeat(64) }, "fence-run", nonce), null);
+		for (const malformed of [
+			{ ...cancellation, extra: true }, { ...cancellation, childPid: 0 }, { ...cancellation, childStartedAt: 0 }, { ...cancellation, childStartedAt: 1.5 },
+			{ ...cancellation, claimedAt: 0 }, { ...cancellation, claimedAt: 1.5 }, { ...cancellation, runId: "other" },
+		]) assert.equal(parseCancellationFence(malformed, "fence-run"), null);
 		assert.equal(parseCompletionFenceAck({ ...ack, extra: true }, "fence-run", nonce), null);
 		assert.equal(parseCompletionFenceAck({ ...ack, acknowledgedAt: 0 }, "fence-run", nonce), null);
 	});

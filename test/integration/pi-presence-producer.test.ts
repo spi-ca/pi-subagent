@@ -379,7 +379,7 @@ describe("pi presence producer wire contract", () => {
     assert.equal(hints, 1);
   });
 
-  test("detects the passive remove capability only from the valid same-session cmux ready advertisement", () => {
+  test("detects the passive remove capability from any valid same-session consumer advertisement", () => {
     const listeners = new Map<string, (value: unknown) => void>();
     let hints = 0;
     const producer = createPiSubagentPresenceProducer({
@@ -391,21 +391,21 @@ describe("pi presence producer wire contract", () => {
 
     producer.startSession("session-1", 0);
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-cmux-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-herdr-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["cmux-status"]));
     listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["cmux-status"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: "presence-remove-v1" } });
+    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-herdr-presence", capabilities: "presence-remove-v1" } });
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
     assert.equal(hints, 1, "cmux-status retains its one-shot callback behavior");
 
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
+    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
-    assert.equal(hints, 1);
+    assert.equal(hints, 1, "Herdr capability must not trigger cmux routing");
 
     producer.startSession("session-2", 1);
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    producer.handleReady(ready("session-2", "pi-cmux-presence", ["presence-remove-v1"]));
+    producer.handleReady(ready("session-2", "future-consumer", ["presence-remove-v1"]));
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
     producer.stop();
     assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);

@@ -56,6 +56,7 @@ import {
   closeHerdrPane,
   inspectHerdrPane,
   interruptHerdrPane,
+  HERDR_MAX_SUBSCRIPTION_PANES,
   parseHerdrEnvironment,
   observeHerdrAgentWait,
   resolveHerdrCallerPane,
@@ -207,7 +208,9 @@ import {
   sameCompletionWinner,
 } from "./interactive-completion.js";
 import {
+  CancellationFenceAuthorityError,
   CompletionFenceAuthorityError,
+  claimCancellationFence,
   publishAndVerifyCompletionFence,
   publishAndVerifyCompletionFenceAck,
   readVerifiedCompletionFence,
@@ -559,6 +562,147 @@ export function createHerdrAgentWaitFallback(options: { handle: HerdrPaneHandle;
     },
   };
 }
+/** One owner-only Herdr event stream per socket generation. Individual runs
+ * retain independent reconciliation authority; this registry shares only the
+ * selector/reconnect transport and fans relevant events out in memory. */
+type SharedHerdrListener = {
+  handle: HerdrPaneHandle;
+  stopped: boolean;
+  onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void;
+  onWake?: () => void;
+  onHealthChange?: (healthy: boolean) => void;
+};
+type SharedHerdrTransport = {
+  listeners: Set<SharedHerdrListener>;
+  subscription: HerdrPaneSubscription | null;
+  healthy: boolean | null;
+  selectorSignature: string;
+  epoch: number;
+  stopped: boolean;
+  reconfigureScheduled: boolean;
+  reconfigure: Promise<void>;
+};
+const sharedHerdrTransports = new Map<string, SharedHerdrTransport>();
+function sharedHerdrTransportKey(handle: HerdrPaneHandle): string {
+  return `${handle.socketPath}\u0000${handle.socketDev}\u0000${handle.socketIno}\u0000${handle.protocol}`;
+}
+function sharedHerdrEventMatches(handle: HerdrPaneHandle, event: string, data: Record<string, unknown> | null): boolean {
+  if (!data) return false;
+  const pane = data.pane && typeof data.pane === "object" && !Array.isArray(data.pane) ? data.pane as Record<string, unknown> : null;
+  const terminalMatches = pane?.terminal_id === handle.terminalId;
+  return (event === "pane_moved" && data.previous_pane_id === handle.paneId && terminalMatches)
+    || data.pane_id === handle.paneId || terminalMatches
+    || (event === "tab_closed" && data.workspace_id === handle.workspaceId && data.tab_id === handle.tabId)
+    || (event === "workspace_closed" && data.workspace_id === handle.workspaceId);
+}
+function sharedHerdrSelectorPaneIds(transport: SharedHerdrTransport): string[] {
+  return [...new Set([...transport.listeners].filter((listener) => !listener.stopped).map((listener) => listener.handle.paneId))].sort();
+}
+function deliverSharedHerdr(transport: SharedHerdrTransport, callback: (listener: SharedHerdrListener) => void): void {
+  for (const listener of transport.listeners) if (!listener.stopped) { try { callback(listener); } catch { /* Event hints never own lifecycle. */ } }
+}
+/** Reconfiguration is microtask-coalesced, then strictly serial: the old stream
+ * is fully drained before a union-selector replacement may connect. */
+function scheduleSharedHerdrTransport(key: string, transport: SharedHerdrTransport): void {
+  if (transport.stopped || transport.reconfigureScheduled) return;
+  transport.reconfigureScheduled = true;
+  queueMicrotask(() => {
+    transport.reconfigure = transport.reconfigure.catch(() => undefined).then(async () => {
+      transport.reconfigureScheduled = false;
+      if (transport.stopped || sharedHerdrTransports.get(key) !== transport) return;
+      const paneIds = sharedHerdrSelectorPaneIds(transport);
+      const signature = paneIds.join("\u0000");
+      if (signature === transport.selectorSignature && transport.subscription) return;
+      const previous = transport.subscription;
+      transport.subscription = null;
+      transport.healthy = null;
+      const epoch = ++transport.epoch;
+      deliverSharedHerdr(transport, (listener) => listener.onHealthChange?.(false));
+      if (previous) {
+        previous.stop();
+        await previous.closed.catch(() => undefined);
+      }
+      if (transport.stopped || sharedHerdrTransports.get(key) !== transport || paneIds.length === 0) return;
+      // A shared endpoint never fans out into extra physical streams. When the
+      // selector union exceeds the same 16-run bound as degraded observation,
+      // listeners remain fail-closed/unhealthy and use their bounded fallback.
+      if (paneIds.length > HERDR_MAX_SUBSCRIPTION_PANES) return;
+      const seed = [...transport.listeners].find((listener) => !listener.stopped);
+      if (!seed) return;
+      transport.selectorSignature = signature;
+      transport.subscription = subscribeHerdrPane({
+        handle: seed.handle,
+        selectorPaneIds: paneIds,
+        onReconcile: () => undefined,
+        reconcileOnEvent: false,
+        wakeOnEvent: false,
+        onWake: () => {
+          if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
+          deliverSharedHerdr(transport, (listener) => listener.onWake?.());
+        },
+        onHealthChange: (healthy) => {
+          if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
+          transport.healthy = healthy;
+          deliverSharedHerdr(transport, (listener) => listener.onHealthChange?.(healthy));
+        },
+        onEvent: (event, data) => {
+          if (transport.stopped || sharedHerdrTransports.get(key) !== transport || transport.epoch !== epoch) return;
+          deliverSharedHerdr(transport, (listener) => {
+            if (!sharedHerdrEventMatches(listener.handle, event, data)) return;
+            listener.onWake?.();
+            void listener.onReconcile(listener.handle);
+          });
+        },
+      });
+      // A listener change while the old stream was draining is coalesced into
+      // exactly one later serial replacement, never a concurrent connection.
+      if (sharedHerdrSelectorPaneIds(transport).join("\u0000") !== signature) scheduleSharedHerdrTransport(key, transport);
+    });
+  });
+}
+function subscribeSharedHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
+  const key = sharedHerdrTransportKey(options.handle);
+  let transport = sharedHerdrTransports.get(key);
+  if (!transport) {
+    transport = { listeners: new Set(), subscription: null, healthy: null, selectorSignature: "", epoch: 0, stopped: false, reconfigureScheduled: false, reconfigure: Promise.resolve() };
+    sharedHerdrTransports.set(key, transport);
+  }
+  const listener: SharedHerdrListener = { ...options, stopped: false };
+  transport.listeners.add(listener);
+  scheduleSharedHerdrTransport(key, transport);
+  let closed = false;
+  let resolveClosed!: () => void;
+  const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  return {
+    stop: () => {
+      if (closed) return;
+      closed = true;
+      listener.stopped = true;
+      transport!.listeners.delete(listener);
+      if (transport!.listeners.size !== 0) {
+        scheduleSharedHerdrTransport(key, transport!);
+        resolveClosed();
+        return;
+      }
+      transport!.stopped = true;
+      transport!.healthy = false;
+      transport!.epoch += 1;
+      sharedHerdrTransports.delete(key);
+      transport!.subscription?.stop();
+      void transport!.reconfigure.catch(() => undefined).then(async () => {
+        await transport!.subscription?.closed.catch(() => undefined);
+      }).finally(resolveClosed);
+    },
+    closed: closedPromise,
+    isHealthy: () => !closed && transport!.healthy === true,
+  };
+}
+
+/** Test-only seam for endpoint-sharing transport verification. */
+export function subscribeSharedHerdrPaneForTest(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; }): HerdrPaneSubscription {
+  return subscribeSharedHerdrPane(options);
+}
+
 const HERDR_COMPLETED_RETIREMENT_MAX_WATCHERS = 16;
 const HERDR_COMPLETED_CLEANUP_RETRY_DELAYS_MS = [100, 250] as const;
 interface CompletedHerdrRetirementWatcher {
@@ -844,7 +988,7 @@ function watchCompletedHerdrDirectRunForRetirement(run: ActiveInteractiveRun, co
     requestReconcile();
     await watcher.reconciliation;
     if (watcher.cancelled || watcher.cleanupCommitted || completedHerdrRetirementWatchers.get(run.runId) !== watcher) return;
-    watcher.subscription = subscribeHerdrPane({
+    watcher.subscription = subscribeSharedHerdrPane({
       handle: herdrHandle,
       onReconcile: requestReconcile,
       onWake: requestReconcile,
@@ -1482,6 +1626,9 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     // promotion; never reinterpret it as an absent terminal record.
     const completionArtifact = await readBrokerArtifact(run.paths!.completionPath);
     if (completionArtifact.outcome !== "missing") return "rejected";
+    // Completion and cancellation now share this immutable pathname. Either
+    // winner revokes ownership transfer before a request can be published.
+    if ((await readBrokerArtifact(run.paths!.completionFencePath)).outcome !== "missing") return "rejected";
     let request: NonNullable<ReturnType<typeof parseOwnershipTransferRequest>>;
     if (requestArtifact.outcome === "missing") {
       request = {
@@ -1562,6 +1709,124 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
  * after the global fence is released. Missing/malformed/replaced completion
  * authority retains recovery.
  */
+type ExactUnixChildTerminationOutcome = "terminated" | "completion-won" | "revoked";
+
+interface ExactUnixChildTerminationOptions {
+  processId: number;
+  expectedStartedAt: number;
+  /** The immutable cancellation claim and durable ownership/state must remain exact. */
+  isStillAuthorized: () => Promise<boolean>;
+  classifyIdentity?: (processId: number, expectedStartedAt: number) => ProcessIdentityStatus;
+  signal?: (processId: number, signal: "SIGTERM" | "SIGKILL") => boolean;
+  sleep?: (milliseconds: number) => Promise<void>;
+  /** Relevant lifecycle/Herdr wake only; never a periodic inspection timer. */
+  waitForWake?: (timeoutMs: number) => Promise<void>;
+  termGraceMs?: number;
+}
+
+/**
+ * Escalate only an exact child PID/start tuple after cancellation has already
+ * won the shared immutable fence. It intentionally never signals a process
+ * group or descendants.
+ */
+async function terminateExactUnixChild(options: ExactUnixChildTerminationOptions): Promise<ExactUnixChildTerminationOutcome> {
+  if (isWindows) return "revoked";
+  const classify = options.classifyIdentity ?? classifyParentProcessIdentity;
+  const signal = options.signal ?? ((processId, terminationSignal) => {
+    try { process.kill(processId, terminationSignal); return true; } catch { return false; }
+  });
+  const sleep = options.sleep ?? (async (milliseconds) => await delay(milliseconds));
+  if (!await options.isStillAuthorized()
+    || classify(options.processId, options.expectedStartedAt) !== "live"
+    || !signal(options.processId, "SIGTERM")) return "revoked";
+  // The cancellation winner remains immutable through one bounded grace
+  // deadline. Relevant lifecycle/Herdr events can prove an early exact-child
+  // exit; no artifact/process polling is performed. Bound pathological
+  // immediate wake delivery before yielding once to the same final deadline.
+  const deadline = Date.now() + Math.max(0, options.termGraceMs ?? SIGKILL_TIMEOUT_MS);
+  let wakeRevalidations = 0;
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    if (!options.waitForWake || wakeRevalidations >= 16) {
+      await sleep(remainingMs);
+      break;
+    }
+    await options.waitForWake(remainingMs);
+    if (Date.now() >= deadline) break;
+    if (!await options.isStillAuthorized()) return "revoked";
+    if (classify(options.processId, options.expectedStartedAt) !== "live") return "terminated";
+    wakeRevalidations += 1;
+  }
+  if (!await options.isStillAuthorized()) return "revoked";
+  if (classify(options.processId, options.expectedStartedAt) !== "live") return "terminated";
+  return signal(options.processId, "SIGKILL") ? "terminated" : "revoked";
+}
+
+/** Test seam for the exact-PID-only Herdr cancellation escalation. */
+export async function terminateExactUnixChildForTest(options: ExactUnixChildTerminationOptions): Promise<boolean> {
+  return await terminateExactUnixChild(options) === "terminated";
+}
+
+/**
+ * Active direct-Herdr cancellation is the sole force-termination authority.
+ * It first elects a cancellation claim against the child's completion fence;
+ * therefore no read of that pathname can race the eventual SIGTERM/SIGKILL.
+ */
+type ExactUnixChildTerminationHooks = Pick<ExactUnixChildTerminationOptions, "classifyIdentity" | "signal" | "sleep" | "waitForWake" | "termGraceMs">;
+
+async function terminateAuthorizedHerdrChild(
+  runId: string,
+  expectedRun: ActiveInteractiveRun,
+  hooks: ExactUnixChildTerminationHooks = {},
+): Promise<ExactUnixChildTerminationOutcome> {
+  const expectedOwnership = expectedRun.ownership;
+  if (!expectedRun.paths || (expectedOwnership !== "managed" && expectedOwnership !== "kept")) return "revoked";
+  let queued: Promise<ExactUnixChildTerminationOutcome> | undefined;
+  await withInteractiveFenceMutex(() => {
+    if (activeInteractiveRuns.get(runId) !== expectedRun || expectedRun.ownership !== expectedOwnership) return;
+    queued = serializeInteractiveRun(expectedRun, async () => {
+      const paths = expectedRun.paths!;
+      const initialState = parseRunState(await readBoundedPrivateJson(paths.statePath), runId);
+      if (!initialState?.childPid || !initialState.childStartedAt) return "revoked";
+      const expectedChild = { pid: initialState.childPid, startedAt: initialState.childStartedAt };
+      const ownsExactState = async () => {
+        const owns = await withInteractiveFenceMutex(() => activeInteractiveRuns.get(runId) === expectedRun
+          && expectedRun.ownership === expectedOwnership);
+        if (!owns) return false;
+        const state = parseRunState(await readBoundedPrivateJson(paths.statePath), runId);
+        return state?.childPid === expectedChild.pid && state.childStartedAt === expectedChild.startedAt;
+      };
+      // Validate completion, ownership, and the exact durable child tuple
+      // before linking the immutable claim. Any existing completion artifact
+      // is terminal authority; a malformed path or an existing cancellation
+      // claim remains revoked/fail-closed inside claimCancellationFence.
+      if ((await readBrokerArtifact(paths.completionPath)).outcome !== "missing" || !await ownsExactState()) return "revoked";
+      const winner = await claimCancellationFence(paths, runId, expectedChild.pid, expectedChild.startedAt);
+      if (winner === "completion-won") return "completion-won";
+      if (winner !== "claimed") return "revoked";
+      // The claim is now the only completion/cancellation winner. Revalidate
+      // only mutable ownership and exact PID/start state during grace; never
+      // reread the shared fence at a signal boundary.
+      return await terminateExactUnixChild({
+        processId: expectedChild.pid,
+        expectedStartedAt: expectedChild.startedAt,
+        isStillAuthorized: ownsExactState,
+        ...hooks,
+      });
+    });
+  });
+  return await queued ?? "revoked";
+}
+
+/** Test seam for the registered-run cancellation path, including its FIFO and artifact checks. */
+export async function terminateAuthorizedHerdrChildForTest(
+  runId: string,
+  hooks: ExactUnixChildTerminationHooks = {},
+): Promise<ExactUnixChildTerminationOutcome> {
+  const run = activeInteractiveRuns.get(runId);
+  return run ? await terminateAuthorizedHerdrChild(runId, run, hooks) : "revoked";
+}
+
 async function interruptActiveInteractiveRunWithoutWinner(options: {
   runId: string;
   expectedRun: ActiveInteractiveRun;
@@ -5951,7 +6216,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     return verified;
   });
   /** Fence callbacks under the same FIFO as incremental drains and final replay. */
-  const fenceCallbacksForCompletion = async (publishIfMissing: boolean): Promise<"none" | "fenced" | "invalid" | "timed-out"> => await serializeResultMutation(async () => {
+  const fenceCallbacksForCompletion = async (publishIfMissing: boolean): Promise<"none" | "fenced" | "cancelled" | "invalid" | "timed-out"> => await serializeResultMutation(async () => {
     if (completionFenceInvalid) return "invalid";
     if (completionFenced) return "fenced";
     if (!paths) return "invalid";
@@ -5961,6 +6226,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         ? await publishAndVerifyCompletionFence(paths, path.basename(paths.runDir), completionFenceNonce)
         : await readVerifiedCompletionFence(paths, path.basename(paths.runDir), completionFenceNonce);
     } catch (error) {
+      if (error instanceof CancellationFenceAuthorityError) return "cancelled";
       if (!(error instanceof CompletionFenceAuthorityError)) throw error;
       completionFenced = true;
       completionFenceInvalid = true;
@@ -6367,7 +6633,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     if (handle.mode === "herdr-pane") {
       const herdrHandle = handle.native;
       herdrAgentWaitFallback = createHerdrAgentWaitFallback({ handle: herdrHandle, onWake: signalHerdrWake });
-      herdrSubscription = subscribeHerdrPane({
+      herdrSubscription = subscribeSharedHerdrPane({
         handle: herdrHandle,
         onReconcile: () => signalHerdrWake(),
         onWake: signalHerdrWake,
@@ -6839,6 +7105,18 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       const completionRead = await readInteractiveCompletionAuthority(paths.completionPath, runId);
       if (completionRead.outcome === "invalid") return failClosedInvalidCompletion();
       const completion = completionRead.outcome === "completion" ? completionRead.completion : null;
+      if (fenceState === "cancelled" && !completion) {
+        // A cancellation claim is a terminal shared-fence winner, not a child
+        // completion awaiting ACK. Do not leave this monitor fenced forever.
+        preserveDiagnostics = true;
+        retainRecoveryMetadata = true;
+        skipFinalRelease = true;
+        result.exitCode = 130;
+        result.stopReason = "aborted";
+        result.errorMessage = "Herdr cancellation claim retained for bounded recovery.";
+        if (!result.stderr.trim()) result.stderr = result.errorMessage;
+        return normalizeCompletedResult(result, true);
+      }
       if (fenceState === "fenced" && !completion) {
         await waitForFreshTopologyOrLifecycleHint();
         continue;
@@ -6982,15 +7260,29 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         }
         if (Date.now() - abortStartedAt >= ABORT_WAIT_MS) {
           if (handle.mode === "herdr-pane" && handle.placement?.placement === "herdr-new-tab") {
-            // Never replace the cooperative child's terminal authority with a
-            // parent winner or pane mutation. A missing/hung control channel
-            // leaves durable recovery for the child's lease fallback/reaper.
+            // Preserve authenticated cooperative abort first. Only after its
+            // bounded grace may active cancellation signal the exact durable
+            // child tuple; any changed completion/ownership/identity retains
+            // recovery and never mutates the Herdr pane or tab.
+            const active = activeInteractiveRuns.get(runId);
+            const escalation = active && active === activeInteractiveRun
+              ? await terminateAuthorizedHerdrChild(runId, active, {
+                waitForWake: async (timeoutMs) => await Promise.race([
+                  runLifecycleServerWait(lifecycleEventServer, runId, timeoutMs),
+                  waitForHerdrWake(timeoutMs),
+                ]),
+              })
+              : "revoked";
+            // A completion or completion fence can appear during SIGTERM
+            // grace. Return to the normal monitor rather than reporting an
+            // abort: it owns fence acknowledgement and winner replay.
+            if (escalation === "completion-won") continue;
             preserveDiagnostics = true;
             retainRecoveryMetadata = true;
             skipFinalRelease = true;
             result.exitCode = 130;
             result.stopReason = "aborted";
-            result.errorMessage = "Herdr cooperative shutdown was not confirmed; recovery state retained.";
+            result.errorMessage = "Herdr cooperative shutdown did not complete; recovery state retained.";
             if (!result.stderr.trim()) result.stderr = result.errorMessage;
             return normalizeCompletedResult(result, true);
           }

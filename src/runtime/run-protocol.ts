@@ -128,6 +128,16 @@ export interface CompletionFenceAckV1 {
 	acknowledgedAt: number;
 }
 
+/** Private immutable cancellation winner sharing the completion fence pathname. */
+export interface CancellationFenceV1 {
+	version: 1;
+	kind: "cancellation-fence";
+	runId: string;
+	childPid: number;
+	childStartedAt: number;
+	claimedAt: number;
+}
+
 /**
  * Legacy private ownership marker. Read-only compatibility for markers written
  * before the public detached-ownership v1 contract; never publish this shape.
@@ -788,12 +798,21 @@ function isCompletionFenceNonce(value: unknown): value is string {
 	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
-export function parseCompletionFence(value: unknown, runId: string, nonce: string): CompletionFenceV1 | null {
+export function parseCompletionFence(value: unknown, runId: string, nonce?: string): CompletionFenceV1 | null {
 	if (!isRecord(value) || !hasExactKeys(value, ["version", "kind", "runId", "nonce", "publishedAt"])
 		|| value.version !== 1 || value.kind !== "completion-fence" || value.runId !== runId || !isSafeRunId(value.runId)
-		|| value.nonce !== nonce || !isCompletionFenceNonce(value.nonce)
+		|| (nonce !== undefined && value.nonce !== nonce) || !isCompletionFenceNonce(value.nonce)
 		|| !Number.isSafeInteger(value.publishedAt) || (value.publishedAt as number) <= 0) return null;
 	return value as unknown as CompletionFenceV1;
+}
+
+/** Strict parser for the private cancellation side of the shared fence race. */
+export function parseCancellationFence(value: unknown, runId: string): CancellationFenceV1 | null {
+	if (!isRecord(value) || !hasExactKeys(value, ["version", "kind", "runId", "childPid", "childStartedAt", "claimedAt"])
+		|| value.version !== 1 || value.kind !== "cancellation-fence" || value.runId !== runId || !isSafeRunId(value.runId)
+		|| !pid(value.childPid) || !Number.isSafeInteger(value.childStartedAt) || (value.childStartedAt as number) <= 0
+		|| !Number.isSafeInteger(value.claimedAt) || (value.claimedAt as number) <= 0) return null;
+	return value as unknown as CancellationFenceV1;
 }
 
 export function parseCompletionFenceAck(value: unknown, runId: string, nonce: string): CompletionFenceAckV1 | null {

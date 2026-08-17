@@ -31,6 +31,7 @@ import {
 	isUsableParentLease,
 	isParentProcessIdentityAlive,
 	classifyParentProcessIdentity,
+	parseCancellationFence,
 	parseCompletionFence,
 	parseCompletionFenceAck,
 	parseAllocationRecordV2,
@@ -89,6 +90,11 @@ interface BridgeConfig {
 interface LastAssistantStatus {
 	stopReason?: string;
 	hasText: boolean;
+}
+
+/** A parent cancellation winner is not a completion fence and never awaits ACK. */
+class CancellationFenceEncounteredError extends Error {
+	constructor() { super("cancellation fence won"); this.name = "CancellationFenceEncounteredError"; }
 }
 
 const SUBAGENT_MANAGED_TITLE_ENV = "PI_SUBAGENT_MANAGED_TITLE";
@@ -540,8 +546,14 @@ export function registerChildBridge(
 		};
 		let published: ReturnType<typeof parseCompletionFence>;
 		try {
-			published = parseCompletionFence(await beforeAckDeadline(async () => await (options.readCompletionFence
-				?? ((filePath: string) => readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true })))(config.completionFencePath!)), config.runId, config.completionFenceNonce);
+			const rawFence = await beforeAckDeadline(async () => await (options.readCompletionFence
+				?? ((filePath: string) => readBoundedPrivateJson(filePath, { requireSingleLineTerminated: true })))(config.completionFencePath!));
+			const cancellation = parseCancellationFence(rawFence, config.runId);
+			if (cancellation) {
+				if (cancellation.childPid === process.pid && cancellation.childStartedAt === childStartedAt) throw new CancellationFenceEncounteredError();
+				throw new Error("cancellation fence conflicts with this child identity");
+			}
+			published = parseCompletionFence(rawFence, config.runId, config.completionFenceNonce);
 		} catch (error) {
 			if (parentIsExactlyDead() && error instanceof Error && error.message === "completion fence acknowledgement deadline expired") return;
 			throw error;
@@ -601,7 +613,12 @@ export function registerChildBridge(
 		};
 		try {
 			await publishCompletionFenceAndWaitForAck(fromChecker);
-		} catch {
+		} catch (error) {
+			if (error instanceof CancellationFenceEncounteredError) {
+				// The parent already won the shared fence. Do not publish/await an ACK;
+				// make one bounded boundary-less aborted settlement instead.
+				return await publishFailure("aborted", "surface-closed", "cancellation-fence", false);
+			}
 			// A failed handshake is deliberately boundary-less: no live callback may
 			// be treated as included when the parent could not prove its ACK.
 			return await publishFailure("failed", "bridge-error", "completion-fence-unverified", false);

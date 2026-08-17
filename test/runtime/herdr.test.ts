@@ -609,7 +609,7 @@ describe("Herdr socket client", () => {
 					type: "pane.agent_status_changed", pane_id: sourcePane.pane_id,
 				});
 				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
-				setTimeout(() => socket.write(`${JSON.stringify({ event: "pane.moved", data: { previous_pane_id: sourcePane.pane_id, pane: moved } })}\n`), 5);
+				setTimeout(() => socket.write(`${JSON.stringify({ event: "pane_moved", data: { previous_pane_id: sourcePane.pane_id, pane: moved } })}\n`), 5);
 				return;
 			}
 			if (request.method === "pane.get" && (request.params as { pane_id: string }).pane_id === sourcePane.pane_id) {
@@ -689,11 +689,11 @@ describe("Herdr socket client", () => {
 		const subscription = subscribeHerdrPane({ handle, onReconcile: () => { reconciled += 1; } });
 		for (let attempt = 0; attempt < 40 && reconciled === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 		const initial = reconciled;
-		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: "other-workspace", tab_id: sourcePane.tab_id } })}\n`);
-		subscriptionSocket!.write(`${JSON.stringify({ event: "workspace.closed", data: { workspace_id: "other-workspace" } })}\n`);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab_closed", data: { workspace_id: "other-workspace", tab_id: sourcePane.tab_id } })}\n`);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "workspace_closed", data: { workspace_id: "other-workspace" } })}\n`);
 		await new Promise((resolve) => setTimeout(resolve, 30));
 		assert.equal(reconciled, initial);
-		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab_closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
 		for (let attempt = 0; attempt < 40 && reconciled === initial; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.ok(reconciled > initial);
 		subscription.stop(); await subscription.closed; await fixture.close();
@@ -728,7 +728,7 @@ describe("Herdr socket client", () => {
 		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
 		const subscription = subscribeHerdrPane({ handle, onReconcile: async () => { calls += 1; if (calls === 1) await first; } });
 		for (let attempt = 0; attempt < 40 && calls === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab_closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
 		release();
 		for (let attempt = 0; attempt < 40 && calls < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.equal(calls, 2, "a pending wake restarts exactly one reconciliation after the active promise settles");

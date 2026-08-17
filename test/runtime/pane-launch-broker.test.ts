@@ -137,7 +137,7 @@ function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = pro
 
 const herdrSource = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-source", terminal_id: "herdr-source-terminal" };
 const herdrChild = { workspace_id: "herdr-workspace", tab_id: "herdr-tab", pane_id: "herdr-child", terminal_id: "herdr-child-terminal" };
-type HerdrBrokerMode = "success" | "split-unknown" | "send-unknown" | "send-known" | "send-known-after-move" | "send-known-duplicate-unrelated" | "split-terminal-reuse" | "split-pane-reuse" | "source-moved" | "source-moved-current-pane-reuse" | `split-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}` | `send-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}`;
+type HerdrBrokerMode = "success" | "split-unknown" | "layout-unknown" | "send-unknown" | "send-known" | "send-known-after-move" | "send-known-duplicate-unrelated" | "split-terminal-reuse" | "split-pane-reuse" | "source-moved" | "source-moved-current-pane-reuse" | `split-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}` | `send-${"malformed" | "oversized" | "wrong-id" | "wrong-type"}`;
 async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protocol = 20) {
 	const socketPath = path.join(root, `herdr-${mode}.sock`), calls: string[] = [], requests: Array<{ method: string; params: Record<string, unknown> }> = [];
 	let sourceGets = 0, tabCreated = false, reboundSourcePaneId: string | null = null, childClosed = false, knownSendFailed = false;
@@ -149,7 +149,7 @@ async function fakeHerdrBrokerServer(root: string, mode: HerdrBrokerMode, protoc
 			if (newline < 0) return;
 			const request = JSON.parse(input.slice(0, newline)) as { id: string; method: string; params: Record<string, unknown> };
 			calls.push(request.method); requests.push({ method: request.method, params: request.params });
-			if (request.method === "pane.split" && mode === "split-unknown" || request.method === "pane.send_text" && mode === "send-unknown") { socket.destroy(); return; }
+			if ((request.method === "pane.split" && mode === "split-unknown") || (request.method === "layout.apply" && mode === "layout-unknown") || (request.method === "pane.send_text" && mode === "send-unknown")) { socket.destroy(); return; }
 			if (mode === "send-known-duplicate-unrelated" && knownSendFailed && request.method === "pane.get" && request.params.pane_id === herdrChild.pane_id) {
 				socket.end(`${JSON.stringify({ id: request.id, error: { code: "pane_not_found", message: "missing" } })}\n`); return;
 			}
@@ -257,6 +257,25 @@ describe("pane launch broker", () => {
 				}
 			} finally { await server.close(); }
 		}
+	});
+
+	test("retains Herdr auto layout response loss as residual risk without retry, discovery, or destructive recovery", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "layout-unknown");
+		try {
+			const stateRoot = path.join(root, "state-layout-unknown"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "herdr-layout-unknown" });
+			assert.equal(await run(await writeHerdrIntent(paths, "herdr-layout-unknown", server.socketPath, 20, "auto"), process.env, paths.runDir), 0);
+			assert.deepEqual(await readBrokerJson(paths.residualRiskPath), {
+				version: 2, runId: "herdr-layout-unknown", reason: "possible-unrecorded-allocation",
+				recordedAt: (await readBrokerJson(paths.residualRiskPath) as { recordedAt: number }).recordedAt,
+			});
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "possible-unrecorded-allocation");
+			assert.deepEqual(server.calls.filter((method) => method === "layout.apply"), ["layout.apply"], "never retry an ambiguous creation");
+			assert.equal(server.calls.includes("pane.list"), false, "tab labels cannot safely rediscover an allocation");
+			assert.equal(server.calls.some((method) => method === "pane.close" || method === "pane.send_keys" || method === "pane.send_text"), false);
+		} finally { await server.close(); }
 	});
 
 	test("allocates auto Herdr children with one direct layout.apply and records the exact root-pane tab", async () => {

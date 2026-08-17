@@ -630,10 +630,12 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 
-	test("stops an in-flight subscription reconciliation before it can call back", async () => {
+	test("stops and drains in-flight subscription reconciliation without post-stop callbacks or requests", async () => {
 		let resolvePaneGet!: () => void, callbacks = 0;
+		const calls: string[] = [];
 		const paneGetHeld = new Promise<void>((resolve) => { resolvePaneGet = resolve; });
 		const fixture = await serverFor((request, socket) => {
+			calls.push(request.method as string);
 			if (request.method === "events.subscribe") return socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
 			void paneGetHeld.then(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`));
 		});
@@ -641,9 +643,12 @@ describe("Herdr socket client", () => {
 		const subscription = subscribeHerdrPane({ handle, onReconcile: () => { callbacks += 1; } });
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		subscription.stop();
+		const requestsAtStop = calls.length;
 		resolvePaneGet();
 		await subscription.closed;
+		await new Promise((resolve) => setTimeout(resolve, 120));
 		assert.equal(callbacks, 0);
+		assert.equal(calls.length, requestsAtStop, "stop prevents a late reconciliation from issuing pane.list or reconnect requests");
 		assert.deepEqual({ workspaceId: handle.workspaceId, tabId: handle.tabId, paneId: handle.paneId }, { workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id });
 		await fixture.close();
 	});
@@ -667,6 +672,86 @@ describe("Herdr socket client", () => {
 		assert.deepEqual({ subscriptions, paneGets }, { subscriptions: 1, paneGets: 1 }, "a healthy idle subscription must not issue steady pane.get polling");
 		subscription.stop(); await subscription.closed;
 		await fixture.close();
+	});
+
+	test("ignores unrelated tab/workspace closure events and wakes only the tracked scope", async () => {
+		let subscriptionSocket: net.Socket | undefined, reconciled = 0;
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "events.subscribe") {
+				subscriptionSocket = socket;
+				assert.deepEqual((request.params as { subscriptions: Array<{ type: string }> }).subscriptions.map(({ type }) => type), ["pane.closed", "pane.exited", "pane.updated", "pane.moved", "pane.agent_status_changed", "tab.closed", "workspace.closed"]);
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				return;
+			}
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, onReconcile: () => { reconciled += 1; } });
+		for (let attempt = 0; attempt < 40 && reconciled === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		const initial = reconciled;
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: "other-workspace", tab_id: sourcePane.tab_id } })}\n`);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "workspace.closed", data: { workspace_id: "other-workspace" } })}\n`);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.equal(reconciled, initial);
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
+		for (let attempt = 0; attempt < 40 && reconciled === initial; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.ok(reconciled > initial);
+		subscription.stop(); await subscription.closed; await fixture.close();
+	});
+
+	test("wakes completed watchers after every failed reconnect attempt without repeating health transitions", async () => {
+		let wakes = 0;
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "events.subscribe") socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, reconnectDelayMs: 100, onReconcile: () => undefined, onWake: () => { wakes += 1; } });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const beforeFailure = wakes;
+		await fixture.close();
+		for (let attempt = 0; attempt < 100 && wakes < beforeFailure + 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(wakes >= beforeFailure + 2, "each completed failed reconnect attempt wakes reconciliation even while health remains false");
+		subscription.stop(); await subscription.closed;
+	});
+
+	test("coalesces a wake received while reconciliation is settling", async () => {
+		let subscriptionSocket: net.Socket | undefined, calls = 0, release!: () => void;
+		const first = new Promise<void>((resolve) => { release = resolve; });
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "events.subscribe") {
+				subscriptionSocket = socket;
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				return;
+			}
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, onReconcile: async () => { calls += 1; if (calls === 1) await first; } });
+		for (let attempt = 0; attempt < 40 && calls === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		subscriptionSocket!.write(`${JSON.stringify({ event: "tab.closed", data: { workspace_id: sourcePane.workspace_id, tab_id: sourcePane.tab_id } })}\n`);
+		release();
+		for (let attempt = 0; attempt < 40 && calls < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(calls, 2, "a pending wake restarts exactly one reconciliation after the active promise settles");
+		subscription.stop(); await subscription.closed; await fixture.close();
+	});
+
+	test("reports strict subscription health transitions across reconnect", async () => {
+		let subscriptions = 0;
+		const health: boolean[] = [];
+		const fixture = await serverFor((request, socket) => {
+			if (request.method === "events.subscribe") {
+				subscriptions += 1;
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				if (subscriptions === 1) setTimeout(() => socket.end(), 5);
+				return;
+			}
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`);
+		});
+		const handle = { socketPath: fixture.socketPath, ...socketGeneration(fixture.socketPath), workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 20 as const };
+		const subscription = subscribeHerdrPane({ handle, onReconcile: () => undefined, onHealthChange: (healthy) => health.push(healthy) });
+		for (let attempt = 0; attempt < 80 && health.length < 3; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.deepEqual(health, [true, false, true]);
+		subscription.stop(); await subscription.closed; await fixture.close();
 	});
 
 	test("reconnects after a subscription disconnect and reconciles once per recovered stream", async () => {

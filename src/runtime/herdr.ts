@@ -23,8 +23,8 @@ const HERDR_SUBSCRIBE_CONNECT_TIMEOUT_MS = 5_000;
 const HERDR_SUBSCRIBE_ACK_TIMEOUT_MS = 5_000;
 const HERDR_RECONNECT_MIN_MS = 100;
 const HERDR_RECONNECT_MAX_MS = 5_000;
-const HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS = 1_000;
-const HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS = 1_250;
+const HERDR_AGENT_WAIT_SERVER_TIMEOUT_MS = 30_000;
+const HERDR_AGENT_WAIT_CLIENT_TIMEOUT_MS = 31_000;
 const HERDR_AGENT_WAIT_MAX_OBSERVERS = 16;
 /** A reconciliation list must remain a bounded recovery operation. */
 const HERDR_MAX_LISTED_PANES = 128;
@@ -378,10 +378,21 @@ export function observeHerdrAgentWait(options: { handle: HerdrPaneHandle; onWake
 }
 /** Events only wake a single coalesced authoritative reconciliation. Event
  * payloads can establish relevance but never update a live binding or presence. */
-export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; reconnectDelayMs?: number; }): HerdrPaneSubscription {
-	let stopped = false; let healthy = false; let current: net.Socket | null = null; let reconciliation: Promise<void> | null = null; let reconciliationPending = false;
+export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconcile: (pane: HerdrPaneHandle | undefined) => Promise<void> | void; onWake?: () => void; onHealthChange?: (healthy: boolean) => void; reconnectDelayMs?: number; }): HerdrPaneSubscription {
+	let stopped = false; let healthy: boolean | null = null; let current: net.Socket | null = null; let reconciliation: Promise<void> | null = null; let reconciliationPending = false;
 	const controller = new AbortController();
 	const wake = () => { if (!stopped) options.onWake?.(); };
+	// Health is a transport fact, not lifecycle authority. Notify exactly once
+	// per transition so callers can add/remove their degraded-only observer.
+	const setHealthy = (next: boolean) => {
+		const changed = healthy !== next;
+		healthy = next;
+		// Health notifications are transition-only, but every completed stream
+		// attempt is a wake: repeated failed reconnects may reveal a completed
+		// watcher whose authoritative read can now succeed.
+		if (changed && !stopped) options.onHealthChange?.(next);
+		wake();
+	};
 	const minDelay = Math.max(HERDR_RECONNECT_MIN_MS, options.reconnectDelayMs ?? HERDR_RECONNECT_MIN_MS);
 	const sleep = async (ms: number) => await new Promise<void>((resolve) => {
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -394,14 +405,17 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 		reconciliationPending = true;
 		if (reconciliation) return;
 		reconciliation = (async () => {
-			do {
-				reconciliationPending = false;
-				if (stopped || controller.signal.aborted) return;
-				const pane = await reconcileHerdrPaneBinding(options.handle, controller.signal);
-				if (stopped || controller.signal.aborted) return;
-				await options.onReconcile(pane);
-			} while (reconciliationPending && !stopped && !controller.signal.aborted);
-		})().catch(() => undefined).finally(() => { reconciliation = null; });
+			reconciliationPending = false;
+			if (stopped || controller.signal.aborted) return;
+			const pane = await reconcileHerdrPaneBinding(options.handle, controller.signal);
+			if (stopped || controller.signal.aborted) return;
+			await options.onReconcile(pane);
+		})().catch(() => undefined).finally(() => {
+			reconciliation = null;
+			// A wake may land after the body observed pending but before this
+			// promise is cleared. Restart exactly one coalesced reconciliation.
+			if (reconciliationPending && !stopped && !controller.signal.aborted) requestReconcile();
+		});
 	};
 	const closed = (async () => {
 		let delay = minDelay;
@@ -411,16 +425,16 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 				await new Promise<void>((resolve, reject) => {
 					const id = safeRequestId(); let buffer = Buffer.alloc(0); let acknowledged = false; let settled = false;
 					const socket = current = net.createConnection({ path: options.handle.socketPath });
-					const finish = (error?: Error) => { if (settled) return; settled = true; healthy = false; wake(); clearTimeout(connectTimer); clearTimeout(ackTimer); socket.destroy(); current = null; error ? reject(error) : resolve(); };
+					const finish = (error?: Error) => { if (settled) return; settled = true; setHealthy(false); clearTimeout(connectTimer); clearTimeout(ackTimer); socket.destroy(); current = null; error ? reject(error) : resolve(); };
 					const connectTimer = setTimeout(() => finish(new Error("Herdr subscription connect timed out.")), HERDR_SUBSCRIBE_CONNECT_TIMEOUT_MS);
 					let ackTimer: ReturnType<typeof setTimeout> | undefined;
 					socket.once("connect", () => { clearTimeout(connectTimer); ackTimer = setTimeout(() => finish(new Error("Herdr subscription acknowledgement timed out.")), HERDR_SUBSCRIBE_ACK_TIMEOUT_MS); socket.write(`${JSON.stringify({ id, method: "events.subscribe", params: { subscriptions: [
 						{ type: "pane.closed" }, { type: "pane.exited" }, { type: "pane.updated" }, { type: "pane.moved" },
-						{ type: "pane.agent_status_changed", pane_id: options.handle.paneId },
+						{ type: "pane.agent_status_changed", pane_id: options.handle.paneId }, { type: "tab.closed" }, { type: "workspace.closed" },
 					] } })}\n`, (error) => { if (error) finish(error); }); });
 					socket.on("data", (chunk: Buffer) => {
 						buffer = Buffer.concat([buffer, chunk]); if (buffer.length > HERDR_MAX_LINE_BYTES) return finish(new Error("Herdr subscription exceeded the strict wire limit."));
-						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; healthy = true; wake(); clearTimeout(ackTimer); delay = minDelay; requestReconcile(); continue; }
+						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; setHealthy(true); clearTimeout(ackTimer); delay = minDelay; requestReconcile(); continue; }
 							const data = isRecord(message.data) ? message.data : null;
 							// Event payloads only establish relevance. Every binding and presence
 							// decision below comes from a fresh pane.get or bounded pane.list.
@@ -429,11 +443,17 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 								&& paneFromSnapshot(data.pane, options.handle.protocol)?.terminalId === options.handle.terminalId;
 							const samePane = data?.pane_id === options.handle.paneId
 								|| paneFromSnapshot(eventPane, options.handle.protocol)?.terminalId === options.handle.terminalId;
-							if (moved || samePane) { wake(); requestReconcile(); } }
+							const tabClosed = message.event === "tab.closed" && data?.workspace_id === options.handle.workspaceId && data.tab_id === options.handle.tabId;
+							const workspaceClosed = message.event === "workspace.closed" && data?.workspace_id === options.handle.workspaceId;
+							if (moved || samePane || tabClosed || workspaceClosed) { wake(); requestReconcile(); } }
 					});
 					socket.once("error", finish); socket.once("close", () => { if (stopped) finish(); else finish(new Error("Herdr subscription disconnected.")); });
 				});
-			} catch { /* bounded retry; direct pane queries remain authority */ }
+			} catch {
+				// Even a failed pre-connect generation/socket check completes a
+				// reconnect attempt and must wake retained completion watchers.
+				setHealthy(false);
+			}
 			if (!stopped) { await sleep(delay); delay = Math.min(HERDR_RECONNECT_MAX_MS, delay * 2); }
 		}
 		await Promise.resolve(reconciliation).catch(() => undefined);
@@ -441,7 +461,7 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 	return { stop: () => {
 		if (stopped) return;
 		stopped = true; healthy = false; reconciliationPending = false; controller.abort(); current?.destroy();
-	}, closed, isHealthy: () => healthy && !stopped };
+	}, closed, isHealthy: () => healthy === true && !stopped };
 }
 
 export async function resolveHerdrCallerPane(env: NodeJS.ProcessEnv = process.env): Promise<HerdrPaneHandle | null> {

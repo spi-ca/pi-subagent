@@ -8,7 +8,7 @@
 
 ## 1. 결정 요약
 
-현재 interactive runtime은 durable completion·lease artifact를 복구 authority로 유지한다. 구현된 cmux 정상 경로는 authenticated lifecycle socket 연결과 1초 memory heartbeat 동안 periodic `system.tree`를 발행하지 않고, disconnect·stale heartbeat·cmux event reconciliation hint·abort/final cleanup에서만 exact snapshot을 사용한다. stable 3.7a 이상 gate를 통과한 tmux run도 process-owned `tmux -C` notification 대기 중 periodic status query와 recurring short-lived tmux process를 만들지 않고, event·disconnect·abort/final/reaper에서만 같은 generation의 exact snapshot을 사용한다. **version/malformed-version 실패는 allocation 전에 fail-closed이며 V2 fallback이 아니다.** 최소 버전을 충족한 뒤 V3의 비-version transport 조건만 통과하지 못한 tmux는 기존 strict V2 safe path를 유지하며, file/lease polling과 일부 session/reaper 상태는 여전히 run 수와 session 길이에 따라 증가한다.
+현재 interactive runtime은 durable completion·lease artifact를 복구 authority로 유지한다. 구현된 cmux 정상 경로는 authenticated lifecycle socket 연결과 1초 memory heartbeat 동안 periodic `system.tree`를 발행하지 않고, disconnect·stale heartbeat·cmux event reconciliation hint·abort/final cleanup에서만 exact snapshot을 사용한다. stable 3.7a 이상 gate를 통과한 tmux run도 process-owned `tmux -C` notification 대기 중 periodic status query와 recurring short-lived tmux process를 만들지 않고, event·disconnect·abort/final/reaper에서만 같은 generation의 exact snapshot을 사용한다. Herdr는 `HERDR_SOCKET_PATH`에 직접 연결하고 Herdr CLI나 supervisor process를 만들지 않는다. healthy `events.subscribe`가 primary wake path이며 `agent.wait`는 stream disconnect/unhealthy 때만 30초 server/31초 client의 긴 bounded degraded fallback으로 run당 observer/in-flight wait 하나, process 전체 최대 16개를 허용한다. Herdr `auto`/new-tab completed retirement는 최초 reconciliation과 relevant pane/tab/workspace event 또는 반복 disconnect/reconnect wake 뒤 fresh `pane.get`/bounded `pane.list` reconciliation으로 진행하고, 자동 `pane.close`/`tab.close`/`pane.send_keys`/`agent.send-keys` mutation을 보내지 않는다. 이는 degraded path까지 순수 event-only라는 주장이 아니다. reconnect backoff, lifecycle/backend fallback timer와 confirmed-absence 뒤의 유한 cleanup-only retry가 남는다. **version/malformed-version 실패는 allocation 전에 fail-closed이며 V2 fallback이 아니다.** 최소 버전을 충족한 뒤 V3의 비-version transport 조건만 통과하지 못한 tmux는 기존 strict V2 safe path를 유지하며, file/lease polling과 일부 session/reaper 상태는 여전히 run 수와 session 길이에 따라 증가한다.
 
 개선 방향은 다음과 같다.
 
@@ -132,7 +132,8 @@ root Pi의 `session_start`는 stale interactive run scan 전체를 기다리지 
 | lease timer | 2초 | durable parent lease 갱신 및 child parent-lease 검사 | 현재 구현; 유지 |
 | UI heartbeat | 기본 1초 | parallel 실행 중 UI 상태 갱신 | 현재 구현; `--subagent-parallel-heartbeat-ms`/`PI_SUBAGENT_PARALLEL_HEARTBEAT_MS`로 설정 가능하며 외부 CLI/file I/O가 없고 completion authority가 아니므로 Phase 2에서 유지 |
 | socket heartbeat | 1초 | authenticated connection의 memory-only liveness hint | Phase 2 구현; disk write나 completion authority가 아니며 monotonic time 사용 |
-| process watchdog | degraded 5초 | socket stale/disconnect와 durable completion fallback 확인 | Phase 2 구현; healthy run에서는 backend CLI를 호출하지 않음 |
+| process watchdog | degraded 5초 | socket stale/disconnect와 durable completion/backend fallback 확인 | Phase 2 구현; healthy run에서는 backend CLI를 호출하지 않음 |
+| Herdr reconnect/cleanup timer | reconnect 100ms–5초 backoff, absence-confirmed cleanup은 유한 backoff | failed `events.subscribe` 재연결 wake와 scrub/artifact removal 실패의 재인가 retry | 구현됨; healthy idle은 polling하지 않으며 retry는 present/unknown 상태에서 시작하거나 무한 반복하지 않음 |
 | diagnostic cleanup timer | 현재 run별 기본 1시간 | terminal run artifact 지연 삭제 | 현재 구현; durable completion/intent의 absolute deadline에서 남은 시간만 예약하므로 restart가 TTL을 reset하지 않으며 polling이 아님 |
 | 단발 timeout/delay | 단발 또는 deadline | abort grace, wrapper settle, broker ready/commit deadline 등 | 현재 구현; polling 성능 수치와 분리 |
 | acceptance-only polling | harness 한정 | live harness의 target absence/evidence 재확인 | production polling이 아니며 별도 보고 |

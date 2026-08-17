@@ -507,92 +507,223 @@ export function subscribeInteractiveRunChanges(observer: InteractiveRunChangeObs
 }
 
 const DETACHED_RETIREMENT_DEGRADED_CADENCE_MS = 5_000;
-const detachedRetirementWatchers = new Map<string, { run: ActiveInteractiveRun; timer: ReturnType<typeof setTimeout> | null; cancelled: boolean }>();
-const completedHerdrRetirementWatchers = new Map<string, { run: ActiveInteractiveRun; completion: CompletionRecord; timer: ReturnType<typeof setTimeout> | null; cancelled: boolean }>();
-
-function cancelDetachedRetirementWatcher(runId: string): void {
-  const watcher = detachedRetirementWatchers.get(runId);
-  if (!watcher) return;
-  watcher.cancelled = true;
-  if (watcher.timer) clearTimeout(watcher.timer);
-  detachedRetirementWatchers.delete(runId);
+interface DetachedRetirementWatcher {
+  run: ActiveInteractiveRun;
+  timer: ReturnType<typeof setTimeout> | null;
+  cancelled: boolean;
+  tick: Promise<void> | null;
+  cleanup: Promise<void> | null;
+  draining: Promise<void> | null;
 }
+const detachedRetirementWatchers = new Map<string, DetachedRetirementWatcher>();
+const detachedRetirementWatcherDrains = new Set<Promise<void>>();
 
-function cancelDetachedRetirementWatchers(): void {
-  for (const runId of [...detachedRetirementWatchers.keys()]) cancelDetachedRetirementWatcher(runId);
+/**
+ * Keep the long agent.wait observer strictly behind an unhealthy event stream.
+ * A draining observer cannot overlap a replacement, even if health changes
+ * faster than its aborted socket settles.
+ */
+export function createHerdrAgentWaitFallback(options: { handle: HerdrPaneHandle; onWake: () => void }): {
+  sync(healthy: boolean): void;
+  stopAndDrain(): Promise<void>;
+} {
+  let stopped = false;
+  let healthy = false;
+  let observer: HerdrAgentWaitObserver | null = null;
+  let drain: Promise<void> | null = null;
+  const stopObserver = () => {
+    if (!observer) return;
+    const current = observer;
+    observer = null;
+    current.stop();
+    drain = current.closed.catch(() => undefined).finally(() => {
+      drain = null;
+      if (!stopped && !healthy) sync(false);
+    });
+  };
+  const sync = (nextHealthy: boolean) => {
+    healthy = nextHealthy;
+    if (stopped || healthy) {
+      stopObserver();
+      return;
+    }
+    if (!observer && !drain) observer = observeHerdrAgentWait({ handle: options.handle, onWake: options.onWake });
+  };
+  return {
+    sync,
+    stopAndDrain: async () => {
+      stopped = true;
+      healthy = true;
+      stopObserver();
+      await drain;
+    },
+  };
+}
+const HERDR_COMPLETED_RETIREMENT_MAX_WATCHERS = 16;
+const HERDR_COMPLETED_CLEANUP_RETRY_DELAYS_MS = [100, 250] as const;
+interface CompletedHerdrRetirementWatcher {
+  run: ActiveInteractiveRun;
+  completion: CompletionRecord;
+  cancelled: boolean;
+  subscription: HerdrPaneSubscription | null;
+  reconciliation: Promise<void> | null;
+  reconciliationPending: boolean;
+  /** Set only after winner, ownership/generation, two absence proofs, and sensitive scrub. */
+  cleanupCommitted: boolean;
+  /** The finite post-commit recursive cleanup; it never reads run artifacts. */
+  cleanup: Promise<void> | null;
+  startup: Promise<void> | null;
+  draining: Promise<void> | null;
+}
+const completedHerdrRetirementWatchers = new Map<string, CompletedHerdrRetirementWatcher>();
+const completedHerdrRetirementWatcherDrains = new Set<Promise<void>>();
+
+function scheduleCompletedHerdrRetirementWatcherDrain(watcher: CompletedHerdrRetirementWatcher): void {
+  if (watcher.draining) return;
+  const drain = Promise.resolve().then(async () => {
+    await watcher.startup?.catch(() => undefined);
+    watcher.subscription?.stop();
+    await watcher.subscription?.closed.catch(() => undefined);
+    await watcher.reconciliation?.catch(() => undefined);
+    if (completedHerdrRetirementWatchers.get(watcher.run.runId) === watcher) {
+      completedHerdrRetirementWatchers.delete(watcher.run.runId);
+    }
+  }).finally(() => { completedHerdrRetirementWatcherDrains.delete(drain); });
+  watcher.draining = drain;
+  completedHerdrRetirementWatcherDrains.add(drain);
 }
 
 function cancelCompletedHerdrRetirementWatcher(runId: string): void {
   const watcher = completedHerdrRetirementWatchers.get(runId);
   if (!watcher) return;
   watcher.cancelled = true;
-  if (watcher.timer) clearTimeout(watcher.timer);
-  completedHerdrRetirementWatchers.delete(runId);
+  watcher.reconciliationPending = false;
+  // A committed recursive cleanup is deliberately not cancelled: it may have
+  // already removed completion.json, so it must finish from in-memory state.
+  watcher.subscription?.stop();
+  // Retain this entry, including its cap slot, until all watcher I/O settles.
+  scheduleCompletedHerdrRetirementWatcherDrain(watcher);
 }
 
 function cancelCompletedHerdrRetirementWatchers(): void {
   for (const runId of [...completedHerdrRetirementWatchers.keys()]) cancelCompletedHerdrRetirementWatcher(runId);
 }
 
-/** A bounded, unref'd, side-effect-free target observer for detached runs. */
-function watchDetachedInteractiveRunForRetirement(run: ActiveInteractiveRun): void {
-  if (!run.paths || detachedRetirementWatchers.has(run.runId)) return;
-  const watcher = { run, timer: null as ReturnType<typeof setTimeout> | null, cancelled: false };
-  detachedRetirementWatchers.set(run.runId, watcher);
-  const tick = async () => {
-    if (watcher.cancelled || activeInteractiveRuns.get(run.runId) !== run || run.ownership !== "detached") {
-      cancelDetachedRetirementWatcher(run.runId);
-      return;
+async function drainCompletedHerdrRetirementWatchers(): Promise<void> {
+  await Promise.all([...completedHerdrRetirementWatcherDrains]);
+}
+
+function scheduleDetachedRetirementWatcherDrain(watcher: DetachedRetirementWatcher): void {
+  if (watcher.draining) return;
+  const drain = Promise.resolve().then(async () => {
+    await watcher.tick?.catch(() => undefined);
+    await watcher.cleanup?.catch(() => undefined);
+    if (detachedRetirementWatchers.get(watcher.run.runId) === watcher) {
+      detachedRetirementWatchers.delete(watcher.run.runId);
     }
-    const observed = await run.backend.inspect(run.handle).catch(() => undefined);
-    if (observed?.exists !== false) return schedule();
-    let queued: Promise<void> | undefined;
-    await withInteractiveFenceMutex(() => {
-      // Reserve this exact detached registry entry before any second probe.
-      // The fence is released while the queued operation performs I/O.
-      if (watcher.cancelled || activeInteractiveRuns.get(run.runId) !== run || run.ownership !== "detached") return;
-      queued = serializeInteractiveRun(run, async () => {
-        const authorized = await withInteractiveFenceMutex(() => !watcher.cancelled
-          && activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached");
-        if (!authorized) return;
-        // A poll result is not retirement authority; re-read the exact handle
-        // after the per-run FIFO predecessor, never while holding the global fence.
-        const confirmed = await run.backend.inspect(run.handle).catch(() => undefined);
-        if (confirmed?.exists !== false) return;
-        // Detached ownership and completion authority must never be silently
-        // collapsed by this observer; retain the candidate for reaper review.
-        if ((await readBrokerArtifact(run.paths!.completionPath)).outcome !== "missing") return;
-        // Keep the registry candidate until every artifact is gone. A failed
-        // delete must remain retryable rather than reporting false retirement.
-        const scrubbed = await removeSelectedSensitiveArtifacts(run.paths!, undefined, false).catch(() => false);
-        let removed = false;
-        if (scrubbed) {
+  }).finally(() => { detachedRetirementWatcherDrains.delete(drain); });
+  watcher.draining = drain;
+  detachedRetirementWatcherDrains.add(drain);
+}
+
+function cancelDetachedRetirementWatcher(runId: string): void {
+  const watcher = detachedRetirementWatchers.get(runId);
+  if (!watcher) return;
+  watcher.cancelled = true;
+  if (watcher.timer) clearTimeout(watcher.timer);
+  watcher.timer = null;
+  // Retain the entry until its inspection and serialized cleanup drain.
+  scheduleDetachedRetirementWatcherDrain(watcher);
+}
+
+function cancelDetachedRetirementWatchers(): void {
+  for (const runId of [...detachedRetirementWatchers.keys()]) cancelDetachedRetirementWatcher(runId);
+}
+
+async function drainDetachedRetirementWatchers(): Promise<void> {
+  await Promise.all([...detachedRetirementWatcherDrains]);
+}
+
+/** A bounded, unref'd, side-effect-free target observer for detached runs. */
+function watchDetachedInteractiveRunForRetirement(run: ActiveInteractiveRun, initialDelayMs = DETACHED_RETIREMENT_DEGRADED_CADENCE_MS): void {
+  if (!run.paths || detachedRetirementWatchers.has(run.runId)) return;
+  const watcher: DetachedRetirementWatcher = { run, timer: null, cancelled: false, tick: null, cleanup: null, draining: null };
+  detachedRetirementWatchers.set(run.runId, watcher);
+  const isAuthorized = async () => await withInteractiveFenceMutex(() => !watcher.cancelled
+    && activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached");
+  const schedule = (delayMs = DETACHED_RETIREMENT_DEGRADED_CADENCE_MS) => {
+    if (watcher.cancelled) return;
+    watcher.timer = setTimeout(() => { void startTick(); }, delayMs);
+    watcher.timer.unref?.();
+  };
+  const startTick = async () => {
+    if (watcher.tick || watcher.cancelled) return;
+    const tick = (async () => {
+      if (!await isAuthorized()) { cancelDetachedRetirementWatcher(run.runId); return; }
+      const observed = await run.backend.inspect(run.handle).catch(() => undefined);
+      if (!await isAuthorized() || observed?.exists !== false) return;
+      let queued: Promise<void> | undefined;
+      await withInteractiveFenceMutex(() => {
+        // Reserve this exact detached registry entry before any second probe.
+        // The fence is released while the queued operation performs I/O.
+        if (watcher.cancelled || activeInteractiveRuns.get(run.runId) !== run || run.ownership !== "detached") return;
+        queued = serializeInteractiveRun(run, async () => {
+          if (!await isAuthorized()) return;
+          // A poll result is not retirement authority; re-read the exact handle
+          // after the per-run FIFO predecessor, never while holding the global fence.
+          const confirmed = await run.backend.inspect(run.handle).catch(() => undefined);
+          if (!await isAuthorized() || confirmed?.exists !== false) return;
+          // Detached ownership and completion authority must never be silently
+          // collapsed by this observer; retain the candidate for reaper review.
+          const completion = await readBrokerArtifact(run.paths!.completionPath);
+          if (!await isAuthorized() || completion.outcome !== "missing") return;
+          // Keep the registry candidate until every artifact is gone. A failed
+          // delete must remain retryable rather than reporting false retirement.
+          if (!await isAuthorized()) return;
+          const scrubbed = await removeSelectedSensitiveArtifacts(run.paths!, undefined, false).catch(() => false);
+          if (!await isAuthorized() || !scrubbed) return;
+          let removed = false;
           try {
+            if (!await isAuthorized()) return;
             await removeRunArtifacts(run.paths!);
             removed = !await fileExists(run.paths!.runDir);
           } catch { /* retry from the retained registry candidate */ }
-        }
-        if (!removed) return;
-        let retired = false;
-        await withInteractiveFenceMutex(() => {
-          if (activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached") {
-            activeInteractiveRuns.delete(run.runId);
-            retired = true;
-          }
+          // Artifact removal and exact absence are irreversible. A reset that
+          // cancels observation after this point must not leave this exact
+          // detached registry entry pointing at the deleted run directory.
+          if (!removed) return;
+          let retired = false;
+          await withInteractiveFenceMutex(() => {
+            if (activeInteractiveRuns.get(run.runId) === run && run.ownership === "detached") {
+              activeInteractiveRuns.delete(run.runId);
+              retired = true;
+            }
+          });
+          if (retired) notifyInteractiveRunChanges();
+          cancelDetachedRetirementWatcher(run.runId);
         });
-        if (retired) notifyInteractiveRunChanges();
-        cancelDetachedRetirementWatcher(run.runId);
+        watcher.cleanup = queued;
       });
+      await queued;
+    })().finally(() => {
+      watcher.tick = null;
+      if (watcher.cancelled) scheduleDetachedRetirementWatcherDrain(watcher);
+      else if (detachedRetirementWatchers.get(run.runId) === watcher) schedule();
     });
-    await queued;
-    if (detachedRetirementWatchers.has(run.runId)) schedule();
+    watcher.tick = tick;
+    await tick;
   };
-  const schedule = () => {
-    if (watcher.cancelled) return;
-    watcher.timer = setTimeout(() => { void tick(); }, DETACHED_RETIREMENT_DEGRADED_CADENCE_MS);
-    watcher.timer.unref?.();
-  };
-  schedule();
+  schedule(initialDelayMs);
+}
+
+/** Test seam for detached retirement; production uses the degraded cadence. */
+export function watchDetachedInteractiveRunForRetirementForTest(runId: string): boolean {
+  const run = activeInteractiveRuns.get(runId);
+  if (!run?.paths) return false;
+  run.ownership = "detached";
+  run.updatedAt = Date.now();
+  watchDetachedInteractiveRunForRetirement(run, 0);
+  return detachedRetirementWatchers.has(runId);
 }
 
 /**
@@ -602,63 +733,124 @@ function watchDetachedInteractiveRunForRetirement(run: ActiveInteractiveRun): vo
  */
 function watchCompletedHerdrDirectRunForRetirement(run: ActiveInteractiveRun, completion: CompletionRecord): void {
   if (!run.paths || run.handle.mode !== "herdr-pane" || run.handle.placement?.placement !== "herdr-new-tab"
-    || completedHerdrRetirementWatchers.has(run.runId)) return;
-  const watcher = { run, completion, timer: null as ReturnType<typeof setTimeout> | null, cancelled: false };
+    || completedHerdrRetirementWatchers.has(run.runId) || completedHerdrRetirementWatchers.size >= HERDR_COMPLETED_RETIREMENT_MAX_WATCHERS) return;
+  const herdrHandle = run.handle.native;
+  const watcher: CompletedHerdrRetirementWatcher = {
+    run, completion, cancelled: false, subscription: null, reconciliation: null, reconciliationPending: false,
+    cleanupCommitted: false, cleanup: null, startup: null, draining: null,
+  };
   completedHerdrRetirementWatchers.set(run.runId, watcher);
-  const isAuthorized = async () => {
-    if (watcher.cancelled || activeInteractiveRuns.get(run.runId) !== run
-      || (run.ownership !== "managed" && run.ownership !== "kept")) return false;
+  const isAuthorized = async () => !watcher.cancelled
+    && canStartInteractiveRun(run.generation)
+    && completedHerdrRetirementWatchers.get(run.runId) === watcher
+    && activeInteractiveRuns.get(run.runId) === run
+    && (run.ownership === "managed" || run.ownership === "kept");
+  const hasCurrentWinner = async () => {
+    if (!await isAuthorized()) return false;
     const artifact = await readBrokerArtifact(run.paths!.completionPath);
     const winner = artifact.outcome === "valid" ? parseCompletionAuthority(artifact.value, run.runId) : null;
-    return winner !== null && sameCompletionWinner(winner, completion);
+    return !watcher.cancelled && winner !== null && sameCompletionWinner(winner, completion) && await isAuthorized();
   };
-  const tick = async () => {
-    if (!await isAuthorized()) { cancelCompletedHerdrRetirementWatcher(run.runId); return; }
+  const finalizeCommittedRetirement = async () => {
+    let retired = false;
+    await withInteractiveFenceMutex(() => {
+      // After the cleanup boundary, this exact entry must not outlive its
+      // authority file, even if reset changed the generation or recursive rm
+      // left a scrubbed partial directory behind.
+      if (activeInteractiveRuns.get(run.runId) === run) {
+        activeInteractiveRuns.delete(run.runId);
+        retired = true;
+      }
+    });
+    if (retired) notifyInteractiveRunChanges();
+    cancelCompletedHerdrRetirementWatcher(run.runId);
+  };
+  const commitCleanup = async (): Promise<boolean> => {
+    // This fence is the irreversible boundary. The durable winner was just
+    // re-read after both absence proofs and after sensitive scrub; this final
+    // synchronous registry/generation check prevents committing stale work.
+    return await withInteractiveFenceMutex(() => {
+      if (!watcher.cancelled && canStartInteractiveRun(run.generation)
+        && completedHerdrRetirementWatchers.get(run.runId) === watcher
+        && activeInteractiveRuns.get(run.runId) === run
+        && (run.ownership === "managed" || run.ownership === "kept")) {
+        watcher.cleanupCommitted = true;
+        return true;
+      }
+      return false;
+    });
+  };
+  const completeCommittedCleanup = async () => {
+    // Never inspect the backend or read any run artifact here. rm may have
+    // removed completion.json before reporting an error, so only the retained
+    // in-memory commitment may authorize these finite recursive retries.
+    for (let attempt = 0; attempt <= HERDR_COMPLETED_CLEANUP_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        await fs.promises.rm(run.paths!.runDir, { recursive: true, force: true });
+        break;
+      } catch { /* Preserve a scrubbed partial directory for the next attempt/reaper. */ }
+      const retryDelay = HERDR_COMPLETED_CLEANUP_RETRY_DELAYS_MS[attempt];
+      if (retryDelay !== undefined) await delay(retryDelay);
+    }
+    await finalizeCommittedRetirement();
+  };
+  const reconcile = async () => {
+    if (watcher.cleanupCommitted || !await hasCurrentWinner()) {
+      if (!watcher.cleanupCommitted) cancelCompletedHerdrRetirementWatcher(run.runId);
+      return;
+    }
+    // This is the first authoritative proof. It runs initially and thereafter
+    // only after a subscription health/reconnect/relevant-event wakeup.
     const observed = await run.backend.inspect(run.handle).catch(() => undefined);
-    if (observed?.exists !== false) { schedule(DETACHED_RETIREMENT_DEGRADED_CADENCE_MS); return; }
+    if (watcher.cancelled || observed?.exists !== false) return;
     let queued: Promise<void> | undefined;
     await withInteractiveFenceMutex(() => {
       if (watcher.cancelled || activeInteractiveRuns.get(run.runId) !== run
         || (run.ownership !== "managed" && run.ownership !== "kept")) return;
       queued = serializeInteractiveRun(run, async () => {
-        const registryAuthorized = await withInteractiveFenceMutex(() => !watcher.cancelled
-          && activeInteractiveRuns.get(run.runId) === run
-          && (run.ownership === "managed" || run.ownership === "kept"));
-        // Durable winner I/O must never retain the process-global fence.
-        if (!registryAuthorized || !await isAuthorized()) return;
-        // The second read is after all earlier per-run work, so neither a
-        // stale absence nor an intervening ownership change can retire it.
+        if (!await hasCurrentWinner()) return;
+        // The second serialized exact-handle read is the required independent
+        // absence proof before any artifact removal.
         const confirmed = await run.backend.inspect(run.handle).catch(() => undefined);
-        if (confirmed?.exists !== false || !await isAuthorized()) return;
+        if (watcher.cancelled || confirmed?.exists !== false || !await hasCurrentWinner()) return;
         const scrubbed = await removeSelectedSensitiveArtifacts(run.paths!, undefined, false).catch(() => false);
-        if (!scrubbed || !await isAuthorized()) return;
-        let removed = false;
-        try {
-          await removeRunArtifacts(run.paths!);
-          removed = !await fileExists(run.paths!.runDir);
-        } catch { /* retain the exact candidate for degraded retry */ }
-        if (!removed) return;
-        let retired = false;
-        await withInteractiveFenceMutex(() => {
-          if (!watcher.cancelled && activeInteractiveRuns.get(run.runId) === run
-            && (run.ownership === "managed" || run.ownership === "kept")) {
-            activeInteractiveRuns.delete(run.runId);
-            retired = true;
-          }
-        });
-        if (retired) notifyInteractiveRunChanges();
-        cancelCompletedHerdrRetirementWatcher(run.runId);
+        if (!scrubbed || !await hasCurrentWinner()) return;
+        // Complete all path safety validation before the irreversible boundary;
+        // retries below must not inspect anything inside this run directory.
+        try { await assertSafeRunArtifactPaths(run.paths!); } catch { return; }
+        if (!await hasCurrentWinner() || !await commitCleanup()) return;
+        watcher.cleanup = completeCommittedCleanup();
+        await watcher.cleanup;
       });
     });
     await queued;
-    if (completedHerdrRetirementWatchers.has(run.runId)) schedule(DETACHED_RETIREMENT_DEGRADED_CADENCE_MS);
   };
-  const schedule = (waitMs: number) => {
-    if (watcher.cancelled) return;
-    watcher.timer = setTimeout(() => { void tick(); }, waitMs);
-    watcher.timer.unref?.();
+  const requestReconcile = () => {
+    if (watcher.cancelled || watcher.cleanupCommitted) return;
+    watcher.reconciliationPending = true;
+    if (watcher.reconciliation) return;
+    watcher.reconciliation = (async () => {
+      watcher.reconciliationPending = false;
+      await reconcile();
+    })().catch(() => undefined).finally(() => {
+      watcher.reconciliation = null;
+      // Do not lose a wake that arrives at the settle boundary.
+      if (watcher.reconciliationPending && !watcher.cancelled && !watcher.cleanupCommitted) requestReconcile();
+    });
   };
-  schedule(0);
+  // Establish the first proof before opening the idle event stream. Subsequent
+  // inspection is therefore exclusively subscription-woken.
+  watcher.startup = (async () => {
+    requestReconcile();
+    await watcher.reconciliation;
+    if (watcher.cancelled || watcher.cleanupCommitted || completedHerdrRetirementWatchers.get(run.runId) !== watcher) return;
+    watcher.subscription = subscribeHerdrPane({
+      handle: herdrHandle,
+      onReconcile: requestReconcile,
+      onWake: requestReconcile,
+      onHealthChange: () => requestReconcile(),
+    });
+  })().catch(() => undefined);
 }
 
 /** Test seam for late direct-Herdr completion retirement; production schedules it after a bounded absence timeout. */
@@ -673,6 +865,8 @@ export function watchCompletedHerdrDirectRunForRetirementForTest(runId: string, 
 const lateFencedInteractiveReleases = new Set<Promise<void>>();
 let interactiveShutdownActive = false;
 let interactiveShutdownGeneration = 0;
+/** Non-null only while reset drains the prior generation outside the fence. */
+let interactiveResetDrainGeneration: number | null = null;
 let lifecycleEventServer: LifecycleEventServer | null = null;
 let lifecycleEventServerStarting: Promise<LifecycleEventServer | null> | null = null;
 async function getLifecycleEventServer(): Promise<LifecycleEventServer | null> {
@@ -920,10 +1114,20 @@ async function withInteractiveFenceMutex<T>(operation: () => Promise<T> | T): Pr
 /** Start this session's shutdown fence exactly once. */
 export async function beginInteractiveShutdownForSession(): Promise<void> {
   await withInteractiveFenceMutex(async () => {
-    if (interactiveShutdownActive) return;
+    if (interactiveShutdownActive) {
+      // A reset deliberately holds the fence closed while it drains. A newer
+      // shutdown supersedes that reset so its final reopen cannot win.
+      if (interactiveResetDrainGeneration === interactiveShutdownGeneration) {
+        interactiveShutdownGeneration += 1;
+        interactiveResetDrainGeneration = null;
+      }
+      return;
+    }
     interactiveShutdownActive = true;
     interactiveShutdownGeneration += 1;
     cancelDetachedRetirementWatchers();
+    // Cancellation happens while fenced; watcher I/O drains below, outside the
+    // global fence, so a reconciliation cannot deadlock on its final check.
     cancelCompletedHerdrRetirementWatchers();
     advanceTopologyMutationGeneration();
     shutdownTmuxControlPool();
@@ -931,13 +1135,19 @@ export async function beginInteractiveShutdownForSession(): Promise<void> {
     launchPreflightSingleFlight.reset();
     await closeLifecycleEventServer();
   });
+  await Promise.all([drainDetachedRetirementWatchers(), drainCompletedHerdrRetirementWatchers()]);
 }
 
 /** Reset for a new session; every reset is a distinct generation. */
 export async function resetInteractiveShutdownForSession(): Promise<void> {
+  let resetGeneration = 0;
   await withInteractiveFenceMutex(async () => {
+    // Keep starts fenced until the old generation's watcher I/O and committed
+    // cleanup have drained. Opening this generation happens in the final fence.
+    interactiveShutdownActive = true;
     interactiveShutdownGeneration += 1;
-    interactiveShutdownActive = false;
+    resetGeneration = interactiveShutdownGeneration;
+    interactiveResetDrainGeneration = resetGeneration;
     cancelDetachedRetirementWatchers();
     cancelCompletedHerdrRetirementWatchers();
     advanceTopologyMutationGeneration();
@@ -945,6 +1155,14 @@ export async function resetInteractiveShutdownForSession(): Promise<void> {
     closeCmuxEvents();
     launchPreflightSingleFlight.reset();
     await closeLifecycleEventServer();
+  });
+  await Promise.all([drainDetachedRetirementWatchers(), drainCompletedHerdrRetirementWatchers()]);
+  await withInteractiveFenceMutex(() => {
+    // A newer reset or shutdown owns the fence now; never reopen over it.
+    if (interactiveShutdownGeneration === resetGeneration && interactiveResetDrainGeneration === resetGeneration) {
+      interactiveShutdownActive = false;
+      interactiveResetDrainGeneration = null;
+    }
   });
 }
 
@@ -1378,16 +1596,15 @@ async function interruptActiveInteractiveRunWithoutWinner(options: {
   return await queued ?? false;
 }
 
-/** Direct Herdr tabs are child-owned. Only repeated read-only absence proves retirement. */
-async function pollHerdrDirectTabAbsence(run: ActiveInteractiveRun): Promise<boolean> {
+/** Direct Herdr tabs are child-owned. One initial and one deadline/event-woken
+ * authoritative read replace the former periodic inspection loop. */
+async function pollHerdrDirectTabAbsence(run: ActiveInteractiveRun, waitForWake: (timeoutMs: number) => Promise<void>): Promise<boolean> {
   const deadline = Date.now() + ABORT_WAIT_MS;
-  do {
-    const snapshot = await run.backend.inspect(run.handle).catch(() => undefined);
-    if (snapshot?.exists === false) return true;
-    if (Date.now() >= deadline) break;
-    await delay(Math.min(INTERACTIVE_PANE_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
-  } while (true);
-  return false;
+  const initial = await run.backend.inspect(run.handle).catch(() => undefined);
+  if (initial?.exists === false) return true;
+  await waitForWake(Math.max(1, deadline - Date.now()));
+  const final = await run.backend.inspect(run.handle).catch(() => undefined);
+  return final?.exists === false;
 }
 
 async function releaseActiveInteractiveRunAfterWinner(options: {
@@ -1395,6 +1612,7 @@ async function releaseActiveInteractiveRunAfterWinner(options: {
   expectedRun: ActiveInteractiveRun;
   completion?: CompletionRecord;
   force?: boolean;
+  waitForHerdrWake?: (timeoutMs: number) => Promise<void>;
 }): Promise<boolean> {
   let queued: Promise<boolean> | undefined;
   await withInteractiveFenceMutex(() => {
@@ -1429,7 +1647,7 @@ async function releaseActiveInteractiveRunAfterWinner(options: {
         // won while this FIFO slot waited revokes even the harmless abort.
         const completionWon = current.paths && (await readBrokerArtifact(current.paths.completionPath)).outcome !== "missing";
         if (!options.completion && !completionWon) void lifecycleEventServer?.requestAbort(options.runId);
-        const absent = await pollHerdrDirectTabAbsence(current);
+        const absent = await pollHerdrDirectTabAbsence(current, options.waitForHerdrWake ?? delay);
         if (!absent && options.completion) watchCompletedHerdrDirectRunForRetirement(current, options.completion);
         return absent;
       }
@@ -1721,7 +1939,6 @@ function finalizeBoundedInteractiveRelease(runId: string, expectedRun: ActiveInt
 }
 
 export async function shutdownActiveInteractiveRuns(): Promise<void> {
-  cancelCompletedHerdrRetirementWatchers();
   // Fence before observing either registry. Any later durable commit is
   // rejected synchronously and its exact cleanup joins lateFenced... above.
   await beginInteractiveShutdownForSession();
@@ -1732,7 +1949,10 @@ export async function shutdownActiveInteractiveRuns(): Promise<void> {
   for (let attempt = 0; attempt < INTERACTIVE_SHUTDOWN_DRAIN_ATTEMPTS; attempt += 1) {
     const runs = Array.from(activeInteractiveRuns.values()).filter((run) => (run.ownership === "managed" || run.ownership === "kept") && !publicationAttempted.has(run.runId));
     const lateReleases = Array.from(lateFencedInteractiveReleases);
-    if (runs.length === 0 && lateReleases.length === 0) return;
+    if (runs.length === 0 && lateReleases.length === 0) {
+      await Promise.all([drainDetachedRetirementWatchers(), drainCompletedHerdrRetirementWatchers()]);
+      return;
+    }
 
     // Start every drain before waiting for any one of them. A stalled lease on
     // one run must not defer another run's FIFO/fence preparation by a second
@@ -1781,6 +2001,7 @@ export async function shutdownActiveInteractiveRuns(): Promise<void> {
     }));
     await Promise.all(lateReleases.map(awaitInteractiveCleanupBounded));
   }
+  await Promise.all([drainDetachedRetirementWatchers(), drainCompletedHerdrRetirementWatchers()]);
 }
 
 const INTERNAL_REAPER_CONTEXT: unique symbol = Symbol("internal-reaper-context");
@@ -5623,7 +5844,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   let removeTmuxDisconnectListener: (() => void) | null = null;
   let cmuxFocusSupported = false;
   let herdrSubscription: HerdrPaneSubscription | null = null;
-  let herdrAgentWaitObserver: HerdrAgentWaitObserver | null = null;
+  let herdrAgentWaitFallback: ReturnType<typeof createHerdrAgentWaitFallback> | null = null;
   const herdrWakeWaiters = new Set<() => void>();
   const signalHerdrWake = () => { for (const wake of [...herdrWakeWaiters]) wake(); herdrWakeWaiters.clear(); };
   const waitForHerdrWake = async (timeoutMs: number): Promise<void> => await new Promise<void>((resolve) => {
@@ -6144,17 +6365,23 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       throw new Error("Interactive session shutdown fenced this committed run before launch.");
     }
     if (handle.mode === "herdr-pane") {
+      const herdrHandle = handle.native;
+      herdrAgentWaitFallback = createHerdrAgentWaitFallback({ handle: herdrHandle, onWake: signalHerdrWake });
       herdrSubscription = subscribeHerdrPane({
-        handle: handle.native,
+        handle: herdrHandle,
         onReconcile: () => signalHerdrWake(),
         onWake: signalHerdrWake,
+        onHealthChange: (healthy) => herdrAgentWaitFallback?.sync(healthy),
       });
-      herdrAgentWaitObserver = observeHerdrAgentWait({ handle: handle.native, onWake: signalHerdrWake });
     }
     const releaseAfterCompletionWinner = async (completion: CompletionRecord): Promise<boolean> => {
       const active = activeInteractiveRuns.get(runId);
       if (!active) return false;
-      const release = releaseActiveInteractiveRunAfterWinner({ runId, expectedRun: active, completion });
+      const release = releaseActiveInteractiveRunAfterWinner({ runId, expectedRun: active, completion,
+        waitForHerdrWake: async (timeoutMs) => await Promise.race([
+          waitForHerdrWake(timeoutMs), runLifecycleServerWait(lifecycleEventServer, runId, timeoutMs),
+        ]),
+      });
       const settled = await awaitInteractiveBooleanBounded(release);
       if (!settled) finalizeBoundedInteractiveRelease(runId, active, release);
       return settled;
@@ -7058,7 +7285,11 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       }
       const active = committedRunId ? activeInteractiveRuns.get(committedRunId) : undefined;
       const release = active && committedRunId
-        ? releaseActiveInteractiveRunAfterWinner({ runId: committedRunId, expectedRun: active, completion: publication.completion })
+        ? releaseActiveInteractiveRunAfterWinner({ runId: committedRunId, expectedRun: active, completion: publication.completion,
+          waitForHerdrWake: async (timeoutMs) => await Promise.race([
+            waitForHerdrWake(timeoutMs), runLifecycleServerWait(lifecycleEventServer, active.runId, timeoutMs),
+          ]),
+        })
         : null;
       const targetClosed = release ? await awaitInteractiveBooleanBounded(release) : false;
       if (release && !targetClosed && active && committedRunId) finalizeBoundedInteractiveRelease(committedRunId, active, release);
@@ -7078,10 +7309,9 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
   } finally {
     releaseTmuxLaunch();
     releaseCmuxLaunch();
-    const stoppedHerdrAgentWaitObserver = herdrAgentWaitObserver;
-    stoppedHerdrAgentWaitObserver?.stop();
-    herdrAgentWaitObserver = null;
-    await stoppedHerdrAgentWaitObserver?.closed.catch(() => undefined);
+    const stoppedHerdrAgentWaitFallback = herdrAgentWaitFallback;
+    herdrAgentWaitFallback = null;
+    await stoppedHerdrAgentWaitFallback?.stopAndDrain();
     const stoppedHerdrSubscription = herdrSubscription;
     stoppedHerdrSubscription?.stop();
     herdrSubscription = null;

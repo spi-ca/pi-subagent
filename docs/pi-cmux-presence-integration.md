@@ -89,7 +89,13 @@ remove를 모르는 이전 consumer는 event를 구독하지 않아 무시하므
 bun test test/integration/pi-presence-producer.test.ts
 ```
 
-`bun run ci`는 type check와 file isolation 전체 테스트를 실행한다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다. 이 focused/unit 범위와 baseline CI는 별도 `pi-cmux-presence` package의 소비 구현이나 live cmux E2E 조합을 증명하지 않는다.
+추가로 `test/fixtures/presence-v1-consumer-profiles.json`과 deterministic fake event-bus harness는 fixed cmux V1(`presence-summary-v1` 없음)과 Herdr V1 + `presence-summary-v1` profile 각각에 대해 consumer-first/producer-first ready handshake, consumer-less replay, terminal update 뒤 remove 순서, summary sequence 경계, 그리고 producer source의 sibling import/socket/CLI/timer polling 부재를 확인한다. 이 fixture는 consumer 구현을 import하거나 socket을 열지 않는 **producer-only 결정적 증거**다.
+
+```bash
+bun test test/integration/presence-v1-compatibility.test.ts
+```
+
+`bun run ci`는 type check와 file isolation 전체 테스트를 실행한다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 file isolation이 필수다. 두 deterministic 범위와 baseline CI는 별도 `pi-cmux-presence` package의 실제 소비 구현이나 live cmux E2E 조합을 증명하지 않는다.
 
 별도 opt-in 교차 smoke는 다음처럼 실행한다.
 

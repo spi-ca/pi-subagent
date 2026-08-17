@@ -113,7 +113,13 @@ root-only presence producer의 wire DTO, session/generation fence, frozen start 
 bun test test/integration/pi-presence-producer.test.ts
 ```
 
-그 뒤 baseline은 `bun run ci`입니다. 이 non-live 범위는 별도 `pi-cmux-presence` package의 실제 consumer 또는 live cmux E2E 조합을 증명하지 않습니다. producer는 dependency 없이 duplicated wire contract를 유지하고, cmux CLI/socket mutation이나 lifecycle authority를 갖지 않습니다.
+`test/fixtures/presence-v1-consumer-profiles.json`를 읽는 별도 deterministic fixture harness는 fixed cmux V1(no summary)와 Herdr V1 + `presence-summary-v1`의 consumer-first/producer-first handshake, replay, update/remove 순서와 summary capability boundary를 producer-only fake event bus에서 확인합니다. 또한 producer source에 sibling consumer import, socket/CLI, timer polling coupling이 없음을 검사합니다.
+
+```bash
+bun test test/integration/presence-v1-compatibility.test.ts
+```
+
+그 뒤 baseline은 `bun run ci`입니다. 이 non-live fixture/unit 범위는 sibling consumer를 import하거나 실제 consumer/socket/Pi loader를 실행하지 않으며, 실제 `pi-cmux-presence`/`pi-herdr-presence` consumer 또는 live cmux/Herdr E2E 조합을 증명하지 않습니다. producer는 dependency 없이 duplicated wire contract를 유지하고, cmux CLI/socket mutation이나 lifecycle authority를 갖지 않습니다.
 
 ### `pi-cmux-presence` 교차 live smoke
 

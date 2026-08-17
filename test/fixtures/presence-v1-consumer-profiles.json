@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "cmux-fixed-v1",
+      "consumer": {
+        "id": "pi-cmux-presence",
+        "capabilities": ["cmux-status", "presence-remove-v1"]
+      },
+      "expectsSummary": false
+    },
+    {
+      "name": "herdr-summary-v1",
+      "consumer": {
+        "id": "pi-herdr-presence",
+        "capabilities": ["presence-remove-v1", "presence-summary-v1"]
+      },
+      "expectsSummary": true
+    }
+  ]
+}

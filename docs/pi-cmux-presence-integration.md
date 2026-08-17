@@ -24,6 +24,7 @@ root `pi-subagent`가 process-local `pi.events`에 `pi-presence:update:v1`과 `p
 | `pi-presence:update:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | 열린 현재 session의 subagent 집계 snapshot |
 | `pi-presence:remove:v1` | `pi-subagent` → 같은 Pi process의 선택 consumer | source의 retained observer 상태 철회 |
 | `pi-presence:ready:v1` | producer ↔ 선택 consumer | consumer-less replay 요청과 consumer advertisement/응답 |
+| `pi-presence:summary:v1` | `pi-subagent` → `presence-summary-v1` capability consumer | 선택적이고 제한된 per-run 요약 |
 | `pi-subagent:dashboard:v1` | `pi-subagent` → 외부 선택 consumer | 기존 active/dashboard contract |
 | `pi-subagent:aggregate-completed:v1` | `pi-subagent` → 외부 선택 consumer | 기존 terminal invocation 알림 |
 | `pi-subagent:detached:v1` | `pi-subagent` → 외부 선택 consumer | 기존 durable promotion 알림 |
@@ -44,7 +45,13 @@ presence producer는 root parent(depth `0`)의 `session_start`에서 session ID�
 
 `update`에는 `version`, `sessionId`, `generation`, 증가하는 `sequence`, `source`, `state`, `counts`가 필수다. 선택 필드는 `progress`, `usage`, `attention`이다. `remove`는 정확히 `version`, `sessionId`, `generation`, 증가하는 `sequence`, `source: { id }`만 가지는 strict DTO다. update/remove/ready parser는 plain object와 exact key를 검사하고, untrusted 필드를 한 번 읽어 소유 DTO로 복사하며 getter/proxy 예외를 밖으로 전파하지 않는다. safe text는 1–96 Unicode code points이고 C0/C1 control 및 bidi·방향성 제어 문자를 거부한다. update는 `idle`/`waiting`/`running`/`success`/`error`/`cancelled` state와 0–1,000,000 count를 허용하며, 각 parser는 범위 밖 수치와 잘못된 중첩 shape를 거부한다.
 
-현재 producer는 `usage`를 **발행하지 않는다**. token, cost, context percent를 계산·조회·추정하지 않는다. task, prompt, raw output, cwd/path, credential, raw title, socket/capability 또는 private cmux/tmux target ID도 update/remove payload에 넣지 않는다.
+producer는 usage를 얻기 위한 추가 poll/query/timer/provider 호출을 하지 않는다. 대신 검증된 finalized invocation의 token/cost aggregate를 invocation ID당 정확히 한 번 `update.usage`에 반영한다. usage 중복 방지 ID 기억은 세션당 서로 다른 invocation ID 최대 `4096`개이며, 포화 후에는 aggregate를 동결하고 새 usage를 반영하지 않는다. context percent는 계산·조회·추정하지 않는다. task, prompt, raw output, cwd/path, credential, raw title, socket/capability 또는 private cmux/tmux target ID도 update/remove payload에 넣지 않는다.
+
+### 선택적 `summary:v1`
+
+`ready.consumer.capabilities`에 정확히 `presence-summary-v1`이 광고된 뒤에만 producer는 `pi-presence:summary:v1`을 발행한다. 기존 generic `update:v1` DTO와 consumer 호환성은 이 capability로 바뀌지 않는다. summary는 별도 generic sequence를 소비하지 않고 연결된 current/replay update의 sequence를 공유하며, update와 summary cache를 먼저 함께 저장한 뒤 synchronous update emit을 수행한다. 같은 session/generation fence 안에서만 발행·replay되고 remove 뒤에는 재생하지 않는다.
+
+summary는 정확히 `{version, sessionId, generation, sequence, source:{id}, active, omitted}`와 선택 `waiting`, `terminal`만 가진 strict/frozen DTO다. `active`는 최대 8개의 `{id, agent, status:"running"|"cancelling", category:"active"|"cancelling", startedAt}`이고, `waiting`은 `{category:"queued"|"cancelling", count}`, `terminal`은 `{id, agent, status:"completed"|"failed"|"cancelled", completedAt}`이다. `omitted`는 `max(0, update.counts.active - active[].length)`이며, 8개 제한으로 내보내지 못한 UX active뿐 아니라 summary `active[]`에 대응하지 않는 scheduler-only 또는 interactive-only active도 포함할 수 있다. scheduler queue가 있으면 `waiting:{category:"queued",count}`로, active snapshot이 cancelling뿐이면 `waiting:{category:"cancelling",count}`로 요약한다. text는 control/bidi 없는 최대 96 Unicode code point, timestamp는 non-negative safe integer, count는 0–1,000,000이다. task, output, error, path, socket, Herdr 식별자는 어떤 경우에도 포함하지 않는다. 이는 observer UI용이며 실행·취소·완료·cleanup 권한을 만들지 않는다.
 
 ## 4. 집계와 진행률
 

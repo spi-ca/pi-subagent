@@ -4,11 +4,13 @@ import {
   MAX_PRESENCE_COUNT,
   PI_PRESENCE_READY_EVENT,
   PI_PRESENCE_REMOVE_EVENT,
+  PI_PRESENCE_SUMMARY_EVENT,
   PI_PRESENCE_UPDATE_EVENT,
   createPiSubagentPresenceProducer,
   isPiCmuxPresenceCmuxStatusReady,
   parsePiPresenceReady,
   parsePiPresenceRemove,
+  parsePiPresenceSummary,
   parsePiPresenceUpdate,
 } from "../../src/integration/pi-presence-producer";
 
@@ -20,6 +22,29 @@ const update = {
 const snapshot = (generation = 0, recent: any[] = [], active: any[] = []) => ({ generation, active, recent });
 const running = (id = "running") => ({ id, status: "running" });
 const completed = (id = "completed") => ({ id, status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2 });
+const canonicalSummary = {
+  version: 1 as const, sessionId: "summary-session", generation: 7, sequence: 9, source: { id: "pi-subagent" },
+  active: [
+    { id: "run-1", agent: "worker", status: "running" as const, category: "active" as const, startedAt: 1 },
+    { id: "run-2", agent: "worker", status: "cancelling" as const, category: "cancelling" as const, startedAt: 2 },
+  ],
+  waiting: { category: "queued" as const, count: 3 },
+  terminal: { id: "run-0", agent: "worker", status: "failed" as const, completedAt: 3 },
+  omitted: 4,
+};
+const invalidCanonicalSummaries: unknown[] = [
+  { ...canonicalSummary, unexpected: true },
+  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], status: "waiting" }] },
+  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], category: "cancelling" }] },
+  { ...canonicalSummary, waiting: { category: "blocked", count: 1 } },
+  { ...canonicalSummary, waiting: { category: "queued", count: MAX_PRESENCE_COUNT + 1 } },
+  { ...canonicalSummary, terminal: { ...canonicalSummary.terminal, status: "error" } },
+  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], startedAt: Number.MAX_SAFE_INTEGER + 1 }] },
+  { ...canonicalSummary, terminal: { ...canonicalSummary.terminal, completedAt: -1 } },
+  { ...canonicalSummary, terminal: undefined },
+  { ...canonicalSummary, omitted: MAX_PRESENCE_COUNT + 1 },
+  { ...canonicalSummary, sessionId: "bad\nsummary" },
+];
 
 describe("pi presence producer wire contract", () => {
   test("strictly parses bounded, private-data-free update and ready DTOs", () => {
@@ -52,6 +77,141 @@ describe("pi presence producer wire contract", () => {
     assert.equal(parsePiPresenceUpdate(throwing), null);
     assert.equal(parsePiPresenceRemove(throwing), null);
     assert.equal(parsePiPresenceReady(throwing), null);
+  });
+
+  test("strictly parses the canonical companion summary fixtures", () => {
+    assert.deepEqual(parsePiPresenceSummary(canonicalSummary), canonicalSummary);
+    assert.equal(parsePiPresenceSummary({ ...canonicalSummary, terminal: { ...canonicalSummary.terminal, completedAt: Number.MAX_SAFE_INTEGER } })?.terminal?.completedAt, Number.MAX_SAFE_INTEGER);
+    for (const invalid of invalidCanonicalSummaries) assert.equal(parsePiPresenceSummary(invalid), null);
+    assert.equal(parsePiPresenceSummary({ ...canonicalSummary, active: Array(9).fill(canonicalSummary.active[0]) }), null);
+    assert.equal(parsePiPresenceSummary(new Proxy({}, { get() { throw new Error("no getter execution"); } })), null);
+  });
+
+  test("summarizes scheduler queue and cancelling-only active work in waiting", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    let scheduler = { active: 1, queued: 0 };
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
+      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "cancelling", startedAt: 1, updatedAt: 1 }]));
+    assert.deepEqual(emitted.at(-1)?.payload.waiting, { category: "cancelling", count: 1 });
+    scheduler = { active: 1, queued: 2 };
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
+    assert.deepEqual(emitted.at(-1)?.payload.waiting, { category: "queued", count: 2 });
+  });
+
+  test("emits the companion summary only after capability advertisement and fences it on removal", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    const active = [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }];
+    producer.publish(snapshot(0, [], active));
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 0);
+    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+    const summaryEvent = emitted.find((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT);
+    assert.ok(summaryEvent);
+    assert.equal(Object.isFrozen(summaryEvent!.payload), true);
+    assert.deepEqual(summaryEvent!.payload.active, [{ id: "run-1", agent: "safe", status: "running", category: "active", startedAt: 1 }]);
+    producer.publish(snapshot(0, [], []));
+    producer.settle();
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_REMOVE_EVENT).length, 1);
+    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 2, "removed state cannot replay a stale summary");
+  });
+
+  test("keeps summary on its associated generic update sequence through synchronous capability advertisement and replay", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    let producer: ReturnType<typeof createPiSubagentPresenceProducer>;
+    producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => {
+        emitted.push({ channel, payload });
+        // pi.events is synchronous: advertise capability while update emission
+        // is still on the stack to catch stale-cache/reentrancy regressions.
+        if (channel === PI_PRESENCE_UPDATE_EVENT && emitted.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT).length === 1) {
+          producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+        }
+      },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
+    const firstUpdate = emitted.find((event) => event.channel === PI_PRESENCE_UPDATE_EVENT)!;
+    const firstSummary = emitted.find((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT)!;
+    assert.equal(firstUpdate.payload.sequence, 1);
+    assert.equal(firstSummary.payload.sequence, firstUpdate.payload.sequence, "reentrant advertisement receives this update's already-cached summary");
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 1);
+
+    producer.handleReady({ version: 1, sessionId: "session-1" });
+    const updates = emitted.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT);
+    const summaries = emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT);
+    assert.equal(updates.at(-1)!.payload.sequence, 2, "summary never consumes the generic update/remove fence");
+    assert.equal(summaries.at(-1)!.payload.sequence, updates.at(-1)!.payload.sequence, "replay companion uses its replay update sequence");
+    producer.publish(snapshot(0, [], []));
+    producer.settle();
+    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_REMOVE_EVENT).at(-1)!.payload.sequence, 4, "remove follows generic updates without summary-only gaps");
+  });
+
+  test("delivers update to every listener before a reentrant capability advertisement emits its summary", () => {
+    const listeners = new Map<string, Array<(payload: unknown) => void>>();
+    const on = (channel: string, handler: (payload: unknown) => void) => {
+      const handlers = listeners.get(channel) ?? [];
+      handlers.push(handler);
+      listeners.set(channel, handlers);
+      return () => listeners.set(channel, handlers.filter((candidate) => candidate !== handler));
+    };
+    const emit = (channel: string, payload: unknown) => {
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+    };
+    const observed: string[] = [];
+    const producer = createPiSubagentPresenceProducer({
+      emit,
+      on,
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    on(PI_PRESENCE_UPDATE_EVENT, (payload) => {
+      observed.push(`first-update:${(payload as { sequence: number }).sequence}`);
+      emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+    });
+    on(PI_PRESENCE_UPDATE_EVENT, (payload) => observed.push(`second-update:${(payload as { sequence: number }).sequence}`));
+    on(PI_PRESENCE_SUMMARY_EVENT, (payload) => observed.push(`first-summary:${(payload as { sequence: number }).sequence}`));
+    on(PI_PRESENCE_SUMMARY_EVENT, (payload) => observed.push(`second-summary:${(payload as { sequence: number }).sequence}`));
+
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
+
+    assert.deepEqual(observed, ["first-update:1", "second-update:1", "first-summary:1", "second-summary:1"]);
+  });
+
+  test("defers a consumer-less ready re-entering update emission until its companion summary is published", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    let producer: ReturnType<typeof createPiSubagentPresenceProducer>;
+    producer = createPiSubagentPresenceProducer({
+      emit: (channel, payload) => {
+        emitted.push({ channel, payload });
+        if (channel === PI_PRESENCE_UPDATE_EVENT && (payload as { sequence?: number }).sequence === 1) {
+          // A synchronous generic ready arrives before this update has emitted
+          // its already-advertised companion summary.
+          producer.handleReady({ version: 1, sessionId: "session-1" });
+        }
+      },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+    });
+    producer.startSession("session-1", 0);
+    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
+    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
+
+    assert.deepEqual(emitted.filter((event) => event.channel !== PI_PRESENCE_READY_EVENT).map((event) => `${event.channel}:${event.payload.sequence}`), [
+      `${PI_PRESENCE_UPDATE_EVENT}:1`,
+      `${PI_PRESENCE_SUMMARY_EVENT}:1`,
+      `${PI_PRESENCE_UPDATE_EVENT}:2`,
+      `${PI_PRESENCE_SUMMARY_EVENT}:2`,
+    ]);
   });
 
   test("accepts the canonical astral text boundary and rejects the next code point", () => {

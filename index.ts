@@ -43,6 +43,7 @@ import { AgentDiscoveryCache } from "./src/core/agent-discovery-cache.js";
 import { settleWithUnrefTimeout } from "./src/core/async-settle.js";
 import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
+import { probeHerdrReadiness } from "./src/runtime/herdr.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -670,6 +671,7 @@ export default function (pi: ExtensionAPI) {
             `terminal: ${terminal}`,
             `cmux identity: ${hasCmuxFields ? isInsideCmux() ? "valid" : "invalid" : "not present"}`,
             `herdr identity: ${hasHerdrFields ? parseHerdrEnvironment() ? "valid" : "invalid" : "not present"}`,
+            "herdr readiness: checking",
             `tmux identity: ${hasTmuxFields ? isInsideTmux() ? "valid" : "invalid" : "not present"}`,
             `layout: ${interactivePaneLayout}`,
             `child policy: ${resolveManagedChildPolicy()}`,
@@ -680,6 +682,10 @@ export default function (pi: ExtensionAPI) {
             `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
             "control readiness: validated per interactive launch (no doctor probe)",
           ];
+          // The probe is observation-only and deliberately exposes only its
+          // bounded category, never Herdr identities or socket paths.
+          const readiness = await probeHerdrReadiness();
+          lines[3] = `herdr readiness: ${readiness.ready ? "ready" : `not-ready (${readiness.category})`}`;
           ctx.ui.notify(lines.join("\n"), "info");
           return;
         }
@@ -712,6 +718,7 @@ export default function (pi: ExtensionAPI) {
             `- depth: ${run.depth}`,
             `- elapsedMs: ${elapsed}`,
             `- target: ${run.exists === undefined ? "unknown" : run.exists ? run.exited ? "exited" : "present" : "absent"}`,
+            ...(run.herdr ? [`- herdr transport: ${run.herdr.transport}`, `- herdr target: ${run.herdr.target}`, `- herdr orphan-risk: ${run.herdr.orphanRisk}`] : []),
             `- focus: ${run.focusSupported ? "supported" : "unsupported"}`,
             `- promote: ${run.promoteSupported ? "supported" : "unsupported"}`,
             ...(run.title ? [`- managedTitle: ${run.title}`, `- titleState: ${run.titleState ?? "unavailable"}`] : []),
@@ -768,8 +775,8 @@ export default function (pi: ExtensionAPI) {
             })),
             ...interactive.map((run) => ({
               rank: INTERACTIVE_OWNERSHIP_PRESENTATION[run.ownership].attention, startedAt: run.startedAt, id: run.runId,
-              label: `${run.agent} · interactive/${formatInteractiveOwnershipForUx(run.ownership)} · d${run.depth} · ${formatSubagentElapsedForUx(Date.now() - run.startedAt)} · ${run.runId}${run.preview ? ` · ${run.preview}` : ""}`,
-              detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.`,
+              label: `${run.agent} · interactive/${formatInteractiveOwnershipForUx(run.ownership)} · d${run.depth} · ${formatSubagentElapsedForUx(Date.now() - run.startedAt)} · ${run.runId}${run.herdr ? ` · herdr ${run.herdr.transport}/${run.herdr.target}` : ""}${run.preview ? ` · ${run.preview}` : ""}`,
+              detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.herdr ? `\n- herdr transport: ${run.herdr.transport}\n- herdr target: ${run.herdr.target}\n- herdr orphan-risk: ${run.herdr.orphanRisk}` : ""}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.`,
               focusRunId: run.runId,
             })),
           ].sort((left, right) => left.rank - right.rank || left.startedAt - right.startedAt || left.id.localeCompare(right.id)).slice(0, SUBAGENT_UX_SELECTOR_LIMIT);
@@ -780,7 +787,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const invocationText = formatSubagentUxList(jobs);
-        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${formatInteractiveOwnershipForUx(run.ownership)}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
+        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${formatInteractiveOwnershipForUx(run.ownership)}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.herdr ? ` · herdr ${run.herdr.transport}/${run.herdr.target} orphan-risk:${run.herdr.orphanRisk}` : ""}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
         ctx.ui.notify(`${invocationText}\n${interactiveText}`, "info");
       },
     });

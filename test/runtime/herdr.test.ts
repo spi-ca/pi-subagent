@@ -20,6 +20,7 @@ import {
 	isHerdrPublicId,
 	observeHerdrAgentWait,
 	parseHerdrEnvironment,
+	probeHerdrReadiness,
 	shellQuoteHerdrWrapper,
 	subscribeHerdrPane,
 } from "../../src/runtime/herdr";
@@ -71,6 +72,36 @@ describe("Herdr socket client", () => {
 			{ HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "😀".repeat(65), HERDR_PANE_ID: "p" },
 			{ HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_WORKSPACE_ID: "w", HERDR_TAB_ID: "t", HERDR_PANE_ID: "😀".repeat(65) },
 		]) assert.equal(parseHerdrEnvironment(env), null);
+	});
+
+	test("reports only bounded read-only readiness categories and uses only the doctor methods", async () => {
+		assert.deepEqual(await probeHerdrReadiness({}), { ready: false, category: "env-not-configured" });
+		const methods: string[] = [];
+		const fixture = await serverFor((request, socket) => {
+			methods.push(request.method as string);
+			const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+				: request.method === "pane.get" ? { type: "pane_info", pane: sourcePane }
+				: { type: "agent_info", agent: { ...sourcePane, agent_status: "idle", focused: false, revision: 1 } };
+			socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+		});
+		const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id };
+		assert.deepEqual(await probeHerdrReadiness(env), { ready: true, category: "ready" });
+		assert.deepEqual(methods, ["ping", "pane.get", "agent.get"], "doctor readiness is a bounded read-only sequence");
+		await fixture.close();
+	});
+
+	test("classifies doctor caller and agent binding mismatches without exposing identities", async () => {
+		for (const scenario of ["pane", "agent"] as const) {
+			const fixture = await serverFor((request, socket) => {
+				const result = request.method === "ping" ? { type: "pong", protocol: 20 }
+					: request.method === "pane.get" ? { type: "pane_info", pane: scenario === "pane" ? { ...sourcePane, tab_id: "other-tab" } : sourcePane }
+					: { type: "agent_info", agent: { ...sourcePane, ...(scenario === "agent" ? { terminal_id: "other-terminal" } : {}), agent_status: "idle", focused: false, revision: 1 } };
+				socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
+			});
+			const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: fixture.socketPath, HERDR_WORKSPACE_ID: sourcePane.workspace_id, HERDR_TAB_ID: sourcePane.tab_id, HERDR_PANE_ID: sourcePane.pane_id };
+			assert.deepEqual(await probeHerdrReadiness(env), { ready: false, category: scenario === "pane" ? "pane-unavailable" : "agent-unavailable" });
+			await fixture.close();
+		}
 	});
 
 	test("requires the exact response id and surfaces server errors", async () => {

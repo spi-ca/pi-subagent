@@ -70,6 +70,10 @@ export interface HerdrPaneHandle extends HerdrSocketGeneration {
 
 export interface HerdrPaneSnapshot { exists: boolean; exited?: boolean; title?: string; }
 
+/** Bounded, non-sensitive readiness result for the caller's Herdr identity. */
+export type HerdrReadinessCategory = "env-not-configured" | "socket-unavailable" | "protocol-unavailable" | "pane-unavailable" | "agent-unavailable" | "ready";
+export interface HerdrReadinessProbe { readonly ready: boolean; readonly category: HerdrReadinessCategory; }
+
 export class HerdrUnknownOutcomeError extends Error {
 	readonly unknownOutcome = true;
 	constructor(message: string, readonly method: string) { super(message); this.name = "HerdrUnknownOutcomeError"; }
@@ -477,6 +481,33 @@ export async function resolveHerdrCallerPane(env: NodeJS.ProcessEnv = process.en
 	const client = new HerdrSocketClient(configured.socketPath, HERDR_DEFAULT_TIMEOUT_MS, generation); const protocol = await client.assertSupportedProtocol();
 	const pane = await client.getPane(configured.paneId, protocol);
 	return pane && pane.paneId === configured.paneId && pane.workspaceId === configured.workspaceId && pane.tabId === configured.tabId ? { ...pane, ...generation } : null;
+}
+/**
+ * Read-only, bounded caller readiness probe. Deliberately return categories,
+ * never server errors or identity values: doctor output must not disclose a
+ * workspace, tab, pane, terminal, socket, or filesystem path.
+ */
+export async function probeHerdrReadiness(env: NodeJS.ProcessEnv = process.env): Promise<HerdrReadinessProbe> {
+	const configured = parseHerdrEnvironment(env);
+	if (!configured) return { ready: false, category: "env-not-configured" };
+	let generation: HerdrSocketGeneration;
+	try { generation = captureHerdrSocketGeneration(configured.socketPath); }
+	catch { return { ready: false, category: "socket-unavailable" }; }
+	const client = new HerdrSocketClient(configured.socketPath, HERDR_DEFAULT_TIMEOUT_MS, generation);
+	let protocol: HerdrProtocolVersion;
+	try { protocol = await client.assertSupportedProtocol(); }
+	catch { return { ready: false, category: "protocol-unavailable" }; }
+	let pane: HerdrPaneHandle | null | undefined;
+	try { pane = await client.getPane(configured.paneId, protocol); }
+	catch { return { ready: false, category: "pane-unavailable" }; }
+	if (!pane || pane.workspaceId !== configured.workspaceId || pane.tabId !== configured.tabId || pane.paneId !== configured.paneId) {
+		return { ready: false, category: "pane-unavailable" };
+	}
+	try {
+		const agent = await client.getAgent(pane.paneId);
+		if (!agent || !sameAgentBinding(agent, pane)) return { ready: false, category: "agent-unavailable" };
+	} catch { return { ready: false, category: "agent-unavailable" }; }
+	return { ready: true, category: "ready" };
 }
 /** Allocate, durably publish through the caller callback, then launch by text exactly once. */
 async function createHerdrPane(options: { cwd: string; wrapperPath: string; tabLabel?: string; signal?: AbortSignal; onAllocated?: (handle: HerdrPaneHandle) => Promise<void>; env?: NodeJS.ProcessEnv; layout: "split" | "auto"; }): Promise<HerdrPaneHandle> {

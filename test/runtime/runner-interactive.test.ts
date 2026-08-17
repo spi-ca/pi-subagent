@@ -74,6 +74,9 @@ import {
 	terminateExactUnixChildForTest,
 	terminateAuthorizedHerdrChildForTest,
 	subscribeSharedHerdrPaneForTest,
+	markRetainedHerdrRunPresentationUnavailableForTest,
+	updateHerdrRunPresentationClassificationForTest,
+	updateHerdrRunTransportPresentationForTest,
 } from "../../src/runtime/runner";
 import { InteractiveLayoutCoordinator, resolveInteractivePaneLayout } from "../../src/runtime/interactive-layout";
 import { buildTmuxPaneSnapshotArgs, buildTmuxServerPidArgs, readTmuxPaneTitle } from "../../src/runtime/tmux";
@@ -220,15 +223,16 @@ describe("interactive pane runner preparation", () => {
 	test("shares one Herdr selector socket, serially reconfigures its pane union, and fans an underscore status event only to its pane", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-shared-"));
 		const socketPath = path.join(root, "herdr.sock");
-		let subscriptions = 0, openSockets = 0, maxOpenSockets = 0;
+		let subscriptions = 0, openSubscriptions = 0, maxOpenSubscriptions = 0;
 		const selectorSets: string[][] = [];
 		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane-a", terminal_id: "terminal-a" };
 		const server = net.createServer((socket) => {
-			openSockets += 1; maxOpenSockets = Math.max(maxOpenSockets, openSockets);
-			socket.once("close", () => { openSockets -= 1; });
+			let isSubscription = false;
+			socket.once("close", () => { if (isSubscription) openSubscriptions -= 1; });
 			socket.once("data", (chunk) => {
 				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string; params?: { subscriptions?: Array<{ type?: string; pane_id?: string }> } };
 				if (request.method !== "events.subscribe") { socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`); return; }
+				isSubscription = true; openSubscriptions += 1; maxOpenSubscriptions = Math.max(maxOpenSubscriptions, openSubscriptions);
 				subscriptions += 1;
 				selectorSets.push((request.params?.subscriptions ?? []).filter((item) => item.type === "pane.agent_status_changed").map((item) => item.pane_id!).sort());
 				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
@@ -239,16 +243,138 @@ describe("interactive pane runner preparation", () => {
 		const stat = fs.lstatSync(socketPath, { bigint: true });
 		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
 		let firstReconciles = 0, secondReconciles = 0;
+		const secondTargets: string[] = [];
 		const first = subscribeSharedHerdrPaneForTest({ handle, onReconcile: () => { firstReconciles += 1; } });
 		for (let attempt = 0; attempt < 40 && subscriptions !== 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-		const second = subscribeSharedHerdrPaneForTest({ handle: { ...handle, paneId: "pane-b", terminalId: "terminal-b" }, onReconcile: () => { secondReconciles += 1; } });
+		const second = subscribeSharedHerdrPaneForTest({ handle: { ...handle, paneId: "pane-b", terminalId: "terminal-b" }, onReconcile: () => { secondReconciles += 1; }, onReconcileTarget: (terminal) => { secondTargets.push(terminal.state); } });
 		for (let attempt = 0; attempt < 80 && (subscriptions !== 2 || secondReconciles !== 1); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.equal(subscriptions, 2, "one serial replacement carries the changed selector union");
 		assert.deepEqual(selectorSets, [["pane-a"], ["pane-a", "pane-b"]]);
-		assert.equal(maxOpenSockets, 1, "replacement waits for the old physical stream to drain");
-		assert.equal(firstReconciles, 0, "pane-b status does not fan out to pane-a");
-		assert.equal(secondReconciles, 1);
+		assert.equal(maxOpenSubscriptions, 1, "replacement waits for the old physical stream to drain");
+		assert.ok(firstReconciles >= 1, "initial healthy subscription reconciles each listener");
+		assert.ok(secondReconciles >= 1);
+		assert.ok(secondTargets.every((target) => target === "unknown"), "malformed read-only reconciliation remains unknown");
 		first.stop(); second.stop(); await Promise.all([first.closed, second.closed]); await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	});
+
+	test("shared Herdr diagnostics reconcile moved terminals across stale close events and reconnects", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-diagnostic-"));
+		const socketPath = path.join(root, "herdr.sock");
+		const initial = { workspace_id: "workspace", tab_id: "allocated-tab", pane_id: "allocated-pane", terminal_id: "child-terminal" };
+		const moved = { workspace_id: "workspace", tab_id: "user-tab", pane_id: "moved-pane", terminal_id: "child-terminal" };
+		let subscriptions = 0;
+		const server = net.createServer((socket) => socket.once("data", (chunk) => {
+			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+			if (request.method === "events.subscribe") {
+				subscriptions += 1;
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				if (subscriptions === 1) setTimeout(() => {
+					socket.write(`${JSON.stringify({ event: "pane_moved", data: { previous_pane_id: initial.pane_id, pane: moved } })}\n`);
+					socket.write(`${JSON.stringify({ event: "pane_closed", data: { pane_id: initial.pane_id } })}\n`);
+					socket.end();
+				}, 5);
+				return;
+			}
+			if (request.method === "pane.get") socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: moved } })}\n`);
+			else if (request.method === "pane.list") socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_list", panes: [moved] } })}\n`);
+			else socket.end(`${JSON.stringify({ id: request.id, result: { type: "pong", protocol: 20 } })}\n`);
+		}));
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: initial.workspace_id, tabId: initial.tab_id, paneId: initial.pane_id, terminalId: initial.terminal_id, protocol: 20 as const };
+		const targets: Array<{ state: string; tab?: string; pane?: string }> = [];
+		const subscription = subscribeSharedHerdrPaneForTest({
+			handle,
+			onReconcile: () => undefined,
+			onReconcileTarget: (terminal) => targets.push(terminal.state === "present" ? { state: terminal.state, tab: terminal.handle.tabId, pane: terminal.handle.paneId } : { state: terminal.state }),
+		});
+		for (let attempt = 0; attempt < 100 && (subscriptions < 2 || targets.length < 3); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(subscriptions >= 2, "a disconnected stream reconnects");
+		assert.ok(targets.length >= 3, "initial health, moved/stale events, and reconnect each wake reconciliation");
+		assert.ok(targets.every((target) => target.state === "present" && target.tab === moved.tab_id && target.pane === moved.pane_id), "a stale close never overrides the authoritative moved-terminal read");
+		subscription.stop(); await subscription.closed;
+		await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	});
+
+	test("discards a classification begun before a successful Herdr reconnect", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-reconnect-classification-"));
+		const socketPath = path.join(root, "herdr.sock");
+		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane", terminal_id: "terminal" };
+		let subscriptions = 0, paneGets = 0;
+		const server = net.createServer((socket) => socket.once("data", (chunk) => {
+			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+			if (request.method === "events.subscribe") {
+				subscriptions += 1;
+				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+				if (subscriptions === 1) setTimeout(() => socket.end(), 5);
+				return;
+			}
+			if (request.method === "pane.get") {
+				paneGets += 1;
+				setTimeout(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`), paneGets === 1 ? 180 : 0);
+				return;
+			}
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pong", protocol: 20 } })}\n`);
+		}));
+		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+		const stat = fs.lstatSync(socketPath, { bigint: true });
+		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
+		const targets: string[] = [];
+		const subscription = subscribeSharedHerdrPaneForTest({
+			handle,
+			onReconcile: () => undefined,
+			onReconcileTarget: (terminal) => targets.push(terminal.state),
+		});
+		for (let attempt = 0; attempt < 100 && (subscriptions < 2 || targets.length < 1); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(subscriptions >= 2, "the transport reconnects before the initial classification returns");
+		assert.ok(paneGets >= 2, "the reconnect schedules a fresh classification");
+		assert.deepEqual(targets, ["present"], "the pre-reconnect classification cannot restore target presentation");
+		subscription.stop(); await subscription.closed;
+		await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	});
+
+	test("clears stale Herdr target presentation on health transitions until fresh classification", async () => {
+		await resetInteractiveShutdownForSession();
+		const runId = "herdr-health-reclassification";
+		const native = { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const };
+		const handle = { mode: "herdr-pane" as const, native, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			updateHerdrRunPresentationClassificationForTest(runId, { state: "present", handle: native });
+			updateHerdrRunTransportPresentationForTest(runId, true);
+			assert.deepEqual(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.herdr, {
+				transport: "healthy", target: "unknown", orphanRisk: "possible",
+			}, "a reconnect acknowledgement cannot retain a stale current target");
+			updateHerdrRunPresentationClassificationForTest(runId, { state: "present", handle: native });
+			assert.deepEqual(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.herdr, {
+				transport: "healthy", target: "current", orphanRisk: "none",
+			}, "only the fresh classification restores healthy/current");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+		}
+	});
+
+	test("marks a retained Herdr run unavailable when its monitor subscription stops", async () => {
+		await resetInteractiveShutdownForSession();
+		const runId = "herdr-monitor-stopped";
+		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
+		const backend = { mode: "herdr-pane" as const, availabilityError: () => null, launch: async () => handle,
+			inspect: async () => ({ exists: true }), interrupt: async () => false, close: async () => false };
+		try {
+			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, generation: getInteractiveShutdownGenerationForTest() }), true);
+			markRetainedHerdrRunPresentationUnavailableForTest(runId);
+			assert.deepEqual(listInteractiveRunUxSnapshots().find((run) => run.runId === runId)?.herdr, {
+				transport: "reconnecting", target: "unknown", orphanRisk: "possible",
+			});
+			markRetainedHerdrRunPresentationUnavailableForTest(runId, true);
+			assert.equal(listActiveInteractiveRunIds().includes(runId), true, "an absent-proven path is left to its winner-site unregister");
+		} finally {
+			unregisterCommittedInteractiveRun(runId, true);
+			await resetInteractiveShutdownForSession();
+		}
 	});
 
 	test("notifies interactive registry observers immediately and after successful shutdown removal", async () => {

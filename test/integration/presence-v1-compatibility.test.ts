@@ -9,18 +9,20 @@ import {
   PI_PRESENCE_SUMMARY_EVENT,
   PI_PRESENCE_UPDATE_EVENT,
   createPiSubagentPresenceProducer,
-  parsePiPresenceReady,
-  parsePiPresenceRemove,
-  parsePiPresenceSummary,
-  parsePiPresenceUpdate,
 } from "../../src/integration/pi-presence-producer";
+import { createFrozenConsumerContract, type FrozenConsumerContract, type PresenceChannel } from "../fixtures/presence-v1-frozen-consumer-contracts";
 
 type ConsumerProfile = {
   readonly name: string;
   readonly consumer: { readonly id: string; readonly capabilities: readonly string[] };
-  readonly expectsSummary: boolean;
+  readonly acceptsSummary: boolean;
+  readonly frozenFrom: { readonly repository: string; readonly revision: string; readonly scope: string };
 };
-type Fixture = { readonly version: 1; readonly profiles: readonly ConsumerProfile[] };
+type Fixture = {
+  readonly version: 1;
+  readonly fixtureScope: string;
+  readonly profiles: readonly ConsumerProfile[];
+};
 type Event = { readonly channel: string; readonly payload: unknown };
 
 const fixturePath = path.resolve(import.meta.dirname, "../fixtures/presence-v1-consumer-profiles.json");
@@ -52,18 +54,31 @@ function eventBus() {
   return { events, emit, on };
 }
 
-function installConsumerFirstResponder(bus: ReturnType<typeof eventBus>, profile: ConsumerProfile): void {
-  bus.on(PI_PRESENCE_READY_EVENT, (payload) => {
-    const ready = parsePiPresenceReady(payload);
-    if (ready && !ready.consumer) {
-      bus.emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: ready.sessionId, consumer: profile.consumer });
-    }
-  });
+function installFrozenConsumer(bus: ReturnType<typeof eventBus>, consumer: FrozenConsumerContract, sessionId: string) {
+  const accepted: string[] = [];
+  const channels: PresenceChannel[] = [PI_PRESENCE_READY_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_SUMMARY_EVENT, PI_PRESENCE_REMOVE_EVENT];
+  for (const channel of channels) {
+    bus.on(channel, (payload) => {
+      if (!consumer.accept(channel, payload, sessionId)) return;
+      if (channel === PI_PRESENCE_READY_EVENT) {
+        // A consumer-owned strict request parser accepted this consumer-less
+        // request; respond with its frozen current ready advertisement.
+        bus.emit(channel, { version: 1, sessionId, consumer: consumer.readyAdvertisement });
+        return;
+      }
+      const sequence = (payload as { sequence: number }).sequence;
+      accepted.push(`${channel}:${sequence}`);
+    });
+  }
+  return accepted;
 }
 
 function assertLifecycle(profile: ConsumerProfile, loadOrder: "consumer-first" | "producer-first"): void {
   const bus = eventBus();
-  if (loadOrder === "consumer-first") installConsumerFirstResponder(bus, profile);
+  const sessionId = "fixture-session";
+  const consumer = createFrozenConsumerContract(profile.name);
+  let accepted: string[] | undefined;
+  if (loadOrder === "consumer-first") accepted = installFrozenConsumer(bus, consumer, sessionId);
   const producer = createPiSubagentPresenceProducer({
     emit: bus.emit,
     on: bus.on,
@@ -71,61 +86,79 @@ function assertLifecycle(profile: ConsumerProfile, loadOrder: "consumer-first" |
     getInteractiveActiveCount: () => 0,
   });
 
-  producer.startSession("fixture-session", 0);
+  producer.startSession(sessionId, 0);
   producer.publish(runningSnapshot);
 
   if (loadOrder === "producer-first") {
-    // A late consumer follows V1 discovery: advertise, then request replay.
-    bus.emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "fixture-session", consumer: profile.consumer });
+    accepted = installFrozenConsumer(bus, consumer, sessionId);
+    // A late consumer first advertises its exact ready identity, then sends
+    // its independent consumer-less replay request.
+    bus.emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId, consumer: consumer.readyAdvertisement });
   }
-  bus.emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "fixture-session" });
+  bus.emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId });
   producer.publish(completedSnapshot);
   producer.settle();
 
-  const updates = bus.events.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT);
-  const summaries = bus.events.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT);
-  const removes = bus.events.filter((event) => event.channel === PI_PRESENCE_REMOVE_EVENT);
-  assert.deepEqual(updates.map((event) => parsePiPresenceUpdate(event.payload)?.sequence), [1, 2, 3], `${profile.name}/${loadOrder}: update and replay sequence`);
-  assert.deepEqual(removes.map((event) => parsePiPresenceRemove(event.payload)?.sequence), [4], `${profile.name}/${loadOrder}: remove follows terminal update`);
-  assert.deepEqual(bus.events.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT || event.channel === PI_PRESENCE_REMOVE_EVENT).map((event) => event.channel), [
-    PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT,
-  ], `${profile.name}/${loadOrder}: terminal update is emitted before lifecycle removal`);
-  assert.equal(parsePiPresenceUpdate(updates[1]?.payload)?.attention, "none", `${profile.name}/${loadOrder}: replay is non-attention-grabbing`);
-  assert.equal(parsePiPresenceUpdate(updates[2]?.payload)?.state, "success", `${profile.name}/${loadOrder}: terminal update precedes remove`);
-  assert.equal(parsePiPresenceRemove(removes[0]?.payload)?.source.id, "pi-subagent");
+  const expected = profile.acceptsSummary
+    ? [
+      "pi-presence:update:v1:1", "pi-presence:summary:v1:1",
+      "pi-presence:update:v1:2", "pi-presence:summary:v1:2",
+      "pi-presence:update:v1:3", "pi-presence:summary:v1:3",
+      "pi-presence:remove:v1:4",
+    ]
+    : ["pi-presence:update:v1:1", "pi-presence:update:v1:2", "pi-presence:update:v1:3", "pi-presence:remove:v1:4"];
+  const consumerExpected = loadOrder === "producer-first" ? expected.filter((entry) => !entry.endsWith(":1")) : expected;
+  assert.deepEqual(accepted, consumerExpected, `${profile.name}/${loadOrder}: independently frozen consumer accepts the available lifecycle`);
 
-  const summarySequences = summaries.map((event) => parsePiPresenceSummary(event.payload)?.sequence);
-  assert.deepEqual(summarySequences, profile.expectsSummary ? [1, 2, 3] : [], `${profile.name}/${loadOrder}: declared capability boundary`);
-  for (const sequence of summarySequences) {
-    const updateIndex = bus.events.findIndex((event) => event.channel === PI_PRESENCE_UPDATE_EVENT && parsePiPresenceUpdate(event.payload)?.sequence === sequence);
-    const summaryIndex = bus.events.findIndex((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT && parsePiPresenceSummary(event.payload)?.sequence === sequence);
-    assert.ok(updateIndex >= 0 && summaryIndex > updateIndex, `${profile.name}/${loadOrder}: summary follows its update`);
-  }
-
-  // The producer's active ready request and the consumer's later request are
-  // the only replay discovery requests. Advertisements never add a replay.
-  const requests = bus.events
-    .filter((event) => event.channel === PI_PRESENCE_READY_EVENT)
-    .map((event) => parsePiPresenceReady(event.payload))
-    .filter((ready): ready is NonNullable<typeof ready> => ready !== null && !ready.consumer);
-  assert.equal(requests.length, 2, `${profile.name}/${loadOrder}: one producer request and one consumer replay request`);
+  const emitted = bus.events.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT || event.channel === PI_PRESENCE_SUMMARY_EVENT || event.channel === PI_PRESENCE_REMOVE_EVENT);
+  assert.deepEqual(emitted.map((event) => event.channel), expected.map((entry) => entry.slice(0, entry.lastIndexOf(":"))), `${profile.name}/${loadOrder}: consumer acceptance preserves update/summary/remove order`);
+  const readyRequests = bus.events
+    .filter((event) => event.channel === PI_PRESENCE_READY_EVENT && !(event.payload as { consumer?: unknown }).consumer);
+  assert.equal(readyRequests.length, 2, `${profile.name}/${loadOrder}: one producer request and one consumer replay request`);
 }
 
-describe("presence V1 producer compatibility fixtures", () => {
-  test("declare the fixed cmux V1 and summary-capable Herdr V1 profiles", () => {
+describe("presence V1 frozen consumer compatibility fixtures", () => {
+  test("mirror the exact current cmux and Herdr ready consumer identities and capability advertisements", () => {
     assert.equal(fixture.version, 1);
-    assert.deepEqual(fixture.profiles.map((profile) => profile.name), ["cmux-fixed-v1", "herdr-summary-v1"]);
-    const cmux = fixture.profiles[0]!;
-    assert.equal(cmux.consumer.id, "pi-cmux-presence");
-    assert.equal(cmux.consumer.capabilities.includes("presence-summary-v1"), false, "fixed cmux V1 must not advertise summary");
-    assert.equal(cmux.expectsSummary, false);
-    assert.equal(fixture.profiles[1]!.expectsSummary, true);
+    assert.match(fixture.fixtureScope, /no sibling runtime import or live E2E/);
+    assert.deepEqual(fixture.profiles.map((profile) => profile.name), ["pi-cmux-presence-ready-v1", "pi-herdr-presence-ready-v1"]);
+    assert.deepEqual(fixture.profiles.map((profile) => profile.consumer), [
+      { id: "pi-cmux-presence", capabilities: ["cmux-status", "cmux-progress", "cmux-attention", "presence-remove-v1"] },
+      { id: "pi-herdr-presence", capabilities: ["presence-remove-v1", "presence-summary-v1", "herdr-pane-report-agent-v1", "herdr-pane-report-metadata-v1"] },
+    ]);
+    assert.deepEqual(fixture.profiles.map((profile) => profile.frozenFrom), [
+      { repository: "pi-cmux-presence", revision: "2ef26ac", scope: "current ready advertisement and V1 update/remove acceptance" },
+      { repository: "pi-herdr-presence", revision: "0918827", scope: "current ready advertisement and pi-subagent update/remove/summary acceptance" },
+    ]);
+    for (const profile of fixture.profiles) {
+      const consumer = createFrozenConsumerContract(profile.name);
+      assert.deepEqual(consumer.readyAdvertisement, profile.consumer, `${profile.name}: consumer-owned fixture and JSON advertisement stay exact`);
+      assert.equal(consumer.acceptsSummary, profile.acceptsSummary, `${profile.name}: consumer-owned summary scope stays exact`);
+    }
   });
 
   for (const profile of fixture.profiles) {
-    test(`${profile.name} completes the deterministic consumer-first handshake and lifecycle`, () => assertLifecycle(profile, "consumer-first"));
-    test(`${profile.name} completes the deterministic producer-first handshake, replay, and lifecycle`, () => assertLifecycle(profile, "producer-first"));
+    test(`${profile.name} independently accepts the deterministic consumer-first handshake and lifecycle`, () => assertLifecycle(profile, "consumer-first"));
+    test(`${profile.name} independently accepts the deterministic producer-first handshake, replay, and lifecycle`, () => assertLifecycle(profile, "producer-first"));
   }
+
+  test("frozen consumer rules retain cmux summary rejection and Herdr's same-fence summary acceptance", () => {
+    const sessionId = "consumer-rule-session";
+    const update = {
+      version: 1, sessionId, generation: 0, sequence: 1,
+      source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" },
+      state: "running", counts: { active: 1, completed: 0, failed: 0 },
+    };
+    const summary = { version: 1, sessionId, generation: 0, sequence: 1, source: { id: "pi-subagent" }, active: [], omitted: 1 };
+    const cmux = createFrozenConsumerContract("pi-cmux-presence-ready-v1");
+    const herdr = createFrozenConsumerContract("pi-herdr-presence-ready-v1");
+    assert.equal(cmux.accept(PI_PRESENCE_UPDATE_EVENT, update, sessionId), true);
+    assert.equal(cmux.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), false, "cmux does not consume summary:v1");
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), false, "Herdr requires an accepted matching update first");
+    assert.equal(herdr.accept(PI_PRESENCE_UPDATE_EVENT, update, sessionId), true);
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), true);
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, { ...summary, source: { id: "other" } }, sessionId), false, "Herdr summary scope is exact pi-subagent");
+  });
 
   test("the producer remains event-only: no sibling consumer, socket, CLI, or polling runtime coupling", () => {
     const producerPath = path.resolve(import.meta.dirname, "../../src/integration/pi-presence-producer.ts");

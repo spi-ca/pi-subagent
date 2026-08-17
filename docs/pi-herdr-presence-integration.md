@@ -50,7 +50,9 @@
 
 ### 3.1 실제 producer-consumer 교차 smoke
 
-현재 producer 단위 테스트만으로는 sibling `pi-herdr-presence` parser와 runtime이 동일 wire contract를 실제로 수락하는지 증명할 수 없다. package dependency를 추가하지 않는 별도 opt-in acceptance를 마련해 다음 순서를 확인한다.
+`test/fixtures/presence-v1-consumer-profiles.json`와 `test/integration/presence-v1-compatibility.test.ts`의 deterministic fake event-bus harness는 package dependency나 sibling import 없이 Herdr V1 + `presence-summary-v1` profile의 consumer-first/producer-first ready handshake, replay, update/summary 같은 sequence, terminal update 뒤 remove를 producer 관점에서 확인한다. 같은 fixture는 fixed cmux V1 summary 경계와 source의 socket/CLI/timer polling coupling 부재도 확인한다. 이는 producer contract fixture 증거이지 sibling `pi-herdr-presence` parser/runtime 수락 증거는 아니다.
+
+실제 sibling `pi-herdr-presence` parser와 runtime이 동일 wire contract를 수락하는지는 여전히 별도 opt-in acceptance로 확인해야 한다. package dependency를 추가하지 않는 acceptance는 다음 순서를 확인한다.
 
 1. consumer advertisement와 consumer-less ready request
 2. producer-first와 consumer-first load order
@@ -154,11 +156,12 @@ presence update/remove/summary는 observer event다. consumer가 subagent 취소
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts
+bun test test/integration/presence-v1-compatibility.test.ts
 bun test test/runtime/herdr.test.ts
 bun run ci
 ```
 
-현재 package script에는 Herdr presence sibling acceptance가 별도로 정의되어 있지 않다. 후속 acceptance를 구현하기 전에는 존재하지 않는 명령이나 live PASS를 문서에 추가하지 않는다.
+두 integration test는 deterministic fixture/fake event-bus 검증이며 실제 sibling consumer load, 실제 Pi loader, Herdr socket/UI smoke가 아니다. 현재 package script에는 Herdr presence sibling acceptance가 별도로 정의되어 있지 않다. 후속 acceptance를 구현하기 전에는 존재하지 않는 명령이나 live PASS를 문서에 추가하지 않는다.
 
 관련 코드와 문서:
 

@@ -38,6 +38,17 @@ const completedSnapshot = {
   recent: [{ id: "run-1", agent: "worker", status: "completed", generation: 0, kind: "foreground", startedAt: 1, updatedAt: 2, completedAt: 2 }],
 } satisfies SubagentUxRegistrySnapshot;
 
+function updateWithEveryOptionalField(sessionId: string, sequence: number) {
+  return {
+    version: 1, sessionId, generation: 0, sequence,
+    source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" },
+    state: "running", counts: { active: 1, completed: 0, failed: 0, queued: 2, cancelled: 3, total: 6 },
+    progress: { value: 0.5, label: "Halfway" },
+    usage: { tokens: 12.5, cost: 0.25, contextPercent: 50 },
+    attention: "info",
+  };
+}
+
 function eventBus() {
   const events: Event[] = [];
   const listeners = new Map<string, Set<(payload: unknown) => void>>();
@@ -142,22 +153,65 @@ describe("presence V1 frozen consumer compatibility fixtures", () => {
     test(`${profile.name} independently accepts the deterministic producer-first handshake, replay, and lifecycle`, () => assertLifecycle(profile, "producer-first"));
   }
 
-  test("frozen consumer rules retain cmux summary rejection and Herdr's same-fence summary acceptance", () => {
+  test("frozen consumer contracts accept all valid optional update fields and reject malformed optional fields", () => {
+    const sessionId = "optional-field-session";
+    const valid = updateWithEveryOptionalField(sessionId, 1);
+    const malformed = [
+      { name: "queued count", payload: { ...valid, sequence: 2, counts: { ...valid.counts, queued: -1 } } },
+      { name: "cancelled count", payload: { ...valid, sequence: 2, counts: { ...valid.counts, cancelled: 1.5 } } },
+      { name: "total count", payload: { ...valid, sequence: 2, counts: { ...valid.counts, total: 1_000_001 } } },
+      { name: "progress value", payload: { ...valid, sequence: 2, progress: { value: 1.01 } } },
+      { name: "progress label", payload: { ...valid, sequence: 2, progress: { value: 0.5, label: "bad\nlabel" } } },
+      { name: "progress shape", payload: { ...valid, sequence: 2, progress: { label: "missing value" } } },
+      { name: "progress shape extra field", payload: { ...valid, sequence: 2, progress: { value: 0.5, extra: true } } },
+      { name: "usage tokens", payload: { ...valid, sequence: 2, usage: { tokens: -1 } } },
+      { name: "usage cost", payload: { ...valid, sequence: 2, usage: { cost: Number.POSITIVE_INFINITY } } },
+      { name: "usage context percentage", payload: { ...valid, sequence: 2, usage: { contextPercent: 101 } } },
+      { name: "usage shape", payload: { ...valid, sequence: 2, usage: { tokens: 1, unexpected: true } } },
+      { name: "attention", payload: { ...valid, sequence: 2, attention: "urgent" } },
+    ];
+    const accessorProgress = { ...valid, sequence: 2, progress: { ...valid.progress } };
+    Object.defineProperty(accessorProgress.progress, "value", { enumerable: true, get: () => 0.5 });
+    const proxyUpdate = new Proxy(valid, {});
+    for (const profile of fixture.profiles) {
+      const consumer = createFrozenConsumerContract(profile.name);
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, valid, sessionId), true, `${profile.name}: all optional update fields are accepted when valid`);
+      for (const invalid of malformed) {
+        assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, invalid.payload, sessionId), false, `${profile.name}: malformed ${invalid.name} is rejected`);
+      }
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, accessorProgress, sessionId), false, `${profile.name}: accessor-backed optional progress is rejected without invocation`);
+      assert.equal(consumer.accept(PI_PRESENCE_UPDATE_EVENT, proxyUpdate, sessionId), false, `${profile.name}: proxied update is rejected`);
+    }
+  });
+
+  test("frozen consumer rules retain cmux summary rejection and Herdr's one-shot update/remove fence", () => {
     const sessionId = "consumer-rule-session";
-    const update = {
-      version: 1, sessionId, generation: 0, sequence: 1,
-      source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" },
-      state: "running", counts: { active: 1, completed: 0, failed: 0 },
+    const update = updateWithEveryOptionalField(sessionId, 1);
+    const summary = {
+      version: 1, sessionId, generation: 0, sequence: 1, source: { id: "pi-subagent" }, active: [], omitted: 1,
+      waiting: { category: "queued", count: 1 }, terminal: { id: "run-1", agent: "worker", status: "completed", completedAt: 1 },
     };
-    const summary = { version: 1, sessionId, generation: 0, sequence: 1, source: { id: "pi-subagent" }, active: [], omitted: 1 };
     const cmux = createFrozenConsumerContract("pi-cmux-presence-ready-v1");
     const herdr = createFrozenConsumerContract("pi-herdr-presence-ready-v1");
     assert.equal(cmux.accept(PI_PRESENCE_UPDATE_EVENT, update, sessionId), true);
     assert.equal(cmux.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), false, "cmux does not consume summary:v1");
     assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), false, "Herdr requires an accepted matching update first");
     assert.equal(herdr.accept(PI_PRESENCE_UPDATE_EVENT, update, sessionId), true);
+    assert.equal(herdr.accept(PI_PRESENCE_UPDATE_EVENT, update, sessionId), false, "duplicate update cannot reset Herdr's summary fence");
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, { ...summary, terminal: undefined }, sessionId), false, "malformed summary does not consume the companion slot");
     assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), true);
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, summary, sessionId), false, "duplicate summary is one-shot rejected");
     assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, { ...summary, source: { id: "other" } }, sessionId), false, "Herdr summary scope is exact pi-subagent");
+
+    const remove = { version: 1, sessionId, generation: 0, sequence: 2, source: { id: "pi-subagent" } };
+    assert.equal(herdr.accept(PI_PRESENCE_REMOVE_EVENT, remove, sessionId), true);
+    assert.equal(herdr.accept(PI_PRESENCE_REMOVE_EVENT, remove, sessionId), false, "duplicate remove is rejected by the shared fence");
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, { ...summary, sequence: 2 }, sessionId), false, "remove tombstone cannot be bypassed by a summary replay");
+
+    const nextUpdate = updateWithEveryOptionalField(sessionId, 3);
+    const nextSummary = { ...summary, sequence: 3 };
+    assert.equal(herdr.accept(PI_PRESENCE_UPDATE_EVENT, nextUpdate, sessionId), true, "a later update creates one fresh companion slot");
+    assert.equal(herdr.accept(PI_PRESENCE_SUMMARY_EVENT, nextSummary, sessionId), true);
   });
 
   test("the producer remains event-only: no sibling consumer, socket, CLI, or polling runtime coupling", () => {

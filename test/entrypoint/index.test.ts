@@ -39,17 +39,18 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
   },
 }));
 const presenceLifecycleCalls: string[] = [];
-let presenceRemoveCapabilityDetected = false;
+const presenceProducerOptions: Array<Record<string, unknown>> = [];
 mock.module("../../src/integration/pi-presence-producer", () => ({
-  createPiSubagentPresenceProducer: () => ({
+  createPiSubagentPresenceProducer: (options: Record<string, unknown>) => {
+    presenceProducerOptions.push(options);
+    return {
     startSession: () => { presenceLifecycleCalls.push("start"); return true; },
     stop: () => undefined,
     publish: () => { presenceLifecycleCalls.push("publish"); return true; },
     beginAgentRun: () => presenceLifecycleCalls.push("begin"),
-    recordFinalUsage: () => { presenceLifecycleCalls.push("usage"); return true; },
-    settle: () => presenceLifecycleCalls.push("settle"),
-    isPresenceRemoveCapabilityDetected: () => presenceRemoveCapabilityDetected,
-  }),
+      settle: () => presenceLifecycleCalls.push("settle"),
+    };
+  },
 }));
 const { default: registerPiSubagent } = await import("../../index");
 
@@ -124,37 +125,6 @@ describe("production dashboard boundary", () => {
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
   });
 
-  test("reports passive presence remove capability in doctor output", async () => {
-    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
-    const commands = new Map<string, { handler: (rawArgs: string, ctx: unknown) => Promise<void> }>();
-    try {
-      delete process.env.PI_SUBAGENT_DEPTH;
-      presenceRemoveCapabilityDetected = false;
-      registerPiSubagent({
-        registerFlag: () => undefined,
-        getFlag: () => undefined,
-        registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
-        registerTool: () => undefined,
-        on: () => undefined,
-        events: { emit: () => undefined },
-        getAllTools: () => [],
-        getCommands: () => [],
-      } as never);
-      const command = commands.get("subagents");
-      assert.ok(command);
-      const notify = (message: string) => { doctorOutput = message; };
-      let doctorOutput = "";
-      await command.handler("doctor", { ui: { notify } });
-      assert.match(doctorOutput, /presence remove capability: not observed/);
-      presenceRemoveCapabilityDetected = true;
-      await command.handler("doctor", { ui: { notify } });
-      assert.match(doctorOutput, /presence remove capability: detected/);
-    } finally {
-      presenceRemoveCapabilityDetected = false;
-      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
-      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
-    }
-  });
 
   test("reports absent, invalid, and valid Herdr identities in doctor output without exposing identity values", async () => {
     const herdrEnvironmentNames = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const;
@@ -238,6 +208,7 @@ describe("production dashboard boundary", () => {
 
       presenceLifecycleCalls.length = 0;
       await sessionStart({}, sessionContext(false));
+      assert.equal(typeof presenceProducerOptions.at(-1)?.getInteractiveActiveInvocationIds, "function");
       assert.ok(presenceLifecycleCalls.includes("start"));
       assert.equal(presenceLifecycleCalls.includes("settle"), false);
 

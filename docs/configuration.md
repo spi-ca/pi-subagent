@@ -154,7 +154,7 @@ managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이�
 
 부모 CLI의 `--api-key` 값은 child argv에 그대로 전달하지 않습니다. 명시한 parent `--provider`, fully-qualified parent model, 또는 허용된 agent model에서 provider를 결정해 provider별 API-key 환경 변수로 매핑하고 private agent-dir overlay를 통해 전달합니다. parent provider와 parent/child model provider가 충돌하거나 provider가 없거나 지원 매핑이 없으면 key 전달을 생략하고 경고하며, 기존 provider별 환경 변수나 다른 auth는 그대로 사용할 수 있습니다. user agent model은 provider hint로 사용할 수 있지만 project agent model은 현재 exact project root가 신뢰된 경우에만 사용합니다. 확실한 상속이 필요하면 지원되는 `--provider` 또는 `provider/model` 형식의 `--model`을 명시하고 서로 일치시키세요.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 dependency 없이 `pi-presence:update:v1`/`pi-presence:remove:v1` producer를 만들고 `pi-presence:ready:v1`을 수신하며 nested child는 만들지 않습니다. 따라서 `managed`는 inherited `pi-cmux-presence` extension도 제외하고, `inherit`도 root producer를 child에 복제하지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-cmux-presence` presence 연동](./pi-cmux-presence-integration.md)을 참고하세요.
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 컨텍스트 모드
 

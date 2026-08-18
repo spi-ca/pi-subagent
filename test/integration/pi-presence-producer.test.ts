@@ -1,847 +1,322 @@
-import { describe, test } from "bun:test";
+import { afterEach, describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import {
-  MAX_PRESENCE_COUNT,
-  PI_PRESENCE_READY_EVENT,
-  PI_PRESENCE_REMOVE_EVENT,
-  PI_PRESENCE_SUMMARY_EVENT,
-  PI_PRESENCE_UPDATE_EVENT,
-  createPiSubagentPresenceProducer,
-  isPiCmuxPresenceCmuxStatusReady,
-  parsePiPresenceReady,
-  parsePiPresenceRemove,
-  parsePiPresenceSummary,
-  parsePiPresenceUpdate,
-} from "../../src/integration/pi-presence-producer";
+import fs from "node:fs";
+import path from "node:path";
+import { createPresenceConsumer, EVENT_NAMES, type PresenceEventV2 } from "@pi/presence";
+import { createPiSubagentPresenceProducer } from "../../src/integration/pi-presence-producer";
 
-const update = {
-  version: 1, sessionId: "session-1", generation: 0, sequence: 1,
-  source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" }, state: "idle",
-  counts: { active: 0, completed: 0, failed: 0 },
-} as const;
-const snapshot = (generation = 0, recent: any[] = [], active: any[] = []) => ({ generation, active, recent });
-const running = (id = "running") => ({ id, status: "running" });
-const completed = (id = "completed") => ({ id, status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2 });
-const canonicalSummary = {
-  version: 1 as const, sessionId: "summary-session", generation: 7, sequence: 9, source: { id: "pi-subagent" },
-  active: [
-    { id: "run-1", agent: "worker", status: "running" as const, category: "active" as const, startedAt: 1 },
-    { id: "run-2", agent: "worker", status: "cancelling" as const, category: "cancelling" as const, startedAt: 2 },
-  ],
-  waiting: { category: "queued" as const, count: 3 },
-  terminal: { id: "run-0", agent: "worker", status: "failed" as const, completedAt: 3 },
-  omitted: 4,
-};
-const invalidCanonicalSummaries: unknown[] = [
-  { ...canonicalSummary, unexpected: true },
-  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], status: "waiting" }] },
-  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], category: "cancelling" }] },
-  { ...canonicalSummary, waiting: { category: "blocked", count: 1 } },
-  { ...canonicalSummary, waiting: { category: "queued", count: MAX_PRESENCE_COUNT + 1 } },
-  { ...canonicalSummary, terminal: { ...canonicalSummary.terminal, status: "error" } },
-  { ...canonicalSummary, active: [{ ...canonicalSummary.active[0], startedAt: Number.MAX_SAFE_INTEGER + 1 }] },
-  { ...canonicalSummary, terminal: { ...canonicalSummary.terminal, completedAt: -1 } },
-  { ...canonicalSummary, terminal: undefined },
-  { ...canonicalSummary, omitted: MAX_PRESENCE_COUNT + 1 },
-  { ...canonicalSummary, sessionId: "bad\nsummary" },
-];
+type Event = { name: string; payload: PresenceEventV2 };
+type Status = "running" | "cancelling" | "completed" | "failed" | "cancelled";
+const cleanup: Array<() => void> = [];
+afterEach(() => { while (cleanup.length) cleanup.pop()!(); });
+const validEpoch = (value: string) => `${value}${"x".repeat(32)}`.slice(0, 32);
 
-describe("pi presence producer wire contract", () => {
-  test("strictly parses bounded, private-data-free update and ready DTOs", () => {
-    assert.deepEqual(parsePiPresenceUpdate(update), update);
-    const remove = { version: 1, sessionId: "session-1", generation: 0, sequence: 2, source: { id: "pi-subagent" } } as const;
-    assert.deepEqual(parsePiPresenceRemove(remove), remove);
-    assert.equal(parsePiPresenceRemove({ ...remove, state: "idle" }), null);
-    assert.equal(parsePiPresenceRemove({ ...remove, source: { id: "pi-subagent", label: "private" } }), null);
-    assert.equal(parsePiPresenceRemove({ ...remove, sequence: 0 }), null);
-    assert.equal(parsePiPresenceRemove({ ...remove, generation: -1 }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, task: "private" }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, sessionId: "bad\nvalue" }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, source: { ...update.source, label: "\u202Espoof" } }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, counts: { ...update.counts, active: MAX_PRESENCE_COUNT + 1 } }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, progress: { value: 1.1 } }), null);
-    assert.equal(parsePiPresenceUpdate({ ...update, usage: { tokens: -1 } }), null);
-    assert.deepEqual(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } }), { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } });
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", source: "unexpected" }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: [], private: true } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1 }), null);
-    assert.equal(parsePiPresenceReady({ sessionId: "session-1" }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x" } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { capabilities: [] } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: Array(17).fill("x") } }), null);
-    assert.equal(isPiCmuxPresenceCmuxStatusReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } }), true);
-    assert.equal(isPiCmuxPresenceCmuxStatusReady({ version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-progress"] } }), false);
-    assert.equal(isPiCmuxPresenceCmuxStatusReady({ version: 1, sessionId: "session-1", consumer: { id: "other", capabilities: ["cmux-status"] } }), false);
+const snapshot = (recent: ReadonlyArray<{ id: string; status: Status; completedAt?: number }> = [], active: ReadonlyArray<{ id: string; status: "running" | "cancelling"; progress?: { completed: number; total: number } }> = [], generation = 0) => ({
+  generation,
+  active: active.map((item, index) => ({ ...item, generation, kind: "foreground" as const, agent: "private-agent", startedAt: index, updatedAt: index })),
+  recent: recent.map((item, index) => ({ ...item, generation, kind: "foreground" as const, agent: "private-agent", startedAt: index, updatedAt: item.completedAt ?? index })),
+});
 
-    const throwing = new Proxy({}, { get() { throw new Error("no getter execution"); } });
-    assert.equal(parsePiPresenceUpdate(throwing), null);
-    assert.equal(parsePiPresenceRemove(throwing), null);
-    assert.equal(parsePiPresenceReady(throwing), null);
+function bus() {
+  const events: Event[] = [];
+  const listeners = new Set<(name: string, payload: unknown) => void>();
+  return {
+    events,
+    emit: (name: string, payload: unknown) => {
+      events.push({ name, payload: payload as PresenceEventV2 });
+      for (const listener of [...listeners]) listener(name, payload);
+    },
+    listen: (listener: (name: string, payload: unknown) => void) => { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+}
+
+function producer(
+  events: ReturnType<typeof bus>,
+  scheduler = () => ({ active: 0, queued: 0 }),
+  options: Partial<Parameters<typeof createPiSubagentPresenceProducer>[0]> = {},
+) {
+  const value = createPiSubagentPresenceProducer({
+    emit: events.emit,
+    getSchedulerCounts: scheduler,
+    getInteractiveActiveCount: () => 0,
+    ...options,
   });
+  cleanup.push(() => value.stop());
+  assert.equal(value.startSession("private-session", 0), true);
+  return value;
+}
 
-  test("strictly parses the canonical companion summary fixtures", () => {
-    assert.deepEqual(parsePiPresenceSummary(canonicalSummary), canonicalSummary);
-    assert.equal(parsePiPresenceSummary({ ...canonicalSummary, terminal: { ...canonicalSummary.terminal, completedAt: Number.MAX_SAFE_INTEGER } })?.terminal?.completedAt, Number.MAX_SAFE_INTEGER);
-    for (const invalid of invalidCanonicalSummaries) assert.equal(parsePiPresenceSummary(invalid), null);
-    assert.equal(parsePiPresenceSummary({ ...canonicalSummary, active: Array(9).fill(canonicalSummary.active[0]) }), null);
-    assert.equal(parsePiPresenceSummary(new Proxy({}, { get() { throw new Error("no getter execution"); } })), null);
+/**
+ * Production options intentionally expose no ordinal seeding. This helper uses
+ * reflective private mutation only to reach wire-boundary states in this test.
+ */
+function seedWireOrdinalsForBoundaryTest(
+  value: ReturnType<typeof createPiSubagentPresenceProducer>,
+  state: Partial<{ wireGeneration: number; sequence: number; terminalOrdinal: number; opened: boolean }>,
+): void {
+  Object.assign(value as unknown as Record<string, unknown>, state);
+}
+
+function consumer(events: ReturnType<typeof bus>, id: "pi-cmux-presence" | "pi-herdr-presence", epoch: string) {
+  const value = createPresenceConsumer({ id, sessionEpoch: validEpoch(epoch) });
+  assert.ok(value);
+  const accepted: PresenceEventV2[] = [];
+  const unlisten = events.listen((name, payload) => {
+    const event = value.accept(name, payload);
+    if (event) accepted.push(event);
   });
+  assert.equal(value.activate((name, ready) => events.emit(name, ready)), true);
+  cleanup.push(() => { unlisten(); value.deactivate(); });
+  return accepted;
+}
 
-  test("summarizes scheduler queue and cancelling-only active work in waiting", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    let scheduler = { active: 1, queued: 0 };
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "cancelling", startedAt: 1, updatedAt: 1 }]));
-    assert.deepEqual(emitted.at(-1)?.payload.waiting, { category: "cancelling", count: 1 });
-    scheduler = { active: 1, queued: 2 };
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
-    assert.deepEqual(emitted.at(-1)?.payload.waiting, { category: "queued", count: 2 });
-  });
-
-  test("emits the companion summary only after capability advertisement and fences it on removal", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    const active = [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }];
-    producer.publish(snapshot(0, [], active));
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 0);
-    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-    const summaryEvent = emitted.find((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT);
-    assert.ok(summaryEvent);
-    assert.equal(Object.isFrozen(summaryEvent!.payload), true);
-    assert.deepEqual(summaryEvent!.payload.active, [{ id: "run-1", agent: "safe", status: "running", category: "active", startedAt: 1 }]);
-    producer.publish(snapshot(0, [], []));
-    producer.settle();
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_REMOVE_EVENT).length, 1);
-    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 2, "removed state cannot replay a stale summary");
-  });
-
-  test("keeps summary incompatible with the fixed V1 cmux consumer while retaining it for other capable consumers", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
-
-    producer.handleReady({
-      version: 1, sessionId: "session-1",
-      consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status", "presence-summary-v1"] },
-    });
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 0);
-
-    producer.handleReady({
-      version: 1, sessionId: "session-1",
-      consumer: { id: "other-presence", capabilities: ["presence-summary-v1"] },
-    });
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 1);
-  });
-
-  test("keeps summary on its associated generic update sequence through synchronous capability advertisement and replay", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    let producer: ReturnType<typeof createPiSubagentPresenceProducer>;
-    producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => {
-        emitted.push({ channel, payload });
-        // pi.events is synchronous: advertise capability while update emission
-        // is still on the stack to catch stale-cache/reentrancy regressions.
-        if (channel === PI_PRESENCE_UPDATE_EVENT && emitted.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT).length === 1) {
-          producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-        }
-      },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
-    const firstUpdate = emitted.find((event) => event.channel === PI_PRESENCE_UPDATE_EVENT)!;
-    const firstSummary = emitted.find((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT)!;
-    assert.equal(firstUpdate.payload.sequence, 1);
-    assert.equal(firstSummary.payload.sequence, firstUpdate.payload.sequence, "reentrant advertisement receives this update's already-cached summary");
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT).length, 1);
-
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    const updates = emitted.filter((event) => event.channel === PI_PRESENCE_UPDATE_EVENT);
-    const summaries = emitted.filter((event) => event.channel === PI_PRESENCE_SUMMARY_EVENT);
-    assert.equal(updates.at(-1)!.payload.sequence, 2, "summary never consumes the generic update/remove fence");
-    assert.equal(summaries.at(-1)!.payload.sequence, updates.at(-1)!.payload.sequence, "replay companion uses its replay update sequence");
-    producer.publish(snapshot(0, [], []));
-    producer.settle();
-    assert.equal(emitted.filter((event) => event.channel === PI_PRESENCE_REMOVE_EVENT).at(-1)!.payload.sequence, 4, "remove follows generic updates without summary-only gaps");
-  });
-
-  test("delivers update to every listener before a reentrant capability advertisement emits its summary", () => {
-    const listeners = new Map<string, Array<(payload: unknown) => void>>();
-    const on = (channel: string, handler: (payload: unknown) => void) => {
-      const handlers = listeners.get(channel) ?? [];
-      handlers.push(handler);
-      listeners.set(channel, handlers);
-      return () => listeners.set(channel, handlers.filter((candidate) => candidate !== handler));
-    };
-    const emit = (channel: string, payload: unknown) => {
-      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
-    };
-    const observed: string[] = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit,
-      on,
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    on(PI_PRESENCE_UPDATE_EVENT, (payload) => {
-      observed.push(`first-update:${(payload as { sequence: number }).sequence}`);
-      emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-    });
-    on(PI_PRESENCE_UPDATE_EVENT, (payload) => observed.push(`second-update:${(payload as { sequence: number }).sequence}`));
-    on(PI_PRESENCE_SUMMARY_EVENT, (payload) => observed.push(`first-summary:${(payload as { sequence: number }).sequence}`));
-    on(PI_PRESENCE_SUMMARY_EVENT, (payload) => observed.push(`second-summary:${(payload as { sequence: number }).sequence}`));
-
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
-
-    assert.deepEqual(observed, ["first-update:1", "second-update:1", "first-summary:1", "second-summary:1"]);
-  });
-
-  test("defers a consumer-less ready re-entering update emission until its companion summary is published", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    let producer: ReturnType<typeof createPiSubagentPresenceProducer>;
-    producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => {
-        emitted.push({ channel, payload });
-        if (channel === PI_PRESENCE_UPDATE_EVENT && (payload as { sequence?: number }).sequence === 1) {
-          // A synchronous generic ready arrives before this update has emitted
-          // its already-advertised companion summary.
-          producer.handleReady({ version: 1, sessionId: "session-1" });
-        }
-      },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.handleReady({ version: 1, sessionId: "session-1", consumer: { id: "summary-ui", capabilities: ["presence-summary-v1"] } });
-    producer.publish(snapshot(0, [], [{ id: "run-1", agent: "safe", status: "running", startedAt: 1, updatedAt: 1 }]));
-
-    assert.deepEqual(emitted.filter((event) => event.channel !== PI_PRESENCE_READY_EVENT).map((event) => `${event.channel}:${event.payload.sequence}`), [
-      `${PI_PRESENCE_UPDATE_EVENT}:1`,
-      `${PI_PRESENCE_SUMMARY_EVENT}:1`,
-      `${PI_PRESENCE_UPDATE_EVENT}:2`,
-      `${PI_PRESENCE_SUMMARY_EVENT}:2`,
-    ]);
-  });
-
-  test("accepts the canonical astral text boundary and rejects the next code point", () => {
-    const atLimit = "😀".repeat(96);
-    const overLimit = "😀".repeat(97);
-    const remove = { version: 1, sessionId: atLimit, generation: 0, sequence: 1, source: { id: atLimit } } as const;
-    const astralUpdate = { ...update, sessionId: atLimit, source: { id: atLimit, label: atLimit, kind: atLimit } } as const;
-    const ready = { version: 1, sessionId: atLimit, consumer: { id: atLimit, capabilities: [atLimit] } } as const;
-
-    assert.deepEqual(parsePiPresenceRemove(remove), remove);
-    assert.deepEqual(parsePiPresenceUpdate(astralUpdate), astralUpdate);
-    assert.deepEqual(parsePiPresenceReady(ready), ready);
-    assert.equal(parsePiPresenceRemove({ ...remove, sessionId: overLimit }), null);
-    assert.equal(parsePiPresenceUpdate({ ...astralUpdate, source: { ...astralUpdate.source, label: overLimit } }), null);
-    assert.equal(parsePiPresenceReady({ ...ready, consumer: { ...ready.consumer, capabilities: [overLimit] } }), null);
-  });
-
-  test("snapshots each removal field once before constructing its owned DTO", () => {
-    let versionReads = 0;
-    let sessionReads = 0;
-    let generationReads = 0;
-    let sequenceReads = 0;
-    let sourceReads = 0;
-    let sourceIdReads = 0;
-    const source = Object.create(Object.prototype, {
-      id: { enumerable: true, get: () => ++sourceIdReads === 1 ? "pi-subagent" : "changed-source" },
-    });
-    const changing = Object.create(Object.prototype, {
-      version: { enumerable: true, get: () => ++versionReads === 1 ? 1 : 2 },
-      sessionId: { enumerable: true, get: () => ++sessionReads === 1 ? "session-1" : "changed-session" },
-      generation: { enumerable: true, get: () => ++generationReads === 1 ? 0 : 1 },
-      sequence: { enumerable: true, get: () => ++sequenceReads === 1 ? 1 : 2 },
-      source: { enumerable: true, get: () => ++sourceReads === 1 ? source : { id: "changed-source" } },
-    });
-
-    assert.deepEqual(parsePiPresenceRemove(changing), {
-      version: 1, sessionId: "session-1", generation: 0, sequence: 1, source: { id: "pi-subagent" },
-    });
-    assert.deepEqual({ versionReads, sessionReads, generationReads, sequenceReads, sourceReads, sourceIdReads }, {
-      versionReads: 1, sessionReads: 1, generationReads: 1, sequenceReads: 1, sourceReads: 1, sourceIdReads: 1,
+describe("V2 subagent presence producer", () => {
+  test("publishes an epoch-neutral structured aggregate with determinate progress only", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "structured-epoch");
+    const value = producer(events, () => ({ active: 2, queued: 3 }));
+    value.publish(snapshot([], [
+      { id: "a", status: "running", progress: { completed: 1, total: 2 } },
+      { id: "b", status: "cancelling", progress: { completed: 2, total: 3 } },
+    ]));
+    const state = events.events.find((event) => event.name === EVENT_NAMES.state)!.payload;
+    assert.deepEqual(state, {
+      version: 2, sessionEpoch: validEpoch("structured-epoch"), generation: 0, sequence: 0, source: "subagent", state: "running",
+      progress: { completed: 3, total: 5 },
+      subagents: { running: 1, cancelling: 1, queued: 3, completed: 0, failed: 0, cancelled: 0, omitted: 0 },
     });
   });
 
-  test("snapshots every update field once before validation and construction", () => {
-    const reads = new Map<string, number>();
-    const changing = <T>(name: string, initial: T, later: T) => ({
-      enumerable: true,
-      get: () => {
-        const count = (reads.get(name) ?? 0) + 1;
-        reads.set(name, count);
-        return count === 1 ? initial : later;
-      },
-    });
-    const source = Object.create(Object.prototype, {
-      id: changing("source.id", "pi-subagent", "changed-id"),
-      label: changing("source.label", "Subagents", "changed-label"),
-      kind: changing("source.kind", "agent-group", "changed-kind"),
-    });
-    const counts = Object.create(Object.prototype, {
-      active: changing("counts.active", 1, -1), completed: changing("counts.completed", 2, -1), failed: changing("counts.failed", 3, -1),
-      queued: changing("counts.queued", 4, -1), cancelled: changing("counts.cancelled", 5, -1), total: changing("counts.total", 15, -1),
-    });
-    const progress = Object.create(Object.prototype, {
-      value: changing("progress.value", 0.5, 2), label: changing("progress.label", "Half", "changed-label"),
-    });
-    const usage = Object.create(Object.prototype, {
-      tokens: changing("usage.tokens", 10, -1), cost: changing("usage.cost", 0.25, -1), contextPercent: changing("usage.contextPercent", 50, -1),
-    });
-    const changingUpdate = Object.create(Object.prototype, {
-      version: changing("version", 1, 2), sessionId: changing("sessionId", "session-1", "changed-session"),
-      generation: changing("generation", 0, -1), sequence: changing("sequence", 1, 0), source: changing("source", source, null),
-      state: changing("state", "running", "invalid"), counts: changing("counts", counts, null), progress: changing("progress", progress, null),
-      usage: changing("usage", usage, null), attention: changing("attention", "info", "invalid"),
-    });
-
-    assert.deepEqual(parsePiPresenceUpdate(changingUpdate), {
-      version: 1, sessionId: "session-1", generation: 0, sequence: 1,
-      source: { id: "pi-subagent", label: "Subagents", kind: "agent-group" }, state: "running",
-      counts: { active: 1, completed: 2, failed: 3, queued: 4, cancelled: 5, total: 15 },
-      progress: { value: 0.5, label: "Half" }, usage: { tokens: 10, cost: 0.25, contextPercent: 50 }, attention: "info",
-    });
-    assert.deepEqual(Object.fromEntries(reads), Object.fromEntries([
-      "version", "sessionId", "generation", "sequence", "source", "state", "counts", "progress", "usage", "attention",
-      "source.id", "source.label", "source.kind", "counts.active", "counts.completed", "counts.failed", "counts.queued", "counts.cancelled", "counts.total",
-      "progress.value", "progress.label", "usage.tokens", "usage.cost", "usage.contextPercent",
-    ].map((name) => [name, 1])));
+  test("assigns increasing state and terminal sequence plus private terminal dedupe ordinals", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "terminal-epoch");
+    const value = producer(events);
+    value.publish(snapshot([{ id: "first-private-id", status: "failed", completedAt: 1 }]));
+    value.publish(snapshot([{ id: "first-private-id", status: "failed", completedAt: 1 }, { id: "second-private-id", status: "completed", completedAt: 2 }]));
+    const observed = events.events.filter((event) => event.name !== EVENT_NAMES.consumerReady);
+    assert.deepEqual(observed.map((event) => event.payload.sequence), [0, 1, 2, 3]);
+    const terminals = observed.filter((event) => event.name === EVENT_NAMES.terminal).map((event) => event.payload as Extract<PresenceEventV2, { eventId: number }>);
+    assert.deepEqual(terminals.map((event) => [event.eventId, event.outcome]), [[0, "failed"], [1, "completed"]]);
+    const failureState = observed.find((event) => event.name === EVENT_NAMES.state)!.payload as Extract<PresenceEventV2, { state: string }>;
+    assert.deepEqual(failureState.attention, { reason: "failure", occurrence: "new" });
   });
 
-  test("strictly snapshots ready DTOs from own data properties", () => {
-    const ready = { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } };
-    const parsed = parsePiPresenceReady(ready);
-    assert.deepEqual(parsed, ready);
-    assert.ok(parsed?.consumer);
-    assert.notEqual(parsed, ready);
-    assert.notEqual(parsed.consumer, ready.consumer);
-    assert.notEqual(parsed.consumer.capabilities, ready.consumer.capabilities);
+  test("replays retained state for consumer-first and producer-first consumers without replaying terminals", () => {
+    const events = bus();
+    const cmux = consumer(events, "pi-cmux-presence", "cmux-epoch");
+    const value = producer(events);
+    value.publish(snapshot([{ id: "failure", status: "failed", completedAt: 1 }]));
+    assert.equal(cmux.filter((event) => "eventId" in event).length, 1);
 
-    const sparseCapabilities = new Array<string>(1);
-    const accessorCapabilities = ["cmux-status"];
-    Object.defineProperty(accessorCapabilities, "0", { enumerable: true, get() { throw new Error("must not read index accessors"); } });
-    const extraCapabilityProperty = ["cmux-status"] as string[] & { private?: string };
-    extraCapabilityProperty.private = "no";
-    const inheritedCapabilities = new Array<string>(1);
-    Object.setPrototypeOf(inheritedCapabilities, { 0: "cmux-status" });
-    const inheritedRoot = Object.create({ version: 1, sessionId: "session-1" });
-    const inheritedConsumer = Object.create({ id: "consumer", capabilities: [] });
-    let rootGetterReads = 0;
-    const changingRoot = { version: 1, sessionId: "session-1" };
-    Object.defineProperty(changingRoot, "consumer", { enumerable: true, get() { rootGetterReads += 1; return { id: "changed", capabilities: [] }; } });
-    let consumerGetterReads = 0;
-    const changingConsumer = { capabilities: [] as string[] };
-    Object.defineProperty(changingConsumer, "id", { enumerable: true, get() { consumerGetterReads += 1; return "changed"; } });
-    const versionAccessor = { sessionId: "session-1" };
-    Object.defineProperty(versionAccessor, "version", { enumerable: true, get() { rootGetterReads += 1; return 1; } });
-    const capabilitiesAccessor = { id: "consumer" };
-    Object.defineProperty(capabilitiesAccessor, "capabilities", { enumerable: true, get() { consumerGetterReads += 1; return []; } });
-
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: undefined }), null, "consumer-less requests must omit consumer");
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: sparseCapabilities } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: accessorCapabilities } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: extraCapabilityProperty } }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: { id: "x", capabilities: inheritedCapabilities } }), null);
-    assert.equal(parsePiPresenceReady(inheritedRoot), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: inheritedConsumer }), null);
-    assert.equal(parsePiPresenceReady(changingRoot), null);
-    assert.equal(parsePiPresenceReady(versionAccessor), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: changingConsumer }), null);
-    assert.equal(parsePiPresenceReady({ version: 1, sessionId: "session-1", consumer: capabilitiesAccessor }), null);
-    assert.equal(rootGetterReads, 0, "root getters must not run");
-    assert.equal(consumerGetterReads, 0, "consumer getters must not run");
-    assert.equal(parsePiPresenceReady(new Proxy({}, { getPrototypeOf() { throw new Error("proxy rejected"); } })), null);
+    const herdr = consumer(events, "pi-herdr-presence", "herdr-epoch");
+    assert.equal(herdr.length, 1, "a late consumer receives one retained state");
+    assert.equal(herdr[0]!.sessionEpoch, validEpoch("herdr-epoch"));
+    assert.equal("eventId" in herdr[0]!, false, "terminals are live-only");
+    assert.deepEqual((herdr[0] as Extract<PresenceEventV2, { state: string }>).attention, { reason: "failure", occurrence: "retained" });
   });
 
-  test("actively requests ready without self-replay and accepts a synchronous consumer response", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const listeners = new Map<string, Set<(value: unknown) => void>>();
-    const emit = (channel: string, payload: unknown) => {
-      emitted.push({ channel, payload });
-      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
-    };
-    const on = (channel: string, handler: (value: unknown) => void) => {
-      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
-      handlers.add(handler);
-      listeners.set(channel, handlers);
-      return () => handlers.delete(handler);
-    };
-    // A consumer loaded first responds synchronously to the producer request.
-    on(PI_PRESENCE_READY_EVENT, (payload) => {
-      const ready = parsePiPresenceReady(payload);
-      if (ready && !ready.consumer) emit(PI_PRESENCE_READY_EVENT, {
-        version: 1, sessionId: ready.sessionId,
-        consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status", "presence-remove-v1"] },
+  test("settles from the cached UX aggregate, then reopens with a higher wire generation", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "withdraw-epoch");
+    const value = producer(events);
+    value.publish(snapshot([], [{ id: "active", status: "running" }]));
+    value.settle();
+    assert.equal(events.events.some((event) => event.name === EVENT_NAMES.withdraw), false, "zero callback counts cannot override retained UX activity");
+    value.publish(snapshot([{ id: "done", status: "completed", completedAt: 1 }]));
+    const withdraw = events.events.find((event) => event.name === EVENT_NAMES.withdraw)!.payload;
+    assert.equal(withdraw.sequence, 3);
+    value.publish(snapshot([], [{ id: "new-active", status: "running" }]));
+    const states = events.events.filter((event) => event.name === EVENT_NAMES.state).map((event) => event.payload as Extract<PresenceEventV2, { state: string }>);
+    assert.deepEqual(states.map((event) => [event.generation, event.sequence]), [[0, 0], [0, 2], [1, 0]]);
+  });
+
+  test("rejects a stale UX snapshot before it can consume terminal dedupe or counts", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "generation-epoch");
+    const value = producer(events);
+    assert.equal(value.publish(snapshot([{ id: "terminal", status: "failed", completedAt: 1 }], [], 1)), false);
+    assert.equal(value.publish(snapshot([{ id: "terminal", status: "failed", completedAt: 1 }])), true);
+    const terminals = events.events.filter((event) => event.name === EVENT_NAMES.terminal);
+    assert.equal(terminals.length, 1);
+    const state = events.events.find((event) => event.name === EVENT_NAMES.state)!.payload as { subagents: { failed: number } };
+    assert.equal(state.subagents.failed, 1);
+  });
+
+  test("counts running and cancelling at invocation granularity despite scheduler child counts", () => {
+    const cases = [
+      { active: [{ id: "origin", status: "running" as const }], scheduler: 1, interactive: ["origin"], expected: { running: 1, cancelling: 0 } },
+      { active: [{ id: "inline", status: "running" as const }], scheduler: 1, interactive: ["old"], expected: { running: 2, cancelling: 0 } },
+      { active: [{ id: "parallel", status: "running" as const }], scheduler: 2, interactive: ["parallel", "parallel"], expected: { running: 1, cancelling: 0 } },
+      { active: [{ id: "origin", status: "running" as const }], scheduler: 1, interactive: [undefined], expected: { running: 2, cancelling: 0 } },
+      // Three active scheduler children belong to this one cancelled parallel invocation.
+      { active: [{ id: "parallel-cancelling", status: "cancelling" as const }], scheduler: 3, interactive: ["parallel-cancelling", "parallel-cancelling", "parallel-cancelling"], expected: { running: 0, cancelling: 1 } },
+    ] as const;
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "mixed-active-epoch");
+    for (const item of cases) {
+      const value = producer(events, () => ({ active: item.scheduler, queued: 0 }), {
+        getInteractiveActiveCount: () => item.interactive.length,
+        getInteractiveActiveInvocationIds: () => item.interactive,
       });
-    });
-    let hints = 0;
-    const producer = createPiSubagentPresenceProducer({
-      emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-      onCmuxStatusConsumer: () => { hints += 1; },
-    });
-
-    assert.doesNotThrow(() => producer.startSession("session-1", 0));
-    const requests = emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer);
-    assert.deepEqual(requests.map((entry) => entry.payload), [{ version: 1, sessionId: "session-1" }]);
-    assert.equal(Object.isFrozen(requests[0]!.payload), true, "the outgoing discovery request is frozen");
-    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 0, "own request cannot replay");
-    assert.equal(hints, 1, "synchronous advertised response is still processed");
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
-  });
-
-  test("treats consumer advertisements as passive and replays only consumer-less requests", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const listeners = new Map<string, Set<(value: unknown) => void>>();
-    const emit = (channel: string, payload: unknown) => {
-      emitted.push({ channel, payload });
-      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
-    };
-    const on = (channel: string, handler: (value: unknown) => void) => {
-      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
-      handlers.add(handler);
-      listeners.set(channel, handlers);
-      return () => handlers.delete(handler);
-    };
-    const producer = createPiSubagentPresenceProducer({ emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 });
-
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [running()]));
-    const updates = () => emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT);
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: [] } });
-    assert.equal(updates().length, 1, "advertisement alone cannot replay cached presence");
-
-    // A later consumer advertises, then sends its own canonical consumer-less
-    // request. Only that request performs the one replay.
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
-    assert.deepEqual(updates().map((entry) => entry.payload.sequence), [1, 2]);
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
-    assert.deepEqual(updates().map((entry) => entry.payload.sequence), [1, 2, 3], "legacy consumer-less requests still replay once");
-
-    const requestsBeforeRestart = emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer).length;
-    producer.startSession("session-2", 1);
-    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_READY_EVENT && !entry.payload.consumer).length, requestsBeforeRestart + 1, "one request per start");
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
-    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 3, "old session ready is fenced after restart");
-    producer.stop();
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-2" });
-    assert.equal(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).length, 3, "stop fences ready replay");
-  });
-
-  test("suppresses an exact self request even when synchronous delivery populates cached presence", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const listeners = new Map<string, Set<(value: unknown) => void>>();
-    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
-    const emit = (channel: string, payload: unknown) => {
-      emitted.push({ channel, payload });
-      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
-    };
-    const on = (channel: string, handler: (value: unknown) => void) => {
-      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
-      handlers.add(handler);
-      listeners.set(channel, handlers);
-      return () => handlers.delete(handler);
-    };
-    // This listener runs before the producer listener and makes current non-null
-    // while the producer's own ready request is still being delivered.
-    on(PI_PRESENCE_READY_EVENT, (payload) => {
-      if (!parsePiPresenceReady(payload)?.consumer) producer.publish(snapshot(0, [], [running()]));
-    });
-    producer = createPiSubagentPresenceProducer({ emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 });
-
-    producer.startSession("session-1", 0);
-    const updates = emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT);
-    assert.deepEqual(updates.map((entry) => entry.payload.sequence), [1], "the exact self request cannot replay newly cached presence");
-    assert.equal(Object.isFrozen(emitted.find((entry) => entry.channel === PI_PRESENCE_READY_EVENT)!.payload), true);
-  });
-
-  test("does not amplify a consumer request across multiple producers", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const listeners = new Map<string, Set<(value: unknown) => void>>();
-    const emit = (channel: string, payload: unknown) => {
-      emitted.push({ channel, payload });
-      for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
-    };
-    const on = (channel: string, handler: (value: unknown) => void) => {
-      const handlers = listeners.get(channel) ?? new Set<(value: unknown) => void>();
-      handlers.add(handler);
-      listeners.set(channel, handlers);
-      return () => handlers.delete(handler);
-    };
-    // Each producer startup receives one consumer advertisement and the
-    // consumer's own consumer-less discovery request. Before either producer
-    // has current presence, neither exchange can emit an update.
-    let startupResponsesRemaining = 2;
-    let emittingOwnRequest = false;
-    on(PI_PRESENCE_READY_EVENT, (payload) => {
-      const ready = parsePiPresenceReady(payload);
-      if (!ready || ready.consumer || emittingOwnRequest || startupResponsesRemaining === 0) return;
-      startupResponsesRemaining -= 1;
-      emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: ready.sessionId, consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } });
-      emittingOwnRequest = true;
-      try { emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: ready.sessionId }); } finally { emittingOwnRequest = false; }
-    });
-    const options = { emit, on, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0 };
-    const first = createPiSubagentPresenceProducer(options);
-    const second = createPiSubagentPresenceProducer(options);
-    first.startSession("session-1", 0);
-    second.startSession("session-1", 0);
-    first.publish(snapshot(0, [], [running("first")]));
-    second.publish(snapshot(0, [], [running("second")]));
-
-    emit(PI_PRESENCE_READY_EVENT, { version: 1, sessionId: "session-1" });
-    assert.deepEqual(emitted.filter((entry) => entry.channel === PI_PRESENCE_UPDATE_EVENT).map((entry) => entry.payload.sequence), [1, 1, 2, 2]);
-  });
-
-  test("fences session/generation, replays only after a snapshot, and removes attention on replay", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const listeners = new Map<string, (value: unknown) => void>();
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      on: (channel, handler) => { listeners.set(channel, handler); return () => listeners.delete(channel); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    assert.equal(producer.startSession("session-1", 2), true);
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted.length, 0);
-    assert.equal(producer.publish(snapshot(1)), false);
-    assert.equal(producer.publish(snapshot(2, [], [running()])), true);
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "other" });
-    assert.equal(emitted.length, 1);
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted.length, 2);
-    assert.equal(emitted[0]!.channel, PI_PRESENCE_UPDATE_EVENT);
-    assert.deepEqual(emitted.map((entry) => entry.payload.sequence), [1, 2]);
-    assert.equal(emitted[1]!.payload.attention, "none");
-    producer.stop();
-    assert.equal(listeners.size, 0);
-  });
-
-  test("stays lazy while idle and only opens a retained source for meaningful work", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    assert.equal(producer.publish(snapshot()), false);
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted.length, 0);
-    assert.equal(producer.publish(snapshot(0, [completed()])), true);
-    assert.equal(emitted[0]!.payload.sequence, 1);
-  });
-
-  test("advertises the exact cmux consumer only as a one-shot passive routing hint", () => {
-    const listeners = new Map<string, (value: unknown) => void>();
-    let hints = 0;
-    const producer = createPiSubagentPresenceProducer({
-      emit: () => {}, on: (channel, handler) => { listeners.set(channel, handler); return () => listeners.delete(channel); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-      onCmuxStatusConsumer: () => { hints += 1; },
-    });
-    producer.startSession("session-1", 0);
-    const ready = { version: 1, sessionId: "session-1", consumer: { id: "pi-cmux-presence", capabilities: ["cmux-status"] } };
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ ...ready, sessionId: "other" });
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ ...ready, consumer: { id: "other", capabilities: ["cmux-status"] } });
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready);
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready);
-    assert.equal(hints, 1);
-  });
-
-  test("detects the passive remove capability from any valid same-session consumer advertisement", () => {
-    const listeners = new Map<string, (value: unknown) => void>();
-    let hints = 0;
-    const producer = createPiSubagentPresenceProducer({
-      emit: () => {}, on: (channel, handler) => { listeners.set(channel, handler); return () => listeners.delete(channel); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-      onCmuxStatusConsumer: () => { hints += 1; },
-    });
-    const ready = (sessionId: string, id: string, capabilities: unknown) => ({ version: 1, sessionId, consumer: { id, capabilities } });
-
-    producer.startSession("session-1", 0);
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("other", "pi-herdr-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "other", ["cmux-status"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-cmux-presence", ["cmux-status"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!({ version: 1, sessionId: "session-1", consumer: { id: "pi-herdr-presence", capabilities: "presence-remove-v1" } });
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    assert.equal(hints, 1, "cmux-status retains its one-shot callback behavior");
-
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
-    listeners.get(PI_PRESENCE_READY_EVENT)!(ready("session-1", "pi-herdr-presence", ["presence-remove-v1"]));
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
-    assert.equal(hints, 1, "Herdr capability must not trigger cmux routing");
-
-    producer.startSession("session-2", 1);
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-    producer.handleReady(ready("session-2", "future-consumer", ["presence-remove-v1"]));
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), true);
-    producer.stop();
-    assert.equal(producer.isPresenceRemoveCapabilityDetected(), false);
-  });
-
-  test("removes immediately or after deferred quiescence without replaying stale presence", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    let scheduler = { active: 1, queued: 0 };
-    let interactive = 0;
-    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
-    producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => {
-        if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload });
-        if (channel === PI_PRESENCE_REMOVE_EVENT) producer.handleReady({ version: 1, sessionId: "session-1" });
-      },
-      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [running()]));
-    producer.settle();
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT]);
-
-    // Deferred settlement preserves a new active publication and removes only
-    // after the last terminal update observes the already-computed zero aggregate.
-    producer.publish(snapshot(0, [], [running("new-parent")]));
-    scheduler = { active: 0, queued: 0 };
-    producer.publish(snapshot(0, [completed("done")]));
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
-    assert.deepEqual(emitted.map((event) => event.payload.sequence), [1, 2, 3, 4]);
-    assert.equal(emitted[2]!.payload.state, "success");
-    assert.deepEqual(emitted[3]!.payload, { version: 1, sessionId: "session-1", generation: 0, sequence: 4, source: { id: "pi-subagent" } });
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted.length, 4, "ready after remove cannot replay");
-
-    scheduler = { active: 1, queued: 0 };
-    producer.publish(snapshot(0, [], [running("next-burst")]));
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.deepEqual(emitted.slice(4).map((event) => event.payload.sequence), [5, 6]);
-    assert.equal(emitted[4]!.payload.counts.completed, 1, "terminal counts remain cumulative within a session");
-  });
-
-  test("scopes deferred settlement to the parent run that settled", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    let scheduler = { active: 1, queued: 0 };
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [running("old-run")]));
-    producer.settle();
-
-    producer.beginAgentRun();
-    scheduler = { active: 0, queued: 0 };
-    producer.publish(snapshot(0, [completed("old-work-finished")]));
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT]);
-    assert.equal(emitted[1]!.payload.counts.completed, 1, "terminal state remains cumulative across parent runs");
-
-    producer.settle();
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
-  });
-
-  test("removes immediately when the retained aggregate is already quiescent", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [completed()]));
-    producer.settle();
-    producer.settle();
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
-  });
-
-  test("defers settlement for queued or interactive aggregate work and removes exactly once", () => {
-    for (const retained of [
-      { name: "queued", scheduler: { active: 0, queued: 1 }, interactive: 0 },
-      { name: "interactive", scheduler: { active: 0, queued: 0 }, interactive: 1 },
-    ]) {
-      const emitted: Array<{ channel: string; payload: any }> = [];
-      let scheduler = retained.scheduler;
-      let interactive = retained.interactive;
-      const producer = createPiSubagentPresenceProducer({
-        emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-        getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => interactive,
-      });
-      producer.startSession("session-1", 0);
-      producer.publish(snapshot());
-      producer.settle();
-      assert.equal(emitted.length, 1, retained.name);
-      scheduler = { active: 0, queued: 0 };
-      interactive = 0;
-      producer.publish(snapshot(0, [completed(`done-${retained.name}`)]));
-      producer.settle();
-      producer.stop();
-      producer.stop();
-      assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT], retained.name);
+      value.publish(snapshot([], item.active));
+      const state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { running: number; cancelling: number } };
+      assert.deepEqual({ running: state.subagents.running, cancelling: state.subagents.cancelling }, item.expected);
+      value.stop();
     }
   });
 
-  test("removes retained state during reload and ignores observer failures", () => {
-    const emitted: Array<{ channel: string; payload: any }> = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push({ channel, payload }); },
-      getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("old-session", 0);
-    producer.publish(snapshot(0, [], [running()]));
-    producer.startSession("new-session", 1);
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
-    assert.equal(emitted[1]!.payload.sessionId, "old-session");
-    producer.publish(snapshot(1, [], [running("new-session-run")]));
-    producer.stop();
-    producer.stop();
-    assert.deepEqual(emitted.map((event) => event.channel), [PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT, PI_PRESENCE_UPDATE_EVENT, PI_PRESENCE_REMOVE_EVENT]);
+  test("uses the complete cached aggregate for deferred and freshly quiescent settlement", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "settle-epoch");
+    const value = producer(events);
+    value.publish(snapshot([], [{ id: "still-running", status: "running" }]));
+    value.settle();
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.withdraw).length, 0);
+    value.publish(snapshot([{ id: "done", status: "completed", completedAt: 1 }]));
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.withdraw).length, 1, "deferred settlement withdraws only after a fresh quiescent UX projection");
 
-    const throwing = createPiSubagentPresenceProducer({
-      emit: () => { throw new Error("observer"); },
-      getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    assert.doesNotThrow(() => throwing.startSession("session-1", 0), "ready request emission failures are isolated");
-    assert.doesNotThrow(() => { throwing.publish(snapshot(0, [], [running()])); throwing.settle(); throwing.stop(); });
+    value.publish(snapshot([{ id: "later", status: "completed", completedAt: 2 }]));
+    value.settle();
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.withdraw).length, 2, "a fresh cached quiescent projection withdraws immediately");
   });
 
-  test("keeps cached replay immutable and blocks synchronous ready recursion", () => {
-    const emitted: any[] = [];
-    let producer!: ReturnType<typeof createPiSubagentPresenceProducer>;
-    producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload: any) => {
-        if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload);
-        try { payload.counts.completed = 999; } catch { /* frozen observer payload */ }
-        if (payload.sequence === 2) producer.handleReady({ version: 1, sessionId: "session-1" });
-      },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [{ id: "done", status: "completed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2 }]));
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted.length, 2, "a replay-triggered ready cannot recurse synchronously");
-    assert.equal(emitted[1].counts.completed, 1);
-    assert.equal(emitted[1].attention, "none");
-    assert.equal(Object.isFrozen(emitted[0]), true);
-    assert.equal(Object.isFrozen(emitted[0].counts), true);
+  test("dedupes against only the current recent window and emits terminals chronologically", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "recent-window-epoch");
+    const value = producer(events);
+    value.publish(snapshot([
+      { id: "newest", status: "completed", completedAt: 20 },
+      { id: "oldest", status: "failed", completedAt: 10 },
+    ]));
+    const terminals = events.events.filter((event) => event.name === EVENT_NAMES.terminal).map((event) => event.payload as Extract<PresenceEventV2, { outcome: string }>);
+    assert.deepEqual(terminals.map((event) => event.outcome), ["failed", "completed"]);
+    const state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as Extract<PresenceEventV2, { state: string }>;
+    assert.equal(state.state, "success");
+
+    value.publish(snapshot());
+    value.publish(snapshot([{ id: "oldest", status: "failed", completedAt: 30 }]));
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 3, "an ID that left recent is a new invocation");
   });
 
-  test("emits terminal attention for foreground and background runs, selects terminal state by newest completion, and projects queue state", () => {
-    const emitted: any[] = [];
-    let scheduler = { active: 0, queued: 0 };
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); }, getSchedulerCounts: () => scheduler, getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    const completed = { id: "completed", status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 30 };
-    const failed = { id: "failed", status: "failed", generation: 0, kind: "background", agent: "safe", startedAt: 1, updatedAt: 20, completedAt: 20 };
-    producer.publish(snapshot(0, [completed, failed]));
-    assert.deepEqual(emitted[0].counts, { active: 0, completed: 1, failed: 1, queued: 0, cancelled: 0, total: 2 });
-    assert.equal(emitted[0].state, "success", "newest terminal determines state, independent of snapshot order");
-    assert.equal(emitted[0].attention, "error", "a failure wins over a simultaneous success across invocation kinds");
-
-    const cancelled = { id: "cancelled", status: "cancelled", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 40, completedAt: 40 };
-    producer.publish(snapshot(0, [cancelled]));
-    assert.equal(emitted[1].state, "cancelled");
-    assert.equal(emitted[1].attention, "none");
-
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.equal(emitted[2].state, "cancelled");
-    assert.equal(emitted[2].attention, "none", "replays never demand attention");
-
-    scheduler = { active: 0, queued: 1 };
-    producer.publish(snapshot());
-    assert.equal(emitted[3].state, "waiting");
-    scheduler = { active: 1, queued: 1 };
-    producer.publish(snapshot());
-    assert.equal(emitted[4].state, "running");
-  });
-
-  test("correlates interactive runs to exact active invocation IDs", () => {
-    const cases = [
-      { name: "managed 1/1/1", activeIds: ["origin"], scheduler: 1, interactiveIds: ["origin"], expected: 1 },
-      { name: "transition while the originating invocation remains active", activeIds: ["origin"], scheduler: 0, interactiveIds: ["origin"], expected: 1 },
-      { name: "retained old run plus unrelated inline invocation", activeIds: ["inline"], scheduler: 1, interactiveIds: ["old"], expected: 2 },
-      { name: "two parallel interactive children", activeIds: ["parallel"], scheduler: 2, interactiveIds: ["parallel", "parallel"], expected: 2 },
-      { name: "missing interactive invocation ID is unmatched", activeIds: ["inline"], scheduler: 1, interactiveIds: [undefined], expected: 2 },
-      { name: "terminal interactive invocation ID is unmatched", activeIds: ["inline"], scheduler: 1, interactiveIds: ["terminal"], expected: 2 },
+  test("uses one newest-first 4096-terminal window for freshness, omission, and retention", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "newest-window-epoch");
+    const value = producer(events);
+    const recent = [
+      ...Array.from({ length: 4_096 }, (_, index) => ({ id: `eligible-${index}`, status: "completed" as const, completedAt: index })),
+      { id: "omitted-terminal", status: "failed" as const, completedAt: 4_096 },
     ];
 
-    for (const activeCase of cases) {
-      const emitted: any[] = [];
-      const producer = createPiSubagentPresenceProducer({
-        emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); },
-        getSchedulerCounts: () => ({ active: activeCase.scheduler, queued: 0 }),
-        getInteractiveActiveCount: () => activeCase.interactiveIds.length,
-        getInteractiveActiveInvocationIds: () => activeCase.interactiveIds,
+    assert.equal(value.publish(snapshot(recent)), true);
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 4_096);
+    let state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { completed: number; failed: number; omitted: number } };
+    assert.equal(state.subagents.completed, 4_096);
+    assert.equal(state.subagents.failed, 0);
+    assert.equal(state.subagents.omitted, 1);
+
+    assert.equal(value.publish(snapshot(recent)), true);
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 4_096, "an unchanged 4097-terminal snapshot emits no terminal twice");
+    state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { completed: number; failed: number; omitted: number } };
+    assert.equal(state.subagents.completed, 4_096);
+    assert.equal(state.subagents.failed, 0);
+    assert.equal(state.subagents.omitted, 1);
+  });
+
+  test("continues terminal accounting after 4096 lifetime terminals without retaining an unbounded event array", () => {
+    let terminalEvents = 0;
+    consumer(bus(), "pi-cmux-presence", "terminal-lifetime-epoch");
+    const value = createPiSubagentPresenceProducer({
+      emit: (name) => { if (name === EVENT_NAMES.terminal) terminalEvents += 1; },
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }),
+      getInteractiveActiveCount: () => 0,
+    });
+    cleanup.push(() => value.stop());
+    assert.equal(value.startSession("private-session", 0), true);
+    for (let index = 0; index <= 4_096; index += 1) value.publish(snapshot([{ id: `terminal-${index}`, status: "completed", completedAt: index }]));
+    assert.equal(terminalEvents, 4_097);
+  });
+
+  test("accepts safe local UX generations solely as equality fences and starts wire generations at zero", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "large-ux-generation-epoch");
+    for (const uxGeneration of [1_000_001, Number.MAX_SAFE_INTEGER]) {
+      const eventOffset = events.events.length;
+      const value = createPiSubagentPresenceProducer({
+        emit: events.emit,
+        getSchedulerCounts: () => ({ active: 0, queued: 0 }),
+        getInteractiveActiveCount: () => 0,
       });
-      producer.startSession("session-1", 0);
-      producer.publish(snapshot(0, [], activeCase.activeIds.map((id) => ({ id, status: "running" }))));
-      assert.equal(emitted[0].counts.active, activeCase.expected, activeCase.name);
+      cleanup.push(() => value.stop());
+      assert.equal(value.startSession("private-session", uxGeneration), true);
+      assert.equal(value.publish(snapshot([{ id: "stale", status: "failed", completedAt: 1 }], [], uxGeneration - 1)), false, "a mismatched UX generation is stale");
+      assert.equal(value.publish(snapshot([{ id: "current", status: "completed", completedAt: 2 }], [], uxGeneration)), true);
+      const observed = events.events.slice(eventOffset)
+        .filter((event) => event.name === EVENT_NAMES.state || event.name === EVENT_NAMES.terminal)
+        .map((event) => event.payload);
+      assert.ok(observed.length > 0);
+      assert.ok(observed.every((event) => event.generation === 0), "a fresh source handle resets bounded wire generation to zero");
+      assert.ok(observed.every((event) => event.generation >= 0 && event.generation <= 1_000_000));
+      assert.equal(observed.filter((event) => "eventId" in event).length, 1);
+      value.stop();
     }
   });
 
-  test("uses the legacy interactive count as an unmatched fallback", () => {
-    const emitted: any[] = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); },
-      getSchedulerCounts: () => ({ active: 1, queued: 0 }),
-      getInteractiveActiveCount: () => 1,
-    });
-    producer.startSession("session-1", 0);
-    producer.publish(snapshot(0, [], [{ id: "origin", status: "running" }]));
-    assert.equal(emitted[0].counts.active, 2);
+  test("rotates source handles atomically before ordinal exhaustion and at maximum wire generation", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "ordinal-epoch");
+    const value = producer(events);
+    seedWireOrdinalsForBoundaryTest(value, { wireGeneration: 7, sequence: 999_998, terminalOrdinal: 1_000_000, opened: true });
+    value.publish(snapshot([{ id: "boundary", status: "completed", completedAt: 1 }]));
+    const observed = events.events.filter((event) => event.name !== EVENT_NAMES.consumerReady).map((event) => event.payload);
+    assert.deepEqual(observed.map((event) => [event.generation, event.sequence]), [[7, 999_999], [0, 0], [0, 1]]);
+    assert.equal((observed[1] as Extract<PresenceEventV2, { eventId: number }>).eventId, 0);
+    value.stop();
+
+    const maxEvents = bus();
+    consumer(maxEvents, "pi-herdr-presence", "max-generation-epoch");
+    const max = producer(maxEvents);
+    seedWireOrdinalsForBoundaryTest(max, { wireGeneration: 1_000_000 });
+    max.publish(snapshot([], [{ id: "active", status: "running" }]));
+    max.publish(snapshot([{ id: "done", status: "completed", completedAt: 1 }]));
+    max.settle();
+    max.publish(snapshot([], [{ id: "next", status: "running" }]));
+    const states = maxEvents.events
+      .filter((event) => event.name === EVENT_NAMES.state && event.payload.sessionEpoch === validEpoch("max-generation-epoch"))
+      .map((event) => event.payload);
+    assert.deepEqual(states.map((event) => [event.generation, event.sequence]), [[1_000_000, 0], [1_000_000, 2], [0, 0]]);
   });
 
-  test("projects each finalized accounting record once into cumulative v1 usage", () => {
-    const emitted: any[] = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel === PI_PRESENCE_UPDATE_EVENT) emitted.push(payload); },
-      getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
+  test("fans out to both shared consumers and isolates throwing event buses", () => {
+    const events = bus();
+    const cmux = consumer(events, "pi-cmux-presence", "epoch-cmux");
+    const herdr = consumer(events, "pi-herdr-presence", "epoch-herdr");
+    const active = producer(events);
+    active.publish(snapshot([], [{ id: "run", status: "running" }]));
+    assert.equal(cmux.length, 1);
+    assert.equal(herdr.length, 1);
+    events.emit(EVENT_NAMES.state, {
+      version: 2, sessionEpoch: validEpoch("epoch-cmux"), generation: 0, sequence: 99, source: "subagent", state: "running",
+      subagents: { running: 1, cancelling: 0, queued: 0, completed: 0, failed: 0, cancelled: 0, omitted: 0 }, private: "rejected",
     });
-    producer.startSession("session-1", 0);
-    const first = { totalTokens: 7, cost: { total: 0.25 } };
-    const second = { totalTokens: 3, cost: { total: 0.5 } };
-    assert.equal(producer.recordFinalUsage("foreground-1", 0, first), true);
-    assert.equal(producer.recordFinalUsage("foreground-1", 0, first), false, "duplicate finalization cannot double-count");
-    assert.equal(producer.recordFinalUsage("background-1", 0, second), true);
-    assert.equal(producer.recordFinalUsage("invalid", 0, { totalTokens: Number.POSITIVE_INFINITY, cost: { total: 1 } }), false);
-    producer.publish(snapshot(0, [completed("foreground-1")]));
-    assert.deepEqual(emitted[0].usage, { tokens: 10, cost: 0.75 });
-    producer.handleReady({ version: 1, sessionId: "session-1" });
-    assert.deepEqual(emitted[1].usage, { tokens: 10, cost: 0.75 }, "replay uses the retained aggregate without recounting");
-    producer.startSession("session-2", 1);
-    assert.equal(producer.recordFinalUsage("stale-foreground", 0, first), false, "a prior session generation cannot contaminate the new aggregate");
-    assert.equal(producer.recordFinalUsage("foreground-1", 1, first), true, "dedupe is session-local");
-    producer.publish(snapshot(1, [completed("session-2-done")]));
-    assert.deepEqual(emitted.at(-1)?.usage, { tokens: 7, cost: 0.25 });
+    assert.equal(cmux.length, 1, "shared strict parser rejects malformed wire payloads");
+    active.stop();
+
+    const throwing = createPiSubagentPresenceProducer({ emit: () => { throw new Error("observer failure"); }, getSchedulerCounts: () => ({ active: 1, queued: 0 }), getInteractiveActiveCount: () => 0 });
+    cleanup.push(() => throwing.stop());
+    assert.doesNotThrow(() => { throwing.startSession("private-session", 5); throwing.publish(snapshot([], [{ id: "run", status: "running" }], 5)); throwing.stop(); });
   });
 
-  test("keeps cumulative terminal counts after UX recent history is pruned and isolates observer failures", () => {
-    const emitted: any[] = [];
-    const producer = createPiSubagentPresenceProducer({
-      emit: (channel, payload) => { if (channel !== PI_PRESENCE_READY_EVENT) emitted.push(payload); }, getSchedulerCounts: () => ({ active: 0, queued: 0 }), getInteractiveActiveCount: () => 0,
-    });
-    producer.startSession("session-1", 0);
-    const one = { id: "one", status: "completed", generation: 0, kind: "foreground", agent: "safe", startedAt: 1, updatedAt: 2, completedAt: 2, progress: { completed: 1, total: 1 } };
-    const two = { ...one, id: "two", status: "failed", startedAt: 3, updatedAt: 4, completedAt: 4 };
-    producer.publish(snapshot(0, [one]));
-    producer.publish(snapshot(0, [two])); // one has been pruned from registry history
-    assert.deepEqual(emitted.map((event) => event.counts.completed), [1, 1]);
-    assert.deepEqual(emitted.map((event) => event.counts.failed), [0, 1]);
-    assert.deepEqual(emitted.map((event) => event.state), ["success", "error"]);
-    assert.deepEqual(emitted.map((event) => event.attention), ["success", "error"]);
-
-    const throwing = createPiSubagentPresenceProducer({ emit: () => { throw new Error("listener"); }, getSchedulerCounts: () => { throw new Error("scheduler"); }, getInteractiveActiveCount: () => { throw new Error("interactive"); } });
-    throwing.startSession("session-1", 0);
-    assert.doesNotThrow(() => throwing.publish(snapshot()));
+  test("relies on the shared parser and cannot project private data or couple to consumers/transports", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "private-epoch");
+    const value = producer(events);
+    value.publish(snapshot([{ id: "invocation-id", status: "failed", completedAt: 1 }]));
+    for (const { payload } of events.events) {
+      const wire = JSON.stringify(payload);
+      for (const forbidden of ["invocation-id", "private-agent", "private-session", "private-task", "private-output", "raw-error", "private-path", "usage", "label", "sessionId"]) assert.equal(wire.includes(forbidden), false, forbidden);
+    }
+    const source = fs.readFileSync(path.resolve(import.meta.dirname, "../../src/integration/pi-presence-producer.ts"), "utf8");
+    assert.match(source, /createPresenceProducer/);
+    assert.doesNotMatch(source, /pi-cmux-presence|pi-herdr-presence|node:(?:net|child_process)|\b(?:spawn|exec|setInterval|setTimeout)\s*\(/);
   });
 });

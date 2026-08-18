@@ -24,13 +24,11 @@
     "test": "bun test --isolate --pass-with-no-tests",
     "check": "bunx tsc --noEmit",
     "ci": "bun run check && bun run test",
-    "acceptance:dry-run": "bun run test/acceptance/live-harness.ts tmux --dry-run && bun run test/acceptance/live-harness.ts cmux --dry-run && bun run test/acceptance/live-harness.ts package --dry-run && bun run acceptance:cmux-presence:dry-run && bun run acceptance:cmux-layout-phase0:dry-run && bun run title:live:dry-run && bun run benchmark:phase0:preflight && bun run benchmark:phase0:verify && bun run benchmark:phase0:live:preflight && bun run benchmark:phase0:live:routine:verify && bun run benchmark:phase0:live:concurrency:verify && bun run benchmark:phase7:preflight && bun run benchmark:phase7:verify",
+    "acceptance:dry-run": "bun run test/acceptance/live-harness.ts tmux --dry-run && bun run test/acceptance/live-harness.ts cmux --dry-run && bun run test/acceptance/live-harness.ts package --dry-run && bun run acceptance:cmux-layout-phase0:dry-run && bun run title:live:dry-run && bun run benchmark:phase0:preflight && bun run benchmark:phase0:verify && bun run benchmark:phase0:live:preflight && bun run benchmark:phase0:live:routine:verify && bun run benchmark:phase0:live:concurrency:verify && bun run benchmark:phase7:preflight && bun run benchmark:phase7:verify",
     "acceptance:layout:dry-run": "bun run test/acceptance/live-harness.ts tmux --dry-run && bun run test/acceptance/live-harness.ts cmux --dry-run",
     "acceptance:layout": "bun run test/acceptance/live-harness.ts tmux && bun run test/acceptance/live-harness.ts cmux",
     "acceptance:tmux": "bun run test/acceptance/live-harness.ts tmux",
     "acceptance:cmux": "bun run test/acceptance/live-harness.ts cmux",
-    "acceptance:cmux-presence:dry-run": "bun run test/acceptance/presence-cmux-live.ts --dry-run",
-    "acceptance:cmux-presence": "bun run test/acceptance/presence-cmux-live.ts",
     "acceptance:cmux-layout-phase0": "bun run test/acceptance/cmux-layout-phase0.ts",
     "acceptance:cmux-layout-phase0:dry-run": "bun run test/acceptance/cmux-layout-phase0.ts --dry-run",
     "acceptance:package": "bun run test/acceptance/live-harness.ts package",
@@ -96,5 +94,8 @@
     }
   },
   "private": true,
-  "packageManager": "bun@1.3.14"
+  "packageManager": "bun@1.3.14",
+  "dependencies": {
+    "@pi/presence": "github:spi-ca/pi-presence#v2-20260818-2"
+  }
 }

@@ -610,11 +610,9 @@ export default function (pi: ExtensionAPI) {
   const presenceProducer = currentDepth === 0
     ? createPiSubagentPresenceProducer({
       emit: (channel, payload) => pi.events.emit(channel, payload),
-      on: typeof pi.events.on === "function" ? (channel, handler) => pi.events.on(channel, handler) : undefined,
       getSchedulerCounts: () => ({ active: scheduler.activeCount, queued: scheduler.queuedCount }),
       getInteractiveActiveCount: () => listPresenceInteractiveRunSnapshots().length,
-      // One in-process snapshot gives presence exact per-run correlation
-      // without making invocation IDs durable or part of the wire DTO.
+      // Atomic process-local correlation only; IDs never enter V2 DTOs.
       getInteractiveActiveInvocationIds: () => listPresenceInteractiveRunSnapshots().map((run) => run.invocationId),
     })
     : null;
@@ -678,7 +676,6 @@ export default function (pi: ExtensionAPI) {
             `scheduler: ${scheduler.activeCount} active, ${scheduler.queuedCount} queued, max ${scheduler.maxActive}`,
             `interactive authority: ${listActiveInteractiveRunIds().length} active`,
             ...reaperDiagnosticUx.formatDoctorStatus(),
-            `presence remove capability: ${presenceProducer?.isPresenceRemoveCapabilityDetected() ? "detected" : "not observed"}`,
             `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
             "control readiness: validated per interactive launch (no doctor probe)",
           ];
@@ -1614,11 +1611,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             backgroundSessionFence,
             (finalizedJob, finalizedUsage) => {
               updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
-              // The generic presence producer receives only finalized internal
-              // accounting, before the terminal UX publication it observes.
-              // Background snapshots deliberately compact usage, so this
-              // callback carries the private pre-compaction aggregate.
-              presenceProducer?.recordFinalUsage?.(finalizedJob.id, uxGeneration, finalizedUsage);
+              // Public accounting remains finalized here. Presence is a
+              // content-free V2 observer projection and receives no usage.
+              void finalizedUsage;
               if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
               else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
               else uxRegistry.fail(finalizedJob.id, uxGeneration);
@@ -1652,9 +1647,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         try {
           const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false, uxRun.id));
           updateUxFromPartial(uxRun.id, uxGeneration, result);
-          // Record before the terminal UX transition so its v1 update carries
-          // the finalized aggregate without exposing accounting in tool DTOs.
-          presenceProducer?.recordFinalUsage?.(uxRun.id, uxGeneration, result.usage);
+          // Public accounting remains part of the result only; V2 presence
+          // deliberately has no usage projection.
           if (foregroundController.signal.aborted) {
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
           }

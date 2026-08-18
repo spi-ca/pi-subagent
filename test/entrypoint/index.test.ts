@@ -17,6 +17,7 @@ import {
 import { buildForkBranchSourceJsonl } from "../../src/core/fork-session";
 import { settleWithUnrefTimeout } from "../../src/core/async-settle";
 import { buildChildProcessEnv } from "../../src/runtime/runner";
+import { PI_SUBAGENT_DASHBOARD_EVENT, type PiSubagentDashboardPayload } from "../../src/integration/pi-cmux-contract";
 
 const { ProcessLocalScheduler: RealProcessLocalScheduler } = await import("../../src/runtime/process-local-scheduler");
 const { createPiSubagentPresenceProducer: createRealPiSubagentPresenceProducer } = await import("../../src/integration/pi-presence-producer");
@@ -215,13 +216,15 @@ describe("production dashboard boundary", () => {
     }
   });
 
-  test("resets seeded old scheduler work before session-start presence subscriptions", async () => {
+  test("resets old scheduler projections at the production dashboard boundary while retaining capacity", async () => {
     const previousDepth = process.env.PI_SUBAGENT_DEPTH;
     const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
     const observed: PresenceEventV2[] = [];
+    const dashboards: PiSubagentDashboardPayload[] = [];
     const presenceConsumer = createPresenceConsumer({ id: "pi-cmux-presence", sessionEpoch: "e".repeat(32) });
     assert.ok(presenceConsumer);
     const emit = (channel: string, payload: unknown) => {
+      if (channel === PI_SUBAGENT_DASHBOARD_EVENT) dashboards.push(payload as PiSubagentDashboardPayload);
       const event = presenceConsumer.accept(channel, payload);
       if (event) observed.push(event);
     };
@@ -257,9 +260,35 @@ describe("production dashboard boundary", () => {
       });
 
       assert.deepEqual(await oldQueued, { started: false });
+      const newSessionDashboards = dashboards.filter((payload) => payload.sessionId === "entrypoint-presence-session");
+      assert.ok(newSessionDashboards.length > 0, "session start publishes actual dashboard payloads");
+      for (const payload of newSessionDashboards) {
+        assert.deepEqual(
+          { active: payload.counts.schedulerActive, queued: payload.counts.schedulerQueued },
+          { active: 0, queued: 0 },
+          "old scheduler work must not appear in the replacement session",
+        );
+      }
       assert.deepEqual(observed, [], "immediate scheduler subscription must not emit stale V2 waiting presence");
+
+      let releaseCurrentGate!: () => void;
+      let markCurrentStarted!: () => void;
+      const currentStarted = new Promise<void>((resolve) => { markCurrentStarted = resolve; });
+      const currentGate = new Promise<void>((resolve) => { releaseCurrentGate = resolve; });
+      const currentHandle = scheduler.createHandle();
+      const currentRunning = scheduler.schedule(currentHandle, async () => {
+        markCurrentStarted();
+        await currentGate;
+        return "current-running";
+      });
+      assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 0, queued: 1 });
+
       releaseOldGate();
-      await oldRunning;
+      await currentStarted;
+      assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 1, queued: 0 });
+      releaseCurrentGate();
+      await Promise.all([oldRunning, currentRunning]);
+      assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 0, queued: 0 });
     } finally {
       presenceConsumer.deactivate();
       if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;

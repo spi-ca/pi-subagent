@@ -107,10 +107,10 @@ bun run benchmark:phase7:record-local
 
 ### Generic presence producer 집중 검증
 
-root-only producer는 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다.
+root-only producer는 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다. 새 session은 dashboard/presence observer를 등록하기 전에 process-local scheduler를 reset하므로, 즉시 전달되는 scheduler 구독이 이전 session의 queued/running 상태를 새 presence로 투영하지 않는다.
 
 ```bash
-bun test test/integration/pi-presence-producer.test.ts
+bun test --isolate test/integration/pi-presence-producer.test.ts test/entrypoint/index.test.ts
 ```
 
 그 뒤 baseline은 `bun run ci`입니다. 이 deterministic 범위는 실제 consumer UI/socket 또는 live cmux/Herdr E2E를 증명하지 않는다.

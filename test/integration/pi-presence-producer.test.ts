@@ -203,22 +203,27 @@ describe("V2 subagent presence producer", () => {
     consumer(events, "pi-cmux-presence", "newest-window-epoch");
     const value = producer(events);
     const recent = [
-      ...Array.from({ length: 4_096 }, (_, index) => ({ id: `eligible-${index}`, status: "completed" as const, completedAt: index })),
-      { id: "omitted-terminal", status: "failed" as const, completedAt: 4_096 },
+      { id: "newest-terminal", status: "failed" as const, completedAt: 4_096 },
+      ...Array.from({ length: 4_096 }, (_, index) => {
+        const completedAt = 4_095 - index;
+        return { id: `completed-${completedAt}`, status: "completed" as const, completedAt };
+      }),
     ];
 
     assert.equal(value.publish(snapshot(recent)), true);
-    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 4_096);
+    const terminals = events.events.filter((event) => event.name === EVENT_NAMES.terminal);
+    assert.equal(terminals.length, 4_096);
+    assert.equal((terminals.at(-1)!.payload as Extract<PresenceEventV2, { outcome: string }>).outcome, "failed", "the first/newest source terminal is retained");
     let state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { completed: number; failed: number; omitted: number } };
-    assert.equal(state.subagents.completed, 4_096);
-    assert.equal(state.subagents.failed, 0);
+    assert.equal(state.subagents.completed, 4_095);
+    assert.equal(state.subagents.failed, 1);
     assert.equal(state.subagents.omitted, 1);
 
     assert.equal(value.publish(snapshot(recent)), true);
     assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 4_096, "an unchanged 4097-terminal snapshot emits no terminal twice");
     state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { completed: number; failed: number; omitted: number } };
-    assert.equal(state.subagents.completed, 4_096);
-    assert.equal(state.subagents.failed, 0);
+    assert.equal(state.subagents.completed, 4_095);
+    assert.equal(state.subagents.failed, 1);
     assert.equal(state.subagents.omitted, 1);
   });
 

@@ -1,7 +1,8 @@
 // Bun implements module mocks but this project's Node-only test types omit it.
 // @ts-expect-error Bun runtime export is intentionally absent from @types/node.
-import { describe, mock, test } from "bun:test";
+import { afterEach, describe, mock, test } from "bun:test";
 import assert from "node:assert/strict";
+import { createPresenceConsumer, type PresenceEventV2 } from "@pi/presence";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,17 @@ import {
 import { buildForkBranchSourceJsonl } from "../../src/core/fork-session";
 import { settleWithUnrefTimeout } from "../../src/core/async-settle";
 import { buildChildProcessEnv } from "../../src/runtime/runner";
+
+const { ProcessLocalScheduler: RealProcessLocalScheduler } = await import("../../src/runtime/process-local-scheduler");
+const { createPiSubagentPresenceProducer: createRealPiSubagentPresenceProducer } = await import("../../src/integration/pi-presence-producer");
+const createdSchedulers: InstanceType<typeof RealProcessLocalScheduler>[] = [];
+class CapturingProcessLocalScheduler extends RealProcessLocalScheduler {
+  constructor(...args: ConstructorParameters<typeof RealProcessLocalScheduler>) {
+    super(...args);
+    createdSchedulers.push(this);
+  }
+}
+
 mock.module("@earendil-works/pi-tui", () => ({
   Container: class {},
   Markdown: class {},
@@ -40,15 +52,36 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 }));
 const presenceLifecycleCalls: string[] = [];
 const presenceProducerOptions: Array<Record<string, unknown>> = [];
+const createdPresenceProducers: ReturnType<typeof createRealPiSubagentPresenceProducer>[] = [];
+afterEach(() => {
+  while (createdPresenceProducers.length > 0) createdPresenceProducers.pop()!.stop();
+});
+mock.module("../../src/runtime/process-local-scheduler", () => ({
+  ProcessLocalScheduler: CapturingProcessLocalScheduler,
+}));
 mock.module("../../src/integration/pi-presence-producer", () => ({
   createPiSubagentPresenceProducer: (options: Record<string, unknown>) => {
     presenceProducerOptions.push(options);
+    const producer = createRealPiSubagentPresenceProducer(options as unknown as Parameters<typeof createRealPiSubagentPresenceProducer>[0]);
+    createdPresenceProducers.push(producer);
     return {
-    startSession: () => { presenceLifecycleCalls.push("start"); return true; },
-    stop: () => undefined,
-    publish: () => { presenceLifecycleCalls.push("publish"); return true; },
-    beginAgentRun: () => presenceLifecycleCalls.push("begin"),
-      settle: () => presenceLifecycleCalls.push("settle"),
+      startSession: (sessionId: string, generation: number) => {
+        presenceLifecycleCalls.push("start");
+        return producer.startSession(sessionId, generation);
+      },
+      stop: () => producer.stop(),
+      publish: (snapshot: Parameters<typeof producer.publish>[0]) => {
+        presenceLifecycleCalls.push("publish");
+        return producer.publish(snapshot);
+      },
+      beginAgentRun: () => {
+        presenceLifecycleCalls.push("begin");
+        producer.beginAgentRun();
+      },
+      settle: () => {
+        presenceLifecycleCalls.push("settle");
+        producer.settle();
+      },
     };
   },
 }));
@@ -177,6 +210,58 @@ describe("production dashboard boundary", () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+  });
+
+  test("resets seeded old scheduler work before session-start presence subscriptions", async () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const observed: PresenceEventV2[] = [];
+    const presenceConsumer = createPresenceConsumer({ id: "pi-cmux-presence", sessionEpoch: "e".repeat(32) });
+    assert.ok(presenceConsumer);
+    const emit = (channel: string, payload: unknown) => {
+      const event = presenceConsumer.accept(channel, payload);
+      if (event) observed.push(event);
+    };
+    assert.equal(presenceConsumer.activate(emit), true);
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH;
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
+        registerCommand: () => undefined,
+        registerTool: () => undefined,
+        on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const scheduler = createdSchedulers.at(-1);
+      assert.ok(scheduler);
+      let releaseOldGate!: () => void;
+      const oldGate = new Promise<void>((resolve) => { releaseOldGate = resolve; });
+      const oldHandle = scheduler.createHandle();
+      const oldRunning = scheduler.schedule(oldHandle, async () => { await oldGate; return "old-running"; });
+      const oldQueued = scheduler.schedule(oldHandle, async () => "old-queued");
+      assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 1, queued: 1 });
+
+      const sessionStart = handlers.get("session_start");
+      assert.ok(sessionStart);
+      await sessionStart({}, {
+        cwd: process.cwd(),
+        hasUI: false,
+        isIdle: () => false,
+        sessionManager: { getSessionId: () => "entrypoint-presence-session", getSessionFile: () => undefined },
+      });
+
+      assert.deepEqual(await oldQueued, { started: false });
+      assert.deepEqual(observed, [], "immediate scheduler subscription must not emit stale V2 waiting presence");
+      releaseOldGate();
+      await oldRunning;
+    } finally {
+      presenceConsumer.deactivate();
       if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
       else process.env.PI_SUBAGENT_DEPTH = previousDepth;
     }

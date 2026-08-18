@@ -432,6 +432,14 @@ describe("tree permit authority immutable CAS snapshots", () => {
     assert.ok(await unknownAdopter.acquireReservation());
   });
 
+  test("returns an empty result for an absent state root without creating it", async () => {
+    const base = await root();
+    const missingRoot = path.join(base, "absent-state-root");
+
+    assert.deepEqual(await reconcileTreePermitAuthorities({ rootDir: missingRoot }), { removed: [], retained: [], scanned: 0 });
+    await assert.rejects(fs.promises.lstat(missingRoot), { code: "ENOENT" });
+  });
+
   test("retains a crashed root authority for live descendants and reclaims its dead root permit", async () => {
     const base = await root();
     const parent = { pid: 481, startedAt: 1 }, child = { pid: 482, startedAt: 1 };

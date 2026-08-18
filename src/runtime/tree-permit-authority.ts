@@ -879,6 +879,14 @@ export async function adoptTreePermitAuthority(options: AdoptTreePermitAuthority
 /** Remove only bounded, exact-dead complete public authorities and private artifacts. */
 export async function reconcileTreePermitAuthorities(options: ReconcileTreePermitAuthoritiesOptions = {}): Promise<ReconcileTreePermitAuthoritiesResult> {
   const rootDir = path.resolve(options.rootDir ?? getRunStateRoot());
+  try {
+    await fs.promises.lstat(rootDir);
+  } catch (error) {
+    // First startup has no retained state to reconcile. Do not initialize the
+    // root here: authority creation remains responsible for that transition.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: [], retained: [], scanned: 0 };
+    throw error;
+  }
   await assertSafeStateRoot(rootDir);
   const namespaceDir = await ensureNamespace(rootDir);
   const classify = options.classifyIdentity ?? ((identity: ProcessIdentity) => classifyParentProcessIdentity(identity.pid, identity.startedAt));

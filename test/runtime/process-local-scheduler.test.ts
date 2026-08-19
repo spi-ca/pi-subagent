@@ -104,6 +104,45 @@ describe("process-local scheduler", () => {
     assert.deepEqual(await scheduler.schedule(second, async () => "new"), { started: true, value: "new" });
   });
 
+  test("keeps old-generation capacity while projecting only current-generation active work", async () => {
+    const scheduler = new ProcessLocalScheduler(1);
+    const states: Array<{ active: number; queued: number; generation: number }> = [];
+    scheduler.subscribe((state) => states.push({ active: state.active, queued: state.queued, generation: state.generation }));
+
+    const oldHandle = scheduler.createHandle();
+    const oldGate = deferred<void>();
+    const oldWork = scheduler.schedule(oldHandle, async () => {
+      await oldGate.promise;
+      return "old";
+    });
+    assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 1, queued: 0 });
+
+    scheduler.startSession();
+    const currentGeneration = scheduler.createHandle().generation;
+    assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 0, queued: 0 });
+    assert.deepEqual(states.at(-1), { active: 0, queued: 0, generation: currentGeneration });
+
+    const currentGate = deferred<void>();
+    let currentStarted = false;
+    const currentHandle = scheduler.createHandle();
+    const currentWork = scheduler.schedule(currentHandle, async () => {
+      currentStarted = true;
+      await currentGate.promise;
+      return "current";
+    });
+    assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 0, queued: 1 });
+
+    oldGate.resolve();
+    await tick();
+    assert.equal(currentStarted, true, "old work releases shared capacity for the current generation");
+    assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 1, queued: 0 });
+
+    currentGate.resolve();
+    await Promise.all([oldWork, currentWork]);
+    assert.deepEqual({ active: scheduler.activeCount, queued: scheduler.queuedCount }, { active: 0, queued: 0 });
+    assert.ok(states.filter((state) => state.generation === currentGeneration).every((state) => state.active >= 0 && state.queued >= 0));
+  });
+
   test("notifies immutable state observers when saturated work dispatches or is cancelled", async () => {
     const scheduler = new ProcessLocalScheduler(1);
     const states: Array<{ active: number; queued: number }> = [];

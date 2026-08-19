@@ -71,7 +71,10 @@ interface InvocationQueue {
  * its own pool, avoiding nested-delegation permit deadlocks.
  */
 export class ProcessLocalScheduler {
-  private active = 0;
+  /** All generations share this capacity counter until each launch releases. */
+  private totalActive = 0;
+  /** Dashboard/observer projection is limited to the current generation. */
+  private readonly activeByGeneration = new Map<number, number>();
   private nextHandleId = 1;
   private generation = 0;
   private accepting = true;
@@ -137,7 +140,7 @@ export class ProcessLocalScheduler {
     this.notifyObservers();
   }
 
-  get activeCount(): number { return this.active; }
+  get activeCount(): number { return this.activeByGeneration.get(this.generation) ?? 0; }
   get queuedCount(): number { return this.queues.reduce((count, queue) => count + queue.entries.length, 0); }
 
   schedule<T>(handle: SchedulerHandle, launch: () => Promise<T>, signal?: AbortSignal): Promise<ScheduledResult<T>> {
@@ -183,7 +186,7 @@ export class ProcessLocalScheduler {
   }
 
   private dispatch(): void {
-    while (this.accepting && this.active < this.maxActive && this.queues.length > 0) {
+    while (this.accepting && this.totalActive < this.maxActive && this.queues.length > 0) {
       // Handles are monotonically registered within a generation. Pick the
       // next queued handle after the previous winner, wrapping at the end.
       // Keeping the cursor even while that handle is active prevents a fast
@@ -204,13 +207,13 @@ export class ProcessLocalScheduler {
       }
       entry.queued = false;
       if (entry.signal && entry.abortListener) entry.signal.removeEventListener("abort", entry.abortListener);
-      this.active += 1;
+      this.incrementActive(entry.handle.generation);
       this.notifyObservers();
       let released = false;
       const release = () => {
         if (released) return;
         released = true;
-        this.active -= 1;
+        this.releaseActive(entry.handle.generation);
         this.notifyObservers();
         this.dispatch();
       };
@@ -221,9 +224,23 @@ export class ProcessLocalScheduler {
     }
   }
 
+  private incrementActive(generation: number): void {
+    this.totalActive += 1;
+    this.activeByGeneration.set(generation, (this.activeByGeneration.get(generation) ?? 0) + 1);
+  }
+
+  private releaseActive(generation: number): void {
+    // Releases can arrive after startSession. They must free shared capacity
+    // without decrementing the replacement session's projected active count.
+    if (this.totalActive > 0) this.totalActive -= 1;
+    const count = this.activeByGeneration.get(generation) ?? 0;
+    if (count <= 1) this.activeByGeneration.delete(generation);
+    else this.activeByGeneration.set(generation, count - 1);
+  }
+
   private snapshot(): ProcessLocalSchedulerState {
     return Object.freeze({
-      active: this.active,
+      active: this.activeCount,
       queued: this.queuedCount,
       maxActive: this.maxActive,
       accepting: this.accepting,

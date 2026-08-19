@@ -931,6 +931,10 @@ export default function (pi: ExtensionAPI) {
     unsubscribeInteractiveRunChanges?.();
     unsubscribeInteractiveRunChanges = null;
     const uxGeneration = uxRegistry.reset();
+    // Scheduler subscriptions publish immediately. Reset its queue before
+    // registering dashboard/presence observers so they cannot project stale
+    // work from the preceding session into the new one.
+    scheduler.startSession(limits.maxActive);
     if (currentDepth === 0 && dashboardPublisher) {
       dashboardPublisher.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
       presenceProducer?.startSession(ctx.sessionManager.getSessionId(), uxGeneration);
@@ -968,7 +972,6 @@ export default function (pi: ExtensionAPI) {
     backgroundJobSettlements.clear();
     sessionShuttingDown = false;
     discoveryCache.startSession();
-    scheduler.startSession(limits.maxActive);
     await treePermitAuthorityLifecycle.startup(limits.maxActive);
     await resetInteractiveShutdownForSession();
     if (currentDepth === 0) {

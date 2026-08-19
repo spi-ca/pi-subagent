@@ -102,20 +102,20 @@ Linux/macOS에서는 해석된 값과 private tree authority/lease capability를
 | JSON 키 | CLI 플래그 | 환경 변수 | 기본값 | 적용 대상 |
 | --- | --- | --- | ---: | --- |
 | `maxActive` | `--subagent-max-active` | `PI_SUBAGENT_MAX_ACTIVE` | 16 | `1`–`256`; Linux/macOS에서는 root parent의 자체 `ACTIVE` lease와 모든 nested foreground/background child를 합친 tree-wide `ACTIVE`/`RESERVED` permit 상한. Windows에서는 process-local scheduler 상한 |
-| `maxParallelTasks` | `--subagent-max-parallel-tasks` | `PI_SUBAGENT_MAX_PARALLEL_TASKS` | 50 | 최상위 `tasks` 배열의 최대 항목 수 |
-| `maxChainSteps` | `--subagent-max-chain-steps` | `PI_SUBAGENT_MAX_CHAIN_STEPS` | 12 | `chain`의 최대 단계 수 |
-| `maxConcurrency` | `--subagent-max-concurrency` | `PI_SUBAGENT_MAX_CONCURRENCY` | 16 | 한 병렬 호출 또는 체인 병렬 단계가 동시에 매핑하는 child 수 |
-| `maxChainParallelTasks` | `--subagent-max-chain-parallel-tasks` | `PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS` | 8 | 체인 병렬 단계 하나의 최대 `tasks` 항목 수 |
-| `maxBackgroundJobs` | `--subagent-max-background-jobs` | `PI_SUBAGENT_MAX_BACKGROUND_JOBS` | 16 | `running` 또는 `cancelling` 백그라운드 작업 수 |
-| `backgroundHistoryLimit` | `--subagent-background-history-limit` | `PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT` | 20 | 보존하는 종료 백그라운드 작업 수 |
+| `maxParallelTasks` | `--subagent-max-parallel-tasks` | `PI_SUBAGENT_MAX_PARALLEL_TASKS` | 50 | 최상위 `tasks` 배열의 최대 항목 수; `0`–`256` |
+| `maxChainSteps` | `--subagent-max-chain-steps` | `PI_SUBAGENT_MAX_CHAIN_STEPS` | 12 | `chain`의 최대 단계 수; `0`–`256` |
+| `maxConcurrency` | `--subagent-max-concurrency` | `PI_SUBAGENT_MAX_CONCURRENCY` | 16 | 한 병렬 호출 또는 체인 병렬 단계가 동시에 매핑하는 child 수; `1`–`256` |
+| `maxChainParallelTasks` | `--subagent-max-chain-parallel-tasks` | `PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS` | 8 | 체인 병렬 단계 하나의 최대 `tasks` 항목 수; `0`–`256` |
+| `maxBackgroundJobs` | `--subagent-max-background-jobs` | `PI_SUBAGENT_MAX_BACKGROUND_JOBS` | 16 | `running` 또는 `cancelling` 백그라운드 작업 수; `0`–`256` |
+| `backgroundHistoryLimit` | `--subagent-background-history-limit` | `PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT` | 20 | 보존하는 종료 백그라운드 작업 수; `0`–`256` |
 | `backgroundHistoryTtlMs` | `--subagent-background-history-ttl-ms` | `PI_SUBAGENT_BACKGROUND_HISTORY_TTL_MS` | 3600000 | 종료 작업 기록의 TTL(밀리초, 1시간) |
-| `backgroundOutputMaxBytes` | `--subagent-background-output-max-bytes` | `PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES` | 16384 | 백그라운드 결과/오류 원문의 UTF-8 바이트 상한 |
+| `backgroundOutputMaxBytes` | `--subagent-background-output-max-bytes` | `PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES` | 16384 | 백그라운드 결과/오류 원문의 UTF-8 바이트 상한; `0`–`65536` (64 KiB) |
 | `backgroundShutdownSettleMs` | `--subagent-background-shutdown-settle-ms` | `PI_SUBAGENT_BACKGROUND_SHUTDOWN_SETTLE_MS` | 3000 | session shutdown이 취소 뒤 정착을 기다리는 최대 시간(밀리초) |
 | `parallelHeartbeatMs` | `--subagent-parallel-heartbeat-ms` | `PI_SUBAGENT_PARALLEL_HEARTBEAT_MS` | 1000 | 병렬 진행 상황 heartbeat 간격(밀리초) |
 
-`--subagent-max-active`는 `1`–`256` safe integer여야 합니다. `--subagent-max-concurrency`와 `--subagent-parallel-heartbeat-ms`는 **양의** safe integer여야 합니다. 나머지 표의 새 숫자 설정은 0 이상의 safe integer여야 합니다. 공백은 제거하지만 부호, 소수, 지수 표기와 safe integer 범위 밖의 값은 허용하지 않습니다. 추가로 `--subagent-background-shutdown-settle-ms`와 `--subagent-parallel-heartbeat-ms`는 Node timer 의미론 때문에 최대 `2147483647`ms입니다. 즉 settle은 0 이상, heartbeat는 양수여야 하며 둘 다 이 timer 상한을 넘을 수 없습니다.
+`maxActive`, task/chain/concurrency/background queue는 최대 `256`이고, `backgroundHistoryLimit`은 최대 `256`, `backgroundOutputMaxBytes`는 최대 `65536`(64 KiB)인 safe integer여야 합니다. 최상위 task, chain 단계, 각 chain 병렬 단계의 개별 상한과 별도로 chain 전체의 순차·병렬 leaf task 합계도 `256`입니다. 이 합계는 task 항목을 순회하거나 실행하기 전에 검사합니다. `maxActive`, `maxConcurrency`, `parallelHeartbeatMs`는 **양의** 값이어야 하며 다른 count/output 설정은 0 이상입니다. `backgroundHistoryTtlMs`는 0 이상의 safe integer입니다. 이 실용 상한은 기존 256 tree-wide active permit/dashboard terminal bound와 64 KiB live session-tail chunk에 맞추며, retained text는 truncation notice를 제외하고 최대 약 16 MiB이므로 기본값과 상한 아래의 기존 설정은 유지합니다. 완료 background record의 agent/task metadata도 각각 4 KiB로 고정 제한됩니다. 공백은 제거하지만 부호, 소수, 지수 표기와 범위 밖의 값은 허용하지 않습니다. 추가로 `--subagent-background-shutdown-settle-ms`와 `--subagent-parallel-heartbeat-ms`는 Node timer 의미론 때문에 최대 `2147483647`ms입니다. 즉 settle은 0 이상, heartbeat는 양수여야 하며 둘 다 이 timer 상한을 넘을 수 없습니다.
 
-0은 비활성화/무제한을 뜻하지 않습니다. `max-parallel-tasks`, `max-chain-steps`, `max-chain-parallel-tasks`가 0이면 해당 비어 있지 않은 호출을 거부하고, `max-background-jobs=0`이면 새 백그라운드 작업을 시작할 수 없습니다. history limit 또는 TTL이 0이면 종료 기록은 pruning 시 즉시 제거됩니다. output max bytes가 0이면 자동 steer와 단건 `status`의 결과/오류 텍스트를 포함하지 않습니다. output text가 상한을 넘으면 보존한 UTF-8 prefix 뒤에 `[Background output truncated: N bytes omitted.]`를 붙입니다. shutdown settle이 0이면 취소 뒤 정착을 의도적으로 기다리지 않습니다. heartbeat는 0을 지원하지 않습니다.
+0은 비활성화/무제한을 뜻하지 않습니다. `max-parallel-tasks`, `max-chain-steps`, `max-chain-parallel-tasks`가 0이면 해당 비어 있지 않은 호출을 거부하고, `max-background-jobs=0`이면 새 백그라운드 작업을 시작할 수 없습니다. history limit 또는 TTL이 0이면 종료 기록은 pruning 시 즉시 제거됩니다. output max bytes가 0이면 자동 steer와 단건 `status`의 결과/오류 텍스트를 포함하지 않습니다. output text는 text chunk를 순차적으로 compact하므로 unbounded joined string/Buffer를 만들지 않으며, 상한을 넘으면 보존한 UTF-8 prefix 뒤에 `[Background output truncated: N bytes omitted.]`를 붙입니다. shutdown settle이 0이면 취소 뒤 정착을 의도적으로 기다리지 않습니다. heartbeat는 0을 지원하지 않습니다.
 
 예시:
 

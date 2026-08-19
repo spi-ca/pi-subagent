@@ -1,6 +1,11 @@
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
+import {
+  MAX_SUBAGENT_BACKGROUND_METADATA_BYTES,
+  MAX_SUBAGENT_CHAIN_STEPS,
+  MAX_SUBAGENT_TASKS,
+} from "./subagent-limits.js";
 import { canonicalizePathForTrust } from "./trust-path.js";
 import { DEFAULT_DELEGATION_MODE } from "./types.js";
 import type { AccountingUsage } from "./accounting-usage.js";
@@ -58,7 +63,8 @@ export interface BackgroundJobRecord {
   status: BackgroundJobStatus;
   startedAt: number;
   completedAt?: number;
-  controller: AbortController;
+  /** Present only while a job can still be cancelled; terminal history has no live controller. */
+  controller?: AbortController;
   result?: BackgroundJobToolResult;
   error?: string;
   agent?: string;
@@ -140,6 +146,8 @@ function validateChainStage(value: unknown, index: number): SubagentInvocationVa
 
   if (value.type === "parallel") {
     if (!Array.isArray(value.tasks) || value.tasks.length === 0) return validationError("input-type", `${location}.tasks must be a non-empty array.`);
+    // Check the fixed representation ceiling before traversing untrusted items.
+    if (value.tasks.length > MAX_SUBAGENT_TASKS) return validationError("input-type", `${location}.tasks exceeds the hard limit of ${MAX_SUBAGENT_TASKS} items.`);
     for (const [taskIndex, task] of value.tasks.entries()) {
       const error = validateSubagentTaskItem(task, `${location}.tasks[${taskIndex}]`);
       if (error) return error;
@@ -185,6 +193,8 @@ export function validateSubagentInvocation(raw: unknown): SubagentInvocationVali
 
   if (raw.tasks !== undefined) {
     if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) return validationError("input-type", "tasks must be a non-empty array.");
+    // Keep raw validation bounded before examining every caller-provided task.
+    if (raw.tasks.length > MAX_SUBAGENT_TASKS) return validationError("input-type", `tasks exceeds the hard limit of ${MAX_SUBAGENT_TASKS} items.`);
     for (const [index, task] of raw.tasks.entries()) {
       const error = validateSubagentTaskItem(task, `tasks[${index}]`);
       if (error) return error;
@@ -193,6 +203,21 @@ export function validateSubagentInvocation(raw: unknown): SubagentInvocationVali
 
   if (raw.chain !== undefined) {
     if (!Array.isArray(raw.chain) || raw.chain.length === 0) return validationError("input-type", "chain must be a non-empty array.");
+    // Keep raw validation bounded before examining every caller-provided stage.
+    if (raw.chain.length > MAX_SUBAGENT_CHAIN_STEPS) return validationError("input-type", `chain exceeds the hard limit of ${MAX_SUBAGENT_CHAIN_STEPS} stages.`);
+
+    // Count stage declarations first so the aggregate leaf ceiling rejects a
+    // fan-out chain before any untrusted task item is traversed.
+    let leafTaskCount = 0;
+    for (const stage of raw.chain) {
+      leafTaskCount += isRecord(stage) && stage.type === "parallel" && Array.isArray(stage.tasks)
+        ? stage.tasks.length
+        : 1;
+      if (leafTaskCount > MAX_SUBAGENT_TASKS) {
+        return validationError("input-type", `chain exceeds the aggregate hard limit of ${MAX_SUBAGENT_TASKS} leaf tasks.`);
+      }
+    }
+
     for (const [index, stage] of raw.chain.entries()) {
       const error = validateChainStage(stage, index);
       if (error) return error;
@@ -237,28 +262,166 @@ export function extractToolText(result?: BackgroundJobToolResult): string {
     .trim();
 }
 
+function normalizeByteLimit(maxBytes: number): number {
+  return Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : 0;
+}
+
+function utf8CodePointBytes(codePoint: number): number {
+  return codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+}
+
+// This is the same whitespace set String.prototype.trim uses, including BOM.
+const TRIM_WHITESPACE = /^\s$/u;
+
+interface ScannedTrimmedText {
+  totalBytes: number;
+  retainedBytes: number;
+  retainedText: string;
+}
+
+/**
+ * Scans the logical `sources.join("\n").trim()` value without constructing it.
+ * Only the retained prefix (bounded by maxRetainedBytes) is materialized.
+ */
+function scanTrimmedUtf8(
+  sources: (visit: (text: string) => void) => void,
+  maxRetainedBytes: number,
+): ScannedTrimmedText {
+  const limit = normalizeByteLimit(maxRetainedBytes);
+  let started = false;
+  let trailingBytes = 0;
+  let totalBytes = 0;
+  let retainedBytes = 0;
+  let retainingPrefix = limit > 0;
+  const retainedParts: string[] = [];
+
+  sources((text) => {
+    let retainedStart = -1;
+    for (let index = 0; index < text.length;) {
+      const codePoint = text.codePointAt(index)!;
+      const width = utf8CodePointBytes(codePoint);
+      const next = index + (codePoint > 0xffff ? 2 : 1);
+      const whitespace = TRIM_WHITESPACE.test(String.fromCodePoint(codePoint));
+      if (!started && whitespace) {
+        index = next;
+        continue;
+      }
+      started = true;
+      if (whitespace) trailingBytes += width;
+      else {
+        totalBytes += trailingBytes + width;
+        trailingBytes = 0;
+      }
+      if (retainingPrefix && retainedBytes + width <= limit) {
+        if (retainedStart === -1) retainedStart = index;
+        retainedBytes += width;
+      } else if (retainingPrefix) {
+        if (retainedStart !== -1) retainedParts.push(text.slice(retainedStart, index));
+        retainedStart = -1;
+        retainingPrefix = false;
+      }
+      index = next;
+    }
+    if (retainedStart !== -1) retainedParts.push(text.slice(retainedStart));
+  });
+
+  return { totalBytes, retainedBytes, retainedText: retainedParts.join("") };
+}
+
+function scanUtf8Prefix(text: string, maxRetainedBytes: number): ScannedTrimmedText {
+  const limit = normalizeByteLimit(maxRetainedBytes);
+  let totalBytes = 0;
+  let retainedBytes = 0;
+  let retainingPrefix = limit > 0;
+  const retainedParts: string[] = [];
+  let retainedStart = -1;
+  for (let index = 0; index < text.length;) {
+    const codePoint = text.codePointAt(index)!;
+    const width = utf8CodePointBytes(codePoint);
+    const next = index + (codePoint > 0xffff ? 2 : 1);
+    totalBytes += width;
+    if (retainingPrefix && retainedBytes + width <= limit) {
+      if (retainedStart === -1) retainedStart = index;
+      retainedBytes += width;
+    } else if (retainingPrefix) {
+      if (retainedStart !== -1) retainedParts.push(text.slice(retainedStart, index));
+      retainedStart = -1;
+      retainingPrefix = false;
+    }
+    index = next;
+  }
+  if (retainedStart !== -1) retainedParts.push(text.slice(retainedStart));
+  return { totalBytes, retainedBytes, retainedText: retainedParts.join("") };
+}
+
+function compactRawUtf8Text(
+  text: string,
+  maxBytes: number,
+  notice: (omittedBytes: number) => string,
+  reserveNotice: boolean,
+): string {
+  const limit = normalizeByteLimit(maxBytes);
+  if (limit === 0) return "";
+
+  const initial = scanUtf8Prefix(text, limit);
+  if (initial.totalBytes <= limit) return text;
+  if (!reserveNotice) return `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`;
+
+  const suffixBytes = Buffer.byteLength(`\n\n${notice(initial.totalBytes)}`, "utf8");
+  const retained = scanUtf8Prefix(text, Math.max(0, limit - suffixBytes));
+  return `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`;
+}
+
+function compactScannedText(
+  sources: (visit: (text: string) => void) => void,
+  maxBytes: number,
+  notice: (omittedBytes: number) => string,
+  reserveNotice: boolean,
+): string {
+  const limit = normalizeByteLimit(maxBytes);
+  if (limit === 0) return "";
+
+  const initial = scanTrimmedUtf8(sources, limit);
+  if (initial.totalBytes <= limit) return initial.retainedText.trimEnd();
+  if (!reserveNotice) {
+    return `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`;
+  }
+
+  // Reserve the complete suffix before retaining metadata. The initial total
+  // is an upper bound for omitted bytes, so this is safe even at digit edges.
+  const suffixBytes = Buffer.byteLength(`\n\n${notice(initial.totalBytes)}`, "utf8");
+  const retained = scanTrimmedUtf8(sources, Math.max(0, limit - suffixBytes));
+  return `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`;
+}
+
 export function truncateBackgroundText(text: string, maxBytes = 16 * 1024): string {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) maxBytes = 0;
-  if (maxBytes === 0) return "";
+  return compactRawUtf8Text(text, maxBytes, (omittedBytes) => `[Background output truncated: ${omittedBytes} bytes omitted.]`, false);
+}
 
-  const utf8 = Buffer.from(text, "utf8");
-  if (utf8.length <= maxBytes) return text;
+function truncateBackgroundMetadata(text: string): string {
+  return compactRawUtf8Text(
+    text,
+    MAX_SUBAGENT_BACKGROUND_METADATA_BYTES,
+    (omittedBytes) => `[Background task metadata truncated: ${omittedBytes} bytes omitted.]`,
+    true,
+  );
+}
 
-  // A UTF-8 code point is at most four bytes. Back up only across the final
-  // incomplete code point so decoding cannot introduce a replacement character.
-  let payloadEnd = maxBytes;
-  let codePointStart = payloadEnd;
-  while (codePointStart > 0 && (utf8[codePointStart] & 0b1100_0000) === 0b1000_0000) codePointStart -= 1;
-  const leadByte = utf8[codePointStart];
-  const codePointBytes = leadByte < 0x80 ? 1
-    : leadByte < 0xe0 ? 2
-      : leadByte < 0xf0 ? 3
-        : 4;
-  if (codePointStart < payloadEnd && payloadEnd - codePointStart < codePointBytes) payloadEnd = codePointStart;
+function backgroundResultTextSources(content: BackgroundJobToolResult["content"]): (visit: (text: string) => void) => void {
+  return (visit) => {
+    let includeSeparator = false;
+    for (const item of content) {
+      if (item.type !== "text") continue;
+      if (includeSeparator) visit("\n");
+      visit(item.text);
+      includeSeparator = true;
+    }
+  };
+}
 
-  const payload = utf8.subarray(0, payloadEnd).toString("utf8");
-  const omittedBytes = utf8.length - payloadEnd;
-  return `${payload}\n\n[Background output truncated: ${omittedBytes} bytes omitted.]`;
+/** Compacts text chunks without first joining or buffering their full output. */
+function compactBackgroundResultText(content: BackgroundJobToolResult["content"], maxBytes = 16 * 1024): string {
+  return compactScannedText(backgroundResultTextSources(content), maxBytes, (omittedBytes) => `[Background output truncated: ${omittedBytes} bytes omitted.]`, false);
 }
 
 function formatUntrustedJsonText(text: string): string {
@@ -278,9 +441,11 @@ export function formatStoredBackgroundToolText(text: string): string {
 
 export function compactBackgroundJobResult(result?: BackgroundJobToolResult, maxBytes?: number): BackgroundJobToolResult | undefined {
   if (!result) return undefined;
-  const text = extractToolText(result);
+  const sources = backgroundResultTextSources(result.content);
+  const hasText = scanTrimmedUtf8(sources, 0).totalBytes > 0;
+  const text = compactBackgroundResultText(result.content, maxBytes);
   return {
-    content: text ? [{ type: "text", text: truncateBackgroundText(text, maxBytes) }] : [],
+    content: hasText ? [{ type: "text", text }] : [],
     isError: result.isError,
   };
 }
@@ -304,17 +469,21 @@ export function createBackgroundJobRecord(options: {
   result?: BackgroundJobToolResult;
   error?: string;
 }): BackgroundJobRecord {
+  const status = options.status ?? "running";
+  const terminal = status !== "running" && status !== "cancelling";
   return {
     id: options.id ?? randomUUID(),
     mode: options.mode,
-    status: options.status ?? "running",
+    status,
     startedAt: options.startedAt ?? Date.now(),
     completedAt: options.completedAt,
-    controller: options.controller ?? new AbortController(),
-    result: options.result,
-    error: options.error,
-    agent: options.agent,
-    task: options.task,
+    ...(terminal ? {} : { controller: options.controller ?? new AbortController() }),
+    // Records are observable through status, so never retain caller-sized
+    // output buffers even when a helper constructs a terminal record directly.
+    result: compactBackgroundJobResult(options.result),
+    error: options.error ? truncateBackgroundText(options.error) : options.error,
+    agent: options.agent === undefined ? undefined : truncateBackgroundMetadata(options.agent),
+    task: options.task === undefined ? undefined : truncateBackgroundMetadata(options.task),
     taskCount: options.taskCount,
     chainStageCount: options.chainStageCount,
   };
@@ -343,6 +512,31 @@ export function getBackgroundJobSnapshot(
   return job ? snapshotBackgroundJob(job) : undefined;
 }
 
+/**
+ * Synchronously claims a running-job slot before any caller starts async setup.
+ * JavaScript runs this check-and-insert atomically between await boundaries.
+ */
+export function reserveBackgroundJob(
+  registry: Map<string, BackgroundJobRecord>,
+  job: BackgroundJobRecord,
+  maxRunningJobs: number,
+): boolean {
+  const running = Array.from(registry.values()).filter(
+    (candidate) => candidate.status === "running" || candidate.status === "cancelling",
+  ).length;
+  if (running >= maxRunningJobs) return false;
+  registry.set(job.id, job);
+  return true;
+}
+
+/** Removes a reservation only when it still belongs to this exact job. */
+export function releaseBackgroundJobReservation(
+  registry: Map<string, BackgroundJobRecord>,
+  job: BackgroundJobRecord,
+): void {
+  if (registry.get(job.id) === job) registry.delete(job.id);
+}
+
 export function cancelBackgroundJobs(
   registry: Map<string, BackgroundJobRecord>,
   id?: string,
@@ -364,7 +558,7 @@ export function cancelBackgroundJobs(
   for (const job of targets) {
     if (job.status === "running" || job.status === "cancelling") {
       job.status = "cancelling";
-      job.controller.abort();
+      job.controller?.abort();
       registry.set(job.id, job);
       cancelled.push(snapshotBackgroundJob(job));
       continue;
@@ -467,7 +661,10 @@ export function finalizeBackgroundJobForSession(options: {
   /** Internal-only pre-compaction accounting; never stored in job snapshots. */
   onFinalized: (job: BackgroundJobRecord, usage: AccountingUsage | undefined) => void;
 }): boolean {
-  if (!options.isSessionCurrent(options.sessionToken)) return false;
+  if (!options.isSessionCurrent(options.sessionToken)) {
+    releaseBackgroundJobReservation(options.registry, options.job);
+    return false;
+  }
 
   const { job, result, fallbackError } = options;
   const cancellationRequested = job.status === "cancelling";
@@ -481,6 +678,8 @@ export function finalizeBackgroundJobForSession(options: {
 
   job.status = status;
   job.completedAt = options.now ?? Date.now();
+  // Do not retain a live signal (and its listeners) in completed history.
+  delete job.controller;
   job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result, options.outputMaxBytes);
   job.error = status === "cancelled" || !fallbackError
     ? undefined
@@ -530,7 +729,7 @@ const ChainTaskStep = Type.Object({
 const ChainParallelStep = Type.Object({
   type: Type.Literal("parallel"),
   label: Type.Optional(Type.String()),
-  tasks: Type.Array(TaskItem, { minItems: 1 }),
+  tasks: Type.Array(TaskItem, { minItems: 1, maxItems: MAX_SUBAGENT_TASKS }),
   condition: Type.Optional(StepCondition),
   continueOnError: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
@@ -544,8 +743,8 @@ export const SubagentParams = Type.Object({
   agent: Type.Optional(Type.String({ minLength: 1 })),
   task: Type.Optional(Type.String({ minLength: 1 })),
   model: Type.Optional(Type.String({ minLength: 1 })),
-  tasks: Type.Optional(Type.Array(TaskItem, { minItems: 1 })),
-  chain: Type.Optional(Type.Array(ChainStep, { minItems: 1 })),
+  tasks: Type.Optional(Type.Array(TaskItem, { minItems: 1, maxItems: MAX_SUBAGENT_TASKS })),
+  chain: Type.Optional(Type.Array(ChainStep, { minItems: 1, maxItems: MAX_SUBAGENT_CHAIN_STEPS })),
   mode: Type.Optional(StringEnum(["spawn", "fork"], {
     default: DEFAULT_DELEGATION_MODE,
   })),

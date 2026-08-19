@@ -8,6 +8,7 @@ import {
   type SubagentInvocationValidationError,
 } from "../../src/core/subagent-config";
 import { getStageLabel } from "../../src/core/chain-helpers";
+import { MAX_SUBAGENT_CHAIN_STEPS, MAX_SUBAGENT_TASKS } from "../../src/core/subagent-limits";
 
 function expectValidationError(raw: unknown, category: SubagentInvocationValidationError["category"], location?: string): string {
   const error = validateSubagentInvocation(raw);
@@ -92,6 +93,22 @@ describe("raw subagent invocation validation", () => {
     assert.equal(validateSubagentInvocation({ tasks: [{ agent: "worker", task: "inspect" }] }), null);
   });
 
+  test("rejects fixed task and chain ceilings before traversing untrusted entries", () => {
+    const uninspected = new Proxy({}, { get: () => { throw new Error("oversized input must not inspect items"); } });
+    const oversizedTasks = Array.from({ length: MAX_SUBAGENT_TASKS + 1 }, () => uninspected);
+    const oversizedChain = Array.from({ length: MAX_SUBAGENT_CHAIN_STEPS + 1 }, () => uninspected);
+    const oversizedStageTasks = Array.from({ length: MAX_SUBAGENT_TASKS + 1 }, () => uninspected);
+    assert.match(expectValidationError({ tasks: oversizedTasks }, "input-type"), /hard limit/);
+    assert.match(expectValidationError({ chain: oversizedChain }, "input-type"), /hard limit/);
+    assert.match(expectValidationError({ chain: [{ type: "parallel", tasks: oversizedStageTasks }] }, "input-type"), /hard limit/);
+  });
+
+  test("rejects aggregate chain leaf tasks before inspecting nested task items", () => {
+    const uninspected = new Proxy({}, { get: () => { throw new Error("aggregate rejection must not inspect items"); } });
+    const chain = Array.from({ length: 129 }, () => ({ type: "parallel", tasks: [uninspected, uninspected] }));
+    assert.match(expectValidationError({ chain }, "input-type"), /aggregate hard limit of 256 leaf tasks/);
+  });
+
   test("requires non-empty chain and valid sequential and nested parallel task positions", () => {
     expectValidationError({ chain: [] }, "input-type", "chain");
     expectValidationError({ chain: [{ type: "parallel", tasks: [] }] }, "input-type", "chain[0].tasks");
@@ -159,8 +176,11 @@ describe("raw subagent invocation validation", () => {
     assert.equal(schema.properties.model.minLength, 1);
     assert.equal(schema.properties.cwd.minLength, 1);
     assert.equal(schema.properties.tasks.minItems, 1);
+    assert.equal(schema.properties.tasks.maxItems, MAX_SUBAGENT_TASKS);
     assert.equal(schema.properties.chain.minItems, 1);
+    assert.equal(schema.properties.chain.maxItems, MAX_SUBAGENT_CHAIN_STEPS);
     assert.equal(schema.properties.chain.items.anyOf[1].properties.tasks.minItems, 1);
+    assert.equal(schema.properties.chain.items.anyOf[1].properties.tasks.maxItems, MAX_SUBAGENT_TASKS);
     assert.equal(schema.properties.tasks.items.properties.agent.minLength, 1);
     assert.equal(schema.properties.tasks.items.properties.task.minLength, 1);
     assert.equal(schema.properties.tasks.items.properties.model.minLength, 1);

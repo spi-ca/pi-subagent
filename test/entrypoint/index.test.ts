@@ -17,6 +17,7 @@ import {
 import { buildForkBranchSourceJsonl } from "../../src/core/fork-session";
 import { settleWithUnrefTimeout } from "../../src/core/async-settle";
 import { buildChildProcessEnv } from "../../src/runtime/runner";
+import { ForkSourceOwnershipManager } from "../../src/runtime/fork-source-ownership";
 import { PI_SUBAGENT_DASHBOARD_EVENT, type PiSubagentDashboardPayload } from "../../src/integration/pi-cmux-contract";
 
 const { ProcessLocalScheduler: RealProcessLocalScheduler } = await import("../../src/runtime/process-local-scheduler");
@@ -414,10 +415,11 @@ describe("subagent tool schema", () => {
         agent: { type: "string", minLength: 1 },
         task: { type: "string", minLength: 1 },
         model: { type: "string", minLength: 1 },
-        tasks: { type: "array", minItems: 1, items: taskItem },
+        tasks: { type: "array", minItems: 1, maxItems: 256, items: taskItem },
         chain: {
           type: "array",
           minItems: 1,
+          maxItems: 256,
           items: {
             anyOf: [
               {
@@ -441,7 +443,7 @@ describe("subagent tool schema", () => {
                 properties: {
                   type: { type: "string", const: "parallel" },
                   label: { type: "string" },
-                  tasks: { type: "array", minItems: 1, items: taskItem },
+                  tasks: { type: "array", minItems: 1, maxItems: 256, items: taskItem },
                   condition,
                   continueOnError: { type: "boolean" },
                 },
@@ -689,6 +691,112 @@ describe("fork branch snapshot validation", () => {
       [{ type: "custom_message", id: "a", parentId: null, timestamp: new Date(0).toISOString(), customType: "x", content: 1, display: true }],
     ];
     for (const entries of cases) assert.equal(buildForkBranchSourceJsonl({ getBranch: () => entries }), null);
+  });
+});
+
+describe("fork setup session fences", () => {
+  test("hands off a deferred background fork after shutdown/replacement without registering or launching it", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-fork-fence-"));
+    const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const previousStack = process.env.PI_SUBAGENT_STACK;
+    const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    let subagentTool: { execute: (...args: unknown[]) => Promise<any> } | undefined;
+    let releaseCreate!: () => void;
+    let markCreateStarted!: () => void;
+    const createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    const createStarted = new Promise<void>((resolve) => { markCreateStarted = resolve; });
+    let childRegistrations = 0;
+    let handoffs = 0;
+    let reconciliations = 0;
+    const manager = {
+      paths: { invocationDir: "/deferred-fork-source" },
+      async registerChild() { childRegistrations += 1; return { childId: "unexpected", childDir: "/unexpected" }; },
+      async quiesce() { handoffs += 1; },
+    };
+    const ownership = ForkSourceOwnershipManager as unknown as {
+      create: (source: string) => Promise<typeof manager>;
+      open: (invocationDir: string) => Promise<{ reconcile: () => Promise<unknown> }>;
+    };
+    const originalCreate = ownership.create;
+    const originalOpen = ownership.open;
+    ownership.create = async () => {
+      markCreateStarted();
+      await createGate;
+      return manager;
+    };
+    ownership.open = async () => ({ reconcile: async () => { reconciliations += 1; return {}; } });
+
+    const sessionContext = (sessionId: string) => ({
+      cwd: tempDir,
+      hasUI: false,
+      isIdle: () => false,
+      ui: { notify: () => undefined, setStatus: () => undefined },
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => undefined,
+        getBranch: () => [],
+      },
+    });
+
+    try {
+      process.env.PI_CODING_AGENT_DIR = path.join(tempDir, "config");
+      process.env.PI_SUBAGENT_DEPTH = "1";
+      process.env.PI_SUBAGENT_STACK = "[]";
+      await fs.mkdir(path.join(process.env.PI_CODING_AGENT_DIR, "agents"), { recursive: true });
+      await fs.writeFile(path.join(process.env.PI_CODING_AGENT_DIR, "agents", "worker.md"), "---\nname: worker\ndescription: worker\n---\nWorker prompt\n");
+      registerPiSubagent({
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: (tool: unknown) => {
+          const candidate = tool as { name?: unknown; execute?: unknown };
+          if (candidate.name === "subagent" && typeof candidate.execute === "function") subagentTool = candidate as typeof subagentTool;
+        },
+        on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      assert.ok(subagentTool);
+      const sessionStart = handlers.get("session_start");
+      const sessionShutdown = handlers.get("session_shutdown");
+      assert.ok(sessionStart);
+      assert.ok(sessionShutdown);
+      await sessionStart({}, sessionContext("old"));
+
+      const start = subagentTool.execute(
+        "deferred-fork",
+        { agent: "worker", task: "do not launch", mode: "fork", background: true },
+        new AbortController().signal,
+        () => undefined,
+        sessionContext("old"),
+      );
+      await createStarted;
+
+      const shutdown = sessionShutdown({}, sessionContext("old"));
+      await Promise.resolve();
+      await sessionStart({}, sessionContext("replacement"));
+      releaseCreate();
+      await shutdown;
+      await assert.rejects(start, /parent session is shutting down/);
+
+      assert.equal(childRegistrations, 0, "a manager created after the fence must not register a child or launch work");
+      assert.equal(handoffs, 1, "the unregistered manager is handed off exactly once");
+      assert.equal(reconciliations, 1, "handoff closes the durable ownership record");
+      const status = await subagentTool!.execute("status", { action: "status" }, new AbortController().signal, () => undefined, sessionContext("replacement"));
+      assert.match(status.content[0]?.text ?? "", /No background subagent jobs/, "the stale background reservation is not retained in the replacement session");
+    } finally {
+      ownership.create = originalCreate;
+      ownership.open = originalOpen;
+      await fs.rm(tempDir, { recursive: true, force: true });
+      if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+      if (previousStack === undefined) delete process.env.PI_SUBAGENT_STACK;
+      else process.env.PI_SUBAGENT_STACK = previousStack;
+    }
   });
 });
 

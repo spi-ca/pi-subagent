@@ -77,6 +77,19 @@ export function validateChainParallelLimit(chain: ChainStage[], maxParallelTasks
   return null;
 }
 
+/** Counts every sequential and nested-parallel leaf before chain execution. */
+export function validateChainLeafTaskLimit(chain: ChainStage[], maxTasks: number): string | null {
+  let taskCount = 0;
+  for (const stage of chain) {
+    taskCount += getChainStageType(stage) === "parallel"
+      ? (stage as ChainParallelStage).tasks.length
+      : 1;
+    if (taskCount > maxTasks) {
+      return `Too many aggregate leaf tasks in chain (${taskCount}). Max is ${maxTasks}.`;
+    }
+  }
+  return null;
+}
 
 export function shouldRunStage(condition: StepConditionName | undefined, state: ChainExecutionState): boolean {
   switch (condition ?? "on_success") {

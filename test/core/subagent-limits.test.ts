@@ -7,6 +7,12 @@ import {
   DEFAULT_SUBAGENT_LIMITS,
   MAX_NODE_TIMER_DELAY_MS,
   MAX_SUBAGENT_ACTIVE,
+  MAX_SUBAGENT_BACKGROUND_HISTORY,
+  MAX_SUBAGENT_BACKGROUND_JOBS,
+  MAX_SUBAGENT_BACKGROUND_METADATA_BYTES,
+  MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES,
+  MAX_SUBAGENT_CHAIN_STEPS,
+  MAX_SUBAGENT_TASKS,
   SUBAGENT_LIMIT_DEFINITIONS,
   getSubagentLimitConfigPaths,
   loadSubagentLimitConfigSources,
@@ -48,13 +54,50 @@ describe("subagent limits", () => {
     assert.ok(warnings.some((message) => /PI_SUBAGENT_MAX_CHAIN_STEPS/.test(message)));
   });
 
-  test("enforces the shared 256 maxActive cap for CLI, environment, and config values", () => {
+  test("enforces documented practical representation ceilings across every source", () => {
     const warnings: string[] = [];
     assert.equal(MAX_SUBAGENT_ACTIVE, 256);
-    assert.equal(resolveSubagentLimits({ env: { PI_SUBAGENT_MAX_ACTIVE: "256" }, warn: () => {} }).maxActive, 256);
-    assert.equal(resolveSubagentLimits({ env: { PI_SUBAGENT_MAX_ACTIVE: "257" }, warn: (message) => warnings.push(message) }).maxActive, 16);
-    assert.equal(resolveSubagentLimits({ env: {}, globalConfig: { maxActive: 257 }, warn: (message) => warnings.push(message) }).maxActive, 16);
-    assert.ok(warnings.every((message) => /at most 256/.test(message)));
+    assert.equal(MAX_SUBAGENT_TASKS, 256);
+    assert.equal(MAX_SUBAGENT_CHAIN_STEPS, 256);
+    assert.equal(MAX_SUBAGENT_BACKGROUND_JOBS, 256);
+    assert.equal(MAX_SUBAGENT_BACKGROUND_HISTORY, 256);
+    assert.equal(MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES, 65_536);
+    assert.equal(MAX_SUBAGENT_BACKGROUND_METADATA_BYTES, 4_096);
+    const maximum = resolveSubagentLimits({
+      env: {
+        PI_SUBAGENT_MAX_ACTIVE: "256",
+        PI_SUBAGENT_MAX_PARALLEL_TASKS: "256",
+        PI_SUBAGENT_MAX_CHAIN_STEPS: "256",
+        PI_SUBAGENT_MAX_CONCURRENCY: "256",
+        PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS: "256",
+        PI_SUBAGENT_MAX_BACKGROUND_JOBS: "256",
+        PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT: "256",
+        PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES: "65536"
+      },
+      warn: () => {},
+    });
+    assert.equal(maximum.maxParallelTasks, MAX_SUBAGENT_TASKS);
+    assert.equal(maximum.maxChainSteps, MAX_SUBAGENT_CHAIN_STEPS);
+    assert.equal(maximum.maxConcurrency, MAX_SUBAGENT_ACTIVE);
+    assert.equal(maximum.maxChainParallelTasks, MAX_SUBAGENT_TASKS);
+    assert.equal(maximum.maxBackgroundJobs, MAX_SUBAGENT_BACKGROUND_JOBS);
+    assert.equal(maximum.backgroundHistoryLimit, MAX_SUBAGENT_BACKGROUND_HISTORY);
+    assert.equal(maximum.backgroundOutputMaxBytes, MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES);
+    const rejected = resolveSubagentLimits({
+      env: {
+        PI_SUBAGENT_MAX_ACTIVE: "257",
+        PI_SUBAGENT_MAX_PARALLEL_TASKS: "257",
+        PI_SUBAGENT_MAX_CHAIN_STEPS: "257",
+        PI_SUBAGENT_MAX_CONCURRENCY: "257",
+        PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS: "257",
+        PI_SUBAGENT_MAX_BACKGROUND_JOBS: "257",
+        PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT: "257",
+        PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES: "65537",
+      },
+      warn: (message) => warnings.push(message),
+    });
+    assert.deepEqual(rejected, DEFAULT_SUBAGENT_LIMITS);
+    assert.ok(warnings.every((message) => /at most (?:256|65536)/.test(message)));
   });
 
   test("uses pi.getFlag as authoritative and never scans positional argv after --", () => {

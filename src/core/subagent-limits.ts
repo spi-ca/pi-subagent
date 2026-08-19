@@ -32,6 +32,22 @@ export const MAX_SUBAGENT_ACTIVE = 256;
 /** Backwards-compatible descriptive alias for consumers of the limits module. */
 export const MAX_SUBAGENT_MAX_ACTIVE = MAX_SUBAGENT_ACTIVE;
 
+/**
+ * Practical representation ceilings. They preserve the established defaults
+ * while preventing unbounded call-shape traversal and retained job state.
+ * Task/concurrency/background caps align with the existing 256 active-permit
+ * ceiling and existing dashboard terminal bound; 64 KiB output aligns with
+ * the live session-tail chunk bound. Together history and output retain at
+ * most roughly 16 MiB of caller-visible text before small truncation notices.
+ */
+export const MAX_SUBAGENT_TASKS = MAX_SUBAGENT_ACTIVE;
+export const MAX_SUBAGENT_CHAIN_STEPS = MAX_SUBAGENT_ACTIVE;
+export const MAX_SUBAGENT_BACKGROUND_JOBS = MAX_SUBAGENT_ACTIVE;
+export const MAX_SUBAGENT_BACKGROUND_HISTORY = MAX_SUBAGENT_ACTIVE;
+export const MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES = 64 * 1024;
+/** Per-field cap for completed background agent/task status metadata. */
+export const MAX_SUBAGENT_BACKGROUND_METADATA_BYTES = 4 * 1024;
+
 export const SUBAGENT_CONFIG_FILENAME = "pi-subagent.json";
 /** Keep config reads bounded even when a file is unexpectedly large. */
 export const MAX_SUBAGENT_CONFIG_BYTES = 64 * 1024;
@@ -40,14 +56,14 @@ export const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
 
 export const SUBAGENT_LIMIT_DEFINITIONS: Record<LimitName, LimitDefinition> = {
   maxActive: { flag: "subagent-max-active", env: "PI_SUBAGENT_MAX_ACTIVE", defaultValue: 16, positive: true, maxValue: MAX_SUBAGENT_ACTIVE },
-  maxParallelTasks: { flag: "subagent-max-parallel-tasks", env: "PI_SUBAGENT_MAX_PARALLEL_TASKS", defaultValue: 50, maxValue: Number.MAX_SAFE_INTEGER },
-  maxChainSteps: { flag: "subagent-max-chain-steps", env: "PI_SUBAGENT_MAX_CHAIN_STEPS", defaultValue: 12, maxValue: Number.MAX_SAFE_INTEGER },
-  maxConcurrency: { flag: "subagent-max-concurrency", env: "PI_SUBAGENT_MAX_CONCURRENCY", defaultValue: 16, positive: true, maxValue: Number.MAX_SAFE_INTEGER },
-  maxChainParallelTasks: { flag: "subagent-max-chain-parallel-tasks", env: "PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS", defaultValue: 8, maxValue: Number.MAX_SAFE_INTEGER },
-  maxBackgroundJobs: { flag: "subagent-max-background-jobs", env: "PI_SUBAGENT_MAX_BACKGROUND_JOBS", defaultValue: 16, maxValue: Number.MAX_SAFE_INTEGER },
-  backgroundHistoryLimit: { flag: "subagent-background-history-limit", env: "PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT", defaultValue: 20, maxValue: Number.MAX_SAFE_INTEGER },
+  maxParallelTasks: { flag: "subagent-max-parallel-tasks", env: "PI_SUBAGENT_MAX_PARALLEL_TASKS", defaultValue: 50, maxValue: MAX_SUBAGENT_TASKS },
+  maxChainSteps: { flag: "subagent-max-chain-steps", env: "PI_SUBAGENT_MAX_CHAIN_STEPS", defaultValue: 12, maxValue: MAX_SUBAGENT_CHAIN_STEPS },
+  maxConcurrency: { flag: "subagent-max-concurrency", env: "PI_SUBAGENT_MAX_CONCURRENCY", defaultValue: 16, positive: true, maxValue: MAX_SUBAGENT_ACTIVE },
+  maxChainParallelTasks: { flag: "subagent-max-chain-parallel-tasks", env: "PI_SUBAGENT_MAX_CHAIN_PARALLEL_TASKS", defaultValue: 8, maxValue: MAX_SUBAGENT_TASKS },
+  maxBackgroundJobs: { flag: "subagent-max-background-jobs", env: "PI_SUBAGENT_MAX_BACKGROUND_JOBS", defaultValue: 16, maxValue: MAX_SUBAGENT_BACKGROUND_JOBS },
+  backgroundHistoryLimit: { flag: "subagent-background-history-limit", env: "PI_SUBAGENT_BACKGROUND_HISTORY_LIMIT", defaultValue: 20, maxValue: MAX_SUBAGENT_BACKGROUND_HISTORY },
   backgroundHistoryTtlMs: { flag: "subagent-background-history-ttl-ms", env: "PI_SUBAGENT_BACKGROUND_HISTORY_TTL_MS", defaultValue: 3_600_000, maxValue: Number.MAX_SAFE_INTEGER },
-  backgroundOutputMaxBytes: { flag: "subagent-background-output-max-bytes", env: "PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES", defaultValue: 16_384, maxValue: Number.MAX_SAFE_INTEGER },
+  backgroundOutputMaxBytes: { flag: "subagent-background-output-max-bytes", env: "PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES", defaultValue: 16_384, maxValue: MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES },
   backgroundShutdownSettleMs: { flag: "subagent-background-shutdown-settle-ms", env: "PI_SUBAGENT_BACKGROUND_SHUTDOWN_SETTLE_MS", defaultValue: 3_000, maxValue: MAX_NODE_TIMER_DELAY_MS },
   parallelHeartbeatMs: { flag: "subagent-parallel-heartbeat-ms", env: "PI_SUBAGENT_PARALLEL_HEARTBEAT_MS", defaultValue: 1_000, positive: true, maxValue: MAX_NODE_TIMER_DELAY_MS },
 };

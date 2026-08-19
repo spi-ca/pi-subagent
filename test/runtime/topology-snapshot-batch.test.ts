@@ -88,19 +88,116 @@ describe("TopologySnapshotBatch", () => {
     }
   });
 
-  test("fans out timeout, malformed sentinel, and failure as unknown then retries", async () => {
-    const timeout = new TopologySnapshotBatch({ timeoutMs: 5 });
-    let pendingCalls = 0;
-    const never = async () => { pendingCalls += 1; return await new Promise<string>(() => {}); };
-    const [one, two] = await Promise.all([
-      timeout.read({ generation: 1, key: "tmux:s", fetch: never }),
-      timeout.read({ generation: 1, key: "tmux:s", fetch: never }),
-    ]);
-    assert.deepEqual(one, { state: "unknown" });
-    assert.deepEqual(two, { state: "unknown" });
-    assert.equal(pendingCalls, 1);
-    assert.deepEqual(timeout.metrics(), { fetches: 1, joins: 1, unknown: 2 });
+  test("clears and unrefs timeout timers while aborting cooperative work", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let fireTimeout!: () => void;
+    let unreferenced = false;
+    let clears = 0;
+    const timer = { unref: () => { unreferenced = true; } } as unknown as ReturnType<typeof setTimeout>;
+    try {
+      (globalThis as any).setTimeout = (callback: () => void) => { fireTimeout = callback; return timer; };
+      (globalThis as any).clearTimeout = (value: unknown) => { if (value === timer) clears += 1; };
+      const batch = new TopologySnapshotBatch({ timeoutMs: 5 });
+      let aborted = false;
+      const pending = batch.read({
+        generation: 1,
+        key: "tmux:cooperative",
+        fetch: async (signal) => await new Promise<string>((resolve) => {
+          signal.addEventListener("abort", () => { aborted = true; resolve("late"); }, { once: true });
+        }),
+      });
+      await Promise.resolve();
+      fireTimeout();
+      assert.deepEqual(await pending, { state: "unknown" });
+      assert.equal(aborted, true);
+      assert.equal(unreferenced, true);
+      assert.equal(clears, 1);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+      (globalThis as any).clearTimeout = originalClearTimeout;
+    }
+  });
 
+  test("keeps non-cooperative timed-out work single-flight until its backend settles", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const timeoutCallbacks: Array<() => void> = [];
+    try {
+      (globalThis as any).setTimeout = (callback: () => void) => { timeoutCallbacks.push(callback); return { unref() {} }; };
+      (globalThis as any).clearTimeout = () => {};
+      const batch = new TopologySnapshotBatch({ timeoutMs: 5 });
+      let calls = 0;
+      let release!: () => void;
+      const neverCooperates = async (_signal: AbortSignal) => {
+        calls += 1;
+        await new Promise<void>((resolve) => { release = resolve; });
+        return "late";
+      };
+      const first = batch.read({ generation: 1, key: "tmux:s", fetch: neverCooperates });
+      await Promise.resolve();
+      timeoutCallbacks.shift()!();
+      assert.deepEqual(await first, { state: "unknown" });
+
+      const joined = await batch.read({ generation: 1, key: "tmux:s", fetch: neverCooperates });
+      assert.deepEqual(joined, { state: "unknown" });
+      assert.equal(calls, 1, "a retry cannot start another backend while the timed-out backend is still running");
+
+      release();
+      // Backend completion, its settled projection, and map cleanup are
+      // deliberately separate microtasks from the timeout result.
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+      const fresh = await batch.read({ generation: 1, key: "tmux:s", fetch: async () => "fresh" });
+      assert.deepEqual(fresh, { state: "known", value: "fresh" });
+      assert.equal(calls, 1);
+      assert.deepEqual(batch.metrics(), { fetches: 2, joins: 1, unknown: 2 });
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+      (globalThis as any).clearTimeout = originalClearTimeout;
+    }
+  });
+
+  test("does not let a timed-out pre-reset backend remove a new-generation lookup", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const timeoutCallbacks: Array<() => void> = [];
+    try {
+      (globalThis as any).setTimeout = (callback: () => void) => { timeoutCallbacks.push(callback); return { unref() {} }; };
+      (globalThis as any).clearTimeout = () => {};
+      const batch = new TopologySnapshotBatch({ timeoutMs: 5 });
+      let calls = 0;
+      let releaseOld!: () => void;
+      let releaseFresh!: () => void;
+      const fetch = async (_signal: AbortSignal) => {
+        const call = ++calls;
+        await new Promise<void>((resolve) => { if (call === 1) releaseOld = resolve; else releaseFresh = resolve; });
+        return call === 1 ? "old" : "fresh";
+      };
+
+      const old = batch.read({ generation: 1, key: "tmux:s", fetch });
+      await Promise.resolve();
+      timeoutCallbacks.shift()!();
+      assert.deepEqual(await old, { state: "unknown" });
+
+      batch.reset();
+      const fresh = batch.read({ generation: 1, key: "tmux:s", fetch });
+      await Promise.resolve();
+      assert.equal(calls, 2);
+      releaseOld();
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve();
+
+      const joined = batch.read({ generation: 1, key: "tmux:s", fetch });
+      assert.equal(calls, 2, "the old backend must not delete the post-reset in-flight entry");
+      releaseFresh();
+      assert.deepEqual(await fresh, { state: "known", value: "fresh" });
+      assert.deepEqual(await joined, { state: "known", value: "fresh" });
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+      (globalThis as any).clearTimeout = originalClearTimeout;
+    }
+  });
+
+  test("fans out malformed sentinel and failure as unknown then retries", async () => {
     const batch = new TopologySnapshotBatch();
     const [failedOne, failedTwo] = await Promise.all([
       batch.read({ generation: 1, key: "tmux:s", fetch: async () => { throw new Error("malformed"); } }),

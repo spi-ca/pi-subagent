@@ -36,6 +36,7 @@ import {
   type ChainStageStatus,
   type ChainTaskStage,
   validateChainLabels,
+  validateChainLeafTaskLimit,
   validateChainParallelLimit,
 } from "./src/core/chain-helpers.js";
 import { type AgentConfig, findNearestProjectAgentsDir, type AgentDiscoveryResult, type AgentScope, type DiscoverAgentOptions } from "./src/core/agents.js";
@@ -45,7 +46,7 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
-import { resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
+import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
@@ -86,6 +87,8 @@ import {
   formatSubagentInvocationValidationError,
   formatSubagentOperationalError,
   pruneBackgroundJobs,
+  releaseBackgroundJobReservation,
+  reserveBackgroundJob,
   type BackgroundJobRecord,
   type BackgroundJobToolResult,
   SubagentParams,
@@ -183,12 +186,6 @@ const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
 const backgroundJobs = new Map<string, BackgroundJobRecord>();
 const backgroundJobSettlements = new Map<string, Promise<void>>();
 
-function countRunningBackgroundJobs(): number {
-  return Array.from(backgroundJobs.values()).filter(
-    (job) => job.status === "running" || job.status === "cancelling",
-  ).length;
-}
-
 function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): void {
   const details = {
     jobId: job.id,
@@ -229,12 +226,14 @@ function startBackgroundJob(
   sessionFence: BackgroundJobSessionFence,
   onSettled?: (job: BackgroundJobRecord, usage: AccountingUsage | undefined) => void,
 ): void {
-  if (!sessionFence.isCurrent(sessionToken)) return;
-  pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
-  backgroundJobs.set(job.id, job);
+  if (!sessionFence.isCurrent(sessionToken)) {
+    releaseBackgroundJobReservation(backgroundJobs, job);
+    return;
+  }
 
   let settlement: Promise<void>;
-  settlement = run(job.controller.signal)
+  settlement = Promise.resolve()
+    .then(() => run(job.controller!.signal))
     .then((result) => {
       finalizeBackgroundJobForSession({
         job,
@@ -268,6 +267,8 @@ function startBackgroundJob(
       });
     })
     .finally(() => {
+      // The stale finalizer above owns reservation release. Do not repeat it
+      // here: a deferred setup may settle after session replacement.
       if (backgroundJobSettlements.get(job.id) === settlement) {
         backgroundJobSettlements.delete(job.id);
       }
@@ -1128,7 +1129,8 @@ export default function (pi: ExtensionAPI) {
           ));
         }
         if (params.chain) {
-          const chainLimitError = validateConfiguredChainLimits(params.chain as ChainStage[], limits)
+          const chainLimitError = validateChainLeafTaskLimit(params.chain as ChainStage[], MAX_SUBAGENT_TASKS)
+            ?? validateConfiguredChainLimits(params.chain as ChainStage[], limits)
             ?? validateChainParallelLimit(params.chain as ChainStage[], limits.maxChainParallelTasks);
           if (chainLimitError) throw new Error(formatSubagentOperationalError("runtime-policy", chainLimitError));
           const chainLabelError = validateChainLabels(params.chain as ChainStage[]);
@@ -1423,8 +1425,16 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           let forkManager: ForkSourceOwnershipManager | undefined;
           if (delegationMode === "fork") {
             try {
-              forkManager = forkManagers.get(schedulerKey) ?? await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!);
-              forkManagers.set(schedulerKey, forkManager);
+              forkManager = forkManagers.get(schedulerKey);
+              // Background fork ownership is created and fenced before its
+              // job is published. Its callback may only consume that exact
+              // registered manager; it has no create await boundary here.
+              if (backgroundExecution) {
+                if (!forkManager) throw new Error("Fork source ownership manager is unavailable for this background invocation.");
+              } else {
+                forkManager ??= await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!);
+                forkManagers.set(schedulerKey, forkManager);
+              }
             } catch (error) {
               const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
               return {
@@ -1571,21 +1581,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             failOperational("runtime-policy", "Cannot start subagents while the parent session is shutting down.");
           }
           pruneBackgroundJobs(backgroundJobs, { maxCompletedJobs: limits.backgroundHistoryLimit, completedTtlMs: limits.backgroundHistoryTtlMs });
-          if (countRunningBackgroundJobs() >= limits.maxBackgroundJobs) {
-            failOperational(
-              "runtime-policy",
-              `Cannot start background subagent job: ${limits.maxBackgroundJobs} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
-            );
-          }
-
-          if (delegationMode === "fork") {
-            try {
-              forkManagers.set(`${schedulerHandle.generation}:${schedulerHandle.id}`, await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!));
-            } catch (error) {
-              const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
-              failOperational("runtime-policy", message);
-            }
-          }
           const job = createBackgroundJobRecord({
             mode: intendedMode,
             agent: params.agent,
@@ -1593,35 +1588,97 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             taskCount: params.tasks?.length,
             chainStageCount: params.chain?.length,
           });
-          const uxGeneration = uxRegistry.captureGeneration();
-          const progressTotal = params.tasks?.length ?? params.chain?.length ?? 1;
-          uxRegistry.start({
-            id: job.id,
-            agent: params.agent ?? (params.tasks ? `${params.tasks.length} parallel agents` : `${params.chain?.length ?? 0} chain stages`),
-            kind: "background",
-            progressTotal,
-            cancel: () => {
-              const cancellation = cancelBackgroundJobs(backgroundJobs, job.id);
-              if (!cancellation.found) job.controller.abort();
-            },
-          });
-          startBackgroundJob(
-            pi,
-            job,
-            (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true, job.id),
-            limits,
-            backgroundSessionFence.capture(),
-            backgroundSessionFence,
-            (finalizedJob, finalizedUsage) => {
-              updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
-              // Public accounting remains finalized here. Presence is a
-              // content-free V2 observer projection and receives no usage.
-              void finalizedUsage;
-              if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
-              else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
-              else uxRegistry.fail(finalizedJob.id, uxGeneration);
-            },
-          );
+          // Claim capacity before a fork source record (or any later async
+          // launch setup) can yield. A second invocation therefore observes
+          // this reservation rather than racing the pre-fork await.
+          if (!reserveBackgroundJob(backgroundJobs, job, limits.maxBackgroundJobs)) {
+            failOperational(
+              "runtime-policy",
+              `Cannot start background subagent job: ${limits.maxBackgroundJobs} background job(s) are already running or cancelling. Wait for a steer result, check status, or cancel an existing job first.`,
+            );
+          }
+
+          const backgroundSessionToken = backgroundSessionFence.capture();
+          const schedulerKey = `${schedulerHandle.generation}:${schedulerHandle.id}`;
+          if (delegationMode === "fork") {
+            let createdForkManager: ForkSourceOwnershipManager;
+            try {
+              createdForkManager = await ForkSourceOwnershipManager.create(forkSessionSnapshotJsonl!);
+            } catch (error) {
+              releaseBackgroundJobReservation(backgroundJobs, job);
+              const message = `Cannot use mode="fork": failed to create source ownership record (${error instanceof Error ? error.message : String(error)}).`;
+              failOperational("runtime-policy", message);
+            }
+
+            // Source creation yields. Only the session that reserved this job
+            // may register its manager or publish the background launch.
+            if (!canStartInvocation() || !backgroundSessionFence.isCurrent(backgroundSessionToken)) {
+              const pendingDiagnosticGeneration = reaperDiagnosticGeneration;
+              try {
+                await handoffForkManager(createdForkManager!);
+              } catch (error) {
+                reportReaperDiagnostic(
+                  pendingDiagnosticGeneration,
+                  forkSourceReconciliationFailureDiagnostic(error, true),
+                  { hasUI: false, ui: ctx.ui },
+                );
+              }
+              releaseBackgroundJobReservation(backgroundJobs, job);
+              failOperational("runtime-policy", "Cannot start subagents while the parent session is shutting down.");
+            }
+            forkManagers.set(schedulerKey, createdForkManager!);
+          }
+
+          try {
+            const uxGeneration = uxRegistry.captureGeneration();
+            const progressTotal = params.tasks?.length ?? params.chain?.length ?? 1;
+            uxRegistry.start({
+              id: job.id,
+              agent: params.agent ?? (params.tasks ? `${params.tasks.length} parallel agents` : `${params.chain?.length ?? 0} chain stages`),
+              kind: "background",
+              progressTotal,
+              cancel: () => {
+                const cancellation = cancelBackgroundJobs(backgroundJobs, job.id);
+                if (!cancellation.found) job.controller?.abort();
+              },
+            });
+            startBackgroundJob(
+              pi,
+              job,
+              (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true, job.id),
+              limits,
+              backgroundSessionToken,
+              backgroundSessionFence,
+              (finalizedJob, finalizedUsage) => {
+                updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
+                // Public accounting remains finalized here. Presence is a
+                // content-free V2 observer projection and receives no usage.
+                void finalizedUsage;
+                if (finalizedJob.status === "cancelled") uxRegistry.cancelled(finalizedJob.id, uxGeneration);
+                else if (finalizedJob.status === "completed") uxRegistry.complete(finalizedJob.id, uxGeneration);
+                else uxRegistry.fail(finalizedJob.id, uxGeneration);
+              },
+            );
+          } catch (error) {
+            const manager = forkManagers.get(schedulerKey);
+            if (manager) {
+              let handoffFinished = false;
+              try {
+                await handoffForkManager(manager);
+                handoffFinished = true;
+              } catch (handoffError) {
+                reportReaperDiagnostic(
+                  reaperDiagnosticGeneration,
+                  forkSourceReconciliationFailureDiagnostic(handoffError, true),
+                  { hasUI: false, ui: ctx.ui },
+                );
+              } finally {
+                if (handoffFinished) forkManagers.delete(schedulerKey);
+              }
+            }
+            releaseBackgroundJobReservation(backgroundJobs, job);
+            throw error;
+          }
           return {
             content: [{
               type: "text",

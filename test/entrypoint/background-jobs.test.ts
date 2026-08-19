@@ -11,6 +11,8 @@ import {
   listBackgroundJobSnapshots,
   pruneBackgroundJobs,
   compactBackgroundJobResult,
+  releaseBackgroundJobReservation,
+  reserveBackgroundJob,
   truncateBackgroundText,
 } from "../../src/core/subagent-config";
 import { emptyAccountingUsage } from "../../src/core/accounting-usage";
@@ -61,7 +63,7 @@ describe("background job helpers", () => {
     assert.equal(cancellation.cancelled[0]?.id, running.id);
     assert.equal(cancellation.terminal.length, 1);
     assert.equal(cancellation.terminal[0]?.id, completed.id);
-    assert.equal(running.controller.signal.aborted, true);
+    assert.equal(running.controller?.signal.aborted, true);
     assert.equal(registry.get(running.id)?.status, "cancelling");
     assert.equal(registry.get(completed.id)?.status, "completed");
   });
@@ -102,6 +104,53 @@ describe("background job helpers", () => {
     assert.equal(truncateBackgroundText("secret", 0), "");
     const compacted = compactBackgroundJobResult({ content: [{ type: "text", text: "secret" }] }, 0);
     assert.deepEqual(compacted?.content, [{ type: "text", text: "" }]);
+  });
+
+  test("compacts result chunks incrementally with historical join-and-trim semantics", () => {
+    const compacted = compactBackgroundJobResult({
+      content: [
+        { type: "text", text: "ab" },
+        { type: "text", text: "cdef" },
+        { type: "image", text: "ignored" } as any,
+      ],
+    }, 3);
+    assert.deepEqual(compacted?.content, [{
+      type: "text",
+      text: "ab\n\n\n[Background output truncated: 4 bytes omitted.]",
+    }]);
+  });
+
+  test("preserves empty, leading, and trailing whitespace across incremental chunks", () => {
+    assert.deepEqual(
+      compactBackgroundJobResult({ content: [{ type: "text", text: "" }, { type: "text", text: "  ab " }, { type: "text", text: " cd  " }] }, 64)?.content,
+      [{ type: "text", text: "ab \n cd" }],
+    );
+    assert.deepEqual(
+      compactBackgroundJobResult({ content: [{ type: "text", text: "" }, { type: "text", text: "   " }] }, 64)?.content,
+      [],
+    );
+    assert.deepEqual(
+      compactBackgroundJobResult({ content: [{ type: "text", text: "  ab " }, { type: "text", text: " cd  " }] }, 5)?.content,
+      [{ type: "text", text: "ab \n \n\n[Background output truncated: 2 bytes omitted.]" }],
+    );
+  });
+
+  test("bounds retained task metadata and direct terminal helper output", () => {
+    const oversized = "x".repeat(8 * 1024);
+    const job = createBackgroundJobRecord({
+      id: "bounded-terminal",
+      mode: "single",
+      status: "completed",
+      agent: oversized,
+      task: oversized,
+      error: oversized,
+      result: { content: [{ type: "text", text: oversized }] },
+    });
+    assert.ok(Buffer.byteLength(job.agent ?? "", "utf8") <= 4 * 1024);
+    assert.ok(Buffer.byteLength(job.task ?? "", "utf8") <= 4 * 1024);
+    assert.ok((job.error?.length ?? 0) < 16_500);
+    assert.ok((job.result?.content[0]?.text.length ?? 0) < 16_500);
+    assert.match(job.task ?? "", /task metadata truncated/);
   });
 
   test("compaction strips internal usage accounting", () => {
@@ -192,7 +241,6 @@ describe("background job helpers", () => {
     registry.set(staleJob.id, staleJob);
 
     fence.invalidate();
-    registry.clear();
     let notifications = 0;
     const finalized = finalizeBackgroundJobForSession({
       job: staleJob,
@@ -204,7 +252,7 @@ describe("background job helpers", () => {
     });
 
     assert.equal(finalized, false);
-    assert.equal(registry.size, 0);
+    assert.equal(registry.size, 0, "a stale-session finalizer releases its reservation");
     assert.equal(notifications, 0);
   });
 
@@ -226,7 +274,28 @@ describe("background job helpers", () => {
 
     assert.equal(finalized, true);
     assert.equal(registry.get(job.id)?.status, "completed");
+    assert.equal(registry.get(job.id)?.controller, undefined, "completed history must not retain a live controller");
     assert.equal(notifiedJobId, job.id);
+  });
+
+  test("reserves capacity before concurrent fork setup yields", async () => {
+    const registry = new Map();
+    const first = createBackgroundJobRecord({ id: "fork-one", mode: "single" });
+    const second = createBackgroundJobRecord({ id: "fork-two", mode: "single" });
+    let releaseSetup!: () => void;
+    const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
+    const startForkSetup = async (job: typeof first) => {
+      assert.equal(reserveBackgroundJob(registry, job, 1), true);
+      await setupGate;
+    };
+
+    const firstSetup = startForkSetup(first);
+    await Promise.resolve(); // The first fork setup has yielded after reserving.
+    assert.equal(reserveBackgroundJob(registry, second, 1), false, "the concurrent admission sees the pre-setup reservation");
+    releaseBackgroundJobReservation(registry, first);
+    assert.equal(reserveBackgroundJob(registry, second, 1), true, "a failed or fenced first setup releases capacity");
+    releaseSetup();
+    await firstSetup;
   });
 
   test("prunes old completed jobs while keeping running jobs", () => {

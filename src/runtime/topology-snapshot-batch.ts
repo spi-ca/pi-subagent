@@ -20,7 +20,12 @@ export interface TopologySnapshotBatchOptions {
   timeoutMs?: number;
 }
 
-type InFlight<T> = Promise<TopologySnapshot<T>>;
+type InFlight<T> = {
+  /** Completes at the caller's timeout boundary, if one is configured. */
+  readonly result: Promise<TopologySnapshot<T>>;
+  /** Completes only after the backend stops, so a timed-out fetch remains single-flight. */
+  readonly settled: Promise<void>;
+};
 
 /**
  * A process-local batcher keyed by an explicit generation and canonical key.
@@ -41,7 +46,8 @@ export class TopologySnapshotBatch {
   async read<T>(options: {
     generation: number;
     key: string;
-    fetch: () => Promise<T | undefined>;
+    /** Internal fetches receive cancellation from the bounded observation. */
+    fetch: (signal: AbortSignal) => Promise<T | undefined>;
     /** Reject a malformed shared response before any waiter can treat it as evidence. */
     validate?: (value: T) => boolean;
   }): Promise<TopologySnapshot<T>> {
@@ -53,22 +59,23 @@ export class TopologySnapshotBatch {
     const existing = this.inFlight.get(mapKey) as InFlight<T> | undefined;
     if (existing) {
       this.joins += 1;
-      const snapshot = await existing;
+      const snapshot = await existing.result;
       if (snapshot.state === "unknown") this.unknown += 1;
       return snapshot;
     }
 
     this.fetches += 1;
-    const fetch = this.fetchSnapshot(options.fetch, options.validate);
-    this.inFlight.set(mapKey, fetch as InFlight<unknown>);
-    try {
-      const snapshot = await fetch;
-      if (snapshot.state === "unknown") this.unknown += 1;
-      return snapshot;
-    } finally {
-      // Do not cache settled evidence. A following poll must be fresh.
-      if (this.inFlight.get(mapKey) === fetch) this.inFlight.delete(mapKey);
-    }
+    const inFlight = this.fetchSnapshot(options.fetch, options.validate);
+    this.inFlight.set(mapKey, inFlight as InFlight<unknown>);
+    // A timeout returns unknown to callers, but this entry stays registered
+    // until its backend has stopped. Otherwise a non-cooperative backend could
+    // be multiplied by every retry after the timeout.
+    void inFlight.settled.finally(() => {
+      if (this.inFlight.get(mapKey) === inFlight) this.inFlight.delete(mapKey);
+    });
+    const snapshot = await inFlight.result;
+    if (snapshot.state === "unknown") this.unknown += 1;
+    return snapshot;
   }
 
   /** Drops only in-flight lookup references; it never promotes old evidence. */
@@ -80,25 +87,40 @@ export class TopologySnapshotBatch {
     return { fetches: this.fetches, joins: this.joins, unknown: this.unknown };
   }
 
-  private async fetchSnapshot<T>(
-    fetch: () => Promise<T | undefined>,
+  private fetchSnapshot<T>(
+    fetch: (signal: AbortSignal) => Promise<T | undefined>,
     validate?: (value: T) => boolean,
-  ): Promise<TopologySnapshot<T>> {
-    try {
-      const value = this.timeoutMs === undefined
-        ? await fetch()
-        : await Promise.race<T | undefined>([
-          fetch(),
-          new Promise<undefined>((resolve) => setTimeout(resolve, this.timeoutMs)),
-        ]);
-      if (value === undefined) return { state: "unknown" };
-      try {
-        return validate && !validate(value) ? { state: "unknown" } : { state: "known", value };
-      } catch {
-        return { state: "unknown" };
-      }
-    } catch {
-      return { state: "unknown" };
+  ): InFlight<T> {
+    const controller = new AbortController();
+    const backend = Promise.resolve()
+      .then(async () => await fetch(controller.signal))
+      .then((value): TopologySnapshot<T> => {
+        if (value === undefined) return { state: "unknown" };
+        try {
+          return validate && !validate(value) ? { state: "unknown" } : { state: "known", value };
+        } catch {
+          return { state: "unknown" };
+        }
+      })
+      .catch((): TopologySnapshot<T> => ({ state: "unknown" }));
+
+    if (this.timeoutMs === undefined) {
+      return { result: backend, settled: backend.then(() => undefined) };
     }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<TopologySnapshot<T>>((resolve) => {
+      timer = setTimeout(() => {
+        // Cooperative command runners terminate promptly; non-cooperative
+        // runners stay registered through backend settlement below.
+        controller.abort();
+        resolve({ state: "unknown" });
+      }, this.timeoutMs);
+      timer.unref?.();
+    });
+    const result = Promise.race([backend, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    return { result, settled: backend.then(() => undefined) };
   }
 }

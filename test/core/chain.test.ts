@@ -4,6 +4,7 @@ import {
   buildChainTaskFromStages,
   shouldRunStage,
   validateChainLabels,
+  validateChainLeafTaskLimit,
   validateChainParallelLimit,
 } from "../../src/core/chain-helpers";
 
@@ -39,6 +40,16 @@ describe("mixed chain helpers", () => {
 
     assert.equal(validateChainParallelLimit(stage, 9), null);
     assert.match(validateChainParallelLimit(stage, 8) ?? "", /Max is 8/);
+  });
+
+  test("enforces one aggregate ceiling across sequential and parallel leaf tasks", () => {
+    const chain = [
+      { agent: "scout", task: "one" },
+      { type: "parallel", tasks: [{ agent: "worker", task: "two" }, { agent: "worker", task: "three" }] },
+      { agent: "planner", task: "four" },
+    ] as any;
+    assert.equal(validateChainLeafTaskLimit(chain, 4), null);
+    assert.match(validateChainLeafTaskLimit(chain, 3) ?? "", /aggregate leaf tasks.*\(4\).*Max is 3/);
   });
 
   test("evaluates conditions from accumulated chain state", () => {

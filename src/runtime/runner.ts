@@ -3746,8 +3746,8 @@ async function inspectActiveInteractiveSnapshot(options: {
     const shared = await topologySnapshotBatch.read({
       generation: batchGeneration,
       key,
-      fetch: async () => {
-        const response = await run(buildCmuxFullTreeArgs(native.workspaceId));
+      fetch: async (signal) => {
+        const response = await run(buildCmuxFullTreeArgs(native.workspaceId), { signal });
         return response.exitCode === 0 ? response.stdout : undefined;
       },
       validate: (raw) => inspectCanonicalCmuxSurfaceTree(raw, native.workspaceId, native.surfaceId) !== undefined,
@@ -3769,10 +3769,10 @@ async function inspectActiveInteractiveSnapshot(options: {
   const shared = await topologySnapshotBatch.read({
     generation: acceptedTransport.epoch,
     key,
-    fetch: async () => {
-      const server = await run(buildTmuxServerPidArgs(native.socketPath));
-      if (server.exitCode !== 0) return undefined;
-      const panes = await run(buildTmuxPaneSnapshotArgs(native.socketPath));
+    fetch: async (signal) => {
+      const server = await run(buildTmuxServerPidArgs(native.socketPath), { signal });
+      if (server.exitCode !== 0 || signal.aborted) return undefined;
+      const panes = await run(buildTmuxPaneSnapshotArgs(native.socketPath), { signal });
       return panes.exitCode === 0 ? { server: server.stdout, panes: panes.stdout } : undefined;
     },
     validate: (snapshot) => parseTmuxServerPidOutput(snapshot.server) !== null && parseTmuxPaneSnapshots(snapshot.panes) !== null,
@@ -3906,10 +3906,15 @@ export async function runCommandCapture(
     let settled = false;
     let aborted = false;
     let abortHandler: (() => void) | undefined;
+    let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (exitCode: number, signalCode: NodeJS.Signals | null = null) => {
       if (settled) return;
       settled = true;
+      if (sigkillTimer) {
+        clearTimeout(sigkillTimer);
+        sigkillTimer = undefined;
+      }
       if (options.signal && abortHandler) {
         options.signal.removeEventListener("abort", abortHandler);
       }
@@ -3942,7 +3947,8 @@ export async function runCommandCapture(
           return;
         }
         proc.kill("SIGTERM");
-        const sigkillTimer = setTimeout(() => {
+        sigkillTimer = setTimeout(() => {
+          sigkillTimer = undefined;
           if (!settled) proc.kill("SIGKILL");
         }, SIGKILL_TIMEOUT_MS);
         sigkillTimer.unref();

@@ -1,7 +1,7 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { createJsonLineChunkProcessor } from "../../src/runtime/runner-core";
-import { mapConcurrent } from "../../src/runtime/runner";
+import { mapConcurrent, runCommandCapture } from "../../src/runtime/runner";
 
 describe("runner core helpers", () => {
   for (const count of [17, 50]) test(`bounds N=${count} work to 16 workers and preserves result indexes`, async () => {
@@ -41,6 +41,38 @@ describe("runner core helpers", () => {
 
     assert.deepEqual(started, [0]);
     assert.deepEqual(Array.from(results), [0, ...Array(count - 1).fill(undefined)]);
+  });
+
+  test("clears runCommandCapture SIGKILL escalation on early process settlement", async () => {
+    if (process.platform === "win32") return;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const timer = { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+    let created = false;
+    let cleared = false;
+    try {
+      (globalThis as any).setTimeout = (callback: () => void, delay?: number) => {
+        if (delay === 5_000) {
+          created = true;
+          return timer;
+        }
+        return originalSetTimeout(callback, delay);
+      };
+      (globalThis as any).clearTimeout = (value: unknown) => {
+        if (value === timer) cleared = true;
+        else originalClearTimeout(value as ReturnType<typeof setTimeout>);
+      };
+      const controller = new AbortController();
+      const pending = runCommandCapture(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { signal: controller.signal });
+      controller.abort();
+      const result = await pending;
+      assert.equal(result.aborted, true);
+      assert.equal(created, true);
+      assert.equal(cleared, true);
+    } finally {
+      (globalThis as any).setTimeout = originalSetTimeout;
+      (globalThis as any).clearTimeout = originalClearTimeout;
+    }
   });
 
   test("splits chunked JSONL lines like the inline runner", () => {

@@ -1,8 +1,8 @@
 # `pi-subagent` V2 presence producer
 
-> **상태:** shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2) 기반 producer
+> **상태:** shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1) 기반 producer
 
-공유 채널, schema, consumer discovery/replay, generation·sequence fence와 registry lifecycle은 canonical [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)을 따른다. 이 문서는 그 위에 얹는 `pi-subagent` 투영만 설명한다.
+공유 채널, schema, consumer discovery/replay, generation·sequence fence와 registry lifecycle은 canonical [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)을 따른다. 이 문서는 그 위에 얹는 `pi-subagent` 투영만 설명한다.
 
 ## Root activation
 
@@ -22,7 +22,7 @@ session/invocation ID, agent·task·label, timestamp, usage, path, raw output/er
 
 ## Dependency and verification
 
-`@pi/presence`는 runtime dependency와 lockfile에서 `github:spi-ca/pi-presence#v2-20260818-2`로 정확히 고정한다.
+`@pi/presence`는 runtime dependency와 lockfile에서 `github:spi-ca/pi-presence#v2-20260828-1`로 정확히 고정한다.
 
 ```bash
 bun test test/integration/pi-presence-producer.test.ts

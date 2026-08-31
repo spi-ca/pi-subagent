@@ -31,7 +31,7 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 | `name` | 예 | — | 도구 호출에서 사용하는 에이전트 식별자입니다. 정확히 일치해야 합니다. |
 | `description` | 예 | — | 메인 에이전트에게 표시되는 짧은 역량 설명입니다. 기본 프롬프트 점유를 줄이기 위해 에이전트 목록에서는 길면 절단될 수 있습니다. |
 | `model` | 아니요 | 호출별 `model`, 없으면 부모 CLI 모델 오버라이드, 없으면 Pi 기본 모델 | 이 에이전트에 사용할 기본 모델 오버라이드입니다. `anthropic/...`, `openrouter/...` 같은 provider 접두사를 지원합니다. |
-| `thinking` | 아니요 | 부모 CLI thinking 오버라이드, 없으면 Pi 기본 thinking 수준 | Thinking 수준입니다: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `max`는 Pi `0.81` 이상에서 도입됐으며, 선택한 모델/provider가 이 수준을 지원·노출할 때만 사용할 수 있습니다. |
+| `thinking` | 아니요 | 현재 부모 세션의 thinking 수준, 없으면 부모 CLI thinking 오버라이드, 없으면 Pi 기본 thinking 수준 | Thinking 수준입니다: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `max`는 Pi `0.81` 이상에서 도입됐으며, 선택한 모델/provider가 이 수준을 지원·노출할 때만 사용할 수 있습니다. |
 | `tools` | 아니요 | 부모 CLI 도구 오버라이드, 없으면 Pi 기본 도구 | Pi `--tools`에 전달하는 전체 도구 allowlist입니다. 쉼표 구분 목록 또는 YAML 배열로 Pi 내장 도구, extension 도구, custom 도구를 모두 지정할 수 있습니다. |
 
 참고:
@@ -39,7 +39,8 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 - `model`은 여러 provider가 같은 모델 ID를 제공할 때 `provider/model` 문법을 사용할 수 있습니다.
 - 호출별 `model`이 있으면 에이전트 파일의 `model`보다 우선합니다. 단일 호출은 최상위 `model`, 병렬 호출은 각 task item의 `model`, 체인 호출은 순차 chain step 또는 parallel stage 안의 각 `tasks[]` 항목의 `model`을 사용합니다.
 - 역할에 예측 가능한 추론 예산이 필요하면 `thinking`을 명시적으로 설정하세요. Pi `0.81` 이상이어도 모델의 `thinkingLevelMap` 또는 provider가 `max`를 지원하지 않으면 Pi가 그 수준을 노출하거나 적용하지 않을 수 있습니다.
-- 호출별 `model`, 에이전트 파일 `model`, `thinking`, `tools`를 생략하면 부모 pi 프로세스의 CLI 오버라이드를 먼저 상속하고, 부모 오버라이드가 없을 때 Pi 기본값을 사용합니다.
+- `thinking`을 생략하면 Pi `0.84.4`에서 호출 시작 시점의 현재 부모 세션 `ctx.thinkingLevel`을 상속합니다. 이 값은 백그라운드 작업이 나중에 시작해도 호출 시점 값으로 고정됩니다. 이 필드가 없는 이전 호환 Pi host에서는 기존처럼 부모 pi 프로세스의 CLI thinking 오버라이드, 그다음 Pi 기본값으로 fallback합니다. 에이전트 파일의 `thinking`은 이보다 우선합니다.
+- 호출별 `model`, 에이전트 파일 `model`, `tools`를 생략하면 부모 pi 프로세스의 CLI 오버라이드를 먼저 상속하고, 부모 오버라이드가 없을 때 Pi 기본값을 사용합니다.
 - 명시적 `tools` 목록은 Pi의 전체 allowlist입니다. nested delegation이 필요한 에이전트는 목록에 이 패키지의 `subagent`도 명시해야 합니다.
 - `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`에서는 extension-owned 도구와 활성 내장 도구 override를 보존할 수 없습니다. `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`만 허용하며, 그 밖의 명시 목록은 실행 전에 fail-closed합니다.
 - Markdown 본문은 Pi의 기본 시스템 프롬프트에 추가됩니다. 기본 시스템 프롬프트를 대체하지 않습니다.

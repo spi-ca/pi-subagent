@@ -61,10 +61,10 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.82.0",
-    "@earendil-works/pi-ai": "^0.82.0",
-    "@earendil-works/pi-coding-agent": "^0.82.0",
-    "@earendil-works/pi-tui": "^0.82.0",
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
     "@types/node": "^25.2.3",
     "typebox": "1.1.38",
     "typescript": "^5.9.3"
@@ -96,6 +96,6 @@
   "private": true,
   "packageManager": "bun@1.3.14",
   "dependencies": {
-    "@pi/presence": "github:spi-ca/pi-presence#v2-20260818-2"
+    "@pi/presence": "github:spi-ca/pi-presence#v2-20260828-1"
   }
 }

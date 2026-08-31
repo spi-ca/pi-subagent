@@ -2,7 +2,7 @@
 
 > **상태:** 현재 동작과 권장 운영 정책
 
-이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. root-only generic presence producer는 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)을 사용하며, 별도 consumer가 이를 선택적으로 표시할 수 있다. `pi-subagent`의 projection 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을, interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
+이 문서는 cmux 안에서 `pi-subagent`와 [`pi-cmux`](https://github.com/javiermolinar/pi-cmux)를 함께 사용할 때의 역할, 설정, 제한을 설명하는 상위 진입점이다. root-only generic presence producer는 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)을 사용하며, 별도 consumer가 이를 선택적으로 표시할 수 있다. `pi-subagent`의 projection 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을, interactive pane의 내부 protocol과 lifecycle 구현은 [cmux/tmux 기반 실제 Pi TUI 설계 및 구현](./cmux-pi-tui-design.md)을 참고한다.
 
 `pi-cmux`는 `pi-subagent`의 실행, 결과 반환, 취소와 cleanup에 필요하지 않은 **선택적 workflow UX 확장**이다. child surface별 sidebar와 command/review 작업 흐름이 필요할 때 설치한다. root Pi/subagent 집계의 generic status·progress·attention은 `pi-subagent` producer를 설치·로드된 `pi-cmux-presence` consumer가 표시할 수 있다.
 
@@ -120,7 +120,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 
 ### Generic presence는 별도 contract
 
-root `pi-subagent`는 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)의 `subagent` projection을 root parent(depth `0`)에서만 생산한다. 이는 Herdr의 내부 socket `agent.*`, child `pane.report_metadata`, dashboard/aggregate/detached와 별개인 best-effort observer이며, consumer는 lifecycle authority를 얻지 않는다. aggregate와 terminal projection, privacy 및 consumer presentation은 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 따른다.
+root `pi-subagent`는 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)의 `subagent` projection을 root parent(depth `0`)에서만 생산한다. 이는 Herdr의 내부 socket `agent.*`, child `pane.report_metadata`, dashboard/aggregate/detached와 별개인 best-effort observer이며, consumer는 lifecycle authority를 얻지 않는다. aggregate와 terminal projection, privacy 및 consumer presentation은 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 따른다.
 
 ## 5. 권장 운영 정책
 

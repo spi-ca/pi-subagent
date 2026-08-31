@@ -7,12 +7,17 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const PI_CORE_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "^0.82.0",
-  "@earendil-works/pi-ai": "^0.82.0",
-  "@earendil-works/pi-coding-agent": "^0.82.0",
-  "@earendil-works/pi-tui": "^0.82.0",
+  "@earendil-works/pi-agent-core": "0.84.4",
+  "@earendil-works/pi-ai": "0.84.4",
+  "@earendil-works/pi-coding-agent": "0.84.4",
+  "@earendil-works/pi-tui": "0.84.4",
 } as const;
 const CLEAN_CHECKOUT_DEV_DEPENDENCIES = { typebox: "1.1.38" } as const;
+const PRESENCE_RELEASE_TAG = "v2-20260828-1";
+const PRESENCE_TAG_OBJECT = "44a22cf793bb8c7d25a202316133ead9d4d4ab8d";
+const PRESENCE_RELEASE_COMMIT = "752592a262d6d31242e6ca46a2a977839fca85eb";
+const PRESENCE_DEPENDENCY = `github:spi-ca/pi-presence#${PRESENCE_RELEASE_TAG}`;
+const PRESENCE_LOCK_RESOLUTION = PRESENCE_TAG_OBJECT.slice(0, 7);
 
 function packedPaths(): string[] {
   const result = spawnSync(process.execPath, ["pm", "pack", "--dry-run", "--ignore-scripts"], {
@@ -25,8 +30,9 @@ function packedPaths(): string[] {
 }
 
 describe("release packaging and live acceptance workflow", () => {
-  test("allows the current Pi 0.82 patch line and resolves clean-checkout dependencies from the lockfile", () => {
+  test("pins Pi 0.84.4 in devDependencies, installed manifests, and the lockfile", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
       devDependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
     };
@@ -36,16 +42,29 @@ describe("release packaging and live acceptance workflow", () => {
     };
 
     assert.equal(tsconfig.compilerOptions.paths, undefined, "typechecking must not require a sibling Pi checkout");
+    assert.equal(manifest.dependencies["@pi/presence"], PRESENCE_DEPENDENCY, "@pi/presence must use the reviewed immutable release tag");
+    assert.match(lockfile, new RegExp(`"@pi/presence": "${PRESENCE_DEPENDENCY}"`), "bun.lock must retain the reviewed immutable release tag");
+    assert.notEqual(PRESENCE_TAG_OBJECT, PRESENCE_RELEASE_COMMIT, "the annotated tag object and its peeled release commit must remain distinct");
+    assert.match(
+      lockfile,
+      new RegExp(`"@pi/presence": \\["@pi/presence@github:spi-ca/pi-presence#${PRESENCE_LOCK_RESOLUTION}"`),
+      "bun.lock must resolve @pi/presence to the reviewed annotated tag object",
+    );
+    assert.doesNotMatch(
+      lockfile,
+      new RegExp(`"@pi/presence": \\["@pi/presence@github:spi-ca/pi-presence#${PRESENCE_RELEASE_COMMIT.slice(0, 7)}"`),
+      "Bun must record the annotated tag object rather than the peeled release commit",
+    );
     for (const [packageName, version] of Object.entries(PI_CORE_DEPENDENCIES)) {
       assert.equal(manifest.peerDependencies[packageName], "*", `${packageName} must accept all Pi core versions`);
-      assert.equal(manifest.devDependencies[packageName], version, `${packageName} must allow the current Pi 0.82 patch line`);
+      assert.equal(manifest.devDependencies[packageName], version, `${packageName} must be exactly pinned to Pi 0.84.4`);
 
       const packageJsonPath = path.join(ROOT, "node_modules", ...packageName.split("/"), "package.json");
       const installedManifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { version: string };
-      assert.match(installedManifest.version, /^0\.82\.\d+$/, `${packageName} must stay on the Pi 0.82 patch line`);
+      assert.equal(installedManifest.version, version, `${packageName} must install exactly Pi 0.84.4`);
       assert.ok(
-        lockfile.includes(`\"${packageName}\": [\"${packageName}@${installedManifest.version}\"`),
-        `bun.lock must resolve ${packageName}@${installedManifest.version}`,
+        lockfile.includes(`\"${packageName}\": [\"${packageName}@${version}\"`),
+        `bun.lock must resolve exactly ${packageName}@${version}`,
       );
       assert.match(import.meta.resolve(packageName), /node_modules\//, `${packageName} must resolve after bun install --frozen-lockfile`);
     }

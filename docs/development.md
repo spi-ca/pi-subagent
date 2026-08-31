@@ -107,7 +107,7 @@ bun run benchmark:phase7:record-local
 
 ### Generic presence producer 집중 검증
 
-root-only producer는 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다. 새 session은 dashboard/presence observer를 등록하기 전에 process-local scheduler를 reset하므로, 즉시 전달되는 scheduler 구독이 이전 session의 queued/running 상태를 새 presence로 투영하지 않는다.
+root-only producer는 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다. 새 session은 dashboard/presence observer를 등록하기 전에 process-local scheduler를 reset하므로, 즉시 전달되는 scheduler 구독이 이전 session의 queued/running 상태를 새 presence로 투영하지 않는다.
 
 ```bash
 bun test --isolate test/integration/pi-presence-producer.test.ts test/entrypoint/index.test.ts
@@ -134,7 +134,7 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 ## 개발 의존성
 
-클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 `^0.82.0`으로 현재 0.82 patch line을 허용하고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
+클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `0.84.4`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
 
 Pi 관련 peer dependency는 host 설치를 막지 않도록 `"*"`로 유지합니다. interactive pane 실행에 필요한 Pi `>=0.80.10`은 peer range가 아니라 runtime version policy로 검사합니다.
 

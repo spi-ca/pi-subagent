@@ -793,6 +793,9 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
   let sessionShuttingDown = false;
+  // Advances at the synchronous boundary of every start/shutdown event.
+  // Async startup continuations may install state only for their own token.
+  let sessionStartupGeneration = 0;
   let startupReaper: StaleInteractiveReaperHandle | null = null;
   const cancelStartupReaperBounded = async (): Promise<void> => {
     const reaper = startupReaper;
@@ -898,6 +901,42 @@ export default function (pi: ExtensionAPI) {
 
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    // This preamble intentionally has no await. A replacement session must
+    // fence old finalizers before a slow config read can yield to them.
+    const startupGeneration = ++sessionStartupGeneration;
+    backgroundSessionFence.startSession();
+    reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
+    cancelBackgroundJobs(backgroundJobs);
+    backgroundJobs.clear();
+    backgroundJobSettlements.clear();
+    unsubscribeUxStatus?.();
+    unsubscribeUxStatus = null;
+    unsubscribeSchedulerStatus?.();
+    unsubscribeSchedulerStatus = null;
+    unsubscribeInteractiveRunChanges?.();
+    unsubscribeInteractiveRunChanges = null;
+    // Observer handles retain their public session/generation fences until
+    // explicitly stopped. Withdraw them before the first startup await so a
+    // command or deferred callback cannot emit into the preceding session
+    // while configuration resolution is in flight.
+    if (currentDepth === 0) {
+      dashboardPublisher?.stop();
+      presenceProducer?.stop();
+      // A host may have disposed the old TUI while delivering replacement
+      // startup. Status cleanup is observer-only and must not block fencing.
+      if (ctx.hasUI) {
+        try { ctx.ui.setStatus("pi-subagent-runs", undefined); } catch { /* non-authoritative TUI cleanup */ }
+      }
+    }
+    const uxGeneration = uxRegistry.reset();
+    discoveredAgents = [];
+    sessionShuttingDown = false;
+    discoveryCache.startSession();
+    // Reset stale queued work synchronously. Resolved limits replace this
+    // provisional capacity only if this startup remains current.
+    scheduler.startSession(limits.maxActive);
+    const isStartupCurrent = () => startupGeneration === sessionStartupGeneration && !sessionShuttingDown;
+
     const projectAgentsDir = findNearestProjectAgentsDir(ctx.cwd);
     const projectTrustOverride = getSessionProjectTrustOverride(ctx);
     const trustedProject = resolveSessionProjectTrust(
@@ -910,28 +949,16 @@ export default function (pi: ExtensionAPI) {
       // authorization; explicit inherited denials still take priority.
       { preserveInheritedSessionTrustOnDeny: currentDepth > 0 },
     );
-    limits = await resolveSubagentLimitsForSession({
+    const resolvedLimits = await resolveSubagentLimitsForSession({
       agentDir: getActiveAgentDir(),
       cwd: ctx.cwd,
       configDirName: CONFIG_DIR_NAME,
       projectTrusted: trustedProject,
       getFlag: (name) => pi.getFlag(name),
     });
+    if (!isStartupCurrent()) return;
 
-    // A new session never inherits old-session background records or reaper
-    // diagnostics. Advance the fence before cancellation so a late old-session
-    // completion cannot notify the replacement TUI.
-    backgroundSessionFence.startSession();
-    reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
-    cancelBackgroundJobs(backgroundJobs);
-    backgroundJobs.clear();
-    unsubscribeUxStatus?.();
-    unsubscribeUxStatus = null;
-    unsubscribeSchedulerStatus?.();
-    unsubscribeSchedulerStatus = null;
-    unsubscribeInteractiveRunChanges?.();
-    unsubscribeInteractiveRunChanges = null;
-    const uxGeneration = uxRegistry.reset();
+    limits = resolvedLimits;
     // Scheduler subscriptions publish immediately. Reset its queue before
     // registering dashboard/presence observers so they cannot project stale
     // work from the preceding session into the new one.
@@ -970,16 +997,21 @@ export default function (pi: ExtensionAPI) {
       updateObservers(uxRegistry.snapshot());
       if (ctx.isIdle()) presenceProducer?.settle();
     }
-    backgroundJobSettlements.clear();
-    sessionShuttingDown = false;
-    discoveryCache.startSession();
+
     await treePermitAuthorityLifecycle.startup(limits.maxActive);
+    if (!isStartupCurrent()) return;
     await resetInteractiveShutdownForSession();
+    if (!isStartupCurrent()) return;
     if (currentDepth === 0) {
       await cancelStartupReaperBounded();
+      if (!isStartupCurrent()) return;
       const diagnosticGeneration = reaperDiagnosticGeneration;
       try {
         const reaper = await startStaleInteractiveReaper();
+        if (!isStartupCurrent()) {
+          await settleWithUnrefTimeout([reaper.cancelAndDrain().catch(() => undefined)], resolvedLimits.backgroundShutdownSettleMs);
+          return;
+        }
         startupReaper = reaper;
         // Observe completion before awaiting startup: both promises can reject
         // from the same enumeration failure, and neither may go unhandled.
@@ -989,8 +1021,13 @@ export default function (pi: ExtensionAPI) {
         );
         void observedCompletion.finally(() => { if (startupReaper === reaper) startupReaper = null; });
         await reaper.startup;
+        if (!isStartupCurrent()) {
+          if (startupReaper === reaper) startupReaper = null;
+          await settleWithUnrefTimeout([reaper.cancelAndDrain().catch(() => undefined)], resolvedLimits.backgroundShutdownSettleMs);
+          return;
+        }
         void observedCompletion.then((settled) => {
-          if (diagnosticGeneration !== reaperDiagnosticGeneration || sessionShuttingDown) return;
+          if (startupGeneration !== sessionStartupGeneration || diagnosticGeneration !== reaperDiagnosticGeneration || sessionShuttingDown) return;
           if ("outcome" in settled) {
             for (const diagnostic of settled.outcome.diagnostics) reportReaperDiagnostic(diagnosticGeneration, diagnostic, ctx);
             return;
@@ -1003,6 +1040,7 @@ export default function (pi: ExtensionAPI) {
           }, ctx);
         });
       } catch (error) {
+        if (!isStartupCurrent()) return;
         reportReaperDiagnostic(diagnosticGeneration, {
           severity: "error",
           code: "reaper-start-failed",
@@ -1011,12 +1049,12 @@ export default function (pi: ExtensionAPI) {
         }, ctx);
       }
     }
-    if (!canDelegate) return;
+    if (!isStartupCurrent() || !canDelegate) return;
 
     const discovery = trustedProject
       ? discoverForSession(ctx.cwd, "both")
       : discoverForSession(ctx.cwd, "user");
-    discoveredAgents = discovery.agents;
+    if (isStartupCurrent()) discoveredAgents = discovery.agents;
   });
 
   if (currentDepth === 0) {
@@ -1029,6 +1067,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     // Invalidate and quarantine before any await/cancellation so a late
     // old-session finalizer cannot repopulate the registry or send a steer.
+    ++sessionStartupGeneration;
     sessionShuttingDown = true;
     backgroundSessionFence.invalidate();
     reaperDiagnosticGeneration = reaperDiagnosticUx.invalidateSession();
@@ -1110,6 +1149,9 @@ export default function (pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        // Capture once at tool invocation time so queued/background work cannot
+        // observe a later parent-session thinking change.
+        const parentThinkingLevel = ctx?.thinkingLevel;
         const invocationDiagnosticGeneration = reaperDiagnosticGeneration;
         const terminalMode = getDefaultTerminalModeFromEnv();
         const rawValidationError = validateSubagentInvocation(params);
@@ -1472,6 +1514,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionId,
               parentSessionFile,
               interactiveShutdownGeneration,
+              parentThinkingLevel,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1495,6 +1538,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionId,
               parentSessionFile,
               interactiveShutdownGeneration,
+              parentThinkingLevel,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1521,6 +1565,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionId,
               parentSessionFile,
               interactiveShutdownGeneration,
+              parentThinkingLevel,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1750,6 +1795,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionId: string,
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
+    parentThinkingLevel: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -1776,6 +1822,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       parentSessionId,
       parentSessionFile,
       interactiveShutdownGeneration,
+      parentThinkingLevel,
       parentDepth: currentDepth,
       parentAgentStack: ancestorAgentStack,
       maxDepth,
@@ -1824,6 +1871,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionId: string,
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
+    parentThinkingLevel: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -1972,6 +2020,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionId,
               parentSessionFile,
               interactiveShutdownGeneration,
+              parentThinkingLevel,
               parentDepth: currentDepth,
               parentAgentStack: ancestorAgentStack,
               maxDepth,
@@ -2070,6 +2119,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         parentSessionId,
         parentSessionFile,
         interactiveShutdownGeneration,
+        parentThinkingLevel,
         parentDepth: currentDepth,
         parentAgentStack: ancestorAgentStack,
         maxDepth,
@@ -2150,6 +2200,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionId: string,
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
+    parentThinkingLevel: string | undefined,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -2217,6 +2268,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionId,
             parentSessionFile,
             interactiveShutdownGeneration,
+            parentThinkingLevel,
             parentDepth: currentDepth,
             parentAgentStack: ancestorAgentStack,
             maxDepth,

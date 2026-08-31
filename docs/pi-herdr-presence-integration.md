@@ -1,8 +1,8 @@
 # `pi-subagent`와 `pi-herdr-presence` V2 연동
 
-> **상태:** shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2) 기반 producer; consumer UI는 별도 package 책임
+> **상태:** shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1) 기반 producer; consumer UI는 별도 package 책임
 
-`pi-subagent` root parent만 `subagent` source를 shared registry에 투영한다. shared protocol의 채널, schema, replay, fence와 registry lifecycle은 canonical [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)을 따른다.
+`pi-subagent` root parent만 `subagent` source를 shared registry에 투영한다. shared protocol의 채널, schema, replay, fence와 registry lifecycle은 canonical [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)을 따른다.
 
 producer projection은 bounded subagent aggregate와 검증 가능한 progress, 새 failure attention, live terminal outcome뿐이다. invocation/run ID는 local dedupe에만 사용하며 session ID, agent/task/prompt, output/error, path, usage, timestamp, socket/pane ID와 credential은 발행하지 않는다.
 

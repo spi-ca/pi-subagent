@@ -18,6 +18,7 @@ import {
 	buildPrivateChildEnvironmentScript,
 	buildInteractivePiArgs,
 	buildPiArgs,
+	resolveChildThinkingLevel,
 	buildInteractiveExtensionArgs,
 	assertManagedChildToolCompatibility,
 	resolveManagedChildPolicy,
@@ -1196,6 +1197,29 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(args.filter((value) => value === resolveCurrentPackageExtensionEntrypoint()).length, 1);
 		assert.equal(args.filter((value) => value === buildInteractiveExtensionArgs([]).at(-1)).length, 1);
 		assert.equal(args.at(-1), "@/tmp/run/task.md");
+	});
+
+	test("covers runner child-argv thinking resolution; entrypoint forwarding is tested separately", () => {
+		const inheritedThinkingAgent = {
+			name: "worker", description: "", systemPrompt: "", source: "user" as const, filePath: "/tmp/worker.md",
+		};
+		assert.equal(resolveChildThinkingLevel("high", "medium", "low"), "high", "agent thinking has priority");
+		assert.equal(resolveChildThinkingLevel(undefined, "medium", "low"), "medium", "parent session thinking precedes parent CLI thinking");
+		assert.equal(resolveChildThinkingLevel(undefined, undefined, "low"), "low", "parent CLI thinking precedes the child default");
+		assert.equal(resolveChildThinkingLevel(undefined, undefined, undefined), undefined, "no inherited value leaves the child default intact");
+
+		const inline = buildPiArgs(inheritedThinkingAgent, null, "/tmp/task", "spawn", null, undefined, undefined, "off");
+		const inlineFork = buildPiArgs(inheritedThinkingAgent, null, "/tmp/task", "fork", "/tmp/fork-session", undefined, undefined, "low");
+		const interactive = buildInteractivePiArgs(inheritedThinkingAgent, null, "/tmp/task", "/tmp/session", undefined, undefined, "medium");
+		assert.deepEqual(inline.slice(inline.indexOf("--thinking"), inline.indexOf("--thinking") + 2), ["--thinking", "off"]);
+		assert.deepEqual(inlineFork.slice(inlineFork.indexOf("--thinking"), inlineFork.indexOf("--thinking") + 2), ["--thinking", "low"]);
+		assert.deepEqual(inlineFork.slice(inlineFork.indexOf("--session"), inlineFork.indexOf("--session") + 2), ["--session", "/tmp/fork-session"]);
+		assert.deepEqual(interactive.slice(interactive.indexOf("--thinking"), interactive.indexOf("--thinking") + 2), ["--thinking", "medium"]);
+
+		const explicitThinkingAgent = { ...inheritedThinkingAgent, thinking: "minimal" };
+		const explicit = buildPiArgs(explicitThinkingAgent, null, "/tmp/task", "spawn", null, undefined, undefined, "high");
+		assert.deepEqual(explicit.slice(explicit.indexOf("--thinking"), explicit.indexOf("--thinking") + 2), ["--thinking", "minimal"]);
+		assert.equal(explicitThinkingAgent.thinking, "minimal", "argv construction must not mutate AgentConfig");
 	});
 
 	test("builds a minimal managed child profile while preserving bridge and nested delegation", () => {

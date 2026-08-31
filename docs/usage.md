@@ -180,7 +180,7 @@ root parent Pi에서는 LLM tool schema를 늘리지 않는 단일 slash command
 
 ### 선택적 generic presence V2
 
-root parent만 shared [`@pi/presence` protocol (v2-20260818-2)](https://github.com/spi-ca/pi-presence/tree/v2-20260818-2)에 `subagent` observer projection을 생산하고 nested child는 producer를 만들지 않는다. state aggregate, terminal mapping/dedupe, privacy와 consumer presentation 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요. presence는 execution, cancel, lease, reaper, cleanup authority가 아닌 best-effort observer이며 public `subagent` schema/result와 accounting은 바뀌지 않는다.
+root parent만 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)에 `subagent` observer projection을 생산하고 nested child는 producer를 만들지 않는다. state aggregate, terminal mapping/dedupe, privacy와 consumer presentation 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요. presence는 execution, cancel, lease, reaper, cleanup authority가 아닌 best-effort observer이며 public `subagent` schema/result와 accounting은 바뀌지 않는다.
 
 ## 권장 패턴
 

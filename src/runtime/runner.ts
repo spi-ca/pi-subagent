@@ -4597,6 +4597,15 @@ export async function claimPhase0LiveProofForChild(_env: NodeJS.ProcessEnv, mode
   };
 }
 
+/** Resolve thinking without mutating the discovered agent configuration. */
+export function resolveChildThinkingLevel(
+  agentThinking: string | undefined,
+  parentSessionThinkingLevel: string | undefined,
+  parentCliThinking: string | undefined,
+): string | undefined {
+  return agentThinking ?? parentSessionThinkingLevel ?? parentCliThinking;
+}
+
 export function buildPiArgs(
   agent: AgentConfig,
   systemPromptPath: string | null,
@@ -4605,6 +4614,8 @@ export function buildPiArgs(
   forkSessionPath: string | null,
   modelOverride?: string,
   childPolicy: ManagedChildPolicy = resolveManagedChildPolicy(),
+  /** Invocation-scoped parent session value captured before any launch delay. */
+  parentThinkingLevel?: string,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
   const args: string[] = [
@@ -4624,7 +4635,7 @@ export function buildPiArgs(
   const model = modelOverride ?? agent.model ?? inheritedCliArgs.fallbackModel;
   if (model) args.push("--model", model);
 
-  const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
+  const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
 
   if (agent.tools && agent.tools.length > 0) {
@@ -4649,6 +4660,8 @@ export function buildInteractivePiArgs(
   childSessionPath: string,
   modelOverride?: string,
   childPolicy: ManagedChildPolicy = resolveManagedChildPolicy(),
+  /** Invocation-scoped parent session value captured before any launch delay. */
+  parentThinkingLevel?: string,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
   const args: string[] = [
@@ -4660,7 +4673,7 @@ export function buildInteractivePiArgs(
 
   const model = modelOverride ?? agent.model ?? inheritedCliArgs.fallbackModel;
   if (model) args.push("--model", model);
-  const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
+  const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
   if (agent.tools && agent.tools.length > 0) {
     args.push("--tools", agent.tools.join(","));
@@ -4781,6 +4794,8 @@ export interface RunAgentOptions {
   taskCwd?: string;
   /** Optional per-call model override. */
   model?: string;
+  /** Invocation-scoped immutable parent session thinking level. */
+  parentThinkingLevel?: string;
   /** Context mode: spawn (fresh) or fork (session snapshot + task). */
   delegationMode: DelegationMode;
   /** Execution surface for child runs. */
@@ -4842,6 +4857,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     invocationId,
     taskCwd,
     model: modelOverride,
+    parentThinkingLevel,
     delegationMode,
     terminalMode,
     interactivePaneLayout = resolveInteractivePaneLayout(undefined),
@@ -5016,6 +5032,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       cwd,
       taskCwd,
       modelOverride,
+      parentThinkingLevel,
       delegationMode,
       interactivePaneLayout,
       forkSessionSnapshotJsonl,
@@ -5080,6 +5097,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       delegationMode,
       forkTmp?.filePath ?? null,
       modelOverride,
+      undefined,
+      parentThinkingLevel,
     );
     const effectiveCwd = taskCwd ?? cwd;
     applyChildProjectIsolation(piArgs, effectiveCwd);
@@ -5686,6 +5705,8 @@ interface RunAgentInInteractivePaneOptions {
   cwd: string;
   taskCwd?: string;
   modelOverride?: string;
+  /** Invocation-scoped immutable parent session thinking level. */
+  parentThinkingLevel?: string;
   delegationMode: DelegationMode;
   forkSessionSnapshotJsonl?: string;
   parentSessionId?: string;
@@ -6429,6 +6450,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       paths.taskPath,
       paths.childSessionPath,
       options.modelOverride,
+      undefined,
+      options.parentThinkingLevel,
     );
     applyChildProjectIsolation(piArgs, effectiveCwd);
 

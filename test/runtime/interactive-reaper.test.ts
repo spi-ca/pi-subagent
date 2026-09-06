@@ -299,29 +299,83 @@ describe("stale interactive run reaper", () => {
 		assert.equal(fs.existsSync(path.join(unmarked, "keep.txt")), true);
 	});
 
-	test("defers all startup-reaper classification when injected 100001-entry enumeration overflows", async () => {
+	test("defers all startup-reaper classification and releases the lock on run-directory-cap overflow", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
 		await prepareRunArtifactPaths({ rootDir: root, runId: "overflow-seed" });
-		const names = Array.from({ length: 100_001 }, (_, index) => `overflow-${index}`);
-		let classifications = 0;
+		const names = Array.from({ length: 10_001 }, (_, index) => `overflow-${index}`);
+		let classifications = 0, cleanupCalls = 0;
 		const handle = await startStaleInteractiveReaper({
 			rootDir: root,
 			enumerateRunDirectories: () => ({
-				startup: Promise.resolve(names.slice(0, 50)), completion: Promise.resolve(names.slice(50, 100_000)), overflow: Promise.resolve(true), cancelAndDrain: async () => undefined,
+				startup: Promise.resolve(names.slice(0, 50)), completion: Promise.resolve(names.slice(50)), overflow: Promise.resolve(true), cancelAndDrain: async () => undefined,
 			}),
 			onValidationConcurrency: (active) => { if (active > 0) classifications += 1; },
+			scheduleCleanup: () => { cleanupCalls += 1; },
 		});
 		await handle.startup;
 		const outcome = await handle.completion;
 		assert.deepEqual(outcome.diagnostics, [{
 			severity: "debug",
-			code: "graph-entry-cap",
-			message: "Reaper graph entry cap exceeded; all mutation was deferred.",
-			details: { limit: 100_000 },
+			code: "run-directory-cap",
+			message: "Reaper run-directory cap exceeded; all mutation was deferred.",
+			details: { limit: 10_000 },
 		}]);
-		assert.match(outcome.diagnostic ?? "", /entry cap/, "legacy direct consumers retain overflow visibility");
+		assert.match(outcome.diagnostic ?? "", /run-directory cap/, "legacy direct consumers retain overflow visibility");
 		assert.equal(outcome.scanned, 0);
 		assert.equal(classifications, 0, "overflow must prevent every classification and mutation");
+		assert.equal(cleanupCalls, 0);
+		const lock = await (await import("../../src/runtime/reaper-coordinator")).acquireReaperRootLock(root, "post-overflow");
+		assert.ok(lock, "overflow must not leak the root lock");
+		await lock.release();
+	});
+
+	test("rejects oversized injected reaper entries before classification or mutation", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		await prepareRunArtifactPaths({ rootDir: root, runId: "overflow-seed" });
+		let classifications = 0, cleanupCalls = 0, reconciliations = 0;
+		const outcome = await reapStaleInteractiveRuns({
+			rootDir: root,
+			enumerateRunDirectories: () => ({
+				startup: Promise.resolve(Array.from({ length: 10_001 }, (_, index) => `overflow-${index}`)), completion: Promise.resolve([]), overflow: Promise.resolve(false), cancelAndDrain: async () => undefined,
+			}),
+			onValidationConcurrency: (active) => { if (active > 0) classifications += 1; },
+			scheduleCleanup: () => { cleanupCalls += 1; },
+			reconcileForkSources: async () => { reconciliations += 1; return { scanned: [], resolved: [], retained: [], removed: [], invalid: [] }; },
+		});
+		assert.equal(outcome.diagnostics[0]?.code, "run-directory-cap");
+		assert.equal(outcome.scanned, 0);
+		assert.equal(classifications, 0);
+		assert.equal(cleanupCalls, 0);
+		assert.equal(reconciliations, 0, "cap overflow must not classify or mutate auxiliary roots");
+	});
+
+	test("releases the production root lock only after deferred enumeration close drains", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-reaper-")); tempDirs.push(root);
+		await prepareRunArtifactPaths({ rootDir: root, runId: "seed" });
+		const originalOpendir = fs.promises.opendir;
+		let releaseClose!: () => void;
+		Object.defineProperty(fs.promises, "opendir", {
+			configurable: true, writable: true,
+			value: (async () => ({
+				read: async () => null,
+				close: async () => await new Promise<void>((resolve) => { releaseClose = resolve; }),
+			})) as unknown as typeof fs.promises.opendir,
+		});
+		try {
+			const handle = await startStaleInteractiveReaper({ rootDir: root, startupBudgetMs: 0, startupEntryBudget: 0 });
+			await handle.startup;
+			for (let index = 0; !releaseClose && index < 10; index += 1) await Promise.resolve();
+			assert.ok(releaseClose);
+			const coordinator = await import("../../src/runtime/reaper-coordinator");
+			assert.equal(await coordinator.acquireReaperRootLock(root, "blocked-before-close"), null);
+			releaseClose();
+			await handle.completion;
+			const lock = await coordinator.acquireReaperRootLock(root, "available-after-close");
+			assert.ok(lock);
+			await lock.release();
+		} finally {
+			Object.defineProperty(fs.promises, "opendir", { configurable: true, writable: true, value: originalOpendir });
+		}
 	});
 
 	test("transfers a bounded startup enumeration and completes in the background", async () => {

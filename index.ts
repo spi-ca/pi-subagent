@@ -620,20 +620,21 @@ export default function (pi: ExtensionAPI) {
   // This is the single UX update boundary for invocation progress. It reads
   // structured details only; child task/output text cannot reach presence.
   const updateUxFromPartial = (id: string, generation: number, value: { content?: Array<{ type?: string; text?: string }>; details?: any } | undefined) => {
-    const text = value?.content?.filter((entry) => entry.type === "text" && typeof entry.text === "string").at(-1)?.text;
-    if (text) uxRegistry.updatePreview(id, text, generation);
+    const preview = value?.content?.filter((entry) => entry.type === "text" && typeof entry.text === "string").at(-1)?.text;
     const details = value?.details;
+    let progress: { completed: number; total: number } | undefined;
     if (details?.mode === "parallel" && Array.isArray(details.results) && details.results.length > 0) {
       const completed = details.results.filter((result: unknown) => typeof result === "object" && result !== null && (result as { exitCode?: unknown }).exitCode !== -1).length;
-      uxRegistry.updateProgress(id, Math.min(details.results.length, completed), details.results.length, generation);
+      progress = { completed: Math.min(details.results.length, completed), total: details.results.length };
     } else if (details?.mode === "chain" && Number.isSafeInteger(details.chainStageCount) && details.chainStageCount > 0) {
       const keys = ["chainCompletedCount", "chainSkippedCount", "chainFailedCount", "chainCompletedWithErrorsCount"] as const;
       const completed = keys.reduce((sum, key) => {
         const count = details[key];
         return sum + (Number.isSafeInteger(count) && count >= 0 ? count : 0);
       }, 0);
-      uxRegistry.updateProgress(id, Math.min(details.chainStageCount, completed), details.chainStageCount, generation);
+      progress = { completed: Math.min(details.chainStageCount, completed), total: details.chainStageCount };
     }
+    uxRegistry.updatePartial(id, { ...(preview === undefined ? {} : { preview }), ...(progress === undefined ? {} : { progress }) }, generation);
   };
   let unsubscribeUxStatus: (() => void) | null = null;
   let unsubscribeSchedulerStatus: (() => void) | null = null;

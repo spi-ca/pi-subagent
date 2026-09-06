@@ -87,6 +87,39 @@ describe("V2 subagent presence producer", () => {
     });
   });
 
+  test("suppresses only exact accepted state projections and clears equality at lifecycle boundaries", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "projection-epoch");
+    const value = producer(events);
+    const running = snapshot([], [{ id: "active", status: "running", progress: { completed: 1, total: 2 } }]);
+    assert.equal(value.publish(running), true);
+    assert.equal(value.publish(running), false, "an exact semantic projection is suppressed");
+    assert.equal(value.publish(snapshot([], [{ id: "active", status: "running", progress: { completed: 2, total: 2 } }])), true, "progress is semantic");
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.state).length, 2);
+    assert.deepEqual(events.events.filter((event) => event.name === EVENT_NAMES.state).map((event) => event.payload.sequence), [0, 1]);
+
+    value.stop();
+    assert.equal(value.startSession("private-session", 0), true);
+    assert.equal(value.publish(running), true, "a replacement source lifecycle republishes the retained state");
+    assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)?.payload.sequence, 0);
+
+    const replacement = consumer(events, "pi-herdr-presence", "projection-replacement-epoch");
+    assert.equal(replacement.length, 1, "a replacement consumer replays the retained source state");
+  });
+
+  test("retries a rejected state because only accepted states enter equality memory", () => {
+    const events = bus();
+    consumer(events, "pi-cmux-presence", "retry-state-epoch");
+    const value = producer(events);
+    seedWireOrdinalsForBoundaryTest(value, { sequence: -2 });
+    assert.equal(value.publish(snapshot([], [{ id: "active", status: "running" }])), false, "invalid state ordinal is rejected");
+    seedWireOrdinalsForBoundaryTest(value, { sequence: -1 });
+    assert.equal(value.publish(snapshot([], [{ id: "active", status: "running" }])), true, "the same rejected semantic state remains retryable");
+    const states = events.events.filter((event) => event.name === EVENT_NAMES.state);
+    assert.equal(states.length, 1);
+    assert.equal(states[0]!.payload.sequence, 0);
+  });
+
   test("assigns increasing state and terminal sequence plus private terminal dedupe ordinals", () => {
     const events = bus();
     consumer(events, "pi-cmux-presence", "terminal-epoch");
@@ -219,7 +252,8 @@ describe("V2 subagent presence producer", () => {
     assert.equal(state.subagents.failed, 1);
     assert.equal(state.subagents.omitted, 1);
 
-    assert.equal(value.publish(snapshot(recent)), true);
+    assert.equal(value.publish(snapshot(recent)), true, "the first failure attention edge is semantic");
+    assert.equal(value.publish(snapshot(recent)), false, "the subsequent exact state projection is suppressed");
     assert.equal(events.events.filter((event) => event.name === EVENT_NAMES.terminal).length, 4_096, "an unchanged 4097-terminal snapshot emits no terminal twice");
     state = events.events.filter((event) => event.name === EVENT_NAMES.state).at(-1)!.payload as { subagents: { completed: number; failed: number; omitted: number } };
     assert.equal(state.subagents.completed, 4_095);

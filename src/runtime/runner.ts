@@ -196,7 +196,7 @@ import {
   getSessionFileIdentity,
   type SessionFileIdentity,
 } from "./completion-v3.js";
-import { MAX_REAPER_GRAPH_ENTRIES, acquireReaperRootLock, acquireRunCleanupClaim, enumerateRunDirectories, planUnifiedReaperGraph, type ReaperCleanupClaim, type ReaperRootLock } from "./reaper-coordinator.js";
+import { MAX_REAPER_GRAPH_ENTRIES, MAX_REAPER_RUN_DIRECTORIES, acquireReaperRootLock, acquireRunCleanupClaim, enumerateRunDirectories, planUnifiedReaperGraph, type ReaperCleanupClaim, type ReaperRootLock } from "./reaper-coordinator.js";
 import {
   LifecycleEventServer,
   SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV,
@@ -2406,6 +2406,7 @@ export function forkSourceReconciliationFailureDiagnostic(error: unknown, shutdo
 }
 
 const GRAPH_ENTRY_CAP_DIAGNOSTIC = `reaper graph entry cap (${MAX_REAPER_GRAPH_ENTRIES}) exceeded; deferred all mutation`;
+const RUN_DIRECTORY_CAP_DIAGNOSTIC = `reaper run-directory cap (${MAX_REAPER_RUN_DIRECTORIES}) exceeded; deferred all mutation`;
 
 function graphEntryCapDiagnostic(): ReaperDiagnostic {
   return {
@@ -2413,6 +2414,15 @@ function graphEntryCapDiagnostic(): ReaperDiagnostic {
     code: "graph-entry-cap",
     message: "Reaper graph entry cap exceeded; all mutation was deferred.",
     details: { limit: MAX_REAPER_GRAPH_ENTRIES },
+  };
+}
+
+function runDirectoryCapDiagnostic(): ReaperDiagnostic {
+  return {
+    severity: "debug",
+    code: "run-directory-cap",
+    message: "Reaper run-directory cap exceeded; all mutation was deferred.",
+    details: { limit: MAX_REAPER_RUN_DIRECTORIES },
   };
 }
 
@@ -2429,6 +2439,11 @@ export interface ReapStaleInteractiveRunsResult {
 function recordGraphEntryCap(outcome: ReapStaleInteractiveRunsResult): void {
   outcome.diagnostic = GRAPH_ENTRY_CAP_DIAGNOSTIC;
   outcome.diagnostics.push(graphEntryCapDiagnostic());
+}
+
+function recordRunDirectoryCap(outcome: ReapStaleInteractiveRunsResult): void {
+  outcome.diagnostic = RUN_DIRECTORY_CAP_DIAGNOSTIC;
+  outcome.diagnostics.push(runDirectoryCapDiagnostic());
 }
 
 export async function reapStaleInteractiveRuns(options: {
@@ -2480,10 +2495,12 @@ export async function reapStaleInteractiveRuns(options: {
   if (ownerStartedAt === null) return outcome;
   const rootLock = internalContext?.rootLock ?? await acquireReaperRootLock(rootDir, `${process.pid}:${ownerStartedAt}`);
   if (!rootLock) return outcome;
+  let skipForkReconciliation = false;
   try {
   let entryNames = internalContext?.entries;
-  if (entryNames && entryNames.length > MAX_REAPER_GRAPH_ENTRIES) {
-    recordGraphEntryCap(outcome);
+  if (entryNames && entryNames.length > MAX_REAPER_RUN_DIRECTORIES) {
+    skipForkReconciliation = true;
+    recordRunDirectoryCap(outcome);
     return outcome;
   }
   if (!entryNames) {
@@ -2491,10 +2508,16 @@ export async function reapStaleInteractiveRuns(options: {
     const startupEntries = await enumeration.startup;
     const [remainingEntries, overflow] = await Promise.all([enumeration.completion, enumeration.overflow]);
     if (overflow) {
-      recordGraphEntryCap(outcome);
+      skipForkReconciliation = true;
+      recordRunDirectoryCap(outcome);
       return outcome;
     }
     entryNames = [...startupEntries, ...remainingEntries];
+    if (entryNames.length > MAX_REAPER_RUN_DIRECTORIES) {
+      skipForkReconciliation = true;
+      recordRunDirectoryCap(outcome);
+      return outcome;
+    }
   }
   // The reserved fork-source root has its own descriptor-bound recovery
   // protocol. It is not a run directory and must never be quarantined as one.
@@ -3366,7 +3389,7 @@ export async function reapStaleInteractiveRuns(options: {
     // Keep the root lock through both graphs: fork records may refer to a
     // just-reaped interactive run directory. Fork reconciliation is best
     // effort and never turns completed run cleanup into a false success.
-    if (!options.signal?.aborted) {
+    if (!options.signal?.aborted && !skipForkReconciliation) {
       try {
         const forkOutcome = await (options.reconcileForkSources ?? reconcileForkSourceOwnershipRoot)({
           stateRoot: rootDir,
@@ -3423,11 +3446,17 @@ export async function startStaleInteractiveReaper(
     // classify or mutate even the startup prefix when the graph is too large.
     if (overflow) {
       const overflowOutcome = { ...empty, diagnostics: [] };
-      recordGraphEntryCap(overflowOutcome);
+      recordRunDirectoryCap(overflowOutcome);
+      return overflowOutcome;
+    }
+    const entries = [...initial, ...remaining];
+    if (entries.length > MAX_REAPER_RUN_DIRECTORIES) {
+      const overflowOutcome = { ...empty, diagnostics: [] };
+      recordRunDirectoryCap(overflowOutcome);
       return overflowOutcome;
     }
     delegatedLock = true;
-    return await reapStaleInteractiveRuns({ ...options, signal: controller.signal, [INTERNAL_REAPER_CONTEXT]: { entries: [...initial, ...remaining], rootLock } });
+    return await reapStaleInteractiveRuns({ ...options, signal: controller.signal, [INTERNAL_REAPER_CONTEXT]: { entries, rootLock } });
   }).finally(async () => {
     if (!delegatedLock) await rootLock.release();
   });

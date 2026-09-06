@@ -133,7 +133,7 @@ describe("Pi cmux parent event contract", () => {
     assert.equal(JSON.stringify(payload).includes("private"), false);
   });
 
-  test("fences stale generations, emits each terminal invocation once, and resets session state", () => {
+  test("fences stale generations, suppresses exact dashboard bodies, and resets session state", () => {
     const emitted: Array<{ channel: string; payload: any }> = [];
     const publisher = createPiSubagentDashboardPublisher({
       emit: (channel, payload) => emitted.push({ channel, payload }),
@@ -150,9 +150,8 @@ describe("Pi cmux parent event contract", () => {
     assert.deepEqual(emitted.map((entry) => entry.channel), [
       PI_SUBAGENT_DASHBOARD_EVENT,
       PI_SUBAGENT_AGGREGATE_COMPLETED_EVENT,
-      PI_SUBAGENT_DASHBOARD_EVENT,
     ]);
-    assert.deepEqual(emitted.map((entry) => entry.payload.sequence), [1, 2, 3]);
+    assert.deepEqual(emitted.map((entry) => entry.payload.sequence), [1, 2]);
     assert.equal(publisher.rememberedTerminalCount, 1);
 
     publisher.startSession("session-2", 2);
@@ -160,6 +159,34 @@ describe("Pi cmux parent event contract", () => {
     assert.equal(emitted.at(-2)?.payload.sequence, 1);
     assert.equal(emitted.at(-1)?.channel, PI_SUBAGENT_AGGREGATE_COMPLETED_EVENT);
     assert.equal(publisher.rememberedTerminalCount, 1);
+  });
+
+  test("allocates dashboard sequences only for exact body changes and never suppresses terminals", () => {
+    const emitted: Array<{ channel: string; payload: any }> = [];
+    const publisher = createPiSubagentDashboardPublisher({
+      emit: (channel, payload) => emitted.push({ channel, payload }),
+      getSchedulerCounts: () => ({ active: 0, queued: 0 }),
+      getInteractiveActiveCount: () => 0,
+      now: () => 100,
+    });
+    publisher.startSession("session-1", 0);
+    assert.equal(publisher.publish(snapshot()), true);
+    assert.equal(publisher.publish(snapshot()), true);
+    assert.equal(publisher.publish({ ...snapshot(), active: [{ ...snapshot().active[0]!, updatedAt: 12 }] }), true);
+    assert.deepEqual(emitted.map((entry) => entry.payload.sequence), [1, 2], "unchanged bodies do not consume a sequence");
+
+    const incompleteTerminal = { ...terminalSnapshot(), recent: [{ ...terminalSnapshot().recent[0]!, completedAt: undefined }] };
+    assert.equal(publisher.publish(incompleteTerminal), true);
+    assert.equal(publisher.publish(terminalSnapshot()), true);
+    assert.deepEqual(emitted.slice(-2).map((entry) => [entry.channel, entry.payload.sequence]), [
+      [PI_SUBAGENT_DASHBOARD_EVENT, 3],
+      [PI_SUBAGENT_AGGREGATE_COMPLETED_EVENT, 4],
+    ], "a terminal publishes even when its canonical dashboard body is unchanged");
+
+    publisher.stop();
+    publisher.startSession("session-1", 0);
+    assert.equal(publisher.publish(snapshot()), true);
+    assert.equal(emitted.at(-1)?.payload.sequence, 1, "lifecycle reset clears dashboard equality memory");
   });
 
   test("publishes one session-fenced detached event with the shared sequence", () => {

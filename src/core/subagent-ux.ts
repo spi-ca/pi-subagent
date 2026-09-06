@@ -56,6 +56,12 @@ export interface SubagentUxCancelResult {
   readonly snapshot?: SubagentUxSnapshot;
 }
 
+/** A single partial observer update; omitted fields intentionally leave state unchanged. */
+export interface SubagentUxPartialUpdate {
+  readonly preview?: unknown;
+  readonly progress?: { readonly completed: number; readonly total: number };
+}
+
 export type SubagentsCommand =
   | { readonly kind: "list" }
   | { readonly kind: "doctor" }
@@ -253,29 +259,40 @@ export class SubagentUxRegistry {
     return Object.freeze({ found: true, changed: true, snapshot });
   }
 
-  updatePreview(id: string, value: unknown, generation = this.currentGeneration): SubagentUxSnapshot | undefined {
-    if (!this.isCurrentGeneration(generation)) return undefined;
-    const record = this.active.get(id) ?? this.recent.get(id);
+  /**
+   * Applies preview and determinate progress as one observer-visible heartbeat.
+   * Repeated valid values deliberately refresh `updatedAt`; malformed, stale,
+   * missing, or empty partials leave observers untouched.
+   */
+  updatePartial(id: string, value: SubagentUxPartialUpdate, generation = this.currentGeneration): SubagentUxSnapshot | undefined {
+    if (!this.isCurrentGeneration(generation) || !value || typeof value !== "object") return undefined;
+    const activeRecord = this.active.get(id);
+    const record = activeRecord ?? this.recent.get(id);
     if (!record) return undefined;
-    const preview = sanitizeSubagentPreview(value, 256);
-    if (!preview) return freezeSnapshot(record);
-    record.preview = preview;
-    record.updatedAt = validTimestamp(this.now());
+
+    const preview = value.preview === undefined ? undefined : sanitizeSubagentPreview(value.preview, 256);
+    const progress = value.progress;
+    if (progress !== undefined && (!activeRecord || !progress || typeof progress !== "object" || !Number.isSafeInteger(progress.completed) || !Number.isSafeInteger(progress.total)
+      || progress.total <= 0 || progress.completed < 0 || progress.completed > progress.total)) return undefined;
+    if (preview === undefined && progress === undefined) return freezeSnapshot(record);
+
+    const updatedAt = validTimestamp(this.now());
+    if (preview !== undefined) record.preview = preview;
+    if (progress !== undefined) record.progress = { completed: progress.completed, total: progress.total };
+    record.updatedAt = updatedAt;
     const snapshot = freezeSnapshot(record);
     this.emit();
     return snapshot;
   }
 
+  /** Compatibility wrapper for preview-only callers. */
+  updatePreview(id: string, value: unknown, generation = this.currentGeneration): SubagentUxSnapshot | undefined {
+    return this.updatePartial(id, { preview: value }, generation);
+  }
+
+  /** Compatibility wrapper for progress-only callers. */
   updateProgress(id: string, completed: number, total: number, generation = this.currentGeneration): SubagentUxSnapshot | undefined {
-    if (!this.isCurrentGeneration(generation) || !Number.isSafeInteger(completed) || !Number.isSafeInteger(total)
-      || total <= 0 || completed < 0 || completed > total) return undefined;
-    const record = this.active.get(id);
-    if (!record) return undefined;
-    record.progress = { completed, total };
-    record.updatedAt = validTimestamp(this.now());
-    const snapshot = freezeSnapshot(record);
-    this.emit();
-    return snapshot;
+    return this.updatePartial(id, { progress: { completed, total } }, generation);
   }
 
   complete(id: string, generation = this.currentGeneration): SubagentUxSnapshot | undefined {

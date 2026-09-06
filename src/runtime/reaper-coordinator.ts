@@ -11,7 +11,9 @@ const MAX_REAPER_ROOT_LOCK_BYTES = 16 * 1024;
 const MAX_REAPER_ROOT_LOCK_MALFORMED_AGE_MS = 60 * 60 * 1000;
 const MAX_REAPER_CLEANUP_CLAIM_BYTES = 16 * 1024;
 const MAX_REAPER_CLEANUP_OWNERS = 64;
-/** Whole-root graph planning must remain bounded even for hostile state roots. */
+/** Filesystem enumeration has a smaller cap than in-memory graph planning. */
+export const MAX_REAPER_RUN_DIRECTORIES = 10_000;
+/** Whole-root graph planning must remain bounded even for hostile supplied graphs. */
 export const MAX_REAPER_GRAPH_ENTRIES = 100_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_256_BIT_BASE64URL = /^[A-Za-z0-9_-]{43}$/;
@@ -588,15 +590,17 @@ export function enumerateRunDirectories(rootDir: string, options: RunDirectoryEn
 	const worker = (async () => {
 		let directory: fs.Dir | undefined;
 		let startupSettled = false;
+		let remaining: string[] | undefined;
+		let exceeded = false;
+		let failure: unknown;
 		try {
 			await assertSafeStateRoot(rootDir);
 			directory = await fs.promises.opendir(rootDir);
 			const initial: string[] = [];
-			const remaining: string[] = [];
+			remaining = [];
 			const deadline = startedAt + startupBudgetMs;
 			let startupEntriesRead = 0;
 			let directoriesRead = 0;
-			let exceeded = false;
 			let inStartup = true;
 			while (!cancelled) {
 				if (inStartup && (startupEntriesRead >= startupEntryBudget || now() >= deadline)) {
@@ -609,7 +613,7 @@ export function enumerateRunDirectories(rootDir: string, options: RunDirectoryEn
 				if (entry.isDirectory()) {
 					// Read one extra directory but never retain it: this proves that a
 					// complete graph cannot fit without allocating an unbounded root.
-					if (++directoriesRead > MAX_REAPER_GRAPH_ENTRIES) { exceeded = true; break; }
+					if (++directoriesRead > MAX_REAPER_RUN_DIRECTORIES) { exceeded = true; break; }
 					(inStartup ? initial : remaining).push(entry.name);
 				}
 				if (inStartup) startupEntriesRead += 1;
@@ -618,16 +622,24 @@ export function enumerateRunDirectories(rootDir: string, options: RunDirectoryEn
 				startupSettled = true;
 				resolveStartup(initial);
 			}
-			resolveCompletion(remaining);
-			resolveOverflow(exceeded);
 		} catch (error) {
-			if (!startupSettled) rejectStartup(error);
-			rejectCompletion(error);
-			rejectOverflow(error);
+			failure = error;
+			if (!startupSettled) {
+				startupSettled = true;
+				rejectStartup(error);
+			}
 		} finally {
-			// This worker is the exclusive owner, so close is invoked exactly once.
+			// This worker is the exclusive owner, so final public results and a
+			// production root-lock release happen only after close has drained.
 			if (directory) await Promise.resolve(directory.close()).catch(() => undefined);
 			settled = true;
+			if (failure !== undefined) {
+				rejectCompletion(failure);
+				rejectOverflow(failure);
+			} else {
+				resolveCompletion(remaining ?? []);
+				resolveOverflow(exceeded);
+			}
 		}
 	})();
 	// The worker itself handles its errors by rejecting the public promises.

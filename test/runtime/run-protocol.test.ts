@@ -822,7 +822,7 @@ describe("run protocol", () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
 		tempDirs.push(root);
 		const paths = await prepareRunArtifactPaths({ rootDir: root, runId: "deadline-expired" });
-		scheduleRunArtifactCleanup(paths.runDir, 60 * 60, Date.now() - 1);
+		assert.equal(scheduleRunArtifactCleanup(paths.runDir, 60 * 60, Date.now() - 1), true);
 		for (let attempt = 0; attempt < 100 && fs.existsSync(paths.runDir); attempt += 1) {
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
@@ -839,5 +839,15 @@ describe("run protocol", () => {
 		assert.equal(fs.existsSync(second.runDir), true);
 		await removeRunArtifacts(second);
 		assert.equal(fs.existsSync(root), true);
+	});
+
+	test("surfaces bounded artifact-cleanup capacity rejection without evicting retained work", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-capacity-"));
+		tempDirs.push(root);
+		const deadline = Date.now() + 1_000_000_000;
+		for (let index = 0; index < 10_000; index += 1) {
+			assert.equal(scheduleRunArtifactCleanup(path.join(root, `retained-${index}`), 0, deadline), true);
+		}
+		assert.equal(scheduleRunArtifactCleanup(path.join(root, "capacity-rejected"), 0, deadline), false);
 	});
 });

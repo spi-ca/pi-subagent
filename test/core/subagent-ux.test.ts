@@ -57,6 +57,42 @@ describe("SubagentUxRegistry", () => {
     assert.throws(() => registry.start({ id: "invalid-progress", agent: "worker", kind: "foreground", progressTotal: 0 }), /progressTotal/);
   });
 
+  test("updates preview and progress atomically while preserving heartbeat freshness", () => {
+    let now = 10;
+    const registry = new SubagentUxRegistry({ now: () => now, createId: () => "atomic" });
+    const job = registry.start({ agent: "worker", kind: "foreground" });
+    const observed: Array<ReturnType<typeof registry.snapshot>> = [];
+    registry.subscribe((value) => observed.push(value));
+
+    now = 11;
+    const first = registry.updatePartial(job.id, {
+      preview: "\x1b[31mworking\x1b[0m",
+      progress: { completed: 1, total: 3 },
+    })!;
+    assert.equal(first.updatedAt, 11);
+    assert.deepEqual(first.progress, { completed: 1, total: 3 });
+    assert.equal(first.preview, "working");
+    assert.equal(observed.length, 1, "one partial produces one immutable observer snapshot");
+    assert.ok(Object.isFrozen(observed[0]));
+    assert.equal(observed[0]!.active[0]!.updatedAt, 11);
+
+    now = 12;
+    const heartbeat = registry.updatePartial(job.id, {
+      preview: "working",
+      progress: { completed: 1, total: 3 },
+    })!;
+    assert.equal(heartbeat.updatedAt, 12, "repeated valid values remain a fresh heartbeat");
+    assert.equal(observed.length, 2);
+
+    assert.equal(registry.updatePartial(job.id, { progress: { completed: 4, total: 3 } }), undefined);
+    assert.equal(registry.updatePartial("missing", { preview: "working" }), undefined);
+    assert.equal(registry.updatePartial(job.id, { preview: "\n\t" })?.updatedAt, 12);
+    assert.equal(registry.updatePartial(job.id, {})?.updatedAt, 12);
+    assert.equal(registry.updatePartial(job.id, null as never), undefined);
+    assert.equal(registry.updatePartial(job.id, { preview: "working" }, registry.captureGeneration() + 1), undefined);
+    assert.equal(observed.length, 2, "invalid, missing, and stale partials do not emit");
+  });
+
   test("uses exact full IDs and makes cancellation idempotent", () => {
     let now = 1;
     const ids = ["full-id-one", "full-id-two"];

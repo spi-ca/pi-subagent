@@ -4,13 +4,13 @@ import * as path from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { GENERATED_BENCHMARK_EVIDENCE_FIXTURES, currentWorktreeSourceIdentity, type WorktreeSourceIdentity } from "./worktree-source-identity";
-import { acquireReaperRootLock, enumerateRunDirectories, planUnifiedReaperGraph } from "../../src/runtime/reaper-coordinator";
+import { MAX_REAPER_RUN_DIRECTORIES, acquireReaperRootLock, enumerateRunDirectories, planUnifiedReaperGraph } from "../../src/runtime/reaper-coordinator";
 import { startStaleInteractiveReaper } from "../../src/runtime/runner";
 import { prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 export const FIXTURE_PATH = path.join(ROOT, "test/fixtures/reaper-performance-baseline.json");
-export const DEFAULT_RUN_DIRECTORIES = 10_000;
+export const DEFAULT_RUN_DIRECTORIES = MAX_REAPER_RUN_DIRECTORIES;
 export const FILESYSTEM_OVERRIDE_RUN_DIRECTORIES = 100_000;
 export const GRAPH_NODE_COUNT = 100_000;
 export const STARTUP_BUDGET_MS = 200;
@@ -101,11 +101,14 @@ function isMetrics(value: unknown, runDirectories: number): value is Metrics {
 			|| !nonNegativeNumber(metric.value) || metric.unit !== METRIC_UNITS[name]) return false;
 	}
 	const metrics = value as unknown as Metrics;
-	return metrics.entryCount.value === runDirectories && metrics.duplicates.value === 0 && metrics.missing.value === 0
-		&& metrics.mutationBeforeGraphCount.value === 0 && metrics.classifiedCount.value === runDirectories
-		&& metrics.validationConcurrencyObserved.value >= 1 && metrics.validationConcurrencyObserved.value <= 8
-		&& metrics.validationConcurrencyObserved.value > 1 && metrics.cleanupConcurrencyObserved.value === 0
-		&& metrics.mutationCount.value === 0 && Number.isInteger(metrics.entryCount.value)
+	const overflowRun = runDirectories === FILESYSTEM_OVERRIDE_RUN_DIRECTORIES;
+	return metrics.entryCount.value === (overflowRun ? MAX_REAPER_RUN_DIRECTORIES : runDirectories)
+		&& metrics.duplicates.value === 0 && metrics.missing.value === (overflowRun ? runDirectories - MAX_REAPER_RUN_DIRECTORIES : 0)
+		&& metrics.mutationBeforeGraphCount.value === 0 && metrics.classifiedCount.value === (overflowRun ? 0 : runDirectories)
+		&& (overflowRun
+			? metrics.validationConcurrencyObserved.value === 0
+			: metrics.validationConcurrencyObserved.value > 1 && metrics.validationConcurrencyObserved.value <= 8)
+		&& metrics.cleanupConcurrencyObserved.value === 0 && metrics.mutationCount.value === 0 && Number.isInteger(metrics.entryCount.value)
 		&& Number.isInteger(metrics.duplicates.value) && Number.isInteger(metrics.missing.value)
 		&& Number.isInteger(metrics.mutationBeforeGraphCount.value) && Number.isInteger(metrics.classifiedCount.value)
 		&& Number.isInteger(metrics.validationConcurrencyObserved.value) && Number.isInteger(metrics.cleanupConcurrencyObserved.value)
@@ -265,15 +268,19 @@ async function measureReaperWorkload(root: string, runDirectories: number): Prom
 			try {
 				const startup = await enumeration.startup;
 				const startupLatencyMs = performance.now() - enumerationStarted;
-				const completion = await enumeration.completion;
+				const [completion, overflow] = await Promise.all([enumeration.completion, enumeration.overflow]);
 				const totalEnumerationMs = performance.now() - enumerationStarted;
 				await enumeration.cancelAndDrain();
 				iteratorDrained = true;
 				const entries = [...startup, ...completion];
 				const unique = new Set(entries);
 				const duplicates = entries.length - unique.size;
+				const expectedOverflow = runDirectories === FILESYSTEM_OVERRIDE_RUN_DIRECTORIES;
+				const expectedEntries = expectedOverflow ? MAX_REAPER_RUN_DIRECTORIES : runDirectories;
 				const missing = runDirectories - unique.size;
-				if (duplicates !== 0 || missing !== 0) throw new Error("benchmark enumeration did not produce an exact run-directory set");
+				if (duplicates !== 0 || overflow !== expectedOverflow || unique.size !== expectedEntries) {
+					throw new Error("benchmark enumeration did not produce the expected bounded run-directory result");
+				}
 				const graphNodes = Array.from({ length: GRAPH_NODE_COUNT }, (_, index) => ({ runId: `graph-${index}`, ...(index === 0 ? {} : { parentRunId: `graph-${index - 1}` }) }));
 				const graphStarted = performance.now();
 				const graph = planUnifiedReaperGraph(graphNodes);
@@ -302,10 +309,13 @@ async function measureReaperWorkload(root: string, runDirectories: number): Prom
 				const startupReturnMs = performance.now() - classificationStarted;
 				const classification = await reaper.completion;
 				const fullClassificationMs = performance.now() - classificationStarted;
-				if (classification.scanned !== runDirectories || classification.skipped.length !== runDirectories
-					|| classification.invalid.length !== 0 || classification.reaped.length !== 0
-					|| scheduleCleanupCalls !== 0 || multiplexerCalls !== 0) {
-					throw new Error("benchmark production reaper classification was not mutation-free");
+				const unexpectedClassification = expectedOverflow
+					? classification.scanned !== 0 || classification.skipped.length !== 0 || classification.invalid.length !== 0
+						|| classification.reaped.length !== 0 || classification.diagnostics[0]?.code !== "run-directory-cap"
+					: classification.scanned !== runDirectories || classification.skipped.length !== runDirectories
+						|| classification.invalid.length !== 0 || classification.reaped.length !== 0;
+				if (unexpectedClassification || scheduleCleanupCalls !== 0 || multiplexerCalls !== 0) {
+					throw new Error("benchmark production reaper classification was not the expected mutation-free result");
 				}
 				await new Promise<void>((resolve) => setTimeout(resolve, 0));
 				peakRss = Math.max(peakRss, process.memoryUsage().rss);

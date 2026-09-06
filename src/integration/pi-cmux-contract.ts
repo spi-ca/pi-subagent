@@ -258,6 +258,8 @@ export class PiSubagentDashboardPublisher {
   private readonly rememberedTerminalLimit: number;
   private readonly rememberedTerminalIds = new Map<string, true>();
   private readonly detachedRunIds = new Set<string>();
+  /** Canonical externally visible dashboard body, without its envelope ordinals. */
+  private lastDashboardBody: string | null = null;
   private sessionId: string | null = null;
   private generation: number | null = null;
   private sequence = 0;
@@ -282,6 +284,7 @@ export class PiSubagentDashboardPublisher {
     this.sessionId = sessionId;
     this.generation = generation;
     this.sequence = 0;
+    this.lastDashboardBody = null;
     this.rememberedTerminalIds.clear();
     this.detachedRunIds.clear();
   }
@@ -289,6 +292,7 @@ export class PiSubagentDashboardPublisher {
   stop(): void {
     this.sessionId = null;
     this.generation = null;
+    this.lastDashboardBody = null;
     this.rememberedTerminalIds.clear();
     this.detachedRunIds.clear();
   }
@@ -310,17 +314,31 @@ export class PiSubagentDashboardPublisher {
       schedulerQueued: scheduler.queued,
       interactiveActive: this.safeInteractiveActiveCount(),
     };
-    const dashboard: PiSubagentDashboardPayload = {
+    const body = JSON.stringify({
       version: 1,
       sessionId: this.sessionId,
       generation: this.generation,
-      sequence: this.nextSequence(),
-      emittedAt: this.safeNow(),
       counts,
       active,
-    };
-    if (isPiSubagentDashboardPayload(dashboard)) this.emitSafely(PI_SUBAGENT_DASHBOARD_EVENT, dashboard);
+    });
+    if (body !== this.lastDashboardBody) {
+      const dashboard: PiSubagentDashboardPayload = {
+        version: 1,
+        sessionId: this.sessionId,
+        generation: this.generation,
+        sequence: this.nextSequence(),
+        emittedAt: this.safeNow(),
+        counts,
+        active,
+      };
+      if (isPiSubagentDashboardPayload(dashboard)) {
+        this.lastDashboardBody = body;
+        this.emitSafely(PI_SUBAGENT_DASHBOARD_EVENT, dashboard);
+      }
+    }
 
+    // Terminal notifications have their own lifecycle and never inherit
+    // dashboard equality suppression.
     for (const item of snapshot.recent) {
       const invocation = aggregateInvocationFromSnapshot(item);
       if (!invocation || this.rememberedTerminalIds.has(invocation.id)) continue;

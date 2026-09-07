@@ -79,12 +79,28 @@ describe("V2 subagent presence producer", () => {
       { id: "a", status: "running", progress: { completed: 1, total: 2 } },
       { id: "b", status: "cancelling", progress: { completed: 2, total: 3 } },
     ]));
-    const state = events.events.find((event) => event.name === EVENT_NAMES.state)!.payload;
-    assert.deepEqual(state, {
-      version: 2, sessionEpoch: validEpoch("structured-epoch"), generation: 0, sequence: 0, source: "subagent", state: "running",
-      progress: { completed: 3, total: 5 },
-      subagents: { running: 1, cancelling: 1, queued: 3, completed: 0, failed: 0, cancelled: 0, omitted: 0 },
-    });
+    const state = events.events.find((event) => event.name === EVENT_NAMES.state)!.payload as Extract<PresenceEventV2, { state: string }>;
+    // The shared protocol deliberately returns canonical null-prototype DTOs.
+    // Assert the received object directly: cloning would hide its wire identity.
+    assert.deepEqual(Object.keys(state).sort(), ["generation", "progress", "sequence", "sessionEpoch", "source", "state", "subagents", "version"]);
+    assert.equal(state.version, 2);
+    assert.equal(state.sessionEpoch, validEpoch("structured-epoch"));
+    assert.equal(state.generation, 0);
+    assert.equal(state.sequence, 0);
+    assert.equal(state.source, "subagent");
+    assert.equal(state.state, "running");
+    assert.deepEqual(Object.keys(state.progress!).sort(), ["completed", "total"]);
+    assert.equal(state.progress!.completed, 3);
+    assert.equal(state.progress!.total, 5);
+    assert.ok(state.subagents);
+    assert.deepEqual(Object.keys(state.subagents).sort(), ["cancelled", "cancelling", "completed", "failed", "omitted", "queued", "running"]);
+    assert.equal(state.subagents.running, 1);
+    assert.equal(state.subagents.cancelling, 1);
+    assert.equal(state.subagents.queued, 3);
+    assert.equal(state.subagents.completed, 0);
+    assert.equal(state.subagents.failed, 0);
+    assert.equal(state.subagents.cancelled, 0);
+    assert.equal(state.subagents.omitted, 0);
   });
 
   test("suppresses only exact accepted state projections and clears equality at lifecycle boundaries", () => {
@@ -131,7 +147,9 @@ describe("V2 subagent presence producer", () => {
     const terminals = observed.filter((event) => event.name === EVENT_NAMES.terminal).map((event) => event.payload as Extract<PresenceEventV2, { eventId: number }>);
     assert.deepEqual(terminals.map((event) => [event.eventId, event.outcome]), [[0, "failed"], [1, "completed"]]);
     const failureState = observed.find((event) => event.name === EVENT_NAMES.state)!.payload as Extract<PresenceEventV2, { state: string }>;
-    assert.deepEqual(failureState.attention, { reason: "failure", occurrence: "new" });
+    assert.deepEqual(Object.keys(failureState.attention!).sort(), ["occurrence", "reason"]);
+    assert.equal(failureState.attention!.reason, "failure");
+    assert.equal(failureState.attention!.occurrence, "new");
   });
 
   test("replays retained state for consumer-first and producer-first consumers without replaying terminals", () => {
@@ -145,7 +163,10 @@ describe("V2 subagent presence producer", () => {
     assert.equal(herdr.length, 1, "a late consumer receives one retained state");
     assert.equal(herdr[0]!.sessionEpoch, validEpoch("herdr-epoch"));
     assert.equal("eventId" in herdr[0]!, false, "terminals are live-only");
-    assert.deepEqual((herdr[0] as Extract<PresenceEventV2, { state: string }>).attention, { reason: "failure", occurrence: "retained" });
+    const attention = (herdr[0] as Extract<PresenceEventV2, { state: string }>).attention!;
+    assert.deepEqual(Object.keys(attention).sort(), ["occurrence", "reason"]);
+    assert.equal(attention.reason, "failure");
+    assert.equal(attention.occurrence, "retained");
   });
 
   test("settles from the cached UX aggregate, then reopens with a higher wire generation", () => {

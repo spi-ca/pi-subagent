@@ -16,6 +16,7 @@ import {
 	main,
 	parseArgs,
 	preflightReaperPerformance,
+	recordLocalBenchmark,
 	validateReaperPerformanceEvidence,
 	verifyCurrentReaperPerformanceEvidence,
 	writePrivateEvidence,
@@ -109,18 +110,17 @@ describe("reaper Phase 7 local performance benchmark", () => {
 		assert.equal(validateReaperPerformanceEvidence(fixture), false);
 	});
 
-	test("binds the local baseline to the current worktree and rejects identity mismatches", async () => {
-		const fixture = JSON.parse(await fs.promises.readFile(FIXTURE_PATH, "utf8"));
-		assert.equal(verifyCurrentReaperPerformanceEvidence(fixture), true);
-		const mismatch = structuredClone(fixture);
-		mismatch.environment.sourceDirty = !fixture.environment.sourceDirty;
+	test("binds fresh synthetic evidence to the current worktree and rejects identity mismatches", { timeout: 20_000 }, async () => {
+		const fresh = await recordLocalBenchmark();
+		assert.equal(verifyCurrentReaperPerformanceEvidence(fresh), true);
+		const mismatch = structuredClone(fresh);
+		mismatch.environment.sourceDirty = !fresh.environment.sourceDirty;
 		assert.equal(verifyCurrentReaperPerformanceEvidence(mismatch), false);
 	});
 
-	test("dry-run and strict verify do not mutate the persisted fixture", async () => {
+	test("ordinary unit CI dry-runs without invoking the retained-evidence gate", async () => {
 		const before = await fs.promises.readFile(FIXTURE_PATH, "utf8");
 		await main(["--dry-run"]);
-		await main(["--verify"]);
 		assert.equal(await fs.promises.readFile(FIXTURE_PATH, "utf8"), before);
 		assert.equal(parseArgs(["--record-local"]), "record-local");
 		assert.throws(() => parseArgs(["--live"]), /usage/);

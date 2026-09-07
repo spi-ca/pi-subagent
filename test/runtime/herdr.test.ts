@@ -35,6 +35,9 @@ async function serverFor(handler: (request: Record<string, unknown>, socket: net
 	const sockets = new Set<net.Socket>();
 	const server = net.createServer((socket) => {
 		sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+		// A deliberately delayed fixture response may race client teardown on
+		// Bun 1.4.2; consume the server-side EPIPE without masking assertions.
+		socket.on("error", () => undefined);
 		let input = "";
 		socket.on("data", (chunk) => {
 			input += chunk.toString("utf8");

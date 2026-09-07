@@ -1,6 +1,8 @@
 export interface JsonLineChunkProcessor {
   pushChunk(chunk: string): void;
   flushRemainder(): void;
+  /** Drop an incomplete record after a transport limit failure. */
+  discardRemainder(): void;
 }
 
 export function createJsonLineChunkProcessor(onLine: (line: string) => void): JsonLineChunkProcessor {
@@ -25,6 +27,9 @@ export function createJsonLineChunkProcessor(onLine: (line: string) => void): Js
         flushText(buffer);
         buffer = "";
       }
+    },
+    discardRemainder() {
+      buffer = "";
     },
   };
 }

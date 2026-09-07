@@ -20,6 +20,27 @@ const workspaceId = "123e4567-e89b-12d3-a456-426614174000";
 const surfaceId = "123e4567-e89b-12d3-a456-426614174010";
 const paneId = "123e4567-e89b-12d3-a456-426614174011";
 
+function resolveNativeCompiler(): string | null {
+	const candidates = [process.env.CC?.trim(), "cc", "clang", "gcc"].filter((value): value is string => Boolean(value));
+	for (const candidate of new Set(candidates)) {
+		const probe = spawnSync(candidate, ["--version"], { encoding: "utf8" });
+		if (probe.status === 0 && !probe.error) return candidate;
+	}
+	return null;
+}
+
+const nativeCompiler = resolveNativeCompiler();
+if (!nativeCompiler) {
+	throw new Error("Native broker tests require a working C compiler. Set CC to an executable compiler path or install one of cc, clang, or gcc; native executable assertions are intentionally not skipped.");
+}
+
+function compileNativeFixture(source: string, binary: string): void {
+	const compiler = nativeCompiler;
+	if (!compiler) throw new Error("Native broker test compiler preflight did not complete.");
+	const compilation = spawnSync(compiler, [source, "-o", binary], { encoding: "utf8" });
+	assert.equal(compilation.status, 0, `Native fixture compilation failed with ${compiler}: ${compilation.stderr || compilation.error?.message || "unknown compiler error"}`);
+}
+
 async function nativeMock(root: string, splitResponse = JSON.stringify({ workspace_id: workspaceId, surface_id: surfaceId, pane_id: paneId }), splitExitCode = 0, targetWorkspaceId = workspaceId): Promise<string> {
 	const source = path.join(root, "mock.c"), binary = path.join(root, "cmux");
 	const preTree = JSON.stringify({ windows: [{ workspaces: [{ id: workspaceId, panes: [{ id: sourcePaneId, surfaces: [{ id: sourceSurfaceId, pane_id: sourcePaneId }] }] }] }] });
@@ -30,7 +51,7 @@ async function nativeMock(root: string, splitResponse = JSON.stringify({ workspa
 #include <unistd.h>
 #include <stdlib.h>
 int main(int n,char**v){int split=0,tree=0,close=0,allocated=0;for(int i=1;i<n;i++){if(!strcmp(v[i],"new-split"))split=1;if(!strcmp(v[i],"tree"))tree=1;if(!strcmp(v[i],"close-surface"))close=1;}const char*l=getenv("CMUX_SOCKET_PATH");if(l){FILE*f=fopen(l,"a");if(f){extern char**environ;fprintf(f,"node=%s bun=%s\\n",getenv("NODE_OPTIONS")?:"",getenv("BUN_OPTIONS")?:"");for(char**e=environ;*e;e++)fprintf(f,"env=%s\\n",*e);for(int i=1;i<n;i++)fprintf(f,"%s ",v[i]);fprintf(f,"\\n");fclose(f);}if(tree){FILE*r=fopen(l,"r");char b[256];while(r&&fgets(b,sizeof b,r)){if(strstr(b,"close-surface"))close=1;if(strstr(b,"new-split"))allocated=1;}if(r)fclose(r);}}if(split){sleep(1);puts(${JSON.stringify(splitResponse)});return ${splitExitCode};}else if(tree)puts(close?${JSON.stringify(absentTree)}:(allocated?${JSON.stringify(presentTree)}:${JSON.stringify(preTree)}));return 0;}`);
-	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
+	compileNativeFixture(source, binary);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
 }
@@ -47,7 +68,7 @@ async function nativeCmuxLayoutMock(root: string, log: string, options: { split?
 	const split = options.split ?? JSON.stringify({ workspace_id: workspaceId, surface_id: surfaceId, pane_id: allocatedPaneId });
 	const surface = options.surface ?? JSON.stringify({ workspace_id: workspaceId, surface_id: surfaceId, pane_id: paneId });
 	await fs.promises.writeFile(source, `#include <stdio.h>\n#include <string.h>\nint main(int n,char**v){int split=0,surface=0,tree=0;for(int i=1;i<n;i++){split|=!strcmp(v[i],"new-split");surface|=!strcmp(v[i],"new-surface");tree|=!strcmp(v[i],"tree");}FILE*f=fopen(${JSON.stringify(log)},"a");if(f){for(int i=1;i<n;i++)fprintf(f,"%s ",v[i]);fputc('\\n',f);fclose(f);}if(tree){puts(${JSON.stringify(tree)});return 0;}if(split){puts(${JSON.stringify(split)});return ${options.splitCode ?? 0};}if(surface){puts(${JSON.stringify(surface)});return ${options.surfaceCode ?? 0};}return 0;}`);
-	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
+	compileNativeFixture(source, binary);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
 }
@@ -82,7 +103,7 @@ async function nativeTmuxMock(root: string, defaultShell: string, log: string, s
 #include <string.h>
 #include <stdlib.h>
 int main(int n,char**v){int show=0,display=0,list=0,split=0,topology=0;for(int i=1;i<n;i++){show|=!strcmp(v[i],"show-options");display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");split|=!strcmp(v[i],"split-window")||!strcmp(v[i],"new-window");topology|=strstr(v[i],"session_id")!=0;}FILE*f=fopen(${JSON.stringify(log)},"a");if(f){for(int i=1;i<n;i++)fprintf(f,"%s ",v[i]);fputc('\\n',f);fclose(f);}if(split){puts(${JSON.stringify(splitResponse)});return ${splitExitCode};}else if(show)puts(${JSON.stringify(defaultShell)});else if(display){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_SERVER_PID");puts(pid?pid:"123");}else if(list){puts(topology?${JSON.stringify(topologyResponse)}:${JSON.stringify(paneListResponse)});return topology?${topologyExitCode}:0;}return 0;}`);
-	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
+	compileNativeFixture(source, binary);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
 }
@@ -94,7 +115,7 @@ async function nativeTmuxGateMock(root: string): Promise<string> {
 #include <unistd.h>
 #include <stdlib.h>
 int main(int n,char**v){int display=0,list=0;for(int i=1;i<n;i++){display|=!strcmp(v[i],"display-message");list|=!strcmp(v[i],"list-panes");}if(display){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_SERVER_PID");puts(pid?pid:"123");return 0;}if(list){const char*pid=getenv("PI_SUBAGENT_TEST_TMUX_PANE_PID");if(pid)printf("%%2|%s\\n",pid);else printf("%%2|%ld\\n",(long)getppid());return 0;}return 1;}`);
-	assert.equal(spawnSync("/usr/bin/cc", [source, "-o", binary]).status, 0);
+	compileNativeFixture(source, binary);
 	await fs.promises.chmod(binary, 0o700);
 	return binary;
 }

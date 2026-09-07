@@ -18,6 +18,7 @@ const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const EVENT_TYPES = new Set(["agent-started", "agent-ended", "agent-settled", "completion-ready", "shutdown", "heartbeat"]);
 const CONTROL_TYPES = new Set(["abort"]);
+const CURRENT_UID = BigInt(process.getuid?.() ?? -1);
 
 export interface LifecycleEvent {
 	version: 1;
@@ -90,45 +91,106 @@ async function safeTemporaryRoot(): Promise<string> {
 	return candidate;
 }
 
+type LifecycleStartupOperations = {
+	lstat?: typeof fs.lstat;
+	chmod?: typeof fs.chmod;
+	open?: typeof fs.open;
+	createServer?: typeof net.createServer;
+	afterMkdtemp?: (directory: string) => void | Promise<void>;
+};
+
 export class LifecycleEventServer {
 	readonly socketPath: string;
 	readonly directory: string;
-	private readonly generation: string;
+	private generation: string | null = null;
 	private readonly markerPath: string;
-	private readonly server: net.Server;
+	private server: net.Server | null = null;
 	private readonly runs = new Map<string, RunRegistration>();
 	private socketIdentity: { dev: bigint; ino: bigint } | null = null;
+	private directoryIdentity: { dev: bigint; ino: bigint } | null = null;
+	private markerIdentity: { dev: bigint; ino: bigint } | null = null;
 	private connections = 0;
+	/** Includes unauthenticated peers so close never waits on a hostile reader. */
+	private readonly connectionsSet = new Set<net.Socket>();
 	private closed = false;
 
-	private constructor(directory: string, generation: string, server: net.Server) {
+	private constructor(directory: string) {
 		this.directory = directory;
 		this.socketPath = path.join(directory, "events.sock");
 		this.markerPath = path.join(directory, "generation");
-		this.generation = generation;
-		this.server = server;
 	}
 
-	static async start(): Promise<LifecycleEventServer> {
+	static async start(operations: LifecycleStartupOperations = {}): Promise<LifecycleEventServer> {
 		if (process.platform === "win32") throw new Error("Lifecycle Unix sockets are unavailable on Windows.");
-		const root = await safeTemporaryRoot();
-		const directory = await fs.mkdtemp(path.join(root, ".pi-se-"));
-		await fs.chmod(directory, 0o700);
-		const generation = crypto.randomBytes(32).toString("base64url");
-		const server = net.createServer();
-		const instance = new LifecycleEventServer(directory, generation, server);
-		await fs.writeFile(instance.markerPath, `${generation}\n`, { mode: 0o600, flag: "wx" });
-		server.on("connection", (socket) => instance.accept(socket));
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(instance.socketPath, () => { server.off("error", reject); resolve(); });
-		});
-		await fs.chmod(instance.socketPath, 0o600);
-		await validateSocketPath(instance.socketPath);
-		const stats = await fs.lstat(instance.socketPath, { bigint: true });
-		if (!stats.isSocket()) { await instance.close(); throw new Error("Lifecycle socket bind did not create a socket."); }
-		instance.socketIdentity = { dev: stats.dev, ino: stats.ino };
-		return instance;
+		const lstat = operations.lstat ?? fs.lstat;
+		const chmod = operations.chmod ?? fs.chmod;
+		const open = operations.open ?? fs.open;
+		const createServer = operations.createServer ?? net.createServer;
+		let instance: LifecycleEventServer | null = null;
+		try {
+			const root = await safeTemporaryRoot();
+			const directory = await fs.mkdtemp(path.join(root, ".pi-se-"));
+			// Arm failure cleanup as soon as mkdtemp returns. If its first identity
+			// probe fails, cleanup intentionally retains the directory: pathname-only
+			// I/O cannot prove an unrecorded artifact still belongs to this startup.
+			instance = new LifecycleEventServer(directory);
+			await operations.afterMkdtemp?.(directory);
+			const initialDirectoryStats = await lstat(directory, { bigint: true });
+			instance.directoryIdentity = { dev: initialDirectoryStats.dev, ino: initialDirectoryStats.ino };
+			instance.generation = crypto.randomBytes(32).toString("base64url");
+			const server = createServer();
+			instance.server = server;
+			await chmod(directory, 0o700);
+			const directoryStats = await lstat(directory, { bigint: true });
+			if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || directoryStats.uid !== CURRENT_UID || (directoryStats.mode & 0o777n) !== 0o700n
+				|| directoryStats.dev !== instance.directoryIdentity.dev || directoryStats.ino !== instance.directoryIdentity.ino) {
+				throw new Error("Lifecycle socket directory setup is unsafe.");
+			}
+			let markerHandle: fs.FileHandle | null = null;
+			try {
+				markerHandle = await open(instance.markerPath, fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | (fsSync.constants.O_NOFOLLOW ?? 0), 0o600);
+				const markerBeforeWrite = await markerHandle.stat({ bigint: true });
+				if (!markerBeforeWrite.isFile() || markerBeforeWrite.uid !== CURRENT_UID || (markerBeforeWrite.mode & 0o777n) !== 0o600n) {
+					throw new Error("Lifecycle socket generation marker setup is unsafe.");
+				}
+				// This identity makes a partially written marker eligible for startup
+				// cleanup; normal close additionally validates its generation content.
+				instance.markerIdentity = { dev: markerBeforeWrite.dev, ino: markerBeforeWrite.ino };
+				await markerHandle.writeFile(`${instance.generation}\n`);
+				const markerAfterWrite = await markerHandle.stat({ bigint: true });
+				if (!markerAfterWrite.isFile() || markerAfterWrite.uid !== CURRENT_UID || (markerAfterWrite.mode & 0o777n) !== 0o600n
+					|| markerAfterWrite.dev !== instance.markerIdentity.dev || markerAfterWrite.ino !== instance.markerIdentity.ino) {
+					throw new Error("Lifecycle socket generation marker changed during setup.");
+				}
+				await chmod(instance.markerPath, 0o600);
+				const markerPathStats = await lstat(instance.markerPath, { bigint: true });
+				if (!markerPathStats.isFile() || markerPathStats.isSymbolicLink() || markerPathStats.uid !== CURRENT_UID || (markerPathStats.mode & 0o777n) !== 0o600n
+					|| markerPathStats.dev !== instance.markerIdentity.dev || markerPathStats.ino !== instance.markerIdentity.ino) {
+					throw new Error("Lifecycle socket generation marker setup is unsafe.");
+				}
+			} finally {
+				if (markerHandle) await markerHandle.close();
+			}
+			server.on("connection", (socket) => instance!.accept(socket));
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(instance!.socketPath, () => { server.off("error", reject); resolve(); });
+			});
+			const stats = await lstat(instance.socketPath, { bigint: true });
+			if (!stats.isSocket()) throw new Error("Lifecycle socket bind did not create a socket.");
+			// Capture the listener generation before post-listen chmod/authority
+			// checks so every startup failure can close its own listener safely.
+			instance.socketIdentity = { dev: stats.dev, ino: stats.ino };
+			await chmod(instance.socketPath, 0o600);
+			await validateSocketPath(instance.socketPath);
+			return instance;
+		} catch (error) {
+			if (instance) {
+				if (instance.socketIdentity) await instance.close().catch(() => undefined);
+				else await instance.cleanupStartupFailure().catch(() => undefined);
+			}
+			throw error;
+		}
 	}
 
 	registerRun(runId: string): string {
@@ -194,6 +256,7 @@ export class LifecycleEventServer {
 	private accept(socket: net.Socket): void {
 		if (this.closed || this.connections >= MAX_CONNECTIONS) { socket.destroy(); return; }
 		this.connections += 1;
+		this.connectionsSet.add(socket);
 		let buffer = Buffer.alloc(0);
 		let authenticated: { runId: string; run: RunRegistration } | null = null;
 		const helloTimer = setTimeout(() => socket.destroy(), HELLO_TIMEOUT_MS);
@@ -252,6 +315,7 @@ export class LifecycleEventServer {
 		const ended = () => {
 			clearTimeout(helloTimer);
 			this.connections = Math.max(0, this.connections - 1);
+			this.connectionsSet.delete(socket);
 			if (authenticated?.run.socket === socket) {
 				authenticated.run.socket = null;
 				authenticated.run.active = false;
@@ -263,21 +327,110 @@ export class LifecycleEventServer {
 		socket.once("error", () => undefined);
 	}
 
+	private async validateStartupMarkerIdentity(): Promise<void> {
+		const markerStats = await fs.lstat(this.markerPath, { bigint: true });
+		if (!this.markerIdentity || !markerStats.isFile() || markerStats.isSymbolicLink()
+			|| markerStats.uid !== CURRENT_UID || (markerStats.mode & 0o777n) !== 0o600n
+			|| markerStats.dev !== this.markerIdentity.dev || markerStats.ino !== this.markerIdentity.ino) {
+			throw new Error("Lifecycle socket startup marker authority changed.");
+		}
+	}
+
+	private async validateCleanupGenerationAuthority(): Promise<void> {
+		const [directory, marker, markerStats] = await Promise.all([
+			fs.lstat(this.directory, { bigint: true }), fs.readFile(this.markerPath, "utf8"), fs.lstat(this.markerPath, { bigint: true }),
+		]);
+		if (!this.generation || !this.directoryIdentity || !this.markerIdentity || !directory.isDirectory() || directory.isSymbolicLink()
+			|| directory.uid !== CURRENT_UID || (directory.mode & 0o777n) !== 0o700n
+			|| directory.dev !== this.directoryIdentity.dev || directory.ino !== this.directoryIdentity.ino
+			|| marker !== `${this.generation}\n` || !markerStats.isFile() || markerStats.isSymbolicLink()
+			|| markerStats.uid !== CURRENT_UID || (markerStats.mode & 0o777n) !== 0o600n
+			|| markerStats.dev !== this.markerIdentity.dev || markerStats.ino !== this.markerIdentity.ino) {
+			throw new Error("Lifecycle socket cleanup authority changed.");
+		}
+	}
+
+	/** Cleanup before a listener identity exists; uncertain artifacts are retained. */
+	private async cleanupStartupFailure(): Promise<void> {
+		this.closed = true;
+		const server = this.server;
+		// Do not invoke native close for a listener whose pathname identity was
+		// never captured: Bun/Node close may unlink a replacement occupant.
+		if (server && !server.listening) {
+			try { await new Promise<void>((resolve) => server.close(() => resolve())); }
+			catch { /* a pre-listen close has no pathname cleanup authority */ }
+		}
+		const directory = await fs.lstat(this.directory, { bigint: true });
+		if (!this.directoryIdentity || !directory.isDirectory() || directory.isSymbolicLink()
+			|| directory.uid !== CURRENT_UID || (directory.mode & 0o777n) !== 0o700n
+			|| directory.dev !== this.directoryIdentity.dev || directory.ino !== this.directoryIdentity.ino) {
+			throw new Error("Lifecycle socket startup cleanup authority changed.");
+		}
+		if (this.markerIdentity) {
+			// A fstat identity captured before marker write proves the partial file;
+			// do not require generation content until successful normal cleanup.
+			await this.validateStartupMarkerIdentity();
+			await fs.unlink(this.markerPath);
+		} else if (await fs.lstat(this.markerPath).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error))) {
+			throw new Error("Lifecycle socket startup marker authority is unavailable.");
+		}
+		await fs.rmdir(this.directory);
+	}
+
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		const server = this.server;
+		if (!server) throw new Error("Lifecycle socket listener was never created.");
 		for (const runId of [...this.runs.keys()]) this.terminalRun(runId);
-		await new Promise<void>((resolve) => this.server.close(() => resolve()));
-		const [directory, marker, markerStats, socket] = await Promise.all([
-			fs.lstat(this.directory), fs.readFile(this.markerPath, "utf8"), fs.lstat(this.markerPath), fs.lstat(this.socketPath, { bigint: true }).catch(() => null),
-		]);
-		if (!directory.isDirectory() || directory.isSymbolicLink() || (directory.mode & 0o777) !== 0o700 || directory.uid !== process.getuid?.()
-			|| marker !== `${this.generation}\n` || !markerStats.isFile() || markerStats.isSymbolicLink() || markerStats.uid !== process.getuid?.() || (markerStats.mode & 0o777) !== 0o600
-			|| !socket?.isSocket() || !this.socketIdentity
-			|| socket.dev !== this.socketIdentity.dev || socket.ino !== this.socketIdentity.ino) {
-			throw new Error("Lifecycle socket cleanup authority changed.");
+		for (const socket of this.connectionsSet) socket.destroy();
+
+		let authorityChanged = false;
+		let unlinkedOwnedSocket = false;
+		let foreignPath: string | null = null;
+		try {
+			// Directory and marker generations are authority too: prove all three
+			// identities before mutating the socket pathname.
+			await this.validateCleanupGenerationAuthority();
+			await validateSocketPath(this.socketPath);
+			const before = await fs.lstat(this.socketPath, { bigint: true });
+			if (!before.isSocket() || !this.socketIdentity || before.dev !== this.socketIdentity.dev || before.ino !== this.socketIdentity.ino) {
+				authorityChanged = true;
+			} else {
+				// Best-effort unlink after checking our generation. A same-UID peer
+				// can still replace this pathname before unlink or native close; the
+				// platform exposes no inode-bound close/unlink operation.
+				await fs.unlink(this.socketPath);
+				unlinkedOwnedSocket = true;
+			}
+		} catch {
+			authorityChanged = true;
 		}
-		await fs.unlink(this.socketPath);
+
+		if (authorityChanged) {
+			// The test/runtime probe confirms Bun's close auto-unlink behavior.
+			// Move the observed foreign pathname aside before closing the owned
+			// listener, then restore it without overwriting any newer occupant.
+			foreignPath = path.join(this.directory, `.foreign-events-${crypto.randomBytes(16).toString("hex")}`);
+			try { await fs.rename(this.socketPath, foreignPath); }
+			catch { foreignPath = null; }
+		}
+
+		try {
+			await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+		} finally {
+			for (const socket of this.connectionsSet) socket.destroy();
+		}
+
+		if (foreignPath) {
+			try {
+				const current = await fs.lstat(this.socketPath).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : Promise.reject(error));
+				if (!current) await fs.rename(foreignPath, this.socketPath);
+			} catch { /* retain the foreign artifact rather than overwrite it */ }
+		}
+		if (authorityChanged || !unlinkedOwnedSocket) throw new Error("Lifecycle socket cleanup authority changed.");
+
+		await this.validateCleanupGenerationAuthority();
 		await fs.unlink(this.markerPath);
 		await fs.rmdir(this.directory);
 	}

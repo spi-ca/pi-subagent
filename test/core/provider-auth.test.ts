@@ -7,11 +7,12 @@ import {
 } from "../../src/core/provider-auth";
 
 describe("documented provider API-key environment mapping", () => {
-  test("covers every Pi 0.80.10 built-in API-key provider", () => {
+  test("covers every Pi 0.85.1 documented built-in API-key provider", () => {
     assert.deepEqual(PROVIDER_API_KEY_ENV_VAR_MAP, {
       "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
       "ant-ling": "ANT_LING_API_KEY",
       anthropic: "ANTHROPIC_API_KEY",
+      baseten: "BASETEN_API_KEY",
       "azure-openai-responses": "AZURE_OPENAI_API_KEY",
       cerebras: "CEREBRAS_API_KEY",
       "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
@@ -30,6 +31,9 @@ describe("documented provider API-key environment mapping", () => {
       "opencode-go": "OPENCODE_API_KEY",
       openai: "OPENAI_API_KEY",
       openrouter: "OPENROUTER_API_KEY",
+      "qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
+      "qwen-token-plan-cn": "QWEN_TOKEN_PLAN_CN_API_KEY",
+      "qwen-token-plan-individual": "QWEN_TOKEN_PLAN_API_KEY",
       radius: "RADIUS_API_KEY",
       together: "TOGETHER_API_KEY",
       "vercel-ai-gateway": "AI_GATEWAY_API_KEY",
@@ -43,8 +47,11 @@ describe("documented provider API-key environment mapping", () => {
     });
   });
 
-  test("maps Bedrock and Radius inherited CLI keys without placing them on argv", () => {
+  test("maps Bedrock, Baseten, Qwen, and Radius inherited CLI keys without placing them on argv", () => {
     assert.equal(getProviderApiKeyEnvVar("Amazon-Bedrock"), "AWS_BEARER_TOKEN_BEDROCK");
+    assert.equal(getProviderApiKeyEnvVar("baseten"), "BASETEN_API_KEY");
+    assert.equal(getProviderApiKeyEnvVar("qwen-token-plan-individual"), "QWEN_TOKEN_PLAN_API_KEY");
+    assert.equal(getProviderApiKeyEnvVar("qwen-token-plan-cn"), "QWEN_TOKEN_PLAN_CN_API_KEY");
     assert.equal(getProviderApiKeyEnvVar("radius"), "RADIUS_API_KEY");
     assert.deepEqual(resolveInheritedCliApiKeyEnvBinding({
       apiKey: "bedrock-secret",

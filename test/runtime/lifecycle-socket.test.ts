@@ -38,6 +38,27 @@ async function setup(runId = "run-1", activate = true) {
 	return { server, root, tokenPath, statePath, token, runId };
 }
 
+async function expectStartupFailureWithCleanup(install: (originals: Record<string, any>, directory: () => string) => Record<string, any>): Promise<void> {
+	const originals = {
+		lstat: fs.promises.lstat,
+		open: fs.promises.open,
+		chmod: fs.promises.chmod,
+		createServer: net.createServer,
+	};
+	let createdDirectory: string | null = null;
+	const operations = install(originals, () => createdDirectory ?? "");
+	const afterMkdtemp = operations.afterMkdtemp;
+	operations.afterMkdtemp = async (directory: string) => {
+		createdDirectory = directory;
+		await afterMkdtemp?.(directory);
+	};
+	// Injection is passed only to this start call; no process-global module
+	// method is mocked, so every failure path restores native behavior by scope.
+	await assert.rejects(() => LifecycleEventServer.start(operations));
+	assert.ok(createdDirectory);
+	assert.equal(await originals.lstat(createdDirectory).then(() => true, () => false), false);
+}
+
 describe("private lifecycle socket", () => {
 	test("consumes the transient token before connect and delivers bounded sequenced hints", async () => {
 		const fixture = await setup();
@@ -117,26 +138,37 @@ describe("private lifecycle socket", () => {
 			const socket = net.createConnection({ path: fixture.server.socketPath }, () => resolve(socket));
 			socket.once("error", reject);
 		});
-		const waitClosed = (socket: net.Socket) => new Promise<void>((resolve) => socket.destroyed ? resolve() : socket.once("close", () => resolve()));
+		const waitClosed = (socket: net.Socket, label: string) => new Promise<void>((resolve, reject) => {
+			if (socket.destroyed) return resolve();
+			const timeout = setTimeout(() => reject(new Error(`Timed out waiting for rejected ${label} socket to close.`)), 500);
+			socket.once("close", () => { clearTimeout(timeout); resolve(); });
+		});
 
 		const wrong = await connect();
+		const wrongClosed = waitClosed(wrong, "wrong-token");
 		wrong.write(`${JSON.stringify({ version: 1, type: "hello", runId: fixture.runId, token: "x".repeat(43), childPid: process.pid, sequence: 0 })}\n`);
-		await waitClosed(wrong);
+		await wrongClosed;
 		assert.equal(fixture.server.isConnected(fixture.runId), false);
 
 		const replay = await connect();
+		// Consume the strict hello acknowledgement just as the real client does;
+		// Bun 1.4.2 leaves a raw paused socket's close notification pending.
+		replay.on("data", () => undefined);
 		replay.write(`${JSON.stringify({ version: 1, type: "hello", runId: fixture.runId, token: fixture.token, childPid: process.pid, sequence: 0 })}\n`);
 		for (let attempt = 0; attempt < 20 && !fixture.server.isConnected(fixture.runId); attempt += 1) await delay(5);
+		const replayClosed = waitClosed(replay, "replayed-sequence");
 		replay.write(`${JSON.stringify({ version: 1, type: "heartbeat", runId: fixture.runId, sequence: 1 })}\n`);
 		replay.write(`${JSON.stringify({ version: 1, type: "heartbeat", runId: fixture.runId, sequence: 1 })}\n`);
-		await waitClosed(replay);
+		await replayClosed;
 
 		const unknown = await connect();
+		const unknownClosed = waitClosed(unknown, "unknown-frame");
 		unknown.write("{\"version\":1,\"type\":\"unknown\"}\n");
-		await waitClosed(unknown);
+		await unknownClosed;
 		const oversized = await connect();
+		const oversizedClosed = waitClosed(oversized, "oversized-pre-auth");
 		oversized.write("x".repeat(4098));
-		await waitClosed(oversized);
+		await oversizedClosed;
 	});
 
 	test("requires a strict server hello acknowledgement before exposing a client", async () => {
@@ -159,5 +191,116 @@ describe("private lifecycle socket", () => {
 		assert.equal(process.env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV], undefined);
 		assert.equal(process.env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV], undefined);
 		assert.equal(fixture.server.isConnected(fixture.runId), false);
+	});
+
+	test("cleans startup artifacts after failures following the initial stat or server creation", async () => {
+		await expectStartupFailureWithCleanup((originals, directory) => {
+			let directoryStats = 0;
+			return { lstat: async (file: string, ...args: any[]) => {
+				if (file === directory() && ++directoryStats === 2) throw new Error("injected post-initial-stat failure");
+				return originals.lstat(file, ...args);
+			} };
+		});
+		await expectStartupFailureWithCleanup((originals) => ({
+			createServer: (...args: any[]) => {
+				const server = originals.createServer(...args);
+				const on = server.on.bind(server);
+				(server as any).on = (event: string, ...listenerArgs: any[]) => {
+					if (event === "connection") throw new Error("injected post-createServer failure");
+					return on(event, ...listenerArgs);
+				};
+				return server;
+			},
+		}));
+	});
+
+	test("cleans proven partial marker artifacts across write, stat, chmod, and listen failures", async () => {
+		await expectStartupFailureWithCleanup((originals) => ({
+			open: async (...args: any[]) => {
+				const handle = await originals.open(...args);
+				return new Proxy(handle, { get(target, property, receiver) {
+					if (property === "writeFile") return async () => { throw new Error("injected marker write failure"); };
+					const value = Reflect.get(target, property, receiver);
+					return typeof value === "function" ? value.bind(target) : value;
+				} });
+			},
+		}));
+		await expectStartupFailureWithCleanup((originals) => ({
+			open: async (...args: any[]) => {
+				const handle = await originals.open(...args);
+				let stats = 0;
+				return new Proxy(handle, { get(target, property, receiver) {
+					if (property === "stat") return async (...statArgs: any[]) => {
+						if (++stats === 2) throw new Error("injected post-write stat failure");
+						return target.stat(...statArgs);
+					};
+					const value = Reflect.get(target, property, receiver);
+					return typeof value === "function" ? value.bind(target) : value;
+				} });
+			},
+		}));
+		await expectStartupFailureWithCleanup((originals) => ({
+			chmod: async (file: string, ...args: any[]) => {
+				if (file.endsWith("/generation")) throw new Error("injected marker chmod failure");
+				return originals.chmod(file, ...args);
+			},
+		}));
+		await expectStartupFailureWithCleanup((originals) => ({
+			createServer: (...args: any[]) => {
+				const server = originals.createServer(...args);
+				(server as any).listen = () => { throw new Error("injected listen failure"); };
+				return server;
+			},
+		}));
+	});
+
+	test("accepts Bun auto-unlink only after proving the pre-close socket generation", async () => {
+		const server = await LifecycleEventServer.start();
+		servers.push(server);
+		const directory = server.directory;
+		const socketPath = server.socketPath;
+		await server.close();
+		assert.equal(await fs.promises.lstat(socketPath).then(() => true, () => false), false);
+		assert.equal(await fs.promises.lstat(directory).then(() => true, () => false), false);
+	});
+
+	test("rejects a replaced generation marker before it mutates the owned socket pathname", async () => {
+		const server = await LifecycleEventServer.start();
+		servers.push(server);
+		const markerPath = (server as any).markerPath as string;
+		const generation = await fs.promises.readFile(markerPath, "utf8");
+		fs.unlinkSync(markerPath);
+		fs.writeFileSync(markerPath, generation, { mode: 0o600 });
+		await assert.rejects(server.close(), /cleanup authority changed/);
+		assert.equal(await fs.promises.readFile(markerPath, "utf8"), generation);
+		await fs.promises.rm(server.directory, { recursive: true, force: true });
+	});
+
+	test("documents the Bun close pathname race with a replacement before native close", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-lifecycle-native-")); roots.push(root);
+		await fs.promises.chmod(root, 0o700);
+		const socketPath = path.join(root, "events.sock");
+		const native = net.createServer();
+		await new Promise<void>((resolve) => native.listen(socketPath, resolve));
+		fs.unlinkSync(socketPath);
+		fs.writeFileSync(socketPath, "foreign", { mode: 0o600 });
+		await new Promise<void>((resolve) => native.close(() => resolve()));
+		assert.equal(await fs.promises.lstat(socketPath).then(() => true, () => false), false, "Bun server.close unlinks a pre-close replacement; LifecycleEventServer must fence replacements before it delegates to native close");
+	});
+
+	test("fences a path replacement before invoking the underlying close and retains the foreign occupant", async () => {
+		const server = await LifecycleEventServer.start();
+		servers.push(server);
+		// Bun's native server.close() unlinks whatever currently occupies its
+		// bound pathname. Replace it before LifecycleEventServer invokes close;
+		// the implementation must quarantine and restore this foreign file.
+		fs.unlinkSync(server.socketPath);
+		fs.writeFileSync(server.socketPath, "replacement", { mode: 0o600 });
+		try {
+			await assert.rejects(server.close(), /cleanup authority changed/);
+			assert.equal(await fs.promises.readFile(server.socketPath, "utf8"), "replacement");
+		} finally {
+			await fs.promises.rm(server.directory, { recursive: true, force: true });
+		}
 	});
 });

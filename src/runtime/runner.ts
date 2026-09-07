@@ -352,6 +352,8 @@ function phase0LiveProofEnabled(): boolean { return phase0LiveProofController !=
 const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;
 const AGENT_END_GRACE_MS = 250;
+/** Fixed internal safety bound for each inline child stream; not user-configurable. */
+export const MAX_INLINE_CHILD_STREAM_BYTES = 64 * 1024 * 1024;
 /** Fixed retry windows for the stopped-bootstrap identity gate. */
 const STOPPED_BOOTSTRAP_IDENTITY_ACQUISITION_TIMEOUT_MS = 100;
 const STOPPED_BOOTSTRAP_STOPPED_STATE_TIMEOUT_MS = 500;
@@ -5384,6 +5386,13 @@ export async function monitorInlineProcess(
     let abortHandler: (() => void) | undefined;
     let semanticCompletionTimer: NodeJS.Timeout | undefined;
     let identityUnavailableAbortTimer: NodeJS.Timeout | undefined;
+    let onClose: ((code: number | null, terminationSignal?: NodeJS.Signals | null) => void) | undefined;
+    let onProcessError: ((error: Error) => void) | undefined;
+    let onStdoutError: ((error: Error) => void) | undefined;
+    let onStderrError: ((error: Error) => void) | undefined;
+    let onStdoutData: ((chunk: Buffer) => void) | undefined;
+    let onStderrData: ((chunk: Buffer) => void) | undefined;
+    let listenersCleaned = false;
 
     const clearSemanticCompletionTimer = () => {
       if (semanticCompletionTimer) {
@@ -5402,13 +5411,13 @@ export async function monitorInlineProcess(
     };
 
     const terminateChild = (): boolean => {
+      // A PID without the start-identity proof is never an authority to signal.
+      if (childPid === undefined || childStartedAt === null) return false;
       if (isWindows) {
-        if (proc.pid !== undefined) {
-          const killer = spawn("taskkill", ["/T", "/F", "/PID", String(proc.pid)], {
-            stdio: "ignore",
-          });
-          killer.unref();
-        }
+        const killer = spawn("taskkill", ["/T", "/F", "/PID", String(childPid)], {
+          stdio: "ignore",
+        });
+        killer.unref();
         return true;
       }
 
@@ -5422,6 +5431,17 @@ export async function monitorInlineProcess(
       return true;
     };
 
+    const cleanupListeners = () => {
+      if (listenersCleaned) return;
+      listenersCleaned = true;
+      if (onStdoutData) proc.stdout.off("data", onStdoutData);
+      if (onStderrData) proc.stderr.off("data", onStderrData);
+      if (onStdoutError) proc.stdout.off("error", onStdoutError);
+      if (onStderrError) proc.stderr.off("error", onStderrError);
+      if (onClose) proc.off("close", onClose);
+      if (onProcessError) proc.off("error", onProcessError);
+    };
+
     const finish = (code: number) => {
       if (settled) return;
       settled = true;
@@ -5430,35 +5450,67 @@ export async function monitorInlineProcess(
         clearTimeout(identityUnavailableAbortTimer);
         identityUnavailableAbortTimer = undefined;
       }
-      if (signal && abortHandler) {
-        signal.removeEventListener("abort", abortHandler);
-      }
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+      cleanupListeners();
       resolve(code);
     };
 
     let lineProcessing = Promise.resolve();
     let maybeFinishFromAgentEnd = () => undefined;
+    const streamLimitBytes = outputLimitBytes ?? MAX_INLINE_CHILD_STREAM_BYTES;
     let pendingStdoutBytes = 0;
     let totalStdoutBytes = 0;
     let stderrBytes = 0;
+    let queuedParserBytes = 0;
     let outputExceeded = false;
-    const failBoundedOutput = () => {
-      if (outputExceeded) return;
-      outputExceeded = true;
-      result.stderr += "\nManaged child output exceeded its bounded safety limit.";
-      terminateChild();
-      finish(1);
+    let fatalTransportFailure = false;
+    const disposeUnverifiedChild = () => {
+      // No identity proof means no signal. Releasing local pipe handles still
+      // bounds this invocation even if an unverified child outlives it.
+      proc.stdin.destroy();
+      proc.stdout.destroy();
+      proc.stderr.destroy();
+      proc.unref();
     };
+    const settleFatalTransportFailure = (message: string) => {
+      if (fatalTransportFailure || settled) return;
+      fatalTransportFailure = true;
+      outputExceeded = true;
+      // A post-agent_end transport failure revokes semantic success and fences
+      // both queued and future JSONL parsing before normalization can restore it.
+      chunkProcessor.discardRemainder();
+      result.sawAgentEnd = false;
+      result.stopReason = "error";
+      result.errorMessage = message;
+      result.stderr += `${result.stderr ? "\n" : ""}${message}`;
+      if (onStdoutData) proc.stdout.removeListener("data", onStdoutData);
+      if (onStderrData) proc.stderr.removeListener("data", onStderrData);
+      if (!terminateChild()) disposeUnverifiedChild();
+      void lineProcessing.then(() => finish(1));
+    };
+    const failBoundedOutput = () => settleFatalTransportFailure(
+      "Inline child stdout or stderr exceeded its fixed bounded safety limit.",
+    );
     const flushLine = (line: string) => {
+      if (outputExceeded || settled) return;
+      const lineBytes = Buffer.byteLength(line, "utf8");
+      queuedParserBytes += lineBytes;
+      // The stream cap alone bounds bytes read, but not the FIFO retained by a
+      // slow signature index. Fence queued complete records as well.
+      if (queuedParserBytes > streamLimitBytes) {
+        failBoundedOutput();
+        return;
+      }
       // stdout chunks may arrive before durable index publication completes.
       // Chaining keeps event/result/callback order identical to JSONL order.
       lineProcessing = lineProcessing.then(async () => {
+        if (outputExceeded || settled) return;
         if (await processPiJsonLineWithAssistantSignatureIndex(line, result, assistantSignatureIndex)) onUpdate();
-        maybeFinishFromAgentEnd();
+        if (!outputExceeded && !settled) maybeFinishFromAgentEnd();
       }).catch(() => {
         // The index and parser both fail closed to exact public-message
         // handling. Do not let an internal optimization failure strand a run.
-      });
+      }).finally(() => { queuedParserBytes = Math.max(0, queuedParserBytes - lineBytes); });
     };
 
     const chunkProcessor = createJsonLineChunkProcessor(flushLine);
@@ -5470,8 +5522,8 @@ export async function monitorInlineProcess(
         if (didClose || settled || !result.sawAgentEnd) return;
         chunkProcessor.flushRemainder();
         void lineProcessing.then(() => {
-          proc.stdout.removeListener("data", onStdoutData);
-          proc.stderr.removeListener("data", onStderrData);
+          proc.stdout.removeListener("data", onStdoutData!);
+          proc.stderr.removeListener("data", onStderrData!);
           finish(0);
           terminateChild();
         });
@@ -5479,35 +5531,42 @@ export async function monitorInlineProcess(
       semanticCompletionTimer.unref();
     };
 
-    const onStdoutData = (chunk: Buffer) => {
-      if (outputLimitBytes !== undefined) {
-        totalStdoutBytes += chunk.length;
-        const lastLf = chunk.lastIndexOf(0x0a);
-        pendingStdoutBytes = lastLf >= 0 ? chunk.length - lastLf - 1 : pendingStdoutBytes + chunk.length;
-        if (totalStdoutBytes > outputLimitBytes || pendingStdoutBytes > outputLimitBytes) {
-          failBoundedOutput();
-          return;
-        }
+    onStdoutData = (chunk: Buffer) => {
+      if (outputExceeded) return;
+      totalStdoutBytes += chunk.length;
+      const lastLf = chunk.lastIndexOf(0x0a);
+      pendingStdoutBytes = lastLf >= 0 ? chunk.length - lastLf - 1 : pendingStdoutBytes + chunk.length;
+      if (totalStdoutBytes > streamLimitBytes || pendingStdoutBytes > streamLimitBytes) {
+        failBoundedOutput();
+        return;
       }
       chunkProcessor.pushChunk(chunk.toString());
     };
 
-    const onStderrData = (chunk: Buffer) => {
-      if (outputLimitBytes !== undefined) {
+    onStderrData = (chunk: Buffer) => {
+      if (outputExceeded) return;
+      const remaining = streamLimitBytes - stderrBytes;
+      if (chunk.length > remaining) {
+        if (remaining > 0) result.stderr += chunk.subarray(0, remaining).toString();
         stderrBytes += chunk.length;
-        if (stderrBytes > outputLimitBytes) {
-          failBoundedOutput();
-          return;
-        }
+        failBoundedOutput();
+        return;
       }
+      stderrBytes += chunk.length;
       result.stderr += chunk.toString();
     };
 
-    proc.stdout.on("data", onStdoutData);
-    proc.stderr.on("data", onStderrData);
+    onStdoutError = (error) => {
+      settleFatalTransportFailure(error.message || "Inline child stream failed.");
+    };
+    onStderrError = onStdoutError;
+    proc.stdout.on("data", onStdoutData!);
+    proc.stderr.on("data", onStderrData!);
+    proc.stdout.on("error", onStdoutError);
+    proc.stderr.on("error", onStderrError);
 
-    const onClose = (code: number | null, terminationSignal?: NodeJS.Signals | null) => {
-      if (didClose) return;
+    onClose = (code: number | null, terminationSignal?: NodeJS.Signals | null) => {
+      if (didClose || settled) return;
       didClose = true;
       chunkProcessor.flushRemainder();
       void lineProcessing.then(() => finish(code ?? (terminationSignal && !result.sawAgentEnd ? 1 : 0)));
@@ -5517,11 +5576,10 @@ export async function monitorInlineProcess(
     // but the close event itself is not replayed to a late listener.
     if (proc.exitCode !== null || proc.signalCode !== null) queueMicrotask(() => onClose(proc.exitCode, proc.signalCode));
 
-    proc.on("error", (err) => {
-      if (!result.stderr.trim()) result.stderr = err.message;
-      chunkProcessor.flushRemainder();
-      void lineProcessing.then(() => finish(1));
-    });
+    onProcessError = (err) => {
+      settleFatalTransportFailure(err.message || "Inline child process failed.");
+    };
+    proc.on("error", onProcessError);
 
     if (signal) {
       abortHandler = () => {
@@ -5641,7 +5699,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
   const assistantSignatureIndex = assistantSignatureIndexDir
     ? new AssistantSignatureIndex(assistantSignatureIndexDir)
     : undefined;
-  const outputLimitBytes = managedChild ? 64 * 1024 * 1024 : undefined;
+  const outputLimitBytes = MAX_INLINE_CHILD_STREAM_BYTES;
   const childStartedAt = await getProcessStartedAtWithRetry(proc.pid);
   const observedSpawnError = spawnState.error;
   let identityFailure = observedSpawnError !== null;

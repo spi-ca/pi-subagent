@@ -103,7 +103,7 @@ bun run benchmark:phase7:verify
 bun run benchmark:phase7:record-local
 ```
 
-기본 record는 실제 private 10,000-run filesystem과 100,000-node in-memory graph를 측정합니다. 실제 100,000-run filesystem 측정은 비용이 큰 명시적 opt-in이며 `PI_SUBAGENT_REAPER_BENCH_RUNS=100000 bun run benchmark:phase7:record-local`로만 실행합니다. 이 override 결과를 일반 baseline으로 남기려는 경우가 아니라면 checked-in fixture를 덮어쓰지 마세요.
+기본 record는 filesystem run-directory cap과 같은 실제 private 10,000-run filesystem 및 별도 100,000-node in-memory graph를 측정합니다. 실제 100,000-run filesystem 측정은 비용이 큰 명시적 opt-in이며 `PI_SUBAGENT_REAPER_BENCH_RUNS=100000 bun run benchmark:phase7:record-local`로만 실행합니다. 이 override는 cap overflow 관찰용이며 일반 baseline으로 남기려는 경우가 아니라면 checked-in fixture를 덮어쓰지 마세요.
 
 ### Generic presence producer 집중 검증
 

@@ -10,7 +10,7 @@ root parent(depth `0`)만 `subagent` source producer를 활성화한다. nested 
 
 ## Aggregate projection
 
-state는 bounded `subagents` aggregate(`running`, `cancelling`, `queued`, `completed`, `failed`, `cancelled`, `omitted`)와 검증 가능한 경우의 `progress.completed/total`만 투영한다. `running`과 `cancelling`은 invocation 단위인 UX registry를 기준으로 하며, 병렬 child 단위인 scheduler active 수와 서로 빼거나 합치지 않는다. exact interactive invocation ID는 UX에 아직 없는 invocation만 보강하고, scheduler active 수는 invocation identity가 전혀 없는 호환 fallback에서만 사용한다. `queued`는 scheduler queue 수다. public subagent input/result와 accounting은 바뀌지 않으며 usage는 presence projection에 넣지 않는다.
+state는 bounded `subagents` aggregate(`running`, `cancelling`, `queued`, `completed`, `failed`, `cancelled`, `omitted`)와 검증 가능한 경우의 `progress.completed/total`만 투영한다. `running`과 `cancelling`은 invocation 단위인 UX registry를 기준으로 하며, 병렬 child 단위인 scheduler active 수와 서로 빼거나 합치지 않는다. exact interactive invocation ID는 UX에 아직 없는 invocation만 보강하고, scheduler active 수는 invocation identity가 전혀 없는 호환 fallback에서만 사용한다. `queued`는 scheduler queue 수다. terminal edge를 먼저 commit한 뒤 generation·state·progress·attention·counter가 모두 같은 state는 sequence를 배정하지 않고 생략한다. cache는 accepted state만 기억하고 source lifecycle/withdraw/rotation에서 비워지므로 rejected publish는 retry 가능하며 retained replay와 failover를 막지 않는다. public subagent input/result와 accounting은 바뀌지 않으며 usage는 presence projection에 넣지 않는다.
 
 ## Terminal mapping and dedupe
 

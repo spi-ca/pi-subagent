@@ -184,7 +184,7 @@ _2x PNG · [SVG](docs/diagram/runtime-execution-modes.svg) · [Mermaid source](d
 
 `PI_SUBAGENT_TERMINAL_MODE=inline|cmux-pane|tmux-pane|herdr-pane`는 terminal mode의 유일한 명시적 override이며, Windows에서는 무시되고 항상 `inline`입니다. `--subagent-pane-layout auto|split` 또는 `PI_SUBAGENT_PANE_LAYOUT`는 별도 layout 설정으로 CLI > 환경 변수 > 기본 `auto` 순입니다. 값은 정확히 소문자 `auto` 또는 `split`이어야 합니다. Herdr의 기본 `auto`는 child마다 unfocused 새 tab의 root pane에서 실행하고, `split`은 child별 기존 오른쪽 split 호환 모드입니다. 상세 계약과 문제 해결은 [`docs/configuration.md`](docs/configuration.md#interactive-pane-layout)을 참고하세요.
 
-interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달합니다. cmux/tmux과 Herdr `split`은 exact surface/pane만 Escape 후 닫지만, Herdr `auto`는 인증된 child의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용하고 present/unknown/hung terminal은 recovery/manual cleanup과 late watcher로 보존합니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
+interactive pane 모드는 `agent_settled` lifecycle을 제공하는 Pi `0.80.10` 이상이 필요합니다. interactive child는 parent-owned 고정 lifecycle로 동작하며, 첫 정상 `agent_settled` 뒤 결과를 부모에 전달합니다. cmux/tmux과 Herdr `split`은 exact surface/pane만 Escape 후 닫지만, Herdr `auto`는 인증된 child의 cooperative `ctx.abort()`/`ctx.shutdown()`만 사용하고 present/unknown/hung terminal은 recovery/manual cleanup과 late watcher로 보존합니다. startup reaper는 private state root에서 최대 10,000개 run directory만 완전 검사하며, 이를 넘기면 어떤 run도 분류·변경하지 않고 다음 시작까지 보존합니다. Zellij FIFO/pane renderer 지원은 제거되었습니다.
 
 ### 위임 보호 장치
 

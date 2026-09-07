@@ -178,7 +178,7 @@ full-message signature 중복 저장을 줄일 때는 compact/on-disk exact sign
 
 Phase 7 전에는 background reaping을 enable하지 않는다. `session_start`에서 monotonic budget은 root safety/lock attempt 전부터 시작한다. `fs.promises.opendir()` async iterator를 consume하다 budget/abort에 도달하면 **같은 open iterator/handle ownership을 background reaper로 transfer**한다; foreground는 이를 close하거나 synthetic cursor를 만들지 않는다. background owner만 completion/cancel/error에 `close()`를 await한다. iterator transfer를 runtime에서 제공할 수 없으면 explicit processed-name set을 durable/in-memory continuation state로 유지하고 새 `opendir`에서 restart한다; resumable directory cursor가 있다고 가정하지 않는다.
 
-enumeration/classification이 끝날 때까지 cleanup을 dispatch하거나 target을 mutate하지 않는다. reaper는 full candidate set과 dependency graph를 완성하고, cycles/unknown dependency를 retained recovery로 남긴 뒤 descendants-first topological order를 만든다. 그 후에만 limited validation/cleanup work를 dispatch한다. production initial budget은 `200ms 또는 50개 run`으로 확정했으며, test/benchmark override는 internal 검증 seam으로만 유지한다.
+enumeration/classification이 끝날 때까지 cleanup을 dispatch하거나 target을 mutate하지 않는다. filesystem enumeration은 10,000개 run directory와 그 다음 한 개 witness로 hard-cap하며 witness를 보면 handle을 닫고 startup prefix를 포함한 전체 root를 retain한다. 이 directory cap은 100,000-node in-memory graph planning cap과 독립적이다. reaper는 cap 안의 full candidate set과 dependency graph를 완성하고, cycles/unknown dependency를 retained recovery로 남긴 뒤 descendants-first topological order를 만든다. 그 후에만 limited validation/cleanup work를 dispatch한다. production initial budget은 `200ms 또는 50개 run`으로 확정했으며, test/benchmark override는 internal 검증 seam으로만 유지한다.
 
 ### 12.2 Process lock, exclusive claim과 quiescence
 

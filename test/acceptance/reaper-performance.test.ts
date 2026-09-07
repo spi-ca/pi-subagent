@@ -96,6 +96,19 @@ describe("reaper Phase 7 local performance benchmark", () => {
 		assert.equal(validateReaperPerformanceEvidence(excessiveValidation), false);
 	});
 
+	test("validates the explicit 100k filesystem override as a bounded overflow without mutation", async () => {
+		const fixture = structuredClone(JSON.parse(await fs.promises.readFile(FIXTURE_PATH, "utf8")));
+		fixture.workload.filesystem.runDirectories = 100_000;
+		fixture.workload.filesystem.hundredKFilesystem.state = "executed";
+		fixture.metrics.entryCount.value = DEFAULT_RUN_DIRECTORIES;
+		fixture.metrics.missing.value = 90_000;
+		fixture.metrics.classifiedCount.value = 0;
+		fixture.metrics.validationConcurrencyObserved.value = 0;
+		assert.equal(validateReaperPerformanceEvidence(fixture), true);
+		fixture.metrics.classifiedCount.value = 1;
+		assert.equal(validateReaperPerformanceEvidence(fixture), false);
+	});
+
 	test("binds the local baseline to the current worktree and rejects identity mismatches", async () => {
 		const fixture = JSON.parse(await fs.promises.readFile(FIXTURE_PATH, "utf8"));
 		assert.equal(verifyCurrentReaperPerformanceEvidence(fixture), true);

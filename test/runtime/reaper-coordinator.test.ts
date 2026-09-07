@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { getCurrentProcessStartedAt, prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
 import {
 	MAX_REAPER_GRAPH_ENTRIES,
+	MAX_REAPER_RUN_DIRECTORIES,
 	acquireReaperRootLock,
 	acquireRunCleanupClaim,
 	enumerateRunDirectories,
@@ -249,6 +250,63 @@ describe("reaper coordinator", () => {
 			assert.deepEqual(await enumeration.completion, ["second", "third"]);
 			await enumeration.cancelAndDrain();
 			assert.equal(closeCalls, 1);
+		} finally {
+			Object.defineProperty(fs.promises, "opendir", { configurable: true, writable: true, value: originalOpendir });
+		}
+	});
+
+	test("settles completion and overflow only after the directory handle closes", async () => {
+		const originalOpendir = fs.promises.opendir;
+		let releaseClose!: () => void;
+		let completionSettled = false, overflowSettled = false;
+		Object.defineProperty(fs.promises, "opendir", {
+			configurable: true, writable: true,
+			value: (async () => ({
+				read: async () => null,
+				close: async () => await new Promise<void>((resolve) => { releaseClose = resolve; }),
+			})) as unknown as typeof fs.promises.opendir,
+		});
+		try {
+			const enumeration = enumerateRunDirectories(await stateRoot(), { startupEntryBudget: 0, startupBudgetMs: 0, now: () => 0 });
+			await enumeration.startup;
+			void enumeration.completion.then(() => { completionSettled = true; });
+			void enumeration.overflow.then(() => { overflowSettled = true; });
+			for (let index = 0; !releaseClose && index < 10; index += 1) await Promise.resolve();
+			assert.ok(releaseClose);
+			assert.equal(completionSettled, false);
+			assert.equal(overflowSettled, false);
+			releaseClose();
+			assert.deepEqual(await enumeration.completion, []);
+			assert.equal(await enumeration.overflow, false);
+			await enumeration.cancelAndDrain();
+		} finally {
+			Object.defineProperty(fs.promises, "opendir", { configurable: true, writable: true, value: originalOpendir });
+		}
+	});
+
+	test("reads exactly the run-directory cap and fails closed after one witness", async () => {
+		const originalOpendir = fs.promises.opendir;
+		let closeCalls = 0;
+		const run = async (count: number) => {
+			let cursor = 0;
+			const entries = Array.from({ length: count }, (_, index) => ({ name: `run-${index}`, isDirectory: () => true })) as unknown as fs.Dirent[];
+			Object.defineProperty(fs.promises, "opendir", {
+				configurable: true, writable: true,
+				value: (async () => ({ read: async () => entries[cursor++] ?? null, close: async () => { closeCalls += 1; } })) as unknown as typeof fs.promises.opendir,
+			});
+			const enumeration = enumerateRunDirectories(await stateRoot(), { startupEntryBudget: 0, startupBudgetMs: 0, now: () => 0 });
+			const [startup, completion, overflow] = await Promise.all([enumeration.startup, enumeration.completion, enumeration.overflow]);
+			await enumeration.cancelAndDrain();
+			return { names: [...startup, ...completion], overflow };
+		};
+		try {
+			const exact = await run(MAX_REAPER_RUN_DIRECTORIES);
+			assert.equal(exact.overflow, false);
+			assert.equal(exact.names.length, MAX_REAPER_RUN_DIRECTORIES);
+			const overflow = await run(MAX_REAPER_RUN_DIRECTORIES + 1);
+			assert.equal(overflow.overflow, true);
+			assert.equal(overflow.names.length, MAX_REAPER_RUN_DIRECTORIES);
+			assert.equal(closeCalls, 2);
 		} finally {
 			Object.defineProperty(fs.promises, "opendir", { configurable: true, writable: true, value: originalOpendir });
 		}

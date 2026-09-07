@@ -46,6 +46,8 @@ export class PiSubagentPresenceProducer {
   private terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
   private lastTerminal: TerminalStatus | null = null;
   private lastAggregate: Pick<Aggregate, "running" | "cancelling" | "queued"> | null = null;
+  /** Last accepted semantic state body; wire sequence is intentionally absent. */
+  private lastStateBody: string | null = null;
   private recentOmitted = 0;
 
   constructor(options: PiSubagentPresenceProducerOptions) {
@@ -77,6 +79,7 @@ export class PiSubagentPresenceProducer {
     this.terminalCounts = { completed: 0, failed: 0, cancelled: 0 };
     this.lastTerminal = null;
     this.lastAggregate = null;
+    this.lastStateBody = null;
     this.recentOmitted = 0;
     return true;
   }
@@ -96,6 +99,7 @@ export class PiSubagentPresenceProducer {
     this.settlementDeferred = false;
     this.previousRecentTerminalIds.clear();
     this.lastAggregate = null;
+    this.lastStateBody = null;
     this.recentOmitted = 0;
   }
 
@@ -160,10 +164,16 @@ export class PiSubagentPresenceProducer {
       ...(progressFor(snapshot.active)),
       ...(failureEdge ? { attention: { reason: "failure" as const, occurrence: "new" as const } } : {}),
     };
+    const stateBody = semanticStateBody(event);
+    if (stateBody === this.lastStateBody) {
+      if (this.settlementDeferred && this.isLastAggregateQuiescent()) this.withdrawCurrent();
+      return emitted;
+    }
     const stateAccepted = safeCall(() => this.producer!.publishState(event));
     if (!stateAccepted) return emitted;
     this.sequence = stateSequence;
     this.lastAggregate = { running: projected.running, cancelling: projected.cancelling, queued: projected.queued };
+    this.lastStateBody = stateBody;
     emitted = true;
     if (this.settlementDeferred && this.isLastAggregateQuiescent()) this.withdrawCurrent();
     return emitted;
@@ -221,6 +231,7 @@ export class PiSubagentPresenceProducer {
     this.wireGeneration = 0;
     this.sequence = -1;
     this.terminalOrdinal = -1;
+    this.lastStateBody = null;
     return true;
   }
 
@@ -239,6 +250,7 @@ export class PiSubagentPresenceProducer {
     this.sequence = nextSequence;
     this.opened = false;
     this.settlementDeferred = false;
+    this.lastStateBody = null;
     return true;
   }
 
@@ -354,6 +366,11 @@ function compareTerminalOldestFirst(left: TerminalSnapshot, right: TerminalSnaps
 function validProgress(completed: number, total: number): boolean { return validOrdinal(total) && total >= 1 && validOrdinal(completed) && completed <= total; }
 function isTerminal(item: SubagentUxSnapshot): item is TerminalSnapshot { return item.status === "completed" || item.status === "failed" || item.status === "cancelled"; }
 function outcomeFor(status: TerminalStatus): TerminalOutcome { return status === "completed" ? "completed" : status === "failed" ? "failed" : "cancelled"; }
+/** Exact wire-visible state equality, deliberately excluding only its ordinal. */
+function semanticStateBody(event: PresenceStateInputV2): string {
+  const { sequence: _sequence, ...body } = event;
+  return JSON.stringify(body);
+}
 function validUxGeneration(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function validOrdinal(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_PRESENCE_COUNT; }
 function clamp(value: number): number { return validOrdinal(value) ? value : value > MAX_PRESENCE_COUNT ? MAX_PRESENCE_COUNT : 0; }

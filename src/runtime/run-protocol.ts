@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isValidTmuxWindowLabel } from "./tmux-window-label.mjs";
+import { getProcessGlobalCleanupCoordinator } from "./keyed-cleanup-coordinator.js";
 
 export const RUN_PROTOCOL_VERSION = 1 as const;
 /** Version for the detached one-shot launch broker protocol. */
@@ -1069,22 +1070,22 @@ export function startParentLeaseWriter(options: {
 	return { renew: requestRenew, stop, stopAndDrain: async () => { stop(); await drain(); } };
 }
 
-export function scheduleRunArtifactCleanup(runDir: string, delaySeconds: number, deadline?: number): void {
+export function scheduleRunArtifactCleanup(runDir: string, delaySeconds: number, deadline?: number): boolean {
 	// A persisted completion/launch timestamp supplies an absolute deadline so
 	// a process restart cannot grant an already-retained run a fresh TTL.
-	const delayMs = Number.isFinite(deadline)
-		? Math.max(0, deadline! - Date.now())
-		: Math.max(0, delaySeconds) * 1000;
-	const timer = setTimeout(() => {
-		const paths = { rootDir: path.dirname(runDir), runDir };
-		void assertSafeRunArtifactPaths(paths)
-			.then(async () => {
-				await removeWrapperStatusTemporaryArtifacts(paths);
-				await fs.promises.rm(runDir, { recursive: true, force: true });
-			})
-			.catch(() => undefined);
-	}, delayMs);
-	timer.unref?.();
+	const canonicalRunDir = path.resolve(runDir);
+	const dueAt = Number.isFinite(deadline)
+		? deadline!
+		: Date.now() + Math.max(0, delaySeconds) * 1000;
+	return getProcessGlobalCleanupCoordinator().schedule(canonicalRunDir, dueAt, async () => {
+		// The coordinator is process-global and may be stale or hostile. Check
+		// the absolute deadline again before any path validation or deletion.
+		if (Date.now() < dueAt) return;
+		const paths = { rootDir: path.dirname(canonicalRunDir), runDir: canonicalRunDir };
+		await assertSafeRunArtifactPaths(paths);
+		await removeWrapperStatusTemporaryArtifacts(paths);
+		await fs.promises.rm(canonicalRunDir, { recursive: true, force: true });
+	});
 }
 
 export async function removeRunArtifacts(paths: RunArtifactPaths): Promise<void> {

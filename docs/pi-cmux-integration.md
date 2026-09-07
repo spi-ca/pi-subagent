@@ -114,7 +114,7 @@ root parent는 process-local `pi.events`에 다음 v1 payload를 publish한다. 
 | `pi-subagent:aggregate-completed:v1` | 같은 envelope와 terminal invocation 요약 | 완료·실패·취소 집계 알림 |
 | `pi-subagent:detached:v1` | 같은 envelope, run ID, agent, `cmux-pane`/`tmux-pane`/`herdr-pane`, detachment time | 새 durable promotion 알림 |
 
-모든 payload는 `version: 1`, `sessionId`, `generation`, 증가하는 `sequence`, `emittedAt`을 가지며 task, prompt, path, credential, raw output을 포함하지 않는다. publisher는 terminal invocation 기억을 256개로, detached notification을 run별 한 번으로 제한한다. consumer는 exact shape와 envelope를 검증하고 세션·generation이 다르거나 sequence가 뒤로 가는 event를 버려야 한다.
+모든 payload는 `version: 1`, `sessionId`, `generation`, 증가하는 `sequence`, `emittedAt`을 가지며 task, prompt, path, credential, raw output을 포함하지 않는다. dashboard는 envelope의 `sequence`·`emittedAt`을 제외한 canonical body(정렬된 bounded active item과 `updatedAt` 포함)가 정확히 같으면 sequence를 배정하지 않고 생략한다. terminal·detached event는 이 dashboard 동등성으로 생략되지 않는다. publisher는 terminal invocation 기억을 256개로, detached notification을 run별 한 번으로 제한한다. consumer는 exact shape와 envelope를 검증하고 세션·generation이 다르거나 sequence가 뒤로 가는 event를 버려야 한다.
 
 `pi-subagent`는 이 channel을 내부에서 소비하거나 dashboard를 위해 cmux CLI/socket mutation을 수행하지 않는다. 외부 선택 consumer는 각 payload와 session/generation/sequence fence를 검증한 뒤 필요한 UI를 best-effort로 갱신할 수 있다. consumer failure는 invocation/lifecycle에 영향을 주어서는 안 된다. detached event도 durable ownership UI를 갱신하려는 외부 consumer를 위한 public 알림일 뿐 lifecycle authority를 만들지 않는다.
 

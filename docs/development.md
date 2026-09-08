@@ -17,7 +17,7 @@
 ```bash
 bun install --frozen-lockfile
 bun run check
-bun test --isolate --pass-with-no-tests
+bun test --isolate --pass-with-no-tests --max-concurrency 1
 bun run ci
 
 # package file 목록에서 V2 broker entrypoint 확인

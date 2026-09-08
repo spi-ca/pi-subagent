@@ -473,13 +473,15 @@ describe("child lifecycle bridge", () => {
 		const settled = bridge.emit("agent_settled");
 		while (!fs.existsSync(bridge.paths.completionFencePath)) await new Promise((resolve) => setTimeout(resolve, 1));
 		const parentStartedAt = getCurrentProcessStartedAt()!;
+		let renewalWrites: Promise<void> = Promise.resolve();
 		const renew = setInterval(() => {
-			void atomicWriteJson(bridge.paths.parentLeasePath, { version: RUN_PROTOCOL_VERSION, runId, parentPid: process.pid, parentStartedAt, renewedAt: Date.now() });
+			renewalWrites = renewalWrites.then(() => atomicWriteJson(bridge.paths.parentLeasePath, { version: RUN_PROTOCOL_VERSION, runId, parentPid: process.pid, parentStartedAt, renewedAt: Date.now() }));
 		}, 20);
 		try {
 			await settled;
 		} finally {
 			clearInterval(renew);
+			await renewalWrites;
 		}
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
 		assert.equal(completion?.status, "failed");

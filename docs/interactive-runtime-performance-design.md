@@ -704,7 +704,7 @@ Phase 0A 및 Phases 5–8은 이 문서에서 재정의하지 않는다. 각각 
 
 ```bash
 bun run check
-bun test --isolate --pass-with-no-tests
+bun test --isolate --pass-with-no-tests --max-concurrency 1
 ```
 
 ### Issue #24 완료: abnormal interactive completion 경계 focused 검증

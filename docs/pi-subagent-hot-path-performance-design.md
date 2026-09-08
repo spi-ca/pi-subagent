@@ -377,7 +377,7 @@ installed Pi의 `--no-extensions` + explicit extension loading capability를 확
 
 ```bash
 bun run check
-bun test --isolate --pass-with-no-tests
+bun test --isolate --pass-with-no-tests --max-concurrency 1
 ```
 
 ### 18.2 제안 test와 측정값

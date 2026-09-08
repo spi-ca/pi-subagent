@@ -4,30 +4,30 @@
 
 ## GitHub 패키지로 설치
 
-사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 다음 명령을 실행합니다.
+사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 검토된 immutable release `v20260907-2`를 지정합니다.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent
+pi install git:github.com/spi-ca/pi-subagent@v20260907-2
 ```
 
 Pi는 설정에 다음과 같은 패키지 항목을 추가하고 저장소를 `~/.pi/agent/git/github.com/spi-ca/pi-subagent` 아래에 클론합니다.
 
 ```json
 {
-  "packages": ["git:github.com/spi-ca/pi-subagent"]
+  "packages": ["git:github.com/spi-ca/pi-subagent@v20260907-2"]
 }
 ```
 
 프로젝트 수준 설정(`.pi/settings.json`)에 설치하려면 `-l`을 사용합니다.
 
 ```bash
-pi install -l git:github.com/spi-ca/pi-subagent
+pi install -l git:github.com/spi-ca/pi-subagent@v20260907-2
 ```
 
-특정 태그나 커밋으로 고정하려면 ref를 붙입니다.
+개발 중인 branch를 추적하려면 mutable ref임을 알고 명시적으로 지정합니다. 일반 사용에는 위 immutable release를 사용하세요.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent@<tag-or-commit>
+pi install git:github.com/spi-ca/pi-subagent@<development-branch>
 ```
 
 ## `pi-subagent.json` 파일 설정
@@ -158,7 +158,7 @@ managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이�
 
 부모 CLI의 `--api-key` 값은 child argv에 그대로 전달하지 않습니다. 명시한 parent `--provider`, fully-qualified parent model, 또는 허용된 agent model에서 provider를 결정해 provider별 API-key 환경 변수로 매핑하고 private agent-dir overlay를 통해 전달합니다. parent provider와 parent/child model provider가 충돌하거나 provider가 없거나 지원 매핑이 없으면 key 전달을 생략하고 경고하며, 기존 provider별 환경 변수나 다른 auth는 그대로 사용할 수 있습니다. user agent model은 provider hint로 사용할 수 있지만 project agent model은 현재 exact project root가 신뢰된 경우에만 사용합니다. 확실한 상속이 필요하면 지원되는 `--provider` 또는 `provider/model` 형식의 `--model`을 명시하고 서로 일치시키세요.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20260907-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260907-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 컨텍스트 모드
 

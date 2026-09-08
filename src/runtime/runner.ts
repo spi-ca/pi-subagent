@@ -422,7 +422,7 @@ const CHILD_CMUX_PROFILE_ENV = Object.freeze({
 });
 const PI_OFFLINE_ENV = "PI_OFFLINE";
 const CHILD_BRIDGE_PATH = fileURLToPath(new URL("./child-bridge.ts", import.meta.url));
-const BROKER_READY_TIMEOUT_MS = 5_000;
+const BROKER_READY_TIMEOUT_MS = 10_000;
 const BROKER_COMMIT_TIMEOUT_MS = 30_000;
 const BROKER_RUNTIME_ENV = "PI_SUBAGENT_BROKER_RUNTIME";
 const BROKER_ENTRYPOINT = fileURLToPath(new URL("./pane-launch-broker.mjs", import.meta.url));

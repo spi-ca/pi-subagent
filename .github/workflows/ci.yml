@@ -83,6 +83,8 @@ jobs:
       - name: Assert installed extension registration without install
         run: env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" CI=1 PI_GRAPH_EXPECTED='${{ matrix.pi-graph }}' PI_OFFLINE=1 bun .github/scripts/package-smoke.ts --existing
       - name: Verify
+        env:
+          PI_GRAPH_EXPECTED: ${{ matrix.pi-graph }}
         run: bun run ci
       - name: Inspect package contents
         run: bun pm pack --dry-run

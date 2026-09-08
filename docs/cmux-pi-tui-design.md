@@ -379,7 +379,7 @@ _2x PNG · [SVG](./diagram/broker-allocation-sequence.svg) · [Mermaid source](.
 5. Broker와 parent는 `decision.json`의 commit/cancel을 경쟁해 publish한다. cancel winner면 broker는 durable exact target만 rollback하고 launch/gate/respawn/child start를 만들지 않는다. commit winner면 ownership은 즉시 parent로 넘어간다; broker는 `launch.json`, `committed` status를 publish한 뒤 종료한다.
 6. Parent는 commit과 allocation을 읽자마자 exact handle을 active registry에 넣는다. `launch.json`이 보일 때까지 reconcile한 다음 gate를 publish한다. cmux는 이 gate 뒤 parent가 sanitized `surface.respawn` RPC를 실행한다. tmux staged verifier와 Herdr broker는 각각 gate, intent, allocation, committed launch 및 exact target binding을 검증한 경우에만 wrapper를 exec 또는 deliver한다. invalid/missing gate는 최대 30초 대기 후 child 없이 exit한다.
 
-`ready`는 success authority가 아니다. `decision.json(kind: "commit")`은 `launch.json`보다 먼저 보일 수 있으며, 이때도 parent가 cleanup ownership을 받는다. Broker decision timeout은 spawn 뒤 시작하는 **총 30초** window다. 그 안에서 `ready` 또는 decision이 처음 5초 안에 보이지 않으면 parent는 ready-timeout cancel을 시도한다. 이는 5초 후 별도의 30초 window를 추가하는 두 단계 timeout이 아니다.
+`ready`는 success authority가 아니다. `decision.json(kind: "commit")`은 `launch.json`보다 먼저 보일 수 있으며, 이때도 parent가 cleanup ownership을 받는다. Broker decision timeout은 spawn 뒤 시작하는 **총 30초** window다. 그 안에서 `ready` 또는 decision이 처음 10초 안에 보이지 않으면 parent는 ready-timeout cancel을 시도한다. 이는 10초 후 별도의 30초 window를 추가하는 두 단계 timeout이 아니다.
 
 ### 8.6 구현에서 확인한 보호 경계
 

@@ -837,31 +837,48 @@ describe("two-tier gated Phase 0 live harness", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); await fs.rm(executableRoot, { recursive: true, force: true }); }
   });
 
-  test("failure cleanup uses watchdog SIGTERM, leaves no orphan sleep, and cannot claim proof", async () => {
+  test("failure cleanup observes only exact watchdog SIGTERM, reaps its helper, and cannot claim proof", async () => {
     if (process.platform === "win32") return;
     const root = await createPrivateEvidenceRoot(), executableRoot = await fs.mkdtemp(path.join(os.homedir(), ".managed-child-pi-live-")), executable = path.join(executableRoot, "pi");
-    let watchdog: { pid: number; startedAt: number } | null = null, sleepHelper: { pid: number; startedAt: number } | null = null, thrown: unknown;
-    const originalKill = process.kill, signals: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
-    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => { signals.push({ pid, signal }); return originalKill(pid, signal); }) as typeof process.kill;
+    let parent: { pid: number; startedAt: number } | null = null, watchdog: { pid: number; startedAt: number } | null = null, sleepHelper: { pid: number; startedAt: number } | null = null, thrown: unknown;
+    const signalIntents: Array<{ identity: Readonly<{ pid: number; startedAt: number }>; signal: NodeJS.Signals }> = [];
+    let observerMutationRejected = false;
     try {
       await fs.chmod(executableRoot, 0o700); await fs.writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 }); await fs.chmod(executable, 0o700);
       const generation = captureManagedChildPiExecutableGeneration(executable);
       try {
         await runParentCell(root, "/fixture/agent", "/fixture/extension", { bin: generation.executable, version: "0.81.1", generation, tmux: generation, cmux: generation }, 1, "short-response", { PATH: process.env.PATH }, {}, undefined, true, { expiresAt: Date.now() + 5_000 }, {
           bootstrapBindTimeoutMs: 1_000,
-          afterBootstrapWatchdogBound: (_parent, binding) => { watchdog = binding.watchdog; sleepHelper = binding.sleepHelper; },
-          afterBootstrapContinued: (parent) => { process.kill(parent.pid, "SIGKILL"); },
+          afterBootstrapWatchdogBound: (boundParent, binding) => {
+            parent = boundParent; watchdog = binding.watchdog; sleepHelper = binding.sleepHelper;
+            // This hook runs after the exact watchdog/helper binding and while
+            // the parent remains stopped. The failure signal is real; cleanup
+            // signal intent is observed separately at its authorization point.
+            const state = spawnSync("/bin/ps", ["-o", "state=", "-p", String(boundParent.pid)], { encoding: "utf8" });
+            assert.equal(state.status, 0); assert.equal(state.stdout.trim().slice(0, 1), "T");
+            process.kill(boundParent.pid, "SIGKILL");
+          },
+          observeBootstrapCleanupSignalIntent: (identity, signal) => {
+            signalIntents.push({ identity, signal });
+            try { (identity as { pid: number }).pid = parent!.pid; } catch { observerMutationRejected = true; }
+            throw new Error("test cleanup observer failure");
+          },
           skipStagedBundleRevalidation: true,
         });
       } catch (error) { thrown = error; }
+      const parentIdentity = parent as { pid: number; startedAt: number } | null;
       const watchdogIdentity = watchdog as { pid: number; startedAt: number } | null, sleepHelperIdentity = sleepHelper as { pid: number; startedAt: number } | null;
-      assert.ok(watchdogIdentity); assert.ok(sleepHelperIdentity);
-      assert.notEqual(getProcessStartedAt(watchdogIdentity!.pid), watchdogIdentity!.startedAt);
-      assert.notEqual(getProcessStartedAt(sleepHelperIdentity!.pid), sleepHelperIdentity!.startedAt, "watchdog trap must reap its /bin/sleep helper");
-      assert.ok(signals.some(({ pid, signal }) => pid === watchdogIdentity!.pid && signal === "SIGTERM"));
-      assert.equal(signals.some(({ pid, signal }) => pid === watchdogIdentity!.pid && signal === "SIGKILL"), false);
+      assert.ok(parentIdentity); assert.ok(watchdogIdentity); assert.ok(sleepHelperIdentity);
+      assert.equal(signalIntents.length, 1);
+      assert.equal(signalIntents[0]!.signal, "SIGTERM");
+      assert.equal(signalIntents[0]!.identity.pid, watchdogIdentity!.pid);
+      assert.equal(signalIntents[0]!.identity.startedAt, watchdogIdentity!.startedAt);
+      assert.equal(Object.isFrozen(signalIntents[0]!.identity), true);
+      assert.equal(observerMutationRejected, true);
+      assert.equal(signalIntents.some(({ signal }) => signal === "SIGKILL"), false);
+      for (const identity of [parentIdentity!, watchdogIdentity!, sleepHelperIdentity!]) assert.notEqual(getProcessStartedAt(identity.pid), identity.startedAt);
       assert.ok(thrown instanceof Phase0CellFailure); assert.equal(thrown.summary.category, "harness-failure"); assert.equal(thrown.summary.cleanupProven, false);
-    } finally { process.kill = originalKill; await fs.rm(root, { recursive: true, force: true }); await fs.rm(executableRoot, { recursive: true, force: true }); }
+    } finally { await fs.rm(root, { recursive: true, force: true }); await fs.rm(executableRoot, { recursive: true, force: true }); }
   });
 
   test("detaches a long-lived output-writing unbound bootstrap without signalling or retaining its handles", async () => {

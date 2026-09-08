@@ -268,12 +268,23 @@ describe("private lifecycle socket", () => {
 		const server = await LifecycleEventServer.start();
 		servers.push(server);
 		const markerPath = (server as any).markerPath as string;
+		const replacementPath = path.join(server.directory, ".generation-replacement");
 		const generation = await fs.promises.readFile(markerPath, "utf8");
-		fs.unlinkSync(markerPath);
-		fs.writeFileSync(markerPath, generation, { mode: 0o600 });
-		await assert.rejects(server.close(), /cleanup authority changed/);
-		assert.equal(await fs.promises.readFile(markerPath, "utf8"), generation);
-		await fs.promises.rm(server.directory, { recursive: true, force: true });
+		try {
+			const original = await fs.promises.lstat(markerPath);
+			await fs.promises.writeFile(replacementPath, generation, { mode: 0o600, flag: "wx" });
+			await fs.promises.chmod(replacementPath, 0o600);
+			const replacement = await fs.promises.lstat(replacementPath);
+			assert.notDeepEqual([replacement.dev, replacement.ino], [original.dev, original.ino]);
+			await fs.promises.rename(replacementPath, markerPath);
+			const installed = await fs.promises.lstat(markerPath);
+			assert.deepEqual([installed.dev, installed.ino], [replacement.dev, replacement.ino]);
+			await assert.rejects(server.close(), /cleanup authority changed/);
+			assert.equal(await fs.promises.readFile(markerPath, "utf8"), generation);
+		} finally {
+			await fs.promises.rm(replacementPath, { force: true });
+			await fs.promises.rm(server.directory, { recursive: true, force: true });
+		}
 	});
 
 	test("documents the Bun close pathname race with a replacement before native close", async () => {

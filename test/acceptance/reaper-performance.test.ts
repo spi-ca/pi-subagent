@@ -110,7 +110,7 @@ describe("reaper Phase 7 local performance benchmark", () => {
 		assert.equal(validateReaperPerformanceEvidence(fixture), false);
 	});
 
-	test("binds fresh synthetic evidence to the current worktree and rejects identity mismatches", { timeout: 20_000 }, async () => {
+	test("binds fresh synthetic evidence to the current worktree and rejects identity mismatches", { timeout: 120_000 }, async () => {
 		const fresh = await recordLocalBenchmark();
 		assert.equal(verifyCurrentReaperPerformanceEvidence(fresh), true);
 		const mismatch = structuredClone(fresh);

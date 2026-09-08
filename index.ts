@@ -25,7 +25,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   buildChainTaskFromStages,
   collectRequestedAgentNamesFromChain,
-  formatChainStageSummaries,
+  formatChainStageEnvelope,
   getChainStageType,
   getStageLabel,
   shouldRunStage,
@@ -50,7 +50,7 @@ import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSess
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
-import { getResultSummaryText } from "./src/core/runner-events.js";
+import { formatBoundedForegroundEnvelope, formatBoundedForegroundResultRecordEnvelope, formatBoundedForegroundResultSummary, formatBoundedForegroundThrownError } from "./src/core/foreground-output.js";
 import { emptyAccountingUsage, finalizeForegroundUsage, type AccountingUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
 import { beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, subscribeInteractiveRunChanges, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
@@ -1150,6 +1150,7 @@ export default function (pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        try {
         // Capture once at tool invocation time so queued/background work cannot
         // observe a later parent-session thinking change.
         const parentThinkingLevel = ctx?.thinkingLevel;
@@ -1759,7 +1760,10 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
           }
           if ("isError" in result && result.isError) {
-            throw new Error(extractToolText(result) || formatSubagentOperationalError("child-execution", "Subagent invocation failed."));
+            // Tool details are not attached to a thrown tool.execute error.
+            // Keep the bounded public text, but never promise inaccessible data.
+            const publicError = extractToolText(result).replaceAll("full structured result remains in tool details", "content is unavailable from this thrown error");
+            throw new Error(publicError || formatSubagentOperationalError("child-execution", "Subagent invocation failed."));
           }
           uxRegistry.complete(uxRun.id, uxGeneration);
           return result;
@@ -1769,6 +1773,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           throw error;
         } finally {
           signal?.removeEventListener("abort", forwardAbort);
+        }
+        } catch (error) {
+          // This is deliberately the outermost operational boundary: agent
+          // names, tasks, validation strings, and unexpected exceptions must
+          // never bypass the model-visible byte/line limits.
+          throw new Error(formatBoundedForegroundThrownError(error));
         }
       },
 
@@ -1839,9 +1849,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         content: [
           {
             type: "text" as const,
-            text: formatSubagentOperationalError(
-              result.stopReason === "aborted" ? "cancellation" : "child-execution",
-              `Agent ${result.stopReason || "failed"}: ${getResultSummaryText(result)}`,
+            text: formatBoundedForegroundEnvelope(
+              formatSubagentOperationalError(result.stopReason === "aborted" ? "cancellation" : "child-execution", `Agent ${result.stopReason || "failed"}:`),
+              formatBoundedForegroundResultSummary(result),
             ),
           },
         ],
@@ -1853,7 +1863,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       content: [
         {
           type: "text" as const,
-          text: getResultSummaryText(result),
+          text: formatBoundedForegroundResultSummary(result),
         },
       ],
       details: makeDetails("single")([result]),
@@ -1960,9 +1970,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           content: [
             {
               type: "text" as const,
-              text: formatSubagentOperationalError(
-                "cancellation",
-                `Chain aborted before stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              text: formatChainStageEnvelope(
+                formatSubagentOperationalError("cancellation", `Chain aborted before stage ${index + 1}/${chain.length} (${label}).`),
+                stages,
               ),
             },
           ],
@@ -2073,9 +2083,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             content: [
               {
                 type: "text" as const,
-                text: formatSubagentOperationalError(
-                  "child-execution",
-                  `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+                text: formatChainStageEnvelope(
+                  formatSubagentOperationalError("child-execution", `Chain stopped at stage ${index + 1}/${chain.length} (${label}).`),
+                  stages,
                 ),
               },
             ],
@@ -2157,9 +2167,9 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           content: [
             {
               type: "text" as const,
-              text: formatSubagentOperationalError(
-                "child-execution",
-                `Chain stopped at stage ${index + 1}/${chain.length} (${label}).\n\n${formatChainStageSummaries(stages)}`,
+              text: formatChainStageEnvelope(
+                formatSubagentOperationalError("child-execution", `Chain stopped at stage ${index + 1}/${chain.length} (${label}).`),
+                stages,
               ),
             },
           ],
@@ -2178,11 +2188,14 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         {
           type: "text" as const,
           text: state.hadError || state.hadCompletedWithErrors
-            ? formatSubagentOperationalError(
-              "child-execution",
-              `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}\n\n${formatChainStageSummaries(stages)}`,
+            ? formatChainStageEnvelope(
+              formatSubagentOperationalError("child-execution", `Chain: ${completed + completedWithErrors}/${chain.length} stages completed${completedWithErrors ? `, ${completedWithErrors} completed with errors` : ""}${skipped ? `, ${skipped} skipped` : ""}${failed ? `, ${failed} failed` : ""}`),
+              stages,
             )
-            : `Chain: ${completed}/${chain.length} stages completed${skipped ? `, ${skipped} skipped` : ""}\n\n${formatChainStageSummaries(stages)}`,
+            : formatChainStageEnvelope(
+              `Chain: ${completed}/${chain.length} stages completed${skipped ? `, ${skipped} skipped` : ""}`,
+              stages,
+            ),
         },
       ],
       details: makeDetails("chain", chainDetails())(flattenedResults),
@@ -2300,19 +2313,15 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     }
 
     const successCount = resultSlots.snapshot().successCount;
-    const summaries = results.map((r) =>
-      `[${r.agent}] ${isResultError(r) ? "failed" : "completed"}: ${getResultSummaryText(r)}`,
-    );
-
     return {
       content: [
         {
           type: "text" as const,
           text: successCount === results.length
-            ? `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`
-            : formatSubagentOperationalError(
-              "child-execution",
-              `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n")}`,
+            ? formatBoundedForegroundResultRecordEnvelope(`Parallel: ${successCount}/${results.length} succeeded`, results)
+            : formatBoundedForegroundResultRecordEnvelope(
+              formatSubagentOperationalError("child-execution", `Parallel: ${successCount}/${results.length} succeeded`),
+              results,
             ),
         },
       ],

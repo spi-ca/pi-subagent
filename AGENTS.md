@@ -28,7 +28,7 @@ bun run ci
 ```
 
 `bun run ci` runs `bun run check` (type check via `tsc --noEmit`) followed by
-`bun run test` (`bun test --isolate --pass-with-no-tests`), and is the required
+`bun run test` (`bun test --isolate --pass-with-no-tests --max-concurrency 1`), and is the required
 check before treating a change as verified. File isolation is required because
 tests intentionally use file-global Bun mocks and process globals. `bun run
 test` and `bun run check` also exist individually as defined in `package.json`.

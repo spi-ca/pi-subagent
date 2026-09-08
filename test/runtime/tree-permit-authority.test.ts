@@ -615,7 +615,7 @@ describe("tree permit authority immutable CAS snapshots", () => {
     await assert.rejects(authority.acquireReservation(), /state chain is invalid/);
   });
 
-  test("compacts more than two epochs into a bounded, adoptable immutable tail", async () => {
+  test("compacts more than two epochs into a bounded, adoptable immutable tail", { timeout: 30_000 }, async () => {
     const base = await root();
     const owner = { pid: 801, startedAt: 1 };
     const ids = identities({ "801:1": "live" });

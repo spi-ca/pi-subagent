@@ -93,9 +93,18 @@ describe("fork source ownership", () => {
 		await assert.rejects(() => manager.writeBootstrap(childId, { sessionPath: session, inheritedOffset: offset, inheritedLength: 16 }), /cannot replace|existing/);
 		const inodeBound = await manager.registerChild({ childId: "child-inode", surface: "inline" });
 		await manager.writeBootstrap(inodeBound.childId, { sessionPath: session, inheritedOffset: offset, inheritedLength: 16 });
-		const original = await fs.promises.readFile(manager.paths.sourcePath);
-		await fs.promises.unlink(manager.paths.sourcePath); await fs.promises.writeFile(manager.paths.sourcePath, original, { mode: 0o600 }); await fs.promises.chmod(manager.paths.sourcePath, 0o600);
-		await assert.rejects(() => verifyAndAcknowledgeForkBootstrap(path.join(inodeBound.childDir, "bootstrap.json"), { pid: 91, startedAt: 92 }), /inode/);
+		const replacementPath = path.join(path.dirname(manager.paths.sourcePath), ".source-replacement");
+		try {
+			const original = await fs.promises.readFile(manager.paths.sourcePath);
+			const originalIdentity = await fs.promises.lstat(manager.paths.sourcePath);
+			await fs.promises.writeFile(replacementPath, original, { mode: 0o600, flag: "wx" }); await fs.promises.chmod(replacementPath, 0o600);
+			const replacementIdentity = await fs.promises.lstat(replacementPath);
+			assert.notDeepEqual([replacementIdentity.dev, replacementIdentity.ino], [originalIdentity.dev, originalIdentity.ino]);
+			await fs.promises.rename(replacementPath, manager.paths.sourcePath);
+			const installedIdentity = await fs.promises.lstat(manager.paths.sourcePath);
+			assert.deepEqual([installedIdentity.dev, installedIdentity.ino], [replacementIdentity.dev, replacementIdentity.ino]);
+			await assert.rejects(() => verifyAndAcknowledgeForkBootstrap(path.join(inodeBound.childDir, "bootstrap.json"), { pid: 91, startedAt: 92 }), /inode/);
+		} finally { await fs.promises.rm(replacementPath, { force: true }); }
 	});
 
 	test("uses hard-link no-replace publication and rejects malformed or conflicting acknowledgements", async () => {

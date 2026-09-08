@@ -329,7 +329,7 @@ describe("inline runner path", () => {
     assert.deepEqual(result.messages, []);
   });
 
-  test("bounds unterminated stdout and stderr for managed inline children", async () => {
+  test("bounds unterminated stdout and stderr for inline children regardless of child policy", async () => {
     for (const stream of ["stdout", "stderr"] as const) {
       const proc = spawn(process.execPath, ["-e", `process.${stream}.write("x".repeat(128)); setInterval(() => {}, 1000);`], {
         detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
@@ -344,7 +344,7 @@ describe("inline runner path", () => {
     }
   });
 
-  test("bounds cumulative newline-delimited stdout for managed inline children", async () => {
+  test("bounds cumulative newline-delimited stdout for inline children regardless of child policy", async () => {
     const script = 'for(let i=0;i<32;i++) process.stdout.write("{}\\n"); setInterval(() => {}, 1000);';
     const proc = spawn(process.execPath, ["-e", script], {
       detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
@@ -356,6 +356,86 @@ describe("inline runner path", () => {
     const monitored = await monitorInlineProcess(proc as any, result as any, undefined, () => {}, undefined, 64);
     assert.equal(monitored.exitCode, 1);
     assert.match(result.stderr, /bounded safety limit/);
+  });
+
+  test("drops an overflowing unterminated JSONL remainder without corrupting prior protocol records", async () => {
+    const valid = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "valid-record" }] } });
+    const proc = spawn(process.execPath, ["-e", `process.stdout.write(${JSON.stringify(valid + "\n")}); setTimeout(() => process.stdout.write(${JSON.stringify('{"incomplete":"')} + "x".repeat(512)), 100); setInterval(() => {}, 1000);`], {
+      detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
+    });
+    const result = {
+      agent: "scout", agentSource: "user" as const, task: "protocol overflow", exitCode: -1,
+      messages: [], stderr: "", usage: emptyUsage(),
+    };
+
+    const monitored = await monitorInlineProcess(proc as any, result as any, undefined, () => undefined, undefined, 256);
+    assert.equal(monitored.exitCode, 1);
+    assert.equal(getFinalOutput(result.messages as any), "valid-record");
+    assert.equal((result as any).sawAgentEnd, false);
+    assert.match(result.stderr, /fixed bounded safety limit/);
+  });
+
+  test("cleans monitor listeners after a stream error without retaining late parser authority", async () => {
+    const proc = new EventEmitter() as any;
+    proc.pid = 12345; proc.exitCode = null; proc.signalCode = null; proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+    proc.kill = () => true; proc.unref = () => undefined;
+    const result = { agent: "scout", agentSource: "user" as const, task: "stream error", exitCode: -1, messages: [], stderr: "", usage: emptyUsage() };
+    const monitored = monitorInlineProcess(proc, result as any, undefined, () => {});
+    for (let attempt = 0; attempt < 20 && proc.stdout.listenerCount("error") === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(proc.stdout.listenerCount("error"), 1);
+    proc.stdout.emit("error", new Error("fixture stream failure"));
+    assert.deepEqual(await monitored, { exitCode: 1, wasAborted: false });
+    assert.equal(proc.stdout.listenerCount("data"), 0);
+    assert.equal(proc.stdout.listenerCount("error"), 0);
+    assert.equal(proc.stderr.listenerCount("data"), 0);
+    assert.equal(proc.stderr.listenerCount("error"), 0);
+    assert.equal(proc.listenerCount("close"), 0);
+    assert.equal(proc.listenerCount("error"), 0);
+  });
+
+  test("a fatal stream or process error after agent_end revokes success and disposes an unverified child", async () => {
+    for (const target of ["stdout", "stderr", "process"] as const) {
+      const proc = new EventEmitter() as any;
+      proc.pid = 12345; proc.exitCode = null; proc.signalCode = null; proc.stdin = new PassThrough(); proc.stdout = new PassThrough(); proc.stderr = new PassThrough();
+      let kills = 0, unrefs = 0;
+      proc.kill = () => { kills += 1; return true; }; proc.unref = () => { unrefs += 1; };
+      const result = { agent: "scout", agentSource: "user" as const, task: "fatal after end", exitCode: -1, messages: [], stderr: "", usage: emptyUsage() };
+      const monitored = monitorInlineProcess(proc, result as any, undefined, () => {});
+      const agentEnd = JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "must-not-win" }] }] }) + "\n";
+      proc.stdout.write(agentEnd);
+      for (let attempt = 0; attempt < 20 && !(result as any).sawAgentEnd; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal((result as any).sawAgentEnd, true, `${target} fixture must reach semantic completion first`);
+      (target === "process" ? proc : proc[target]).emit("error", new Error(`${target} failure`));
+      const outcome = await monitored;
+      result.exitCode = outcome.exitCode;
+      const normalized = normalizeCompletedResult(result as any, outcome.wasAborted);
+      assert.equal(normalized.exitCode, 1);
+      assert.equal(normalized.sawAgentEnd, false);
+      assert.match(normalized.stderr, new RegExp(`${target} failure`));
+      assert.equal(kills, 0, "a missing start identity must never authorize a PID signal");
+      assert.ok(proc.stdin.destroyed && proc.stdout.destroyed && proc.stderr.destroyed);
+      assert.equal(unrefs, 1);
+      assert.equal(proc.stdout.listenerCount("data"), 0);
+      assert.equal(proc.stdout.listenerCount("error"), 0);
+      assert.equal(proc.stderr.listenerCount("data"), 0);
+      assert.equal(proc.stderr.listenerCount("error"), 0);
+      assert.equal(proc.listenerCount("close"), 0);
+      assert.equal(proc.listenerCount("error"), 0);
+      proc.stdout.emit("data", Buffer.from("late JSONL must be ignored\n"));
+      assert.equal(getFinalOutput(normalized.messages as any), "must-not-win");
+    }
+  });
+
+  test("an output-limit failure fences queued and late agent_end success", async () => {
+    const agentEnd = JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "must-not-win" }] }] });
+    const proc = spawn(process.execPath, ["-e", `process.stdout.write(${JSON.stringify(agentEnd + "\\n" + "x".repeat(512))}); setInterval(() => {}, 1000);`], {
+      detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
+    });
+    const result = { agent: "scout", agentSource: "user" as const, task: "late agent end", exitCode: -1, messages: [], stderr: "", usage: emptyUsage() };
+    const monitored = await monitorInlineProcess(proc as any, result as any, undefined, () => undefined, undefined, 256);
+    assert.equal(monitored.exitCode, 1);
+    assert.equal((result as any).sawAgentEnd, false);
+    assert.equal(getFinalOutput(result.messages as any), "");
   });
 
   test("preserves semantic completion across chunked JSONL output", async () => {

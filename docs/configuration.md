@@ -4,30 +4,30 @@
 
 ## GitHub 패키지로 설치
 
-사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 다음 명령을 실행합니다.
+사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 검토된 immutable release `v20260907-2`를 지정합니다.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent
+pi install git:github.com/spi-ca/pi-subagent@v20260907-2
 ```
 
 Pi는 설정에 다음과 같은 패키지 항목을 추가하고 저장소를 `~/.pi/agent/git/github.com/spi-ca/pi-subagent` 아래에 클론합니다.
 
 ```json
 {
-  "packages": ["git:github.com/spi-ca/pi-subagent"]
+  "packages": ["git:github.com/spi-ca/pi-subagent@v20260907-2"]
 }
 ```
 
 프로젝트 수준 설정(`.pi/settings.json`)에 설치하려면 `-l`을 사용합니다.
 
 ```bash
-pi install -l git:github.com/spi-ca/pi-subagent
+pi install -l git:github.com/spi-ca/pi-subagent@v20260907-2
 ```
 
-특정 태그나 커밋으로 고정하려면 ref를 붙입니다.
+개발 중인 branch를 추적하려면 mutable ref임을 알고 명시적으로 지정합니다. 일반 사용에는 위 immutable release를 사용하세요.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent@<tag-or-commit>
+pi install git:github.com/spi-ca/pi-subagent@<development-branch>
 ```
 
 ## `pi-subagent.json` 파일 설정
@@ -133,6 +133,10 @@ PI_SUBAGENT_BACKGROUND_OUTPUT_MAX_BYTES=0 pi
 
 interactive transport/protocol의 frame·artifact·recovery 같은 안전 상한은 고정 구현값이며 이 CLI/환경 변수 설정으로 바꿀 수 없습니다.
 
+### Foreground 출력 경계
+
+inline foreground child의 stdout과 stderr는 managed/inherit 정책과 관계없이 각각 고정 내부 안전 상한으로 감시합니다. 상한을 넘거나 newline 없는 JSONL record가 상한을 넘으면 child를 종료하고 실패로 보고하며, 미완성 JSON record는 결과로 해석하지 않습니다. single/parallel/chain의 모델 전달 결과와 chain의 이전 단계 handoff도 고정 내부 예산으로 제한됩니다. record 전체를 포함할 수 없으면 whole-record를 유지한 채 남은 record 수를 세는 terminal omission notice를 남깁니다. tool result의 structured details/TUI는 원본 상태를 보존하지만, chain handoff와 thrown error의 notice는 그 details에 접근할 수 있다고 약속하지 않습니다. 이 경계는 설정 키나 CLI 플래그가 아닙니다.
+
 ### 순환 방지
 
 `--subagent-prevent-cycles`는 현재 위임 스택에 이미 있는 에이전트 이름으로 다시 위임하는 것을 막습니다. `writer -> writer` 같은 자기 재귀와 `planner -> reviewer -> planner` 같은 순환을 방지합니다.
@@ -154,7 +158,7 @@ managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이�
 
 부모 CLI의 `--api-key` 값은 child argv에 그대로 전달하지 않습니다. 명시한 parent `--provider`, fully-qualified parent model, 또는 허용된 agent model에서 provider를 결정해 provider별 API-key 환경 변수로 매핑하고 private agent-dir overlay를 통해 전달합니다. parent provider와 parent/child model provider가 충돌하거나 provider가 없거나 지원 매핑이 없으면 key 전달을 생략하고 경고하며, 기존 provider별 환경 변수나 다른 auth는 그대로 사용할 수 있습니다. user agent model은 provider hint로 사용할 수 있지만 project agent model은 현재 exact project root가 신뢰된 경우에만 사용합니다. 확실한 상속이 필요하면 지원되는 `--provider` 또는 `provider/model` 형식의 `--model`을 명시하고 서로 일치시키세요.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20260907-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260907-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 컨텍스트 모드
 
@@ -259,9 +263,9 @@ Herdr `auto`/new-tab의 자동 cancel은 pane mutation이 아니라 child bridge
 
 ### Interactive provider 환경 전달
 
-inline child는 부모의 provider 환경을 그대로 사용합니다. interactive child는 multiplexer의 오래된 global environment를 쓰지 않고, 아래 Pi `0.80.10` provider 환경만 private `0600` secret artifact로 전달한 뒤 wrapper가 source 즉시 삭제합니다. 값은 broker environment·argv·로그에 넣지 않습니다.
+inline child는 부모의 provider 환경을 그대로 사용합니다. interactive child는 multiplexer의 오래된 global environment를 쓰지 않고, 아래 Pi `0.85.1` 지원 provider 환경만 private `0600` secret artifact로 전달한 뒤 wrapper가 source 즉시 삭제합니다. 값은 broker environment·argv·로그에 넣지 않습니다.
 
-- Pi [`providers.md`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/providers.md)의 built-in API-key 변수 전체(예: `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`)
+- Pi `0.85.1` [`providers.md`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/providers.md)의 built-in API-key allowlist: `AWS_BEARER_TOKEN_BEDROCK`, `ANT_LING_API_KEY`, `ANTHROPIC_API_KEY`, `BASETEN_API_KEY`, `AZURE_OPENAI_API_KEY`, `CEREBRAS_API_KEY`, `CLOUDFLARE_API_KEY`, `DEEPSEEK_API_KEY`, `FIREWORKS_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`, `KIMI_API_KEY`, `MINIMAX_API_KEY`, `MINIMAX_CN_API_KEY`, `MISTRAL_API_KEY`, `NVIDIA_API_KEY`, `OPENCODE_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `QWEN_TOKEN_PLAN_API_KEY`, `QWEN_TOKEN_PLAN_CN_API_KEY`, `RADIUS_API_KEY`, `TOGETHER_API_KEY`, `AI_GATEWAY_API_KEY`, `XAI_API_KEY`, `XIAOMI_API_KEY`, `XIAOMI_TOKEN_PLAN_AMS_API_KEY`, `XIAOMI_TOKEN_PLAN_CN_API_KEY`, `XIAOMI_TOKEN_PLAN_SGP_API_KEY`, `ZAI_API_KEY`, `ZAI_CODING_CN_API_KEY`
 - Azure: `AZURE_OPENAI_BASE_URL`, `AZURE_OPENAI_RESOURCE_NAME`, `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`; Cloudflare: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_GATEWAY_ID`
 - Bedrock/AWS: profile, access/session credential, region/default region, ECS container/IRSA credential 변수와 `AWS_BEDROCK_FORCE_CACHE`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, `AWS_BEDROCK_SKIP_AUTH`, `AWS_BEDROCK_FORCE_HTTP1`
 - Vertex: `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_APPLICATION_CREDENTIALS`; `PI_CACHE_RETENTION`

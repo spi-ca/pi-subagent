@@ -619,7 +619,7 @@ internal cache/lease/reaper algorithm의 failure boundary는 각각 [companion �
 
 #### M0 harness 상태
 
-`test/acceptance/performance-phase0.ts`는 provider, cmux, tmux를 전혀 변경하지 않는 고정 local-child benchmark다. 명시적인 `--record-local`에서만 `1/4/8/16 × idle-wait/short-response/long-response/cancel/external-close`를 barrier로 동시에 실행한다. 각 cell은 monotonic duration·settlement latency, child spawn/status-polling count, parent CPU delta/peak RSS/event-loop delay, peak child count와 exact cleanup/residual을 실제 측정한다. `test/fixtures/transport-performance-phase0-baseline.json`은 이 실행으로 생성한 **current-source-bound local evidence**다. ISO capture time 외에 revision, dirty flag, tracked/untracked content·mode digest를 기록하며, local 필수 metric 또는 current identity가 다르면 verify가 실패한다.
+`test/acceptance/performance-phase0.ts`는 provider, cmux, tmux를 전혀 변경하지 않는 고정 local-child benchmark다. 명시적인 `--record-local`에서만 `1/4/8/16 × idle-wait/short-response/long-response/cancel/external-close`를 barrier로 동시에 실행한다. 각 cell은 monotonic duration·settlement latency, child spawn/status-polling count, parent CPU delta/peak RSS/event-loop delay, peak child count와 exact cleanup/residual을 실제 측정한다. `test/fixtures/transport-performance-phase0-baseline.json`은 과거 실행에서 보존한 local capture다. 이 문서 변경 뒤에는 현재 source binding 증거가 아니며, ISO capture time 외에 revision, dirty flag, tracked/untracked content·mode digest를 기록한다. local 필수 metric 또는 current identity가 다르면 verify가 실패한다.
 
 schema template/preflight와 baseline verify는 의도적으로 다르다. `bun run benchmark:phase0:preflight`은 runtime과 schema declaration만 검사하고, `bun run benchmark:phase0:verify`는 persisted measured baseline과 현재 source identity를 strict validate한다. 둘 다 project를 변경하지 않는다. fixture를 갱신하는 유일한 명령은 `bun run benchmark:phase0:record-local`이다. Phase 0 local, Phase 7 local, schema v4 live routine/concurrency fixture는 하나의 generated evidence set이므로 이 네 fixture는 `sourceDirty`와 identity digest 양쪽에서 명시적으로 제외한다; 나머지 source/runtime/harness/test/docs tracked·untracked content와 mode는 계속 결속되고 timestamps와 symlink traversal은 사용하지 않는다. local backend에서 cmux/tmux contract metric은 `not-applicable`이며, 후속 실제 transport benchmark는 `not-instrumented`와 혼동하지 않는다. persisted allowlist에는 environment의 revision/dirty/digest/OS/arch/Bun/contract status, fixed workload, sample, canonical metric과 cleanup evidence만 있다. task, prompt, transcript, argv, ambient env와 credential/token은 기록하지 않는다; private staging root/file은 실제 `0700`/`0600`으로 검증한다.
 
@@ -704,7 +704,7 @@ Phase 0A 및 Phases 5–8은 이 문서에서 재정의하지 않는다. 각각 
 
 ```bash
 bun run check
-bun test --isolate --pass-with-no-tests
+bun test --isolate --pass-with-no-tests --max-concurrency 1
 ```
 
 ### Issue #24 완료: abnormal interactive completion 경계 focused 검증

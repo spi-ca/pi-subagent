@@ -300,7 +300,14 @@ function closeExactDescendants(child: ChildProcess, targets: readonly ProcessIde
   }
 }
 type ExactProcessIdentityClassifier = (identity: ProcessIdentity) => ProcessIdentityStatus;
+type Phase0BootstrapSignalIntentObserver = (identity: Readonly<ProcessIdentity>, signal: NodeJS.Signals) => void;
 const classifyExactProcessIdentity: ExactProcessIdentityClassifier = (identity) => classifyParentProcessIdentity(identity.pid, identity.startedAt);
+/** Observers are post-signal telemetry only; they cannot affect exact signal authority. */
+function signalExactBootstrapIdentity(identity: ProcessIdentity, signal: NodeJS.Signals, observeSignalIntent?: Phase0BootstrapSignalIntentObserver): void {
+  const authorized = Object.freeze({ pid: identity.pid, startedAt: identity.startedAt });
+  process.kill(authorized.pid, signal);
+  try { observeSignalIntent?.(authorized, signal); } catch {}
+}
 
 /** Exact cleanup treats an unprobeable identity as unproven, never absent. */
 export async function terminateExactPhase0Identities(identities: Iterable<ProcessIdentity>, timeoutMs = 5_000, classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity): Promise<void> {
@@ -343,7 +350,7 @@ export type Phase0BootstrapWatchdogBinding = Readonly<{ watchdog: ProcessIdentit
  * before the stopped parent can be touched. No PID or process-group fallback
  * is permitted here.
  */
-export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapWatchdogBinding | null, parent: ProcessIdentity | null, classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity): Promise<void> {
+export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapWatchdogBinding | null, parent: ProcessIdentity | null, classify: ExactProcessIdentityClassifier = classifyExactProcessIdentity, observeSignalIntent?: Phase0BootstrapSignalIntentObserver): Promise<void> {
   if (binding === null) {
     if (parent !== null) throw new Error("bootstrap watchdog identity is unavailable; parent cleanup is unproven");
     return;
@@ -363,7 +370,7 @@ export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapW
   try { watchdogStatus = classify(watchdog); } catch { throw new Error("bootstrap watchdog cleanup was not proven"); }
   if (watchdogStatus === "live") {
     // SIGTERM runs the watchdog's trap, which kills and reaps its /bin/sleep.
-    try { process.kill(watchdog.pid, "SIGTERM"); } catch { throw new Error("bootstrap watchdog cleanup was not proven"); }
+    try { signalExactBootstrapIdentity(watchdog, "SIGTERM", observeSignalIntent); } catch { throw new Error("bootstrap watchdog cleanup was not proven"); }
   }
   if (!await awaitBoundDead()) {
     // Only the independently exact-bound helper may receive fallback cleanup;
@@ -371,7 +378,7 @@ export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapW
     let helperStatus: ProcessIdentityStatus;
     try { helperStatus = classify(sleepHelper); } catch { throw new Error("bootstrap watchdog/helper cleanup was not proven"); }
     if (helperStatus === "live") {
-      try { process.kill(sleepHelper.pid, "SIGTERM"); } catch { throw new Error("bootstrap watchdog/helper cleanup was not proven"); }
+      try { signalExactBootstrapIdentity(sleepHelper, "SIGTERM", observeSignalIntent); } catch { throw new Error("bootstrap watchdog/helper cleanup was not proven"); }
     }
     if (!await awaitBoundDead()) throw new Error("bootstrap watchdog/helper cleanup was not proven");
   }
@@ -382,7 +389,7 @@ export async function terminateExactBootstrapAuthority(binding: Phase0BootstrapW
   try { parentStatus = classify(parent); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
   if (parentStatus === "unknown") throw new Error("bootstrap parent cleanup was not proven");
   if (parentStatus === "dead") return;
-  try { process.kill(parent.pid, "SIGKILL"); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
+  try { signalExactBootstrapIdentity(parent, "SIGKILL", observeSignalIntent); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
   const deadline = Date.now() + 5_000;
   while (true) {
     try { parentStatus = classify(parent); } catch { throw new Error("bootstrap parent cleanup was not proven"); }
@@ -1012,6 +1019,8 @@ export type Phase0ParentCellTestHooks = {
   afterBootstrapContinued?: (parent: ProcessIdentity, binding: Phase0BootstrapWatchdogBinding) => void | Promise<void>;
   /** Test-only exact identity probe; unknown is deliberately cleanup-unproven. */
   classifyBootstrapIdentity?: ExactProcessIdentityClassifier;
+  /** Test-harness-only post-signal observer; exceptions and mutation cannot affect cleanup. */
+  observeBootstrapCleanupSignalIntent?: Phase0BootstrapSignalIntentObserver;
   afterBootstrapResumed?: (identity: ProcessIdentity) => void | Promise<void>;
   afterPrimaryFailureCaptured?: () => void | Promise<void>;
   /** Test-only: production always requires the staged executable/theme bundle fence. */
@@ -1030,7 +1039,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
   let bootstrapWatchdogBinding: Phase0BootstrapWatchdogBinding | null = null;
   let parentIdentity: ProcessIdentity | null = null;
   const terminateBootstrapAuthority = (classify: ExactProcessIdentityClassifier): Promise<void> =>
-    terminateExactBootstrapAuthority(bootstrapWatchdogBinding, bootstrapWatchdogBinding ? bootstrapParentIdentity ?? parentIdentity : null, classify);
+    terminateExactBootstrapAuthority(bootstrapWatchdogBinding, bootstrapWatchdogBinding ? bootstrapParentIdentity ?? parentIdentity : null, classify, testHooks.observeBootstrapCleanupSignalIntent);
   const terminateProviderChildIdentities = (classify: ExactProcessIdentityClassifier): Promise<void> => {
     const bootstrapKeys = new Set([bootstrapWatchdogBinding?.watchdog ?? null, bootstrapWatchdogBinding?.sleepHelper ?? null, bootstrapParentIdentity, parentIdentity]
       .filter((identity): identity is ProcessIdentity => identity !== null)

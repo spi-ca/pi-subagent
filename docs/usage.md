@@ -180,7 +180,7 @@ root parent Pi에서는 LLM tool schema를 늘리지 않는 단일 slash command
 
 ### 선택적 generic presence V2
 
-root parent만 shared [`@pi/presence` protocol (v2-20260828-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260828-1)에 `subagent` observer projection을 생산하고 nested child는 producer를 만들지 않는다. state aggregate, terminal mapping/dedupe, privacy와 consumer presentation 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요. presence는 execution, cancel, lease, reaper, cleanup authority가 아닌 best-effort observer이며 public `subagent` schema/result와 accounting은 바뀌지 않는다.
+root parent만 shared [`@pi/presence` protocol (v2-20260907-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260907-1)에 `subagent` observer projection을 생산하고 nested child는 producer를 만들지 않는다. state aggregate, terminal mapping/dedupe, privacy와 consumer presentation 경계는 [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요. presence는 execution, cancel, lease, reaper, cleanup authority가 아닌 best-effort observer이며 public `subagent` schema/result와 accounting은 바뀌지 않는다.
 
 ## 권장 패턴
 
@@ -198,7 +198,7 @@ child TUI stdout은 부모 결과 channel로 사용하지 않으며, 부모는 d
 
 Interactive runtime의 broker/backend resolver 우선순위(`PI_SUBAGENT_BROKER_RUNTIME` → `PATH`의 `bun` → `node`, cmux는 app control socket v2 직접 사용, tmux는 비어 있지 않은 `TMUX_BIN` 뒤 `PATH`의 `tmux`)와 symlink/shebang shim 지원 범위는 [configuration의 V2 broker runtime과 backend resolver](./configuration.md#v2-broker-runtime과-backend-resolver)를 참고하세요.
 
-interactive child의 provider credential/configuration은 inline과 같은 Pi `0.80.10` 지원 변수만 private `0600` artifact로 전달됩니다. `AWS_BEARER_TOKEN_BEDROCK`, `RADIUS_API_KEY`, Azure/Cloudflare/Bedrock/Vertex 설정, proxy/CA 변수의 정확한 목록과 arbitrary environment 제외 규칙은 [configuration의 Interactive provider 환경 전달](./configuration.md#interactive-provider-환경-전달)을 참고하세요. 별도 Phase 0 provider-live acceptance synthetic parent는 production child 환경을 바꾸지 않는 harness이며, explicit allowlist의 PATH/HOME/locale, proxy/CA와 명시 transport/harness 값만 받습니다. ambient `PI_SUBAGENT_*`, credential, shell/loader hook, arbitrary variable, multiplexer state는 전달하지 않습니다. 실패 root를 retain할 경우 raw error/output 대신 bounded private top-level `failure-summary.json` 하나만 남을 수 있습니다. recovery scrub은 valid checkpoint(있다면)와 valid summary 외 artifact를 보존하지 않으며, `cleanupProven`은 cell과 transport cleanup 모두가 증명됐을 때만 true입니다.
+interactive child의 provider credential/configuration은 inline과 같은 Pi `0.85.1` 지원 allowlist만 private `0600` artifact로 전달됩니다. `ANT_LING_API_KEY`, `BASETEN_API_KEY`, `CEREBRAS_API_KEY`, `KIMI_API_KEY`, `OPENCODE_API_KEY`, `AI_GATEWAY_API_KEY`, Xiaomi/ZAI token-plan key를 포함한 built-in key, Azure/Cloudflare/Bedrock/Vertex 설정, proxy/CA 변수의 정확한 목록과 arbitrary environment 제외 규칙은 [configuration의 Interactive provider 환경 전달](./configuration.md#interactive-provider-환경-전달)을 참고하세요. 별도 Phase 0 provider-live acceptance synthetic parent는 production child 환경을 바꾸지 않는 harness이며, explicit allowlist의 PATH/HOME/locale, proxy/CA와 명시 transport/harness 값만 받습니다. ambient `PI_SUBAGENT_*`, credential, shell/loader hook, arbitrary variable, multiplexer state는 전달하지 않습니다. 실패 root를 retain할 경우 raw error/output 대신 bounded private top-level `failure-summary.json` 하나만 남을 수 있습니다. recovery scrub은 valid checkpoint(있다면)와 valid summary 외 artifact를 보존하지 않으며, `cleanupProven`은 cell과 transport cleanup 모두가 증명됐을 때만 true입니다.
 
 프로젝트 에이전트 승인 범위는 해당 에이전트 프롬프트뿐입니다. 프로젝트에서 실행되는 child Pi는 항상 `--no-context-files --no-approve`를 사용하므로 그 승인만으로 `AGENTS.md`/`CLAUDE.md`, `.pi/settings.json`, extensions, packages, themes 같은 프로젝트 코드를 로드하지 않습니다. 신뢰된 에이전트 프롬프트는 확장이 직접 전달합니다.
 
@@ -231,7 +231,7 @@ interactive child의 provider credential/configuration은 inline과 같은 Pi `0
 | periodic backend inspect polling 제거 | authenticated lifecycle socket과 durable `CompletionRecordV3`로 구현됨; lifecycle hint/terminal/degraded/final recovery에서는 completion JSON, session JSONL, wrapper status를 strict snapshot으로 계속 읽음 |
 | cmux canonical control-socket adapter | 구현됨; production CLI fallback 없음 |
 | cmux periodic inspect 제거와 tmux `-C` polling 제거 | healthy lifecycle cmux와 minimum gate를 통과한 tmux에서 구현됨; disconnect/degraded/final/reaper는 strict inspection 유지 |
-| M0 local-child benchmark matrix | current-source-bound local evidence 생성됨; cmux/tmux transport는 `not-applicable` |
+| M0 local-child benchmark matrix | historical retained local capture; 현재 source binding 증거가 아니며 cmux/tmux transport는 `not-applicable` |
 | Phase 0 gated provider live evidence | schema v4 two-tier capture가 완료됨. `routine-v1`은 총 5~6분, `cmux-concurrency-16-v1`은 약 8.2분으로 반복 관찰됐으며 SLA가 아님. source 변경 뒤에는 `test/fixtures/transport-performance-phase0-live-routine.json`과 `test/fixtures/transport-performance-phase0-live-concurrency.json`을 다시 생성하고 두 tier별 current-source verifier를 모두 통과해야 함 |
 
 `bun run benchmark:phase0:preflight`은 non-mutating schema/runtime preflight이고 `bun run benchmark:phase0:verify`는 current-source-bound measured local evidence를 검증합니다. fixture 갱신은 고정 안전 workload만 실행하는 명시적 `bun run benchmark:phase0:record-local`로만 합니다. Phase 0 local, Phase 7 local, 그리고 두 live fixture는 하나의 generated evidence set으로 `sourceDirty`와 identity digest 양쪽에서 제외됩니다. 나머지 source/test/docs를 포함한 tracked/untracked content·mode는 현재 worktree와 대조합니다. 이 local evidence는 provider, cmux, tmux를 변경하지 않으며, layout 또는 crash/reaper acceptance의 historical PASS와도 별개입니다.

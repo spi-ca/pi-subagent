@@ -12,12 +12,42 @@ const PI_CORE_DEPENDENCIES = {
   "@earendil-works/pi-coding-agent": "0.84.4",
   "@earendil-works/pi-tui": "0.84.4",
 } as const;
+const PI_GRAPH_PACKAGE_NAME = /^@earendil-works\/pi-[a-z0-9][a-z0-9._-]*$/;
+const EXACT_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const CLEAN_CHECKOUT_DEV_DEPENDENCIES = { typebox: "1.1.38" } as const;
-const PRESENCE_RELEASE_TAG = "v2-20260828-1";
-const PRESENCE_TAG_OBJECT = "44a22cf793bb8c7d25a202316133ead9d4d4ab8d";
-const PRESENCE_RELEASE_COMMIT = "752592a262d6d31242e6ca46a2a977839fca85eb";
+const PRESENCE_RELEASE_TAG = "v2-20260907-1";
+const PRESENCE_TAG_OBJECT = "ae5e27f30497d79384595d0ad7eabc3535dd45dd";
+const PRESENCE_RELEASE_COMMIT = "78256300e166b40e7a627c321fa0eb9a9e4e2b89";
 const PRESENCE_DEPENDENCY = `github:spi-ca/pi-presence#${PRESENCE_RELEASE_TAG}`;
 const PRESENCE_LOCK_RESOLUTION = PRESENCE_TAG_OBJECT.slice(0, 7);
+
+function selectedPiCoreDependencies(raw = process.env.PI_GRAPH_EXPECTED): Record<keyof typeof PI_CORE_DEPENDENCIES, string> {
+  if (raw === undefined) return { ...PI_CORE_DEPENDENCIES };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("PI_GRAPH_EXPECTED must be a JSON package/version map");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("PI_GRAPH_EXPECTED must be a JSON package/version map");
+  }
+  const graph = parsed as Record<string, unknown>;
+  for (const [name, version] of Object.entries(graph)) {
+    if (!PI_GRAPH_PACKAGE_NAME.test(name) || typeof version !== "string" || !EXACT_VERSION.test(version)) {
+      throw new Error(`PI_GRAPH_EXPECTED has an invalid Pi graph entry: ${name}@${String(version)}`);
+    }
+  }
+  const expected = {} as Record<keyof typeof PI_CORE_DEPENDENCIES, string>;
+  for (const packageName of Object.keys(PI_CORE_DEPENDENCIES) as Array<keyof typeof PI_CORE_DEPENDENCIES>) {
+    const version = graph[packageName];
+    if (typeof version !== "string" || !EXACT_VERSION.test(version)) {
+      throw new Error(`PI_GRAPH_EXPECTED must provide an exact version for ${packageName}`);
+    }
+    expected[packageName] = version;
+  }
+  return expected;
+}
 
 function packedPaths(): string[] {
   const result = spawnSync(process.execPath, ["pm", "pack", "--dry-run", "--ignore-scripts"], {
@@ -30,13 +60,14 @@ function packedPaths(): string[] {
 }
 
 describe("release packaging and live acceptance workflow", () => {
-  test("pins Pi 0.84.4 in devDependencies, installed manifests, and the lockfile", () => {
+  test("uses the selected Pi graph for manifest and installed peer packages while keeping the lock baseline", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
       devDependencies: Record<string, string>;
       peerDependencies: Record<string, string>;
     };
     const lockfile = fs.readFileSync(path.join(ROOT, "bun.lock"), "utf8");
+    const selectedPiDependencies = selectedPiCoreDependencies();
     const tsconfig = JSON.parse(fs.readFileSync(path.join(ROOT, "tsconfig.json"), "utf8")) as {
       compilerOptions: { paths?: unknown };
     };
@@ -55,18 +86,20 @@ describe("release packaging and live acceptance workflow", () => {
       new RegExp(`"@pi/presence": \\["@pi/presence@github:spi-ca/pi-presence#${PRESENCE_RELEASE_COMMIT.slice(0, 7)}"`),
       "Bun must record the annotated tag object rather than the peeled release commit",
     );
-    for (const [packageName, version] of Object.entries(PI_CORE_DEPENDENCIES)) {
+    for (const [packageName, version] of Object.entries(selectedPiDependencies)) {
       assert.equal(manifest.peerDependencies[packageName], "*", `${packageName} must accept all Pi core versions`);
-      assert.equal(manifest.devDependencies[packageName], version, `${packageName} must be exactly pinned to Pi 0.84.4`);
+      assert.equal(manifest.devDependencies[packageName], version, `${packageName} must use the selected exact Pi graph version`);
 
       const packageJsonPath = path.join(ROOT, "node_modules", ...packageName.split("/"), "package.json");
       const installedManifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { version: string };
-      assert.equal(installedManifest.version, version, `${packageName} must install exactly Pi 0.84.4`);
+      assert.equal(installedManifest.version, version, `${packageName} must install the selected exact Pi graph version`);
+      assert.ok(fs.existsSync(fileURLToPath(import.meta.resolve(packageName))), `${packageName} must resolve after install`);
+    }
+    for (const [packageName, version] of Object.entries(PI_CORE_DEPENDENCIES)) {
       assert.ok(
         lockfile.includes(`\"${packageName}\": [\"${packageName}@${version}\"`),
-        `bun.lock must resolve exactly ${packageName}@${version}`,
+        `bun.lock must retain clean-checkout baseline ${packageName}@${version}`,
       );
-      assert.match(import.meta.resolve(packageName), /node_modules\//, `${packageName} must resolve after bun install --frozen-lockfile`);
     }
     for (const [packageName, version] of Object.entries(CLEAN_CHECKOUT_DEV_DEPENDENCIES)) {
       assert.equal(manifest.devDependencies[packageName], version, `${packageName} must be exactly pinned for clean checkouts`);
@@ -76,6 +109,15 @@ describe("release packaging and live acceptance workflow", () => {
       );
       assert.match(import.meta.resolve(packageName), /node_modules\//, `${packageName} must resolve after bun install --frozen-lockfile`);
     }
+  });
+
+  test("rejects malformed selected Pi graph input instead of falling back to the baseline", () => {
+    assert.throws(() => selectedPiCoreDependencies("not-json"), /PI_GRAPH_EXPECTED must be a JSON package\/version map/);
+    assert.throws(() => selectedPiCoreDependencies("{}"), /must provide an exact version for @earendil-works\/pi-agent-core/);
+    assert.throws(
+      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-tui":"latest"}'),
+      /invalid Pi graph entry/,
+    );
   });
 
   test("packages required docs and schemas without Finder or dot metadata", () => {

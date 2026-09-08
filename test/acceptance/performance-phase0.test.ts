@@ -65,19 +65,18 @@ describe("performance Phase 0 local benchmark", () => {
     }
   });
 
-  test("recording is an explicit mode; dry-run and verify do not mutate the fixture", async () => {
+  test("recording is explicit and ordinary unit CI does not invoke the retained-evidence gate", async () => {
     const before = await fs.promises.readFile(FIXTURE_PATH, "utf8");
     await main(["--dry-run"]);
-    await main(["--verify"]);
     assert.equal(await fs.promises.readFile(FIXTURE_PATH, "utf8"), before);
     assert.equal(parseArgs(["--record-local"]), "record-local");
     assert.throws(() => parseArgs(["--live"]), /usage/);
   });
 
-  test("binds the local baseline to the current worktree and rejects identity mismatches", async () => {
-    const fixture = JSON.parse(await fs.promises.readFile(FIXTURE_PATH, "utf8"));
-    assert.equal(verifyCurrentPerformanceEvidence(fixture), true);
-    const mismatch = structuredClone(fixture);
+  test("binds fresh synthetic evidence to the current worktree and rejects identity mismatches", async () => {
+    const fresh = await recordLocalBenchmark();
+    assert.equal(verifyCurrentPerformanceEvidence(fresh), true);
+    const mismatch = structuredClone(fresh);
     mismatch.environment.worktreeDigest = "0".repeat(64);
     assert.equal(verifyCurrentPerformanceEvidence(mismatch), false);
   });

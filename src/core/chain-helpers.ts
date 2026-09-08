@@ -1,3 +1,4 @@
+import { formatBoundedForegroundRecordEnvelope, formatBoundedForegroundRecords } from "./foreground-output.js";
 import { getResultSummaryText } from "./runner-events.js";
 import { isResultError, type SingleResult } from "./types.js";
 
@@ -104,33 +105,37 @@ export function shouldRunStage(condition: StepConditionName | undefined, state: 
   }
 }
 
+function chainStageRecords(stages: ChainStageRecord[]): Array<{ identifier: string; body: string }> {
+  return stages.map((stage, index) => ({
+    identifier: `${index + 1}. ${stage.label}`,
+    body: stage.status === "skipped"
+      ? `skipped: ${stage.reason ?? "condition not met"}`
+      : `${stage.type}, ${stage.status}:\n${stage.results.length > 0
+        ? stage.results.map((result) =>
+          `#### [${result.agent}] ${isResultError(result) ? "failed" : "completed"}\n${getResultSummaryText(result)}`,
+        ).join("\n\n")
+        : stage.reason ?? "(no output)"}`,
+  }));
+}
+
+function formatChainStageRecords(stages: ChainStageRecord[], destination: "tool-result" | "chain-handoff" = "tool-result"): string {
+  return formatBoundedForegroundRecords(chainStageRecords(stages), undefined, "chain stage record", destination);
+}
+
 export function buildChainTaskFromStages(task: string, previousStages: ChainStageRecord[]): string {
-  const previous = previousStages
-    .filter((stage) => stage.status !== "skipped")
-    .map((stage) => {
-      const body = stage.results.length > 0
-        ? stage.results
-            .map((result) => `### ${result.agent} (${isResultError(result) ? "failed" : "completed"})\n${getResultSummaryText(result)}`)
-            .join("\n\n")
-        : stage.reason ?? "(no output)";
-      return `## ${stage.label} (${stage.type}, ${stage.status})\n${body}`;
-    })
-    .join("\n\n");
+  const previous = formatChainStageRecords(previousStages.filter((stage) => stage.status !== "skipped"), "chain-handoff");
 
   if (!previous.trim()) return task;
+  // The fixed budget applies only to prior output records. The current task is
+  // always appended intact so omitted history cannot rewrite or displace it.
   return `Previous chain stage outputs are provided for context. Use them as evidence, but follow the current task instructions.\n\n${previous}\n\n---\n\nCurrent task:\n${task}`;
 }
 
 export function formatChainStageSummaries(stages: ChainStageRecord[]): string {
-  return stages
-    .map((stage, index) => {
-      if (stage.status === "skipped") {
-        return `[${index + 1}. ${stage.label}] skipped: ${stage.reason ?? "condition not met"}`;
-      }
-      const summaries = stage.results.map((r) =>
-        `  [${r.agent}] ${isResultError(r) ? "failed" : "completed"}: ${getResultSummaryText(r)}`,
-      );
-      return `[${index + 1}. ${stage.label}] ${stage.status}:\n${summaries.join("\n\n")}`;
-    })
-    .join("\n\n");
+  return formatChainStageRecords(stages, "tool-result");
+}
+
+/** Reserve the final chain header before formatting stage records. */
+export function formatChainStageEnvelope(header: string, stages: ChainStageRecord[]): string {
+  return formatBoundedForegroundRecordEnvelope(header, chainStageRecords(stages), "chain stage record");
 }

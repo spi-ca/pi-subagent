@@ -1026,8 +1026,19 @@ describe("child lifecycle bridge", () => {
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		assert.ok(publishAttempts > 0);
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		await new Promise((resolve) => setTimeout(resolve, 160));
-		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-ack-failure")), "lease-expired");
+		const deadline = Date.now() + 2_000;
+		let completion: ReturnType<typeof parseCompletionAuthority> = null;
+		while (Date.now() < deadline && completion === null) {
+			try {
+				const value: unknown = JSON.parse(await fs.promises.readFile(bridge.paths.completionPath, "utf8"));
+				completion = parseCompletionAuthority(value, "transfer-ack-failure");
+				assert.ok(completion, "a published completion authority must be valid");
+			} catch (error: unknown) {
+				if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (completion === null) await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.equal(completionError(completion), "lease-expired");
 		assert.equal(bridge.lifecycle.aborted, true, "failed ACK publication must not detach the child");
 	});
 

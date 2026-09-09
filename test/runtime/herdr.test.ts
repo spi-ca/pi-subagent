@@ -136,8 +136,8 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 
-	test("creates one unfocused protocol-19/20 child tab through one direct layout.apply", async () => {
-		for (const protocol of [19, 20] as const) {
+	test("creates one unfocused protocol-19/20/22 child tab through one direct layout.apply", async () => {
+		for (const protocol of [19, 20, 22] as const) {
 			const child = { ...sourcePane, tab_id: `child-tab-${protocol}`, pane_id: `child-pane-${protocol}`, terminal_id: `child-terminal-${protocol}` };
 			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 			const fixture = await serverFor((request, socket) => {
@@ -231,8 +231,8 @@ describe("Herdr socket client", () => {
 		}
 	});
 
-	test("reports bounded child metadata with exact protocol-19/20 params and source-scoped clear", async () => {
-		for (const protocol of [19, 20] as const) {
+	test("reports bounded child metadata with exact protocol-19/20/22 params and source-scoped clear", async () => {
+		for (const protocol of [19, 20, 22] as const) {
 			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 			const fixture = await serverFor((request, socket) => {
 				calls.push({ method: request.method as string, params: request.params as Record<string, unknown> });
@@ -439,8 +439,8 @@ describe("Herdr socket client", () => {
 		}
 	});
 
-	test("uses strict protocol-19/20 AgentInfo reads and agent.focus without pane.focus fallback", async () => {
-		for (const protocol of [19, 20] as const) {
+	test("uses strict protocol-19/20/22 AgentInfo reads and agent.focus without pane.focus fallback", async () => {
+		for (const protocol of [19, 20, 22] as const) {
 			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 			const agent = { ...sourcePane, agent_status: "working", focused: false, revision: 4, state_change_seq: 9 };
 			const fixture = await serverFor((request, socket) => {
@@ -497,7 +497,7 @@ describe("Herdr socket client", () => {
 	});
 
 	test("agent wait is abort-aware, closes promptly, and never wakes after stop", async () => {
-		for (const protocol of [19, 20] as const) {
+		for (const protocol of [19, 20, 22] as const) {
 			const calls: string[] = [];
 			let waitParams: Record<string, unknown> | undefined;
 			const agent = { ...sourcePane, agent_status: "working", focused: false, revision: 1, state_change_seq: 1 };
@@ -569,8 +569,8 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 
-	test("falls back to one bounded all-workspaces list and rebinds protocol 19/20 moved panes", async () => {
-		for (const protocol of [19, 20] as const) {
+	test("falls back to one bounded all-workspaces list and rebinds protocol 19/20/22 moved panes", async () => {
+		for (const protocol of [19, 20, 22] as const) {
 			const moved = { ...sourcePane, workspace_id: `workspace-${protocol}`, tab_id: `tab-${protocol}`, pane_id: `moved-${protocol}` };
 			const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 			const fixture = await serverFor((request, socket) => {
@@ -596,7 +596,7 @@ describe("Herdr socket client", () => {
 			["duplicate unrelated terminal", [unrelated, { ...unrelated, pane_id: "another-pane" }]],
 			["malformed", [{ pane_id: "missing-stable-id" }]], ["oversized", Array.from({ length: 129 }, () => sourcePane)],
 		];
-		for (const protocol of [19, 20] as const) for (const [_name, panes] of cases) {
+		for (const protocol of [19, 20, 22] as const) for (const [_name, panes] of cases) {
 			const fixture = await serverFor((request, socket) => {
 				const response = request.method === "pane.get"
 					? { id: request.id, error: { code: "pane_not_found", message: "moved" } }

@@ -435,7 +435,7 @@ describe("run protocol", () => {
 		const deliveryUnknown = { version: 2 as const, runId: "v2", terminalMode: "herdr-pane" as const, allocationPath: paths.allocationPath, recordedAt: 1 };
 		assert.deepEqual(parseLaunchDeliveryUnknownV2(deliveryUnknown, "v2", paths.runDir), deliveryUnknown);
 		assert.equal(parseLaunchDeliveryUnknownV2({ ...deliveryUnknown, allocationPath: paths.launchPath }, "v2", paths.runDir), null);
-		for (const protocol of [19, 20] as const) {
+		for (const protocol of [19, 20, 22] as const) {
 			const gate = { version: 2 as const, runId: "v2", terminalMode: "herdr-pane" as const, protocol, launchPath: paths.launchPath, publishedAt: 1 };
 			assert.deepEqual(parseLaunchGateV2(gate, "v2", paths.runDir), gate);
 		}
@@ -468,7 +468,7 @@ describe("run protocol", () => {
 		assert.equal(hasAllocationIntentSourceBinding(legacyIntent, legacyAllocation), false);
 		const herdrIntent = { ...cmuxIntent, terminalMode: "herdr-pane" as const, source: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", sourcePaneId: "source", sourceTerminalId: "source-terminal", protocol: 20 as const, generation: { socketDev: "1", socketIno: "2" } }, backendPath: "/usr/bin/bun" };
 		const herdrAllocation = { version: 2 as const, runId: "r", terminalMode: "herdr-pane" as const, target: { socketPath: "/tmp/herdr.sock", workspaceId: "workspace", tabId: "tab", paneId: "child", terminalId: "terminal", protocol: 20 as const, generation: { socketDev: "1", socketIno: "2" } }, allocatedAt: 1 };
-		for (const protocol of [19, 20] as const) {
+		for (const protocol of [19, 20, 22] as const) {
 			const intent = { ...herdrIntent, source: { ...herdrIntent.source, protocol } };
 			const allocation = { ...herdrAllocation, target: { ...herdrAllocation.target, protocol } };
 			assert.deepEqual(parseLaunchIntentV2(intent, "r"), intent);

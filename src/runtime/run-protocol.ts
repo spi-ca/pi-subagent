@@ -1109,7 +1109,7 @@ export const TMUX_WINDOW_ID_RE = /^@(?:0|[1-9][0-9]*)$/;
 type V2Mode = "cmux-pane" | "tmux-pane" | "herdr-pane";
 /** Herdr IDs are opaque public protocol values, never shell/URL fragments. */
 /** `protocol` is the immutable result of the exact pre-allocation ping gate. */
-export type HerdrProtocolVersion = 19 | 20;
+export type HerdrProtocolVersion = 19 | 20 | 22;
 export type HerdrSocketGenerationV2 = { socketDev: string; socketIno: string };
 /** Generation-less Herdr records are retained only for diagnostics, never mutation authority. */
 export type HerdrSourceV2 = { socketPath: string; workspaceId: string; tabId: string; sourcePaneId: string; sourceTerminalId: string; protocol: HerdrProtocolVersion; generation?: HerdrSocketGenerationV2 };
@@ -1238,7 +1238,7 @@ function isCmuxControlTransport(value: unknown): value is CmuxControlTransportV2
 function isHerdrPublicId(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 256 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
-function isHerdrProtocol(value: unknown): value is HerdrProtocolVersion { return value === 19 || value === 20; }
+function isHerdrProtocol(value: unknown): value is HerdrProtocolVersion { return value === 19 || value === 20 || value === 22; }
 function isHerdrSocketGeneration(value: unknown): value is HerdrSocketGenerationV2 {
 	return isRecord(value) && exactKeys(value, ["socketDev", "socketIno"])
 		&& typeof value.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(value.socketDev)

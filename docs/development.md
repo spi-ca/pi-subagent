@@ -212,7 +212,7 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 
 ### Herdr 테스트 경계
 
-Herdr 테스트에는 fake owner-only Unix socket을 사용하며 live mutating Herdr acceptance test는 실행하지 않습니다. 집중 검증 근거는 `bun test test/runtime/herdr.test.ts test/runtime/pane-launch-broker.test.ts test/runtime/interactive-reaper.test.ts test/runtime/runner-interactive.test.ts test/runtime/run-protocol.test.ts`입니다. protocol 19/20 workspace-scoped `layout.apply` 한 번(`tab_id` 없음, `focus: false`, root direct wrapper argv), strict `layout_apply.layout.root` 뒤의 `pane.get` terminal binding, `agent.get`/bounded `agent.wait`/single `agent.focus`, `pane.report_metadata`, 조용한 gate rejection, auto에서 `pane.send_text`와 parent mutation을 사용하지 않는 동작을 다룹니다. terminal `present|absent|unknown`, socket 교체와 legacy record fail-closed도 검증합니다. 현재 smoke는 non-mutating protocol-19 `agent.get`/`agent.wait`뿐이며 live focus 또는 metadata mutation을 주장하지 않습니다.
+Herdr 테스트에는 fake owner-only Unix socket을 사용하며 live mutating Herdr acceptance test는 실행하지 않습니다. 집중 검증 근거는 `bun test test/runtime/herdr.test.ts test/runtime/pane-launch-broker.test.ts test/runtime/interactive-reaper.test.ts test/runtime/runner-interactive.test.ts test/runtime/run-protocol.test.ts`입니다. protocol 19/20/22 workspace-scoped `layout.apply` 한 번(`tab_id` 없음, `focus: false`, root direct wrapper argv), strict `layout_apply.layout.root` 뒤의 `pane.get` terminal binding, `agent.get`/bounded `agent.wait`/single `agent.focus`, `pane.report_metadata`, 조용한 gate rejection, auto에서 `pane.send_text`와 parent mutation을 사용하지 않는 동작을 다룹니다. terminal `present|absent|unknown`, socket 교체와 legacy record fail-closed도 검증합니다. 현재 smoke는 non-mutating protocol-19 `agent.get`/`agent.wait`뿐이며 live focus 또는 metadata mutation을 주장하지 않습니다.
 
 ## 자동 CI 호환성 매트릭스
 

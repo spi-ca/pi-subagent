@@ -428,10 +428,10 @@ describe("pane launch broker", () => {
 		}
 	});
 
-	test("records the negotiated protocol 19 and 20 in Herdr allocation and gate authority", async () => {
+	test("records negotiated Herdr protocols 19, 20, and 22 in allocation and gate authority", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const runtime = fs.realpathSync(process.execPath);
-		for (const protocol of [19, 20] as const) {
+		for (const protocol of [19, 20, 22] as const) {
 			const server = await fakeHerdrBrokerServer(root, "success", protocol);
 			try {
 				const stateRoot = path.join(root, `state-protocol-${protocol}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });

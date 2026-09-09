@@ -6647,7 +6647,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     } else {
       const configured = parseHerdrEnvironment(process.env);
       if (!configured) throw new Error("Herdr pane mode requires a complete Herdr environment.");
-      // `resolveHerdrCallerPane` negotiates protocol 19/20 and records the live
+      // `resolveHerdrCallerPane` negotiates protocol 19/20/22 and records the live
       // binding, rather than trusting an environment address that may move.
       const live = await resolveHerdrCallerPane(process.env);
       if (!live) throw new Error("Herdr source pane is unavailable or no longer matches its configured workspace/tab binding.");

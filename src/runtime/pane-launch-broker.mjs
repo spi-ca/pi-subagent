@@ -25,7 +25,7 @@ const isUuidString = (value) => typeof value === "string" && UUID.test(value);
 // Preserve backend UUID spelling, but never distinguish case aliases in authority checks.
 const cmuxIdsEqual = (left, right) => isUuidString(left) && isUuidString(right) && left.toLowerCase() === right.toLowerCase();
 const PANE = /^%(?:0|[1-9][0-9]*)$/;
-const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20]);
+const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20, 22]);
 const isHerdrProtocol = (value) => HERDR_SUPPORTED_PROTOCOLS.has(value);
 const HERDR_ID = /^[^\u0000-\u001f\u007f-\u009f]{1,256}$/u;
 const HERDR_MAX_LINE_BYTES = 256 * 1024;
@@ -125,7 +125,7 @@ const HERDR_DIRECT_STARTUP_ENV = Object.freeze({
 });
 async function assertHerdrProtocol(socketPath, expectedProtocol) {
   const pong = await herdrRequest(socketPath, "ping", {});
-  if (!isHerdrProtocol(pong.protocol)) throw new Error("Herdr protocol must be one of 19 or 20");
+  if (!isHerdrProtocol(pong.protocol)) throw new Error("Herdr protocol must be one of 19, 20, or 22");
   if (expectedProtocol !== undefined && pong.protocol !== expectedProtocol) throw new Error(`Herdr protocol changed from ${expectedProtocol} to ${pong.protocol}`);
   return pong.protocol;
 }

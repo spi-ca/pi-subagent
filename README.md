@@ -23,10 +23,10 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 
 ## 설치
 
-Pi의 GitHub 패키지 설치 방식을 사용합니다. 기본 설치는 검토된 immutable release `v20260907-2`에 고정합니다.
+Pi의 GitHub 패키지 설치 방식을 사용합니다. 기본 설치는 검토된 immutable release `v20260909-1`에 고정합니다.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent@v20260907-2
+pi install git:github.com/spi-ca/pi-subagent@v20260909-1
 ```
 
 위 명령은 사용자 설정(`~/.pi/agent/settings.json`)에 다음과 같은 패키지 항목을 추가하고 저장소를 `~/.pi/agent/git/github.com/spi-ca/pi-subagent` 아래에 클론합니다.
@@ -170,7 +170,7 @@ CLI > 환경 변수 > 신뢰된 프로젝트 파일 > 전역 파일 > 내장 기
 `PI_SUBAGENT_TERMINAL_MODE`가 정확한 값이면 auto-detection보다 항상 우선합니다. 지정하지 않았을 때 확장이 현재 환경을 보고 다음 순서로 자동 선택합니다.
 
 - cmux 내부: `cmux-pane` — 기본 `auto`에서는 root sibling이 하나의 새 오른쪽 pane 안의 surface를 공유하고, nested descendant는 정확한 source pane에 surface로 쌓입니다.
-- Herdr 내부: `herdr-pane` — cmux가 아니고 owner-only Unix socket의 exact workspace/tab/pane/terminal binding이 검증될 때 기본 `auto`는 parent focus를 유지한 채 child마다 새 tab의 strict root pane에서 실행하고, `split`은 child별 오른쪽 split 호환 모드입니다. 설치된 Herdr v0.8.0의 protocol 19와 preview protocol 20의 공통 socket subset을 지원합니다.
+- Herdr 내부: `herdr-pane` — cmux가 아니고 owner-only Unix socket의 exact workspace/tab/pane/terminal binding이 검증될 때 기본 `auto`는 parent focus를 유지한 채 child마다 새 tab의 strict root pane에서 실행하고, `split`은 child별 오른쪽 split 호환 모드입니다. Herdr v0.8.0의 protocol 19, preview protocol 20, v0.9.0의 protocol 22에서 검증된 공통 socket subset을 지원합니다.
 - tmux 내부: `tmux-pane` — cmux와 Herdr가 모두 아니면 child마다 같은 session의 detached window를 사용합니다.
 - 그 외 환경: `inline`
 
@@ -246,4 +246,4 @@ MIT. 자세한 내용은 [`LICENSE`](LICENSE)와 [`NOTICE`](NOTICE)를 참고하
 
 ### Herdr 안전 경계
 
-Herdr 지원은 `HERDR_SOCKET_PATH` owner-only Unix socket에 직접 연결하며 Herdr CLI나 별도 supervisor process를 실행하지 않습니다. live mutation acceptance가 아니라 protocol 19/20 strict fake-socket 테스트로 검증됩니다. socket `dev`/`ino` generation·protocol마다 process-local `events.subscribe` physical stream 하나를 공유하고 relevant event만 listener별 in-memory fan-out합니다. 완료 retire watcher는 최초 reconciliation 뒤 relevant event와 매 disconnect/reconnect(반복 실패 포함) wake에서만 fresh `pane.get` 또는 bounded `pane.list`를 다시 읽으며 5초 backend polling을 하지 않습니다. healthy `events.subscribe`가 기본 wake-up 경로이고, `agent.wait`는 stream이 끊기거나 unhealthy일 때만 degraded run당 동시 observer와 in-flight wait 하나, 긴 bounded wait(30초/31초), process 전체 최대 16개로 씁니다. completed auto watcher도 최대 16개이며 cap 밖 후보는 registry recovery로 보존합니다. 공통 subset은 `agent.get`/`agent.wait`/`agent.focus`와 `pane.report_metadata`를 포함합니다. `auto`는 workspace-scoped `layout.apply` 한 번으로 `tab_id` 없이 unfocused 새 tab의 root pane에 wrapper direct argv를 시작하며, static `tab_label`은 이 생성 요청에서만 설정합니다. `split`은 기존 tab에 direct argv를 안전하게 넣을 수 없는 Herdr의 명시적 legacy `pane.split` + `pane.send_text` 경로이고, `auto`에서 fallback하지 않습니다. `agent.focus`는 user-initiated exact rebinding 뒤 한 번만 보내며 `pane.focus` fallback/retry가 없습니다. Herdr `auto`/new-tab cleanup은 `pane.close`, `tab.close`, `pane.send_keys`, `agent.send-keys` 같은 자동 close mutation을 보내지 않습니다. title과 child metadata는 별도 진단 정보이고 lifecycle authority는 generation-bound socket과 exact terminal identity입니다.
+Herdr 지원은 `HERDR_SOCKET_PATH` owner-only Unix socket에 직접 연결하며 Herdr CLI나 별도 supervisor process를 실행하지 않습니다. live mutation acceptance가 아니라 protocol 19/20/22 strict fake-socket 테스트로 검증됩니다. socket `dev`/`ino` generation·protocol마다 process-local `events.subscribe` physical stream 하나를 공유하고 relevant event만 listener별 in-memory fan-out합니다. 완료 retire watcher는 최초 reconciliation 뒤 relevant event와 매 disconnect/reconnect(반복 실패 포함) wake에서만 fresh `pane.get` 또는 bounded `pane.list`를 다시 읽으며 5초 backend polling을 하지 않습니다. healthy `events.subscribe`가 기본 wake-up 경로이고, `agent.wait`는 stream이 끊기거나 unhealthy일 때만 degraded run당 동시 observer와 in-flight wait 하나, 긴 bounded wait(30초/31초), process 전체 최대 16개로 씁니다. completed auto watcher도 최대 16개이며 cap 밖 후보는 registry recovery로 보존합니다. 공통 subset은 `agent.get`/`agent.wait`/`agent.focus`와 `pane.report_metadata`를 포함합니다. `auto`는 workspace-scoped `layout.apply` 한 번으로 `tab_id` 없이 unfocused 새 tab의 root pane에 wrapper direct argv를 시작하며, static `tab_label`은 이 생성 요청에서만 설정합니다. `split`은 기존 tab에 direct argv를 안전하게 넣을 수 없는 Herdr의 명시적 legacy `pane.split` + `pane.send_text` 경로이고, `auto`에서 fallback하지 않습니다. `agent.focus`는 user-initiated exact rebinding 뒤 한 번만 보내며 `pane.focus` fallback/retry가 없습니다. Herdr `auto`/new-tab cleanup은 `pane.close`, `tab.close`, `pane.send_keys`, `agent.send-keys` 같은 자동 close mutation을 보내지 않습니다. title과 child metadata는 별도 진단 정보이고 lifecycle authority는 generation-bound socket과 exact terminal identity입니다.

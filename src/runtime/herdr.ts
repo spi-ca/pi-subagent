@@ -11,9 +11,9 @@ import {
 
 export { HERDR_MAX_PUBLIC_ID_BYTES, isHerdrPublicId, parseHerdrEnvironment } from "../core/herdr-environment.js";
 
-/** v0.8.0 speaks protocol 19; current preview builds speak protocol 20. */
-export const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20] as const);
-export type HerdrProtocolVersion = 19 | 20;
+/** v0.8.0 speaks protocol 19; preview builds speak 20; v0.9.0 speaks 22. */
+export const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20, 22] as const);
+export type HerdrProtocolVersion = 19 | 20 | 22;
 export function isSupportedHerdrProtocol(value: unknown): value is HerdrProtocolVersion {
 	return typeof value === "number" && HERDR_SUPPORTED_PROTOCOLS.has(value as HerdrProtocolVersion);
 }
@@ -235,7 +235,7 @@ export class HerdrSocketClient {
 	/** Negotiate only the reviewed common subset and optionally pin its prior result. */
 	async assertSupportedProtocol(expected?: HerdrProtocolVersion, signal?: AbortSignal): Promise<HerdrProtocolVersion> {
 		const result = await this.request("ping", {}, { signal });
-		if (!isSupportedHerdrProtocol(result.protocol)) throw new HerdrProtocolError("Herdr protocol must be one of 19 or 20.");
+		if (!isSupportedHerdrProtocol(result.protocol)) throw new HerdrProtocolError("Herdr protocol must be one of 19, 20, or 22.");
 		if (expected !== undefined && result.protocol !== expected) throw new HerdrProtocolError(`Herdr protocol changed from ${expected} to ${result.protocol}.`);
 		return result.protocol;
 	}

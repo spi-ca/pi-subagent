@@ -211,10 +211,10 @@ function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): 
       },
       { triggerTurn: true, deliverAs: "steer" },
     );
-  } catch (error) {
-    console.warn(
-      `[pi-subagent] Failed to deliver background result for job ${job.id}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+  } catch {
+    // Delivery is best-effort. Never log untrusted thrown text: it can contain
+    // provider output or credentials, and no retry/ack protocol exists here.
+    console.warn(`[pi-subagent] Failed to deliver background result for job ${job.id}.`);
   }
 }
 

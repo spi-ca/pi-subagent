@@ -467,9 +467,23 @@ provider-live recorder는 macOS arm64의 명시적 Pi/tmux/cmux executable과 ro
 - [x] `ProcessLocalScheduler`가 accepted/start/cancel-before-start/settled 계수와 enqueue→dispatch queue wait, dispatch→local slot release 시간의 count/sum/max를 기록한다. monotonic 시간과 고정 크기 숫자 집계만 사용하며 개별 job history, 원문, 추가 polling/timer, 파일/provider I/O는 만들지 않는다. overflow·잘못된 clock도 scheduling 동작이나 finite snapshot을 깨지 않는다.
 - [x] host `session_start`당 통계 epoch는 한 번만 바뀐다. startup의 provisional/resolved `scheduler.startSession()` 두 호출은 유지하지만 통계를 두 번 지우지 않는다. 이전 epoch의 늦은 release는 capacity만 반환하고 새 통계를 오염시키지 않으며, shutdown과 queued cancellation도 epoch 경계로 검증한다.
 - [x] 집계는 immutable 내부 snapshot으로만 읽고, 사람이 호출하는 `/subagents doctor`에만 표시한다. tool input/result, background status, dashboard/presence event와 durable tree protocol schema 같은 machine-readable consumer 계약에는 필드를 추가하지 않는다.
-- [ ] background notification의 동기 거부와 session replacement 테스트를 보강하고, ACK 부재·보존 한계·취소 후 재실행 절차를 사용자 문서와 맞춘다.
+- [x] `test/entrypoint/session-start-fence.test.ts`에서 동기 notification 거부 뒤 완료 결과·status 보존, `sendMessage()` 호출 정확히 1회, 예외 원문 없는 고정 경고를 검증한다. 기존 session replacement fence와 exact-ID cancel→실제 종료→fresh invocation도 검증한다. 코드·테스트는 전체 CI **1,084 pass, 3 skip, 0 fail**로 확인했으며, ACK 부재·보존 한계·취소 후 재실행은 [사용법](./usage.md#상태-확인과-취소)을 따른다. 영속 복원·live 작업 수정 API는 추가하지 않았다.
 
 queue wait는 scheduler enqueue 이후만, local slot time은 tree permit 대기와 runner callback 정리까지 포함한다. tree permit의 늦은 durable settlement, child 전체 RSS/PSS, host keystroke→response 또는 steer 전달 지연은 이 집계가 측정하지 않는다. 기본 background history/output 제한과 기존 호출별·tree-wide cap은 유지한다. 이 측정 추가만으로 속도나 메모리 절감이 입증됐다고 주장하지 않는다.
+
+### 19.3 제한된 로컬 revision 비교
+
+`68b8111` → `fd6913e`를 Linux x86_64 / AMD Ryzen 5 5600G / Bun 1.4.2에서 비교했다. 별도 detached worktree마다 M0·M7 warm-up을 수행한 뒤 3쌍을 AB/BA/AB 순서로 측정했으며, 16단계 모두 완료되고 두 worktree의 변경 없음과 recorder 임시 상태의 정리를 확인했다. tracked fixture는 수정하지 않았다.
+
+| M7 관측값 | baseline 중앙값 [최솟값–최댓값] | candidate 중앙값 [최솟값–최댓값] |
+| --- | --- | --- |
+| 전체 분류 시간 | 3,986 ms [3,924–7,544] | 3,937 ms [3,929–5,548] |
+| startup latency | 6.43 ms [6.28–6.50] | 6.09 ms [5.82–6.59] |
+| RSS 증가량 | 163 MiB [61–199] | 128 MiB [115–135] |
+
+이는 **반복 3회의 관측값이지 유의한 성능 개선의 증명은 아니다.** 측정 harness는 두 revision에서 동일하며, 범위가 겹치고 M0/M7의 일부 시간 지표는 증가하기도 했다. M0 RSS는 부모 프로세스만 측정한다. 이 비교는 scheduler 우선순위 효과, 전체 child RSS/PSS, Phase 0–8 종합 성능이나 macOS/cmux/provider-live 검증을 대신하지 않는다.
+
+원본 JSON·환경·단계별 검증·집계는 측정 호스트의 private 외부 경로 `/tmp/pi-subagent-perf-V2OuAQnt/artifacts/`에 보존했다. 이는 저장소에 배포되는 fixture가 아니며 임시 경로의 영속성을 보장하지 않는다. 원본이 없으면 위 수치만으로 재검증 완료를 주장하지 않는다. 기존 current-source fixture 검증 gate와 §19.1의 미완료 항목은 그대로 남긴다.
 
 <a id="20-권장-구현-순서"></a>
 ## 20. 역사적 구현 순서와 남은 결정

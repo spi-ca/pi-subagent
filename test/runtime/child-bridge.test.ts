@@ -705,7 +705,7 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("publishes the boundary-less V3 failure record when boundary capture faults", async () => {
-		const bridge = await setupBridge("run-boundary-capture-fault");
+		const bridge = await setupBridge("run-boundary-capture-fault", { leaseStaleMs: 10_000 });
 		await bridge.emit("session_start");
 		await bridge.emit("agent_start");
 		await fs.promises.rm(bridge.paths.childSessionPath);
@@ -991,11 +991,34 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("does not resume the checker when ACK publication writes then throws and delayed readback later confirms it", async () => {
+		const deferred = () => {
+			let resolve!: () => void;
+			return { promise: new Promise<void>((done) => { resolve = done; }), resolve: () => resolve() };
+		};
+		const waitForSignal = async (signal: Promise<void>, description: string) => {
+			let timer: NodeJS.Timeout | undefined;
+			try {
+				await Promise.race([signal, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), 2_000); })]);
+			} finally { if (timer) clearTimeout(timer); }
+		};
+		const publisherAttempted = deferred();
+		const allowAckReadback = deferred();
+		const detachedOwnershipAccepted = deferred();
 		let reads = 0;
 		const bridge = await setupBridge("transfer-ack-ambiguous", {
 			isProcessIdentityAlive: () => true,
-			publishPromotionAck: async (filePath, value) => { await atomicWriteJson(filePath, value); throw new Error("written acknowledgement reported as failed"); },
-			readPromotionAck: async (filePath) => ++reads <= 3 ? null : await readJsonFile(filePath),
+			leaseStaleMs: 10_000,
+			publishPromotionAck: async (filePath, value) => {
+				publisherAttempted.resolve();
+				await atomicWriteJson(filePath, value);
+				throw new Error("written acknowledgement reported as failed");
+			},
+			readPromotionAck: async (filePath) => {
+				if (++reads <= 3) return null;
+				await allowAckReadback.promise;
+				return await readJsonFile(filePath);
+			},
+			releaseInheritedTreePermit: async () => { detachedOwnershipAccepted.resolve(); return true; },
 		});
 		const allocation = { version: 2, runId: "transfer-ack-ambiguous", terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
@@ -1004,9 +1027,14 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174007", runId: "transfer-ack-ambiguous",
 			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 60));
-		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		await new Promise((resolve) => setTimeout(resolve, 320));
+		await waitForSignal(publisherAttempted.promise, "the fenced checker to attempt ACK publication");
+		try {
+			await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
+		} finally {
+			allowAckReadback.resolve();
+		}
+		await waitForSignal(detachedOwnershipAccepted.promise, "delayed ACK readback to elect detached ownership and stop the checker");
+		assert.ok(reads > 3, "the ambiguous write must be reconciled by delayed ACK readback");
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-ack-ambiguous"));
 		assert.equal(bridge.lifecycle.aborted, false, "an ambiguous published ACK must never reactivate parent-death aborting");
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-ack-ambiguous"), null);

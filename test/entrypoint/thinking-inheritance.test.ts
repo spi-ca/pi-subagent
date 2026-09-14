@@ -8,6 +8,7 @@ import * as path from "node:path";
 const captured: Array<{ agentName: string; parentThinkingLevel?: string }> = [];
 
 mock.module("@earendil-works/pi-tui", () => ({
+  Box: class {},
   Container: class {}, Markdown: class {}, Spacer: class {}, Text: class {},
 }));
 mock.module("../../src/runtime/tree-permit-authority", () => ({
@@ -97,6 +98,7 @@ describe("subagent thinking inheritance", () => {
       delete process.env.PI_SUBAGENT_DEPTH;
       delete process.env.PI_SUBAGENT_STACK;
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,

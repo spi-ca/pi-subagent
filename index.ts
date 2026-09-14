@@ -50,6 +50,7 @@ import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSess
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
+import { renderBackgroundResult } from "./src/ui/background-result.js";
 import { formatBoundedForegroundEnvelope, formatBoundedForegroundResultRecordEnvelope, formatBoundedForegroundResultSummary, formatBoundedForegroundThrownError } from "./src/core/foreground-output.js";
 import { emptyAccountingUsage, finalizeForegroundUsage, type AccountingUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
@@ -526,6 +527,7 @@ async function requestProjectAgentApprovalIfNeeded(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, renderBackgroundResult);
   pi.registerFlag("subagent-max-depth", {
     description: "Maximum allowed subagent delegation depth (default: 5).",
     type: "string",
@@ -667,6 +669,7 @@ export default function (pi: ExtensionAPI) {
           const hasTmuxFields = process.env.TMUX !== undefined || process.env.TMUX_PANE !== undefined;
           const piCmuxTool = pi.getAllTools().some((tool) => tool.name === "cmux_open_terminal" && tool.sourceInfo.source !== "builtin");
           const piCmuxCommand = pi.getCommands().some((entry) => entry.source === "extension" && /^(?:cmv|cmh|cmo|cmt)(?::\d+)?$/.test(entry.name));
+          const schedulerMetrics = scheduler.getMetricsSnapshot();
           const lines = [
             `terminal: ${terminal}`,
             `cmux identity: ${hasCmuxFields ? isInsideCmux() ? "valid" : "invalid" : "not present"}`,
@@ -676,6 +679,9 @@ export default function (pi: ExtensionAPI) {
             `layout: ${interactivePaneLayout}`,
             `child policy: ${resolveManagedChildPolicy()}`,
             `scheduler: ${scheduler.activeCount} active, ${scheduler.queuedCount} queued, max ${scheduler.maxActive}`,
+            `scheduler metrics: epoch ${schedulerMetrics.epoch}; accepted ${schedulerMetrics.accepted}, started ${schedulerMetrics.started}, cancelled-before-start ${schedulerMetrics.cancelledBeforeStart}, settled ${schedulerMetrics.settled}`,
+            `scheduler queue wait: count ${schedulerMetrics.enqueueToDispatch.count}, sum ${schedulerMetrics.enqueueToDispatch.sumMs} ms, max ${schedulerMetrics.enqueueToDispatch.maxMs} ms`,
+            `scheduler dispatch-to-local-slot-release: count ${schedulerMetrics.dispatchToLocalSlotRelease.count}, sum ${schedulerMetrics.dispatchToLocalSlotRelease.sumMs} ms, max ${schedulerMetrics.dispatchToLocalSlotRelease.maxMs} ms (local slot only; not tree settlement or host response)`,
             `interactive authority: ${listActiveInteractiveRunIds().length} active`,
             ...reaperDiagnosticUx.formatDoctorStatus(),
             `pi-cmux metadata: ${piCmuxTool || piCmuxCommand ? "possibly detected (registry name only)" : "not observable"}`,
@@ -933,8 +939,10 @@ export default function (pi: ExtensionAPI) {
     discoveredAgents = [];
     sessionShuttingDown = false;
     discoveryCache.startSession();
-    // Reset stale queued work synchronously. Resolved limits replace this
-    // provisional capacity only if this startup remains current.
+    // Reset observational metrics before cancelling stale queued work, then
+    // replace its scheduler generation. Resolved limits below use a second
+    // generation without splitting this host-session metrics epoch.
+    scheduler.resetMetrics();
     scheduler.startSession(limits.maxActive);
     const isStartupCurrent = () => startupGeneration === sessionStartupGeneration && !sessionShuttingDown;
 

@@ -15,6 +15,7 @@ type AssertionProfile = {
   tools?: readonly string[];
   providers?: readonly string[];
   commands?: readonly string[];
+  messageRenderers?: readonly string[];
   hooks?: readonly string[];
   eventListeners?: readonly string[];
   exports?: readonly string[];
@@ -31,7 +32,7 @@ const PROFILES: Record<string, AssertionProfile> = {
   // registration must remain inert when the clean smoke environment has none.
   "pi-herdr-presence": { extension: true },
   "pi-kiro-api": { extension: true, providers: ["kiro-api-key"] },
-  "@mjakl/pi-subagent": { extension: true, tools: ["subagent"], commands: ["subagents"], hooks: ["session_start", "agent_start", "agent_settled", "session_shutdown", "before_agent_start"] },
+  "@mjakl/pi-subagent": { extension: true, tools: ["subagent"], commands: ["subagents"], messageRenderers: ["subagent_result"], hooks: ["session_start", "agent_start", "agent_settled", "session_shutdown", "before_agent_start"] },
   "@pi/presence": { extension: false, exports: ["EVENT_NAMES", "createPresenceProducer", "createPresenceConsumer"] },
 };
 
@@ -76,6 +77,7 @@ const pi = {
   registerTool: (value) => calls.push({ kind: "registerTool", name: String(value?.name), value }),
   registerProvider: (value) => calls.push({ kind: "registerProvider", name: String(value?.id ?? value?.api), value }),
   registerCommand: (name, value) => calls.push({ kind: "registerCommand", name: String(name), value }),
+  registerMessageRenderer: (name, value) => calls.push({ kind: "registerMessageRenderer", name: String(name), value }),
   registerFlag: (name, value) => calls.push({ kind: "registerFlag", name: String(name), value }),
   getFlag: () => undefined,
   getAllTools: () => [],
@@ -93,6 +95,7 @@ if (profile.extension) {
   requireNames("registerTool", profile.tools);
   requireNames("registerProvider", profile.providers);
   requireNames("registerCommand", profile.commands);
+  requireNames("registerMessageRenderer", profile.messageRenderers);
   requireNames("on", profile.hooks);
   requireNames("events.on", profile.eventListeners);
 } else {
@@ -159,6 +162,10 @@ function selfTest(): void {
     runFixture(root, "valid-extension", 'export default function(pi) { pi.registerTool({ name: "fixture-tool" }); pi.on("session_start", () => {}); pi.events.on("fixture:v2", () => {}); }\n', extensionProfile, true);
     runFixture(root, "missing-default", 'export const value = true;\n', extensionProfile, false);
     runFixture(root, "zero-registrations", 'export default function() {}\n', extensionProfile, false);
+    const rendererProfile: AssertionProfile = { extension: true, messageRenderers: ["subagent_result"] };
+    runFixture(root, "valid-renderer", 'export default function(pi) { pi.registerMessageRenderer("subagent_result", () => undefined); }\n', rendererProfile, true);
+    runFixture(root, "missing-renderer", 'export default function() {}\n', rendererProfile, false);
+    runFixture(root, "wrong-renderer", 'export default function(pi) { pi.registerMessageRenderer("other", () => undefined); }\n', rendererProfile, false);
     const libraryProfile: AssertionProfile = { extension: false, exports: ["EVENT_NAMES", "createPresenceProducer"] };
     runFixture(root, "valid-library", 'export const EVENT_NAMES = {}; export const createPresenceProducer = () => undefined;\n', libraryProfile, true);
     runFixture(root, "missing-library-export", 'export const EVENT_NAMES = {};\n', libraryProfile, false);

@@ -19,16 +19,33 @@ import type { SingleResult, SubagentDetails } from "../../src/core/types";
 
 const roots: string[] = [];
 const original = { execPath: process.execPath, path: process.env.PATH, tmux: process.env.TMUX, tmuxPane: process.env.TMUX_PANE, stateRoot: process.env.PI_SUBAGENT_RUN_STATE_DIR, brokerRuntime: process.env.PI_SUBAGENT_BROKER_RUNTIME };
+type PhaseName = "completion" | "fence" | "malformed" | "cancel" | "external-close" | "shutdown" | "reload" | "final-socket-close" | "final-socket-remove" | "after-each-shutdown" | "after-each-reset" | "after-each-roots";
+let phaseOrigin = performance.now();
+
+async function phase<T>(name: PhaseName, work: () => Promise<T>): Promise<T> {
+  const elapsed = () => Math.round(performance.now() - phaseOrigin);
+  console.log(`[fake-adapter-e2e] phase:start ${name} elapsedMs=${elapsed()}`);
+  try {
+    const result = await work();
+    console.log(`[fake-adapter-e2e] phase:end ${name} elapsedMs=${elapsed()}`);
+    return result;
+  } catch (error) {
+    console.log(`[fake-adapter-e2e] phase:failure ${name} elapsedMs=${elapsed()}`);
+    throw error;
+  }
+}
 
 afterEach(async () => {
-  await shutdownActiveInteractiveRuns().catch(() => undefined);
-  await resetInteractiveShutdownForSession();
+  await phase("after-each-shutdown", async () => await shutdownActiveInteractiveRuns().catch(() => undefined));
+  await phase("after-each-reset", async () => await resetInteractiveShutdownForSession());
   resetInteractivePiVersionChecksForTest();
   process.execPath = original.execPath;
   for (const [name, value] of Object.entries({ PATH: original.path, TMUX: original.tmux, TMUX_PANE: original.tmuxPane, PI_SUBAGENT_RUN_STATE_DIR: original.stateRoot, PI_SUBAGENT_BROKER_RUNTIME: original.brokerRuntime })) {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
-  while (roots.length) await fs.promises.rm(roots.pop()!, { recursive: true, force: true });
+  await phase("after-each-roots", async () => {
+    while (roots.length) await fs.promises.rm(roots.pop()!, { recursive: true, force: true });
+  });
 });
 
 const agent: AgentConfig = {
@@ -248,6 +265,7 @@ async function runFake(task: string, options: { signal?: AbortSignal; onUpdate?:
 describe("fake-adapter interactive runAgent E2E", () => {
   test("runs allocation through gate, wrapper, child completion, exact close, cancellation, external close, and session reload without real tmux", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
+    phaseOrigin = performance.now();
     const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-runner-e2e-"));
     roots.push(root);
     const stateRoot = path.join(root, "runs");
@@ -268,13 +286,16 @@ describe("fake-adapter interactive runAgent E2E", () => {
       assert.equal(resolveBackendExecutable("tmux-pane"), fs.realpathSync(path.join(bin, "tmux")));
       await resetInteractiveShutdownForSession();
 
-      const completed = await runFake("complete normally");
-      assert.equal(completed.exitCode, 0, `${completed.errorMessage ?? ""}\n${completed.stderr}`);
-      assert.match(JSON.stringify(completed.messages), /fake interactive completion/);
-      await clearFakeTarget(socketPath);
-      assert.deepEqual(listActiveInteractiveRunIds(), []);
-      await resetInteractiveShutdownForSession();
+      await phase("completion", async () => {
+        const completed = await runFake("complete normally");
+        assert.equal(completed.exitCode, 0, `${completed.errorMessage ?? ""}\n${completed.stderr}`);
+        assert.match(JSON.stringify(completed.messages), /fake interactive completion/);
+        await clearFakeTarget(socketPath);
+        assert.deepEqual(listActiveInteractiveRunIds(), []);
+        await resetInteractiveShutdownForSession();
+      });
 
+      await phase("fence", async () => {
       const updates: string[] = [];
       let callbackBlocked = false;
       let callbackExitingAt = 0;
@@ -311,7 +332,9 @@ describe("fake-adapter interactive runAgent E2E", () => {
       }
       await clearFakeTarget(socketPath);
       await resetInteractiveShutdownForSession();
+      });
 
+      await phase("malformed", async () => {
       let malformedUpdates = 0;
       const malformedController = new AbortController();
       const malformedCompletion = runFake("malformed completion after fence", {
@@ -339,7 +362,9 @@ describe("fake-adapter interactive runAgent E2E", () => {
       assert.equal(malformedState.closeCount ?? 0, 0, "malformed completion must not close the target");
       await clearFakeTarget(socketPath);
       await resetInteractiveShutdownForSession();
+      });
 
+      await phase("cancel", async () => {
       const controller = new AbortController();
       const cancelling = runFake("hold for cancellation", { signal: controller.signal });
       await waitFor(() => listActiveInteractiveRunIds()[0], "cancellable active run");
@@ -347,7 +372,9 @@ describe("fake-adapter interactive runAgent E2E", () => {
       const cancelled = await cancelling;
       assert.equal(cancelled.exitCode, 130);
       await clearFakeTarget(socketPath);
+      });
 
+      await phase("external-close", async () => {
       const externallyClosing = runFake("hold for external close");
       await waitFor(() => listActiveInteractiveRunIds()[0], "externally closed active run");
       const external = JSON.parse(await fs.promises.readFile(`${socketPath}.fake-state.json`, "utf8"));
@@ -358,7 +385,9 @@ describe("fake-adapter interactive runAgent E2E", () => {
       const externalResult = await externallyClosing;
       assert.notEqual(externalResult.exitCode, 0);
       await clearFakeTarget(socketPath);
+      });
 
+      await phase("shutdown", async () => {
       const shuttingDown = runFake("hold for session shutdown");
       await waitFor(() => listActiveInteractiveRunIds()[0], "shutdown active run");
       await shutdownActiveInteractiveRuns();
@@ -366,9 +395,13 @@ describe("fake-adapter interactive runAgent E2E", () => {
       assert.notEqual(shutdownResult.exitCode, 0);
       await clearFakeTarget(socketPath);
       await resetInteractiveShutdownForSession();
+      });
+
+      await phase("reload", async () => {
       const reloaded = await runFake("complete after session reload");
       assert.equal(reloaded.exitCode, 0);
       await clearFakeTarget(socketPath);
+      });
 
       const fake = JSON.parse(await fs.promises.readFile(`${socketPath}.fake-state.json`, "utf8"));
       assert.equal(fake.sourcePid, process.pid, "source pane identity must never be mutated");
@@ -387,8 +420,8 @@ describe("fake-adapter interactive runAgent E2E", () => {
       assert.ok(childPids.length >= 4, "the E2E must observe actual fake Pi child processes");
       assert.ok(childPids.every((pid) => !alive(pid)), "fake Pi child processes must not leak after exact pane cleanup");
     } finally {
-      await new Promise<void>((resolve) => socket.close(() => resolve()));
-      await fs.promises.rm(socketPath, { force: true });
+      await phase("final-socket-close", async () => await new Promise<void>((resolve) => socket.close(() => resolve())));
+      await phase("final-socket-remove", async () => await fs.promises.rm(socketPath, { force: true }));
     }
   });
 });

@@ -1222,6 +1222,22 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(explicitThinkingAgent.thinking, "minimal", "argv construction must not mutate AgentConfig");
 	});
 
+	test("keeps inherited extensions enabled by default for inline and interactive children", () => {
+		const agent = { name: "worker", description: "", systemPrompt: "", source: "user" as const, filePath: "/tmp/worker.md" };
+		const previousPolicy = process.env.PI_SUBAGENT_CMUX_CHILD_POLICY;
+		try {
+			delete process.env.PI_SUBAGENT_CMUX_CHILD_POLICY;
+			assert.equal(resolveManagedChildPolicy(), "inherit");
+			const inline = buildPiArgs(agent, null, "/tmp/task", "spawn", null);
+			const interactive = buildInteractivePiArgs(agent, null, "/tmp/task", "/tmp/session");
+			assert.equal(inline.includes("--no-extensions"), false);
+			assert.equal(interactive.includes("--no-extensions"), false);
+		} finally {
+			if (previousPolicy === undefined) delete process.env.PI_SUBAGENT_CMUX_CHILD_POLICY;
+			else process.env.PI_SUBAGENT_CMUX_CHILD_POLICY = previousPolicy;
+		}
+	});
+
 	test("builds a minimal managed child profile while preserving bridge and nested delegation", () => {
 		assert.equal(resolveManagedChildPolicy({}), "inherit");
 		assert.equal(resolveManagedChildPolicy({ PI_SUBAGENT_CMUX_CHILD_POLICY: "managed" }), "managed");

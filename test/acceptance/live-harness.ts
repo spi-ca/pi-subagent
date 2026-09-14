@@ -54,6 +54,7 @@ export const PACKAGE_REGISTRATION_EXPECTED_FLAGS = [
 const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "session_shutdown", "before_agent_start"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_TOOLS = ["subagent"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_COMMANDS = ["subagents"] as const;
+const PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS = ["subagent_result"] as const;
 export const PACKAGE_PROBE_EVENT_CHANNELS = ["pi-subagent:dashboard:v1", "pi-subagent:aggregate-completed:v1"] as const;
 
 type PackageProbeEvents = {
@@ -1529,11 +1530,13 @@ const expectedFlags = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_FLAGS)};
 const expectedEvents = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_EVENTS)};
 const expectedTools = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_TOOLS)};
 const expectedCommands = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_COMMANDS)};
+const expectedMessageRenderers = ${JSON.stringify(PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS)};
 const assertExactRegistrationNames = ${assertExactPackageRegistrationNames.toString()};
 const registeredFlags: unknown[] = [];
 const registeredEvents: unknown[] = [];
 const registeredTools: unknown[] = [];
 const registeredCommands: unknown[] = [];
+const registeredMessageRenderers: unknown[] = [];
 const PACKAGE_PROBE_EVENT_CHANNELS = ${JSON.stringify(PACKAGE_PROBE_EVENT_CHANNELS)};
 const createBoundedPackageProbeEvents = ${createBoundedPackageProbeEvents.toString()};
 const api = new Proxy({
@@ -1544,12 +1547,14 @@ const api = new Proxy({
   on: (event: unknown, handler: unknown) => { if (typeof handler !== "function") throw new Error("non-function event handler"); registeredEvents.push(event); },
   registerTool: (tool: { name?: unknown }) => { registeredTools.push(tool?.name); },
   registerCommand: (name: unknown, command: { handler?: unknown }) => { if (typeof command?.handler !== "function") throw new Error("command has no handler"); registeredCommands.push(name); },
+  registerMessageRenderer: (customType: unknown, renderer: unknown) => { if (typeof renderer !== "function") throw new Error("message renderer is not a function"); registeredMessageRenderers.push(customType); },
 }, { get(target, key, receiver) { if (typeof key !== "string" || !(key in target)) throw new Error("unexpected ExtensionAPI access: " + String(key)); return Reflect.get(target, key, receiver); } });
 extension(api as never);
 assertExactRegistrationNames(registeredFlags, expectedFlags, "flag");
 assertExactRegistrationNames(registeredEvents, expectedEvents, "event");
 assertExactRegistrationNames(registeredTools, expectedTools, "tool");
 assertExactRegistrationNames(registeredCommands, expectedCommands, "command");
+assertExactRegistrationNames(registeredMessageRenderers, expectedMessageRenderers, "message renderer");
 console.log("registered:subagent");
 `, { mode: 0o600 });
     const registration = await run("bun", [probe], { cwd: installRoot, env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR } });

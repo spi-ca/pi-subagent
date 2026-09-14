@@ -31,6 +31,7 @@ class CapturingProcessLocalScheduler extends RealProcessLocalScheduler {
 }
 
 mock.module("@earendil-works/pi-tui", () => ({
+  Box: class {},
   Container: class {},
   Markdown: class {},
   Spacer: class {},
@@ -160,6 +161,22 @@ describe("production dashboard boundary", () => {
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
   });
 
+  test("registers the display-only background result renderer", () => {
+    const renderers = new Map<string, unknown>();
+    registerPiSubagent({
+      registerMessageRenderer: (customType: string, renderer: unknown) => renderers.set(customType, renderer),
+      registerFlag: () => undefined,
+      getFlag: () => undefined,
+      registerCommand: () => undefined,
+      registerTool: () => undefined,
+      on: () => undefined,
+      events: { emit: () => undefined },
+      getAllTools: () => [],
+      getCommands: () => [],
+    } as never);
+    assert.equal(renderers.size, 1);
+    assert.equal(typeof renderers.get("subagent_result"), "function");
+  });
 
   test("reports absent, invalid, and valid Herdr identities in doctor output without exposing identity values", async () => {
     const herdrEnvironmentNames = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"] as const;
@@ -169,6 +186,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
@@ -217,6 +235,48 @@ describe("production dashboard boundary", () => {
     }
   });
 
+  test("reports bounded scheduler metrics in doctor output without task or identifier text", async () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const commands = new Map<string, { handler: (rawArgs: string, ctx: unknown) => Promise<void> }>();
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH;
+      registerPiSubagent({
+        registerMessageRenderer: () => undefined,
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
+        registerTool: () => undefined,
+        on: () => undefined,
+        events: { emit: () => undefined },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const scheduler = createdSchedulers.at(-1);
+      const command = commands.get("subagents");
+      assert.ok(scheduler);
+      assert.ok(command);
+      const rawTaskText = "doctor-must-not-print-this-task";
+      const rawIdText = "doctor-must-not-print-this-id";
+      const handle = scheduler.createHandle();
+      const rawPayload = `${rawTaskText}:${rawIdText}`;
+      assert.deepEqual(await scheduler.schedule(handle, async () => rawPayload), { started: true, value: rawPayload });
+
+      let doctorOutput = "";
+      await command.handler("doctor", { ui: { notify: (message: string) => { doctorOutput = message; } } });
+      assert.match(doctorOutput, /scheduler metrics: epoch \d+; accepted \d+, started \d+, cancelled-before-start \d+, settled \d+/);
+      assert.match(doctorOutput, /scheduler queue wait: count \d+, sum \d+\.?\d* ms, max \d+\.?\d* ms/);
+      assert.match(doctorOutput, /scheduler dispatch-to-local-slot-release: count \d+, sum \d+\.?\d* ms, max \d+\.?\d* ms \(local slot only; not tree settlement or host response\)/);
+      assert.doesNotMatch(doctorOutput, new RegExp(rawTaskText));
+      assert.doesNotMatch(doctorOutput, new RegExp(rawIdText));
+      for (const value of [scheduler.getMetricsSnapshot().epoch, scheduler.getMetricsSnapshot().accepted, scheduler.getMetricsSnapshot().started, scheduler.getMetricsSnapshot().cancelledBeforeStart, scheduler.getMetricsSnapshot().settled]) {
+        assert.ok(Number.isFinite(value) && value >= 0);
+      }
+    } finally {
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+  });
+
   test("resets old scheduler projections at the production dashboard boundary while retaining capacity", async () => {
     const previousDepth = process.env.PI_SUBAGENT_DEPTH;
     const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
@@ -233,6 +293,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,
@@ -303,6 +364,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -345,6 +407,7 @@ describe("production dashboard boundary", () => {
       else process.env.PI_SUBAGENT_DEPTH = depth;
       const handlers = new Map<string, unknown>();
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -465,7 +528,8 @@ describe("subagent tool schema", () => {
       execute?: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; isError?: boolean }>;
     } | undefined;
     const pi = {
-      registerFlag: () => undefined,
+      registerMessageRenderer: () => undefined,
+        registerFlag: () => undefined,
       getFlag: () => undefined,
       registerCommand: () => undefined,
       registerTool: (tool: unknown) => {
@@ -746,6 +810,7 @@ describe("fork setup session fences", () => {
       await fs.mkdir(path.join(process.env.PI_CODING_AGENT_DIR, "agents"), { recursive: true });
       await fs.writeFile(path.join(process.env.PI_CODING_AGENT_DIR, "agents", "worker.md"), "---\nname: worker\ndescription: worker\n---\nWorker prompt\n");
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -811,7 +876,8 @@ describe("project-agent root confirmation", () => {
     const confirmations: Array<{ title: string; body: string }> = [];
     let subagentTool: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
     const pi = {
-      registerFlag: () => undefined,
+      registerMessageRenderer: () => undefined,
+        registerFlag: () => undefined,
       getFlag: () => undefined,
       registerCommand: () => undefined,
       registerTool: (tool: unknown) => {
@@ -921,6 +987,7 @@ describe("pi-subagent child project trust", () => {
 
       const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
       const pi = {
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,

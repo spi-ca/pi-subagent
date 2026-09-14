@@ -65,11 +65,18 @@ mock.module("../../src/core/subagent-limits", () => ({
 }));
 
 const { ProcessLocalScheduler: RealProcessLocalScheduler } = await import("../../src/runtime/process-local-scheduler");
-const createdSchedulers: InstanceType<typeof RealProcessLocalScheduler>[] = [];
+const createdSchedulers: CapturingProcessLocalScheduler[] = [];
 class CapturingProcessLocalScheduler extends RealProcessLocalScheduler {
+  metricsResetCalls = 0;
+
   constructor(...args: ConstructorParameters<typeof RealProcessLocalScheduler>) {
     super(...args);
     createdSchedulers.push(this);
+  }
+
+  override resetMetrics(): void {
+    this.metricsResetCalls += 1;
+    super.resetMetrics();
   }
 }
 mock.module("../../src/runtime/process-local-scheduler", () => ({
@@ -77,6 +84,7 @@ mock.module("../../src/runtime/process-local-scheduler", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
+  Box: class {},
   Container: class {}, Markdown: class {}, Spacer: class {}, Text: class {},
 }));
 mock.module("@earendil-works/pi-coding-agent", () => ({
@@ -156,6 +164,7 @@ describe("session-start background completion fence", () => {
       const messages: unknown[] = [];
       const observerEvents: Array<{ channel: string; payload: unknown }> = [];
       registerPiSubagent({
+        registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,
@@ -185,6 +194,7 @@ describe("session-start background completion fence", () => {
 
       resolvedMaxActiveValues.push(1);
       await sessionStart({}, session("old"));
+      assert.equal(createdSchedulers.at(-1)?.metricsResetCalls, 1, "the host startup establishes one metrics epoch despite provisional/resolved scheduler generations");
       let finishOldRun!: () => void;
       oldRunFinished = new Promise<void>((resolve) => { finishOldRun = resolve; });
       releaseOldRun = finishOldRun;
@@ -198,6 +208,7 @@ describe("session-start background completion fence", () => {
       const slowResolutionEntered = new Promise<void>((resolve) => { markSlowResolutionEntered = resolve; });
       const replaced = sessionStart({}, session("replacement", { hasUI: true, throwOnStatusClear: true }));
       await slowResolutionEntered;
+      assert.equal(createdSchedulers.at(-1)?.metricsResetCalls, 2, "the reset occurs synchronously before slow configuration resolution");
 
       // session_start has reached its first await, so its synchronous preamble
       // must already have withdrawn/fenced all old observer state. The direct
@@ -227,6 +238,7 @@ describe("session-start background completion fence", () => {
       const latest = sessionStart({}, session("latest"));
       releaseSlowLimits();
       await Promise.all([replaced, latest]);
+      assert.equal(createdSchedulers.at(-1)?.metricsResetCalls, 3, "each host session_start resets metrics exactly once, including racing starts");
       assert.equal(createdSchedulers.at(-1)?.maxActive, 3, "the slower superseded startup must not replace the latest session limits");
       assert.deepEqual(dashboardLifecycleCalls.filter((call) => call.startsWith("start:")), ["start:old:1", "start:latest:3"], "only the winning startup initializes a dashboard generation");
       assert.deepEqual(presenceLifecycleCalls.filter((call) => call.startsWith("start:")), ["start:old:1", "start:latest:3"], "only the winning startup initializes a presence generation");

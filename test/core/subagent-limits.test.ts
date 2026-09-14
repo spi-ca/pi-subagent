@@ -284,11 +284,11 @@ describe("subagent limits", () => {
     assert.equal(MAX_NODE_TIMER_DELAY_MS, 2_147_483_647);
   });
 
-  test("keeps README and configuration tables in parity with runtime keys", async () => {
+  test("keeps the canonical configuration table in parity with runtime keys", async () => {
     const readme = await fs.readFile(path.resolve(import.meta.dirname, "../../README.md"), "utf8");
     const configuration = await fs.readFile(path.resolve(import.meta.dirname, "../../docs/configuration.md"), "utf8");
+    assert.match(readme, /\[설정\]\(docs\/configuration\.md\)/);
     for (const name of Object.keys(SUBAGENT_LIMIT_DEFINITIONS)) {
-      assert.match(readme, new RegExp("\\| `" + name + "` \\|"));
       assert.match(configuration, new RegExp("\\| `" + name + "` \\|"));
     }
     const packageJson = JSON.parse(await fs.readFile(path.resolve(import.meta.dirname, "../../package.json"), "utf8")) as { files?: string[] };

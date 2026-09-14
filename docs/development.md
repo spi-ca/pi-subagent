@@ -12,19 +12,35 @@
 
 - `package.json`의 `packageManager` 필드와 맞는 Bun
 
-## 명령
+<a id="명령"></a>
+## 기본 개발 절차
 
 ```bash
 bun install --frozen-lockfile
-bun run check
-bun test --isolate --pass-with-no-tests --max-concurrency 1
 bun run ci
-
-# package file 목록에서 V2 broker entrypoint 확인
-bun pm pack --dry-run
 ```
 
-`bun run ci`는 타입 체크와 file isolation 테스트를 실행합니다. 테스트는 의도적으로 file-global Bun mock과 process global을 사용하므로 isolation이 필수입니다. `bun pm pack --dry-run` 출력에는 `src/runtime/pane-launch-broker.mjs`, `pi-subagent.schema.json`, `pi-subagent.detached-ownership.schema.json`가 포함되어야 합니다. opt-in acceptance는 production과 같은 deterministic runtime/backend resolver를 사용합니다. runtime path는 선택된 실행 명령이고 interpreter path는 native binary 또는 첫 shebang interpreter입니다. interactive preflight는 backend뿐 아니라 broker runtime/interpreter/entrypoint의 realpath·inode·metadata generation을 캡처하고 intent publish 및 broker spawn 직전에 다시 확인합니다. tmux는 canonical socket inode와 server PID start identity도 preflight와 publish 직전에 재검증합니다. env shebang과 Bun/Node를 `exec`하는 shell wrapper도 지원하므로 parent Pi의 `process.execPath`를 provenance로 신뢰하지 않습니다. live cmux/tmux는 명시적 environment gate가 필요합니다. cmux harness는 caller workspace를 disposable로 요구하지 않고, 자체 private workspace를 생성·정리합니다. 기본 push/schedule CI에는 포함하지 않으며 `.github/workflows/live-acceptance.yml`의 `workflow_dispatch`로만 tmux와 명시적 self-hosted cmux job을 실행합니다. 실제 multiplexer가 없는 CI에서는 `test/integration/fake-adapter-runner.e2e.test.ts`가 full `runAgent` completion/cancel/external-close/shutdown/reload를 검증합니다. broker acceptance에는 backend response 수신 뒤 `allocation.json` publish 전 exact STOP/kill window도 포함됩니다. live crash/reaper E2E는 reaper 직전 fixture의 실제 absent/zombie 상태와 해당 exact run ID의 `reaped` 결과를 증거로 요구하며, platform zombie liveness 판정은 parser/reaper 단위 테스트가 별도로 보장합니다. package tarball smoke는 isolated tarball의 pack/install/exact-module-import, strict `subagent` registration, bounded dashboard/aggregate `pi.events` probe와 두 public schema 포함만 확인하는 retained 실행 증거가 있고 full Pi session은 범위 밖입니다. 정적 harness/unit/package 기준은 executable **GO**다. 설계 문서에는 live cmux run `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`과 tmux run `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df`의 **PASS**가 기록되어 있지만, 그 private retained evidence는 저장소에 포함되지 않으며 현재 worktree에서 독립 재실행한 결과로 간주하지 않습니다. 상세 checkpoint·evidence·cleanup 규칙은 [`cmux-pi-tui-design.md`의 Acceptance runbook](./cmux-pi-tui-design.md#12-acceptance-runbook)을 따릅니다.
+| 목적 | 명령 | 해석 |
+| --- | --- | --- |
+| 타입 검사 | `bun run check` | `tsc --noEmit` |
+| 격리 단위·통합 테스트 | `bun test --isolate --pass-with-no-tests --max-concurrency 1` | file-global Bun mock과 process global 때문에 isolation이 필수 |
+| 기본 검증 | `bun run ci` | 위 두 검사를 순서대로 실행 |
+| 배포 파일 목록 확인 | `bun pm pack --dry-run` | `src/runtime/pane-launch-broker.mjs`, 두 public schema가 포함되어야 함 |
+
+## 승인된 opt-in acceptance와 benchmark
+
+아래 명령은 기본 CI가 아닙니다. provider·network·실제 multiplexer·파일 기록을 사용할 수 있으므로, 실행 전에 범위와 필요한 환경 변수를 명시적으로 승인받으세요. 기본 push/schedule CI에는 포함하지 않고, live tmux와 self-hosted cmux는 `.github/workflows/live-acceptance.yml`의 수동 `workflow_dispatch`에서만 실행합니다.
+
+### 실행 범위와 evidence 해석
+
+opt-in acceptance는 production과 같은 deterministic runtime/backend resolver를 사용합니다. runtime path는 선택된 실행 명령이고 interpreter path는 native binary 또는 첫 shebang interpreter입니다. interactive preflight는 backend뿐 아니라 broker runtime/interpreter/entrypoint의 realpath·inode·metadata generation을 캡처하고 intent publish 및 broker spawn 직전에 다시 확인합니다. tmux는 canonical socket inode와 server PID start identity도 preflight와 publish 직전에 재검증합니다. env shebang과 Bun/Node를 `exec`하는 shell wrapper도 지원하므로 parent Pi의 `process.execPath`를 provenance로 신뢰하지 않습니다. live cmux/tmux는 명시적 environment gate가 필요합니다. cmux harness는 caller workspace를 disposable로 요구하지 않고, 자체 private workspace를 생성·정리합니다. 실제 multiplexer가 없는 CI에서는 `test/integration/fake-adapter-runner.e2e.test.ts`가 full `runAgent` completion/cancel/external-close/shutdown/reload를 검증합니다. broker acceptance에는 backend response 수신 뒤 `allocation.json` publish 전 exact STOP/kill window도 포함됩니다. live crash/reaper E2E는 reaper 직전 fixture의 실제 absent/zombie 상태와 해당 exact run ID의 `reaped` 결과를 증거로 요구하며, platform zombie liveness 판정은 parser/reaper 단위 테스트가 별도로 보장합니다. package tarball smoke는 isolated tarball의 pack/install/exact-module-import, strict `subagent` registration, bounded dashboard/aggregate `pi.events` probe와 두 public schema 포함만 확인하는 retained 실행 증거가 있고 full Pi session은 범위 밖입니다. 정적 harness/unit/package 기준은 executable **GO**다. 설계 문서에는 live cmux run `accept-929d0c06-51a6-45ca-8bfb-098d719e8171`과 tmux run `accept-e6670112-84e7-4e1a-8a3f-95f77a5bc3df`의 **PASS**가 기록되어 있지만, 그 private retained evidence는 저장소에 포함되지 않으며 현재 worktree에서 독립 재실행한 결과로 간주하지 않습니다. 상세 checkpoint·evidence·cleanup 규칙은 [`cmux-pi-tui-design.md`의 Acceptance runbook](./cmux-pi-tui-design.md#12-acceptance-runbook)을 따릅니다.
+
+| 범위 | 대표 명령 | 실행 전 조건 |
+| --- | --- | --- |
+| 비변경 사전 점검 | `bun run acceptance:dry-run` | live 실행 승인 불필요 |
+| package/managed profile | `acceptance:package`, `acceptance:managed-child` | 해당 environment gate를 명시 |
+| live tmux/cmux·title | `acceptance:tmux`, `acceptance:cmux`, `title:live:*` | 실제 terminal mutation 승인과 canonical executable 지정 |
+| provider-live record | `benchmark:phase0:live:*:record` | provider child 수와 macOS arm64 조건을 명시적으로 승인 |
 
 ```bash
 bun run acceptance:dry-run

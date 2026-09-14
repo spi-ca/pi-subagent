@@ -4,24 +4,24 @@
 
 ## GitHub 패키지로 설치
 
-사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 검토된 immutable release `v20260907-2`를 지정합니다.
+사용자 수준 Pi 설정 파일(`~/.pi/agent/settings.json`)에 설치하려면 검토된 immutable release `v20260909-1`를 지정합니다.
 
 ```bash
-pi install git:github.com/spi-ca/pi-subagent@v20260907-2
+pi install git:github.com/spi-ca/pi-subagent@v20260909-1
 ```
 
 Pi는 설정에 다음과 같은 패키지 항목을 추가하고 저장소를 `~/.pi/agent/git/github.com/spi-ca/pi-subagent` 아래에 클론합니다.
 
 ```json
 {
-  "packages": ["git:github.com/spi-ca/pi-subagent@v20260907-2"]
+  "packages": ["git:github.com/spi-ca/pi-subagent@v20260909-1"]
 }
 ```
 
 프로젝트 수준 설정(`.pi/settings.json`)에 설치하려면 `-l`을 사용합니다.
 
 ```bash
-pi install -l git:github.com/spi-ca/pi-subagent@v20260907-2
+pi install -l git:github.com/spi-ca/pi-subagent@v20260909-1
 ```
 
 개발 중인 branch를 추적하려면 mutable ref임을 알고 명시적으로 지정합니다. 일반 사용에는 위 immutable release를 사용하세요.
@@ -94,6 +94,10 @@ Linux/macOS에서 `--subagent-max-active`는 root parent와 모든 nested child�
 값은 `1`–`256` safe integer여야 합니다. 잘못된 CLI·환경·파일 값은 warning 후 무시하며, 다음 우선순위 값 또는 기본값을 사용합니다. 이 값은 `subagent` 도구의 public parameter가 아닙니다. queued 작업은 process, pane 또는 artifact를 만들지 않으며 취소·session shutdown 때 terminal aborted result가 됩니다. scheduler 전용 update는 추가하지 않지만, 기존 callback 계약을 보존하기 위해 parallel/chain aggregate update에는 아직 permit을 기다리는 작업도 running placeholder로 포함될 수 있습니다. invocation 안에서는 FIFO이고 invocation 사이는 strict round-robin입니다.
 
 Linux/macOS에서는 해석된 값과 private tree authority/lease capability를 child에 안전하게 전달합니다. foreground invocation은 현재 parent permit을 durable `PARKED_WAIT`로 전환한 뒤 descendant에 넘기고 마지막 local waiter가 끝날 때만 복귀시킵니다. background invocation은 parent가 계속 실행되므로 transfer 없이 spare permit을 기다립니다. authority는 exact PID/start identity와 immutable generation-CAS snapshot을 사용하며 crash 뒤 dead lease만 회수하고 unknown identity는 capacity를 보수적으로 retain합니다. 설정 파일 reload는 local scheduler의 다음 session 값을 바꾸지만, 생성·adopt가 끝난 durable authority의 cap을 변경하지 않습니다. Windows에서는 durable authority/lease capability가 없고 reload된 값이 process-local scheduler에만 적용됩니다.
+
+### `/subagents doctor` scheduler metrics
+
+`/subagents doctor`는 현재 host session epoch의 process-local scheduler 집계를 표시합니다. `accepted`/`started`/`cancelled-before-start`/`settled`와 queue wait, dispatch-to-local-slot-release의 count·sum·max를 밀리초(ms)로 확인할 수 있습니다. 후자의 시간은 **local scheduler slot이 해제될 때까지**만 뜻하며 tree permit 정착, child host 응답 또는 전체 작업 완료 시간은 포함하지 않습니다. 값은 관찰용 고정 크기 집계이고 session 시작 때 새 epoch로 초기화되며, task 내용·run ID·외부 식별자는 출력하지 않습니다.
 
 ### 호출 및 백그라운드 한계
 

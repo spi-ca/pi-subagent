@@ -340,6 +340,7 @@ Transport Phases 0–4의 owner와 cross-document dependency는 [canonical phase
 
 Phase 2의 hard prerequisite는 Phase 0A parent lease writer와 child checker **둘 다**다. parent는 initial awaited renewal, `stopAndDrain()`과 lifecycle-fenced final rename을 먼저 완료해야 하고, child lease check에는 initial awaited check, `stopAndDrain()`, post-I/O generation/terminal check, absolute due/max-gap, one-latest-pending 및 bounded stagger를 적용한다. terminal publication은 새 scheduling을 막고 parent/child in-flight write/check를 drain한 뒤 진행하며 terminal 뒤 late lease rename이 없음을 증명한다. slow I/O, stop/quiesce, repeated failure와 late completion fixture를 통과하기 전에는 Phase 2를 enable하지 않는다.
 
+<a id="phase-5-scheduler--구현됨"></a>
 ### Phase 5: Scheduler — 구현됨
 
 process-local shared permit pool, invocation별 FIFO/strict round-robin queue, queued cancel/shutdown 및 terminal/launch-failure 뒤 permit 반환을 적용한다. default는 16이고 CLI > environment > trusted project file > global file > default precedence이며 매 session start에 다시 적용된다. background record 자체는 permit을 소비하지 않는다. **Linux/macOS에서만 tree-wide hard cap이 구현됨**: root의 durable fixed permit authority를 nested child가 공유하며, session-start 재로드 뒤 process-local `maxActive`와 root cap은 다를 수 있다. Windows는 durable tree cap 없이 process-local scheduler로 fallback한다. foreground `PARKED_WAIT` transfer와 exact-dead crash reclaim을 포함한 Linux/macOS 계약은 §10.4와 §19를 따른다.
@@ -417,6 +418,8 @@ test/runtime/reaper-streaming-budget.test.ts
 
 이 문서가 authoritative한 internal 개선안 중 Phase 0A, Phase 2 lease sub-gate, Phase 5 scheduler에 더해 Phase 6 exact tail/signature와 Phase 7의 conservative proven-dead reaper branch가 구현되었다. Phase 7은 live owner를 quiesced ack 없이 acquire하지 않고 retain하며, parent·broker·child의 PID/start identity가 모두 반복 검증된 dead proof일 때만 cleanup claim을 acquired로 전환한다. 이 상태는 managed-child default 전환 또는 전체 goal 완료 선언이 아니다.
 
+scheduler metrics 변경은 `bun run ci`에서 **1,071 pass, 3 skip, 0 fail**로 검증되었고, reviewer `6791558e`는 finding이 없었다. 이는 아래 첫 세 metrics 항목의 구현 근거이며, Phase 0–8 종합 benchmark나 live fixture의 current-source 증거를 대신하지 않는다.
+
 - [x] generation-scoped topology snapshot batch (same generation/canonical key의 in-flight read-only fetch만 공유, settle 즉시 폐기, timeout/failure `unknown` fan-out 및 metrics focused tests)
 - [x] trust-safe session agent-discovery cache (session generation/keyed trust context, metadata/full-body separation, manifest revalidation, shutdown clear 및 focused core tests)
 - [x] strict tmux source preflight와 cmux control-v2 source-topology single-flight (shutdown/socket/topology generation과 workspace/surface UUID key, 응답 후 socket·mutation fence, exit/control/parser 분리 진단, parallel-3 mutation-race focused tests); parent PID/start identity memo는 별도 범위
@@ -437,13 +440,47 @@ test/runtime/reaper-streaming-budget.test.ts
 
 각 항목은 이 문서의 internal acceptance와 해당 prerequisite를 통과하기 전에는 완료로 표시하지 않는다.
 
-## 20. 권장 구현 순서
+### 19.1 남은 검증의 실행 계획
 
-1. current baseline과 internal regression tests를 고정하고, canonical register에서 요구하는 transport prerequisite를 확인한다.
-2. Phase 0A를 작은 독립 변경으로 적용한다: topology/cache/preflight, parent lease single-flight, aggregate/usage visibility, fork/private artifact async I/O.
-3. Phase 0A parent writer와 Phase 2 child checker를 함께 hard gate로 묶고 slow-I/O/terminal-race 및 terminal 뒤 late-rename 부재 evidence를 확인한다.
-4. Phase 5 scheduler를 적용한 뒤 queue fairness, foreground/background overlap과 nested delegation boundary를 검증한다.
-5. Phase 6 tail/signature와 Phase 7 reaper를 각각 exactness/claim evidence가 준비된 뒤 enable한다.
-6. Phase 8 managed-child opt-in은 integration/acceptance을 통과했다. managed-child default 전환 여부는 별도 benchmark와 호환성 증거 뒤에만 결정한다.
+위 aggregate gate와 종합 benchmark TODO는 다음 순서로 마무리한다. component 테스트 통과, 과거 live PASS와 현재 source-bound 성능 증거를 서로 대체하지 않는다.
 
-각 internal milestone은 선행 transport lifecycle safety와 이 문서의 acceptance를 모두 충족한 뒤 진행한다. transport implementation 순서는 canonical register를 따른다.
+1. **병렬 실행 회귀 검증:** `test/entrypoint/concurrent-invocations.test.ts`는 등록된 `subagent.execute` 호출 두 개가 `maxActive=2`에서 어느 작업도 끝나기 전에 함께 runner에 도달하는지, 세 번째 queued 호출의 취소가 runner launch 없이 끝나는지 확인한다. 실제 entrypoint와 process-local scheduler를 통과하되 runner·tree authority 경계는 mock이므로 broker·provider full-path 증거는 아니다. `mapConcurrent`와 scheduler의 bounded concurrency는 유지하고, lease/completion fence·ownership transfer·exact cleanup의 직렬 구간은 측정 근거 없이 병렬화하지 않는다.
+2. **실환경 lifecycle 검증:** [layout 문서 §16.2](./interactive-pane-layout-design.md#162-아직-주장하지-않는-범위)의 미검증 범위를 기준으로 completion/cancel/reload/crash와 foreground/background/chain overlap의 시나리오별 근거를 수집한다. 기존 tmux/cmux acceptance가 직접 다루지 않는 시나리오는 harness 보강 전까지 미검증으로 남긴다. Herdr fake-socket 테스트를 live acceptance로 간주하지 않는다. 실제 terminal mutation과 provider 호출은 별도 승인 및 [개발 문서의 실행 gate](./development.md#명령)를 따른다.
+3. **Phase 0–8 비교 설계:** baseline/candidate Git revision을 먼저 확정하고 같은 host·OS/arch·Bun/Pi/backend 버전·설정·workload·동시성에서 비교한다. warm-up, 반복 횟수, 집계 통계와 허용 회귀 기준은 측정 전에 정한다. phase별 metric과 해당 harness를 매핑하고 미계측 phase를 명시한다. 현재 M0/M7 local 및 M0 live recorder만으로 전체 phase의 before/after 완료를 주장하지 않는다.
+4. **비교 artifact와 evidence gate:** 기존 recorder는 고정 tracked fixture를 덮어쓰므로 두 revision 비교용으로 그대로 실행하지 않는다. 먼저 worktree 밖 private output과 읽기 전용 비교 경로를 마련하고, 각 artifact의 자체 revision/digest·환경·cleanup 증거를 검증한다. baseline을 candidate의 source identity로 다시 쓰지 않는다. 정식 fixture 갱신은 source 변경 commit 뒤 record하고 fixture-only commit하는 기존 계약을 유지한다. `preflight` 성공은 측정이나 current-source `verify` 성공이 아니다. retained fixture 검증 실패 시 해당 evidence gate는 실패 상태로 남기며 historical hash를 갱신해 통과시키지 않는다.
+5. **managed-child 정책:** 기본값 `inherit`, 명시적 `managed` opt-in을 유지한다. 기본값 전환은 위 비교와 extension/tool 호환성·nested delegation·cleanup 검증을 통과한 뒤 별도로 결정한다. background completion 사용량 회계는 [명시적 비목표](./pi-081-usage-accounting-design.md)이므로 이 검증 보강에 포함하지 않는다.
+
+provider-live recorder는 macOS arm64의 명시적 Pi/tmux/cmux executable과 routine 15개 또는 concurrency 16개 provider child 실행 승인을 요구한다. Linux 또는 cmux 없는 환경에서는 로컬 deterministic 테스트와 non-mutating preflight/verify까지만 수행하며, live gate나 platform 검사를 완화하지 않는다. 외부 환경·승인·baseline이 준비되지 않았다면 위 TODO를 미완료로 유지한다.
+
+### 19.2 사용자 응답성 개선의 적용 결정
+
+사용자 입력에 빨리 반응하는 것과 child 처리량을 늘리는 것은 별도 목표다. 긴 부모 foreground 호출을 managed background로 전환하는 workflow 개선은 유지하되, runtime은 다음 범위만 우선 적용한다. 호출 형식뿐 아니라 실행 순서·lifecycle·공유 observer protocol 계약을 바꿔야 한다면 문제 근거, 영향받는 Pi extension/consumer, 호환성·이행 및 검증 범위를 설명하고 사용자 승인을 먼저 받는다.
+
+| 후보 | 결정 | 근거·완료 조건 |
+| --- | --- | --- |
+| background 결과 재전달 | 자동 재시도 보류, 실패 경계 회귀 검증 우선 | Pi `sendMessage()`는 `void`이며 전달 ACK가 없다. 동기 호출 반환은 host-call acceptance일 뿐 사용자 전달·provider turn 성공이 아니다. 재시도로 알림이나 turn을 중복 생성하지 않으며, 동기 거부 후 보존된 결과의 현재 세션 `status` 조회와 stale-session fence를 테스트한다. |
+| reload 이후 작업 추적 | 영속 registry·자동 복원 보류 | session start/shutdown의 cancel+clear는 이전 세션 결과 주입을 차단하는 계약이다. terminal metadata 복구도 session-file identity와 copied/forked lineage·개인정보·TTL 정책 결정이 먼저다. 기존 durable child recovery와 부모 background 목록을 혼동하지 않는다. |
+| foreground 우선 처리 | 측정 및 별도 승인 전 보류 | 현재 strict round-robin을 유지한다. 예약 슬롯·강제 선점·기본 cap 확대는 하지 않는다. queue latency 증거 뒤 bounded preference의 효용·starvation 방지·tree permit 영향과 계약 변경을 검토한다. |
+| queued 작업 방향 수정 | 새 API 보류, cancel 후 fresh invocation 유지 | queued work는 task 문자열뿐 아니라 launch closure·fork manager·permit source·session fence를 캡처한다. exact-ID 취소 요청만으로 writer가 종료됐다고 판단하지 않으며, 실제 종료 확인 뒤 fresh invocation으로 새 trust/fork/capture 검증을 수행한다. |
+| 응답성 측정 | 고정 크기의 로컬 scheduler 집계 우선 적용 | 아래 범위의 결정적 clock·취소·session fence 테스트와 전체 CI가 통과해야 구현 완료로 표시한다. |
+
+- [x] `ProcessLocalScheduler`가 accepted/start/cancel-before-start/settled 계수와 enqueue→dispatch queue wait, dispatch→local slot release 시간의 count/sum/max를 기록한다. monotonic 시간과 고정 크기 숫자 집계만 사용하며 개별 job history, 원문, 추가 polling/timer, 파일/provider I/O는 만들지 않는다. overflow·잘못된 clock도 scheduling 동작이나 finite snapshot을 깨지 않는다.
+- [x] host `session_start`당 통계 epoch는 한 번만 바뀐다. startup의 provisional/resolved `scheduler.startSession()` 두 호출은 유지하지만 통계를 두 번 지우지 않는다. 이전 epoch의 늦은 release는 capacity만 반환하고 새 통계를 오염시키지 않으며, shutdown과 queued cancellation도 epoch 경계로 검증한다.
+- [x] 집계는 immutable 내부 snapshot으로만 읽고, 사람이 호출하는 `/subagents doctor`에만 표시한다. tool input/result, background status, dashboard/presence event와 durable tree protocol schema 같은 machine-readable consumer 계약에는 필드를 추가하지 않는다.
+- [ ] background notification의 동기 거부와 session replacement 테스트를 보강하고, ACK 부재·보존 한계·취소 후 재실행 절차를 사용자 문서와 맞춘다.
+
+queue wait는 scheduler enqueue 이후만, local slot time은 tree permit 대기와 runner callback 정리까지 포함한다. tree permit의 늦은 durable settlement, child 전체 RSS/PSS, host keystroke→response 또는 steer 전달 지연은 이 집계가 측정하지 않는다. 기본 background history/output 제한과 기존 호출별·tree-wide cap은 유지한다. 이 측정 추가만으로 속도나 메모리 절감이 입증됐다고 주장하지 않는다.
+
+<a id="20-권장-구현-순서"></a>
+## 20. 역사적 구현 순서와 남은 결정
+
+다음은 완료된 내부 phase의 **역사적 적용 순서**입니다. 현재 완료/미완료의 authoritative 상태는 §19를 따르며, 이 순서는 새 작업의 승인 또는 구현 지시가 아닙니다.
+
+1. baseline과 internal regression tests, canonical transport prerequisite를 먼저 고정했다.
+2. Phase 0A에 topology/cache/preflight, parent lease single-flight, aggregate/usage visibility, fork/private artifact async I/O를 적용했다.
+3. Phase 0A parent writer와 Phase 2 child checker를 hard gate로 묶어 slow-I/O/terminal-race와 terminal 뒤 late-rename 부재를 검증했다.
+4. Phase 5 scheduler를 적용하고 queue fairness, foreground/background overlap과 nested delegation 경계를 검증했다.
+5. Phase 6 tail/signature와 Phase 7 conservative reaper를 각각 exactness/claim evidence 뒤에 enable했다.
+6. Phase 8의 `managed` opt-in은 integration/acceptance을 통과했다. 기본값 전환과 Phase 0–8 종합 benchmark는 여전히 §19.1의 별도 결정·증거가 필요하다.
+
+각 milestone은 선행 transport lifecycle safety와 이 문서의 acceptance를 충족한 뒤 진행했다. transport phase의 canonical register는 [transport 설계 §14](./interactive-runtime-performance-design.md#14-canonical-cross-document-phase-register)를 따른다.

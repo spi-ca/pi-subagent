@@ -86,11 +86,15 @@ mock.module("../../src/runtime/process-local-scheduler", () => ({
 mock.module("@earendil-works/pi-tui", () => ({
   Box: class {},
   Container: class {}, Markdown: class {}, Spacer: class {}, Text: class {},
+  visibleWidth: (text: string) => text.length,
+  wrapTextWithAnsi: (text: string, width: number) => [text.slice(0, width)],
+  truncateToWidth: (text: string, width: number) => text.slice(0, width),
 }));
 mock.module("@earendil-works/pi-coding-agent", () => ({
   CONFIG_DIR_NAME: ".pi",
   getAgentDir: () => ".pi",
   getMarkdownTheme: () => ({}),
+  keyHint: (_keybinding: string, description: string) => description,
   parseFrontmatter: <T>(content: string): { frontmatter: T; body: string } => {
     const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
     if (!match) throw new Error("invalid frontmatter");

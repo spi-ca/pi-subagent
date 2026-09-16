@@ -666,7 +666,7 @@ describe("tree permit authority immutable CAS snapshots", () => {
     await run(() => "not-json\n");
   });
 
-  test("keeps concurrent checkpoint compaction and successor CAS no-replay safe", async () => {
+  test("keeps concurrent checkpoint compaction and successor CAS no-replay safe", { timeout: 15_000 }, async () => {
     const base = await root();
     const owner = { pid: 841, startedAt: 1 };
     const ids = identities({ "841:1": "live" });

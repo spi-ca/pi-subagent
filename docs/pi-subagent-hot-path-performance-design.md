@@ -471,7 +471,13 @@ provider-live recorder는 macOS arm64의 명시적 Pi/tmux/cmux executable과 ro
 
 queue wait는 scheduler enqueue 이후만, local slot time은 tree permit 대기와 runner callback 정리까지 포함한다. tree permit의 늦은 durable settlement, child 전체 RSS/PSS, host keystroke→response 또는 steer 전달 지연은 이 집계가 측정하지 않는다. 기본 background history/output 제한과 기존 호출별·tree-wide cap은 유지한다. 이 측정 추가만으로 속도나 메모리 절감이 입증됐다고 주장하지 않는다.
 
-### 19.3 제한된 로컬 revision 비교
+### 19.3 Background 결과 renderer 경계 계획
+
+`subagent_result` producer의 content/details/delivery shape는 바꾸지 않고 display-only renderer만 보강한다. producer는 모든 현재·이전 경로에서 `crypto.randomUUID()`로 job ID를 만들므로 canonical lowercase v4 UUID 외 metadata는 인식하지 않고 fallback으로 처리한다. 펼친 본문은 12 KiB head, fallback은 4 KiB head를 유지하고 최대 64 logical line을 Pi의 ANSI-aware wrapper로 줄바꿈한 뒤 최대 96 rendered row만 layout에 넘긴다. wrapper의 일반 행은 재절단하지 않으며, 좁은 폭에서 단일 cell에 담을 수 없는 overwide 행만 `?`로 대체하고 clipping/substitution 표시를 남긴다. 따라서 모든 행은 폭을 넘지 않고 CJK·emoji가 조용히 사라지지 않는다. 행 예산이 소진되면 명시적인 `[display clipped; ...]` footer를 남기므로 긴 한 줄의 suffix를 조용히 잃지 않는다. 이 방식은 wrapper의 보통 경로를 한 번 처리하는 것을 목표로 하지만, overwide 행 검증은 정확성 경계이며 별도 custom ANSI parser를 도입하지 않는다. 각 display component는 마지막 폭의 rendered row만 보관하고 `invalidate()`에서 버린다. process-global cache는 없다.
+
+접힌 보기는 비신뢰 preview, 생략 사실, `app.tools.expand`의 현재 key hint를 함께 표시하고 expanded 본문을 계산하지 않는다. producer가 이미 붙인 canonical positive safe-integer trailing `[Background output truncated: N bytes omitted.]`만 bounded suffix 검사 뒤 별도의 비신뢰 footer로 보호해 표시하며, invalid·oversized digit notice는 일반적으로 제한된 비신뢰 body로 남긴다. renderer 자체의 `[display clipped; ...]`과 producer notice는 서로 구별한다. 이 표시는 원문 전체의 보존·복구를 약속하지 않는다. fixture 기반 historical envelope/persistence, malformed UUID/control fallback, invalid notice digits, producer/UI clipping, CJK·emoji 폭과 depth-disabled 등록을 focused test로 확인한다.
+
+### 19.4 제한된 로컬 revision 비교
 
 `68b8111` → `fd6913e`를 Linux x86_64 / AMD Ryzen 5 5600G / Bun 1.4.2에서 비교했다. 별도 detached worktree마다 M0·M7 warm-up을 수행한 뒤 3쌍을 AB/BA/AB 순서로 측정했으며, 16단계 모두 완료되고 두 worktree의 변경 없음과 recorder 임시 상태의 정리를 확인했다. tracked fixture는 수정하지 않았다.
 

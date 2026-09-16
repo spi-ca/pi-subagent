@@ -31,16 +31,23 @@ class CapturingProcessLocalScheduler extends RealProcessLocalScheduler {
 }
 
 mock.module("@earendil-works/pi-tui", () => ({
-  Box: class {},
+  Box: class {
+    children: unknown[] = [];
+    addChild(child: unknown): void { this.children.push(child); }
+  },
   Container: class {},
   Markdown: class {},
   Spacer: class {},
   Text: class {},
+  visibleWidth: (text: string) => text.length,
+  wrapTextWithAnsi: (text: string, width: number) => [text.slice(0, width)],
+  truncateToWidth: (text: string, width: number) => text.slice(0, width),
 }));
 mock.module("@earendil-works/pi-coding-agent", () => ({
   CONFIG_DIR_NAME: ".pi",
   getAgentDir: () => ".pi",
   getMarkdownTheme: () => ({}),
+  keyHint: (_keybinding: string, description: string) => `${description} (Alt+E)`,
   parseFrontmatter: <T>(content: string): { frontmatter: T; body: string } => {
     const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
     if (!match) throw new Error("invalid frontmatter");
@@ -161,21 +168,30 @@ describe("production dashboard boundary", () => {
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
   });
 
-  test("registers the display-only background result renderer", () => {
+  test("registers the display-only background result renderer even when depth disables the tool", () => {
     const renderers = new Map<string, unknown>();
+    let registeredTools = 0;
     registerPiSubagent({
       registerMessageRenderer: (customType: string, renderer: unknown) => renderers.set(customType, renderer),
       registerFlag: () => undefined,
-      getFlag: () => undefined,
+      getFlag: (name: string) => name === "subagent-max-depth" ? "0" : undefined,
       registerCommand: () => undefined,
-      registerTool: () => undefined,
+      registerTool: () => { registeredTools += 1; },
       on: () => undefined,
       events: { emit: () => undefined },
       getAllTools: () => [],
       getCommands: () => [],
     } as never);
+    assert.equal(registeredTools, 0);
     assert.equal(renderers.size, 1);
-    assert.equal(typeof renderers.get("subagent_result"), "function");
+    const renderer = renderers.get("subagent_result") as (message: unknown, options: unknown, theme: unknown) => { children: Array<{ render: (width: number) => string[] }> };
+    assert.equal(typeof renderer, "function");
+    const component = renderer(
+      { content: "legacy", details: {} },
+      { expanded: false, outputPad: 0 },
+      { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text },
+    );
+    assert.match(component.children[0]!.render(100).join("\n"), /Alt\+E/, "the renderer uses the configured expansion binding rather than its fallback");
   });
 
   test("reports absent, invalid, and valid Herdr identities in doctor output without exposing identity values", async () => {

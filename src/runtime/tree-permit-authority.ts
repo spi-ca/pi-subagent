@@ -347,8 +347,8 @@ export class TreePermitAuthority {
       const initialLease: StoredLease = { id: crypto.randomUUID(), token: randomToken(), state: "ACTIVE", owner: current, reservedBy: current };
       const initial: PermitState = { version: VERSION, rootIdentity, maxActive: manifest.maxActive, generation: 0, previousDigest: GENESIS_DIGEST, leases: [initialLease] };
       if (!await publishSnapshot(stagingDir, initial, current)) throw new Error("Initial tree permit state unexpectedly collided.");
-      const snapshot = await loadLatestSnapshot(stagingDir, manifest);
-      if (!snapshot || snapshot.state.generation !== 0) throw new Error("Tree permit authority state was not durably published.");
+      const loaded = await loadLatestSnapshot(stagingDir, manifest);
+      if (loaded.kind !== "valid" || loaded.snapshot.state.generation !== 0) throw new Error("Tree permit authority state was not durably published.");
       const staged = await fs.promises.lstat(stagingDir);
       if (!privateDirectory(staged)) throw new Error("Tree permit staging directory is unsafe.");
       await fsyncDirectory(stagingDir);
@@ -627,10 +627,17 @@ export class TreePermitAuthority {
     let compactionRequired = false;
     for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
       const manifest = await this.#readManifest();
-      const snapshot = await loadLatestSnapshot(this.authorityDir, manifest);
+      const loaded = await loadLatestSnapshot(this.authorityDir, manifest);
       // A reader can observe an unlink in a completed checkpoint compaction.
-      // Retry the whole load/CAS cycle; malformed data never becomes accepted.
-      if (!snapshot) { sawInvalidSnapshot = true; await sleep(RETRY_MS); continue; }
+      // Retry only those transient reads; immutable malformed names/nodes and
+      // oversized final files cannot become valid through compaction.
+      if (loaded.kind !== "valid") {
+        if (loaded.kind === "permanent") throw new Error("Tree permit authority state chain is invalid.");
+        sawInvalidSnapshot = true;
+        await sleep(RETRY_MS);
+        continue;
+      }
+      const snapshot = loaded.snapshot;
       if (compactionRequired || snapshot.requiresCompaction || snapshot.state.generation - snapshot.checkpointGeneration >= CHECKPOINT_INTERVAL
         || snapshot.totalBytes + (2 * SNAPSHOT_FILE_BYTES) > MAX_SNAPSHOT_BYTES) {
         compactionRequired = true;
@@ -1254,10 +1261,18 @@ interface InspectedSnapshotFiles {
   totalBytes: number;
   legacyNoCheckpoint: boolean;
 }
+type SnapshotInspection =
+  | { kind: "valid"; files: InspectedSnapshotFiles }
+  | { kind: "transient" }
+  | { kind: "permanent" };
+type SnapshotLoad =
+  | { kind: "valid"; snapshot: Snapshot }
+  | { kind: "transient" }
+  | { kind: "permanent" };
 
-async function inspectSnapshotFiles(directory: string, allowMigrationCompaction = false): Promise<InspectedSnapshotFiles | null> {
+async function inspectSnapshotFiles(directory: string, allowMigrationCompaction = false): Promise<SnapshotInspection> {
   let handle: fs.Dir;
-  try { handle = await fs.promises.opendir(directory); } catch { return null; }
+  try { handle = await fs.promises.opendir(directory); } catch { return { kind: "transient" }; }
   const stateNames: string[] = [];
   const checkpointNames: string[] = [];
   let entries = 0;
@@ -1267,40 +1282,50 @@ async function inspectSnapshotFiles(directory: string, allowMigrationCompaction 
     for await (const entry of handle) {
       // Do not turn a hostile directory into an unbounded names array.  The
       // legacy cap is the only large collection this reader is allowed to hold.
-      if (++entries > MAX_SNAPSHOT_DIRECTORY_ENTRIES) return null;
+      if (++entries > MAX_SNAPSHOT_DIRECTORY_ENTRIES) return { kind: "transient" };
       const name = entry.name;
       const isState = name.startsWith("state-");
       const isCheckpoint = name.startsWith("checkpoint-");
       if (!isState && !isCheckpoint) continue;
-      if (snapshotGeneration(name, isState ? "state" : "checkpoint") === null) return null;
+      // Only immutable publishers create these names, so a malformed final
+      // name cannot be repaired by concurrent checkpoint compaction.
+      if (snapshotGeneration(name, isState ? "state" : "checkpoint") === null) return { kind: "permanent" };
       const stat = await fs.promises.lstat(path.join(directory, name)).catch(() => null);
-      if (!stat || !privateFile(stat) || !Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > SNAPSHOT_FILE_BYTES) return null;
+      // A compactor may unlink an enumerated valid snapshot before lstat.
+      if (!stat) return { kind: "transient" };
+      // Immutable snapshots are linked only after their final private mode and
+      // bounded contents exist. Compaction can remove them, never repair a
+      // present invalid node or an oversized final file.
+      if (!privateFile(stat) || !Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > SNAPSHOT_FILE_BYTES) return { kind: "permanent" };
       if (isCheckpoint) hasCheckpoint = true;
       // A crash can leave a valid new checkpoint beside an oversized legacy
       // chain.  Enumeration cannot decide that until it has validated the
       // checkpoint and tail, so it always uses the bounded migration envelope.
       // loadLatestSnapshot restores the smaller steady-state limit afterwards.
-      if (stateNames.length + checkpointNames.length >= MAX_LEGACY_SNAPSHOT_FILES) return null;
+      // Counts and aggregate bytes can change while a valid compaction is
+      // unlinking its old chain, so they intentionally remain retryable.
+      if (stateNames.length + checkpointNames.length >= MAX_LEGACY_SNAPSHOT_FILES) return { kind: "transient" };
       bytes += stat.size;
-      if (!Number.isSafeInteger(bytes) || bytes > MAX_LEGACY_SNAPSHOT_BYTES) return null;
+      if (!Number.isSafeInteger(bytes) || bytes > MAX_LEGACY_SNAPSHOT_BYTES) return { kind: "transient" };
       (isState ? stateNames : checkpointNames).push(name);
     }
-  } catch { return null; }
+  } catch { return { kind: "transient" }; }
   stateNames.sort();
   checkpointNames.sort();
-  return { stateNames, checkpointNames, totalBytes: bytes, legacyNoCheckpoint: !hasCheckpoint };
+  return { kind: "valid", files: { stateNames, checkpointNames, totalBytes: bytes, legacyNoCheckpoint: !hasCheckpoint } };
 }
 
-async function loadLatestSnapshot(directory: string, manifest: Manifest): Promise<Snapshot | null> {
-  const files = await inspectSnapshotFiles(directory);
-  if (!files) return null;
+async function loadLatestSnapshot(directory: string, manifest: Manifest): Promise<SnapshotLoad> {
+  const inspected = await inspectSnapshotFiles(directory);
+  if (inspected.kind !== "valid") return inspected;
+  const files = inspected.files;
   let checkpoint: Snapshot | null = null;
   // Check every checkpoint, not merely the selected one: a corrupt older
   // checkpoint must not be silently hidden by a newer valid one.
   for (const name of files.checkpointNames) {
     const expectedGeneration = snapshotGeneration(name, "checkpoint");
     const candidate = expectedGeneration === null ? null : await readCheckpoint(directory, name, manifest, expectedGeneration);
-    if (!candidate) return null;
+    if (!candidate) return { kind: "transient" };
     checkpoint = candidate;
   }
   const checkpointGeneration = checkpoint?.state.generation ?? 0;
@@ -1308,7 +1333,7 @@ async function loadLatestSnapshot(directory: string, manifest: Manifest): Promis
     ? files.stateNames.filter((name) => (snapshotGeneration(name, "state") ?? Number.MAX_SAFE_INTEGER) <= checkpointGeneration)
     : [];
   const laterStates = files.stateNames.filter((name) => !checkpoint || (snapshotGeneration(name, "state") ?? -1) > checkpointGeneration);
-  if (!checkpoint && files.stateNames.length === 0) return null;
+  if (!checkpoint && files.stateNames.length === 0) return { kind: "transient" };
   // Only one exact checkpoint plus its pre-checkpoint immutable chain can be
   // an interrupted compaction. Multiple checkpoints or an oversized current
   // tail are not migration input and fail closed.
@@ -1316,14 +1341,14 @@ async function loadLatestSnapshot(directory: string, manifest: Manifest): Promis
     && oldStateNames.length > 0
     && files.stateNames.length + files.checkpointNames.length > MAX_SNAPSHOT_FILES;
   if (checkpoint && !migrationInProgress
-    && (files.stateNames.length + files.checkpointNames.length > MAX_SNAPSHOT_FILES || files.totalBytes > MAX_SNAPSHOT_BYTES)) return null;
+    && (files.stateNames.length + files.checkpointNames.length > MAX_SNAPSHOT_FILES || files.totalBytes > MAX_SNAPSHOT_BYTES)) return { kind: "transient" };
   let previousDigest = checkpoint?.digest ?? GENESIS_DIGEST;
   let latest = checkpoint;
   let expectedGeneration = checkpoint ? checkpointGeneration + 1 : 0;
   for (const name of laterStates) {
-    if (name !== stateName(expectedGeneration)) return null;
+    if (name !== stateName(expectedGeneration)) return { kind: "transient" };
     const snapshot = await readSnapshot(directory, name, manifest, expectedGeneration);
-    if (!snapshot || snapshot.state.previousDigest !== previousDigest) return null;
+    if (!snapshot || snapshot.state.previousDigest !== previousDigest) return { kind: "transient" };
     previousDigest = snapshot.digest;
     latest = snapshot;
     expectedGeneration += 1;
@@ -1333,13 +1358,16 @@ async function loadLatestSnapshot(directory: string, manifest: Manifest): Promis
     // A no-checkpoint history is migration input only once it exceeds the
     // compact steady-state tail. Its full chain was still validated above.
     : files.stateNames.length > MAX_SNAPSHOT_FILES;
-  return latest ? { ...latest, checkpointGeneration, requiresCompaction, fileCount: files.stateNames.length + files.checkpointNames.length, totalBytes: files.totalBytes } : null;
+  return latest
+    ? { kind: "valid", snapshot: { ...latest, checkpointGeneration, requiresCompaction, fileCount: files.stateNames.length + files.checkpointNames.length, totalBytes: files.totalBytes } }
+    : { kind: "transient" };
 }
 
 async function loadStableLatestSnapshot(directory: string, manifest: Manifest): Promise<Snapshot | null> {
   for (let attempt = 0; attempt < MAX_SNAPSHOT_LOAD_RETRIES; attempt += 1) {
-    const snapshot = await loadLatestSnapshot(directory, manifest);
-    if (snapshot) return snapshot;
+    const loaded = await loadLatestSnapshot(directory, manifest);
+    if (loaded.kind === "valid") return loaded.snapshot;
+    if (loaded.kind === "permanent") return null;
     await sleep(RETRY_MS);
   }
   return null;
@@ -1371,12 +1399,12 @@ async function ensureCheckpointAndCompact(directory: string, manifest: Manifest,
   const checkpoint: Checkpoint = { ...checkpointWithoutMac, hmac: checkpointMac(manifest.token, checkpointWithoutMac) };
   const beforePublish = await inspectSnapshotFiles(directory);
   const checkpointBytes = Buffer.byteLength(checkpointContent(checkpoint), "utf8");
-  const checkpointAlreadyPresent = beforePublish?.checkpointNames.includes(checkpointName(checkpoint.generation));
+  const checkpointAlreadyPresent = beforePublish.kind === "valid" && beforePublish.files.checkpointNames.includes(checkpointName(checkpoint.generation));
   // Legacy no-checkpoint migration may temporarily exceed the steady-state
   // tail count; compaction immediately removes the legacy chain afterwards.
-  if (!beforePublish || (!checkpointAlreadyPresent && !beforePublish.legacyNoCheckpoint
-    && beforePublish.stateNames.length + beforePublish.checkpointNames.length >= MAX_SNAPSHOT_FILES)
-    || (!checkpointAlreadyPresent && beforePublish.totalBytes + checkpointBytes > MAX_LEGACY_SNAPSHOT_BYTES)) {
+  if (beforePublish.kind !== "valid" || (!checkpointAlreadyPresent && !beforePublish.files.legacyNoCheckpoint
+    && beforePublish.files.stateNames.length + beforePublish.files.checkpointNames.length >= MAX_SNAPSHOT_FILES)
+    || (!checkpointAlreadyPresent && beforePublish.files.totalBytes + checkpointBytes > MAX_LEGACY_SNAPSHOT_BYTES)) {
     throw new Error("Tree permit checkpoint exceeds the authority file cap.");
   }
   if (!await publishImmutableContent(directory, checkpointName(checkpoint.generation), checkpointContent(checkpoint))) {
@@ -1385,8 +1413,9 @@ async function ensureCheckpointAndCompact(directory: string, manifest: Manifest,
   }
   const verified = await readCheckpoint(directory, checkpointName(checkpoint.generation), manifest, checkpoint.generation);
   if (!verified || verified.digest !== snapshot.digest || stateContent(verified.state) !== stateContent(snapshot.state)) throw new Error("Tree permit checkpoint publish verification failed.");
-  const files = await inspectSnapshotFiles(directory, true);
-  if (!files) throw new Error("Tree permit checkpoint compaction cannot inspect authority files.");
+  const inspected = await inspectSnapshotFiles(directory, true);
+  if (inspected.kind !== "valid") throw new Error("Tree permit checkpoint compaction cannot inspect authority files.");
+  const files = inspected.files;
   for (const name of files.stateNames) {
     const value = snapshotGeneration(name, "state");
     if (value !== null && value <= checkpoint.generation) await fs.promises.unlink(path.join(directory, name)).catch((error) => {
@@ -1400,5 +1429,5 @@ async function ensureCheckpointAndCompact(directory: string, manifest: Manifest,
     });
   }
   await fsyncDirectory(directory);
-  if (!await loadLatestSnapshot(directory, manifest)) throw new Error("Tree permit checkpoint compaction verification failed.");
+  if ((await loadLatestSnapshot(directory, manifest)).kind !== "valid") throw new Error("Tree permit checkpoint compaction verification failed.");
 }

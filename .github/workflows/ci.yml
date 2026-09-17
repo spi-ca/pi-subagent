@@ -17,18 +17,51 @@ permissions:
 
 jobs:
   verify:
-    name: ${{ matrix.lane }}
+    name: ${{ matrix.lane }} / ${{ matrix.stage }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The stage runner's 15/20-minute external group boundary owns timeout cleanup.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
           - lane: locked baseline
+            stage: core
+            bun-version: 1.3.14
+            pi-version: ""
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.84.4","@earendil-works/pi-ai":"0.84.4","@earendil-works/pi-client":"0.84.4","@earendil-works/pi-coding-agent":"0.84.4","@earendil-works/pi-protocol":"0.84.4","@earendil-works/pi-telemetry":"0.84.4","@earendil-works/pi-tui":"0.84.4"}'
+          - lane: locked baseline
+            stage: phase0
+            bun-version: 1.3.14
+            pi-version: ""
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.84.4","@earendil-works/pi-ai":"0.84.4","@earendil-works/pi-client":"0.84.4","@earendil-works/pi-coding-agent":"0.84.4","@earendil-works/pi-protocol":"0.84.4","@earendil-works/pi-telemetry":"0.84.4","@earendil-works/pi-tui":"0.84.4"}'
+          - lane: locked baseline
+            stage: reaper
+            bun-version: 1.3.14
+            pi-version: ""
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.84.4","@earendil-works/pi-ai":"0.84.4","@earendil-works/pi-client":"0.84.4","@earendil-works/pi-coding-agent":"0.84.4","@earendil-works/pi-protocol":"0.84.4","@earendil-works/pi-telemetry":"0.84.4","@earendil-works/pi-tui":"0.84.4"}'
+          - lane: locked baseline
+            stage: sessionTail
             bun-version: 1.3.14
             pi-version: ""
             pi-graph: '{"@earendil-works/pi-agent-core":"0.84.4","@earendil-works/pi-ai":"0.84.4","@earendil-works/pi-client":"0.84.4","@earendil-works/pi-coding-agent":"0.84.4","@earendil-works/pi-protocol":"0.84.4","@earendil-works/pi-telemetry":"0.84.4","@earendil-works/pi-tui":"0.84.4"}'
           - lane: current compatibility
+            stage: core
+            bun-version: 1.4.2
+            pi-version: 0.85.1
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+          - lane: current compatibility
+            stage: phase0
+            bun-version: 1.4.2
+            pi-version: 0.85.1
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+          - lane: current compatibility
+            stage: reaper
+            bun-version: 1.4.2
+            pi-version: 0.85.1
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+          - lane: current compatibility
+            stage: sessionTail
             bun-version: 1.4.2
             pi-version: 0.85.1
             pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
@@ -90,10 +123,36 @@ jobs:
           env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" CI=1 PI_GRAPH_EXPECTED='${{ matrix.pi-graph }}' PI_OFFLINE=1 bun .github/scripts/package-smoke.ts --self-test
       - name: Assert installed extension registration without install
         run: env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" CI=1 PI_GRAPH_EXPECTED='${{ matrix.pi-graph }}' PI_OFFLINE=1 bun .github/scripts/package-smoke.ts --existing
-      - name: Verify
+      - name: Type check each core compatibility lane
+        if: matrix.stage == 'core'
+        run: bun run check
+      - name: Run isolated CI stage
         env:
           PI_GRAPH_EXPECTED: ${{ matrix.pi-graph }}
-        run: bun run ci
+          CI_STAGE_DIAGNOSTICS_DIR: ${{ runner.temp }}/ci-stage-diagnostics
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$CI_STAGE_DIAGNOSTICS_DIR"
+          bun .github/scripts/ci-stage.ts "${{ matrix.stage }}" --strict-linux
+      - id: validate-stage-diagnostic
+        name: Validate exact sanitized stage diagnostic manifest
+        if: always()
+        run: |
+          set -euo pipefail
+          report_path="$(bun .github/scripts/ci-stage.ts --validate-diagnostic-dir "$RUNNER_TEMP/ci-stage-diagnostics")"
+          case "$report_path" in
+            "$RUNNER_TEMP"/ci-stage-diagnostics/ci-stage-*/*.json) ;;
+            *) echo "validated report path escaped the owned diagnostics root" >&2; exit 1 ;;
+          esac
+          printf 'report_path=%s\n' "$report_path" >> "$GITHUB_OUTPUT"
+      - name: Upload exact sanitized stage diagnostic
+        if: always() && steps.validate-stage-diagnostic.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-stage-${{ matrix.lane }}-${{ matrix.stage }}
+          path: ${{ steps.validate-stage-diagnostic.outputs.report_path }}
+          if-no-files-found: error
+          retention-days: 7
       - name: Inspect package contents
         run: bun pm pack --dry-run
       - name: Tarball install and registration smoke (provider-free)
@@ -105,3 +164,26 @@ jobs:
           test -f "$RUNNER_TEMP/package.json.original"
           mv "$RUNNER_TEMP/package.json.original" package.json
           git diff --exit-code -- package.json bun.lock
+
+  aggregate:
+    name: required CI stage aggregate
+    if: always()
+    needs: [verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every matrix stage to succeed
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          case "$VERIFY_RESULT" in
+            success) ;;
+            failure|cancelled|skipped)
+              echo "one or more required core/heavy matrix stages ended: $VERIFY_RESULT" >&2
+              exit 1
+              ;;
+            *)
+              echo "unexpected required-stage aggregate result: $VERIFY_RESULT" >&2
+              exit 1
+              ;;
+          esac

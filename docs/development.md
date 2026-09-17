@@ -23,9 +23,14 @@ bun run ci
 | 목적 | 명령 | 해석 |
 | --- | --- | --- |
 | 타입 검사 | `bun run check` | `tsc --noEmit` |
-| 격리 단위·통합 테스트 | `bun test --isolate --pass-with-no-tests --max-concurrency 1` | file-global Bun mock과 process global 때문에 isolation이 필수 |
-| 기본 검증 | `bun run ci` | 위 두 검사를 순서대로 실행 |
+| core 격리 단위·통합 테스트 | `bun run test:core` | file-global Bun mock과 process global 때문에 isolation이 필수이며, 아래 heavy 파일만 제외한다 |
+| Phase 0 local heavy | `bun run test:phase0` | `test/acceptance/performance-phase0.test.ts` 전체 |
+| Phase 7 reaper heavy | `bun run test:reaper` | 실제 10,000 run-directory benchmark와 100,000-node graph |
+| session-tail heavy | `bun run test:session-tail` | 추출된 100,000-ID reverse replay |
+| 전체 기본 검증 | `bun run ci` | 타입 검사 뒤 core와 세 heavy stage를 각각 독립 external process로 순서대로 실행 |
 | 배포 파일 목록 확인 | `bun pm pack --dry-run` | `src/runtime/pane-launch-broker.mjs`, 두 public schema가 포함되어야 함 |
+
+`bun run ci`는 축약 별칭이 아니다. repository root 아래의 Bun filename form (`.test`, `_test`, `.spec`, `_spec` + `js`/`jsx`/`ts`/`tsx`)은 inventory에서 정확히 한 stage에 배정한다. core가 제외하는 파일은 `test/acceptance/performance-phase0.test.ts`, `test/acceptance/reaper-performance.test.ts`, `test/runtime/reaper-coordinator-heavy.test.ts`, `test/runtime/session-tail-heavy.test.ts`뿐이다. 각 stage는 `--isolate --max-concurrency 1 --bail=1`을 사용하고 empty reporter outcome을 실패로 처리한다. 세 heavy stage는 skipped reporter outcome도 실패로 처리한다; core의 명시적 opt-in skip은 유지한다. Linux hosted CI는 명시적 `--strict-linux`으로 Python 3 `/proc` supervisor를 사용한다. supervisor는 Bun이 전달한 original parent PID를 `PDEATHSIG` 직후 재확인하고, bootstrap 중 취소를 관찰하면 `Popen` 전 abort하므로 **관찰된** parent 부재·pre-spawn 취소에서는 workload를 launch하지 않는다. 이 확인과 OS spawn은 원자적이지 않다. 확인 직후 동시 signal/parent death와 OS spawn이 겹치면 이미 생성된 workload는 bounded TERM/KILL과 reaping으로 정리하며, 임의 parent death 뒤에 부작용이 전혀 없다고 주장하지 않는다. workload가 살아 있는 동안에는 direct `Popen` child PID를 제외한 adopted child만 selective `waitpid(pid, WNOHANG)`로 reap한다. process group뿐 아니라 관찰한 PID/start-time/session descendant를 bounded TERM/KILL과 reaping으로 정리한다. `setsid` escape가 원래 group에 남는다고 주장하지 않는다. supervisor record가 사라지면 outer Bun은 관찰한 exact PID/start-time만 best-effort로 정리하지만 결과를 `cleanup_incomplete`로 fail-closed한다. macOS 등 local platform은 같은 inventory/JUnit 규칙과 direct-child bounded cleanup을 사용하되 detached descendant 보장을 제공하지 않는다. PID identity 재확인은 same-UID·non-adversarial local runner의 잔여 위험을 줄일 뿐 Node API만으로 same-UID PID TOCTOU를 완전히 제거한다고 주장하지 않는다. stage timeout은 blanket `--timeout`이 아니므로 각 test의 원래 timeout과 workload는 바꾸지 않는다. JUnit flags는 현재 Bun 1.4.2에서 확인했으며, public Bun 1.3.14 lane은 CI에서 별도로 검증한다; 이 문서는 1.3.14의 local 실행을 주장하지 않는다.
 
 ## 승인된 opt-in acceptance와 benchmark
 
@@ -232,7 +237,7 @@ Herdr 테스트에는 fake owner-only Unix socket을 사용하며 live mutating 
 
 ## 자동 CI 호환성 매트릭스
 
-push와 pull request의 일반 CI는 provider 인증 정보, provider 요청, live multiplexer 또는 macOS fixture를 사용하지 않는다. `bun run ci`, `bun pm pack --dry-run`, 그리고 tarball을 lifecycle script 없이 격리 temporary consumer에 설치해 registration stub으로 import하는 smoke를 실행한다. smoke는 `KIRO_API_KEY`를 제거하고 `PI_OFFLINE=1`을 설정한다. live tmux/cmux acceptance는 계속 [`live-acceptance.yml`](../.github/workflows/live-acceptance.yml)의 수동 `workflow_dispatch` gate에만 남는다.
+push와 pull request의 일반 CI는 provider 인증 정보, provider 요청, live multiplexer 또는 macOS fixture를 사용하지 않는다. 각 Bun/Pi lane은 core, Phase 0, reaper, session-tail heavy의 네 독립 matrix runner를 사용하며 core 두 lane은 isolated stage 전에 typecheck도 수행한다. 모든 runner는 selected Pi graph verifier, ephemeral compatibility restore, `bun pm pack --dry-run`, lifecycle script 없는 격리 temporary consumer registration smoke를 유지한다. smoke는 `KIRO_API_KEY`를 제거하고 `PI_OFFLINE=1`을 설정한다. aggregate job은 matrix 결과가 `success`가 아니면 실패한다. stage 종료 telemetry는 schema와 8 KiB bound를 artifact upload 전에 검증하며, allowlist JSON(결과, duration, Bun, OS/arch, CPU/메모리/filesystem capacity, observed owned-process CPU/RSS/I/O)만 upload한다. environment, command argument, hostname, raw stdout/payload 및 raw JUnit XML은 저장하거나 upload하지 않는다. validation은 non-hidden report directory의 exact one-file JSON manifest만 `GITHUB_OUTPUT`에 기록하고 upload는 그 exact path만 사용한다. root의 extra entry, subdirectory, symlink, non-JSON 또는 unexpected filename은 거부한다. raw JUnit directory는 mkdtemp `(dev,ino)`와 report identity를 재확인한 경우에만 삭제하며 replacement는 retain한다. output은 existing non-symlink directory 아래 exclusive temporary file과 atomic non-replacing publication으로 쓴 뒤 directory identity를 재확인한다. Node에는 descriptor-relative `openat` API가 없으므로 attacker-controlled filesystem에 대한 완전한 race-free 보장은 제공하지 않는다. live tmux/cmux acceptance는 계속 [`live-acceptance.yml`](../.github/workflows/live-acceptance.yml)의 수동 `workflow_dispatch` gate에만 남는다.
 
 | lane | Bun | Pi development graph | install |
 | --- | --- | --- | --- |

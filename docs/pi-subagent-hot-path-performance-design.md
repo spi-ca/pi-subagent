@@ -452,6 +452,16 @@ scheduler metrics 변경은 `bun run ci`에서 **1,071 pass, 3 skip, 0 fail**로
 
 provider-live recorder는 macOS arm64의 명시적 Pi/tmux/cmux executable과 routine 15개 또는 concurrency 16개 provider child 실행 승인을 요구한다. Linux 또는 cmux 없는 환경에서는 로컬 deterministic 테스트와 non-mutating preflight/verify까지만 수행하며, live gate나 platform 검사를 완화하지 않는다. 외부 환경·승인·baseline이 준비되지 않았다면 위 TODO를 미완료로 유지한다.
 
+### 19.1.1 CI 안정화 Stage 1 점검 목록
+
+다음은 lifecycle/benchmark fixture의 정리 작업이며 production runtime/protocol 계약 변경이나 live provider/backend 실행을 뜻하지 않는다.
+
+- [x] positive child-bridge fixture가 실제 갱신되는 parent lease를 유지하고 terminal 전 `stopAndDrain`한다 (focused and affected-file regression verification complete).
+- [x] stale/missing/dead/forged negative fixture는 100ms deadline을 명시적으로 유지하며 positive 경로와 분리한다 (focused and affected-file regression verification complete).
+- [x] completion/transfer fixture는 sleep 추측 대신 read-start, durable ACK, completion 및 drain 신호를 기다리고 cleanup 전에 work/release barrier를 끝낸다 (focused and affected-file regression verification complete).
+- [x] Herdr process fixture의 post-spawn failure는 성공 경로와 같은 actual child/socket/stream cleanup을 거치며 private root 제거 전에 child·stdout·stderr·socket close 순서를 확인한다 (focused and affected-file regression verification complete).
+- [x] Stage 2 CI external-process boundary: `bun run ci`는 check 뒤 core와 세 heavy workload를 독립 stage로 실행한다. Linux CI stage는 Python 3 `/proc` supervisor가 session/process-group identity를 workload와 group cleanup이 끝날 때까지 보유하고, Bun 전달 original parent PID를 `PDEATHSIG` 직후 재확인해 orphan workload spawn을 거부하며, direct `Popen` child 상태를 소비하지 않고 adopted zombie만 selective `waitpid(pid, WNOHANG)`로 reap한다. timeout/signal에는 bounded TERM→KILL cleanup과 group-empty 확인을 수행한다. inventory는 repository-root Bun filename form을 정확히 한 stage에 배정하고 required heavy path의 missing/duplicate/empty partition을 fail-closed한다. JUnit outcome은 bounded private raw file에서 pass와 heavy-stage skip을 확인한 뒤 삭제하며 allowlist telemetry는 schema/size 검증 후에만 upload한다. 이 boundary는 Bun의 in-process timeout이 filesystem I/O를 취소하거나 Node API만으로 PID TOCTOU를 완전히 제거한다고 주장하지 않으며 original test timeout/workload를 유지한다.
+
 ### 19.2 사용자 응답성 개선의 적용 결정
 
 사용자 입력에 빨리 반응하는 것과 child 처리량을 늘리는 것은 별도 목표다. 긴 부모 foreground 호출을 managed background로 전환하는 workflow 개선은 유지하되, runtime은 다음 범위만 우선 적용한다. 호출 형식뿐 아니라 실행 순서·lifecycle·공유 observer protocol 계약을 바꿔야 한다면 문제 근거, 영향받는 Pi extension/consumer, 호환성·이행 및 검증 범위를 설명하고 사용자 승인을 먼저 받는다.

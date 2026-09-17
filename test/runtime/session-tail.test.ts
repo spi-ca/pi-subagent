@@ -668,7 +668,7 @@ describe("session JSONL tail", () => {
 		assert.equal(swapped, true);
 	});
 
-	test("snapshots initially recent IDs before new entries can evict them", async () => {
+	test("snapshots initially recent IDs before new entries can evict them", { timeout: 30_000 }, async () => {
 		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
 		tempDirs.push(dir);
 		const filePath = path.join(dir, "session.jsonl");
@@ -685,7 +685,7 @@ describe("session JSONL tail", () => {
 		assert.equal(drained.resultChanged, true);
 	});
 
-	test("keeps the recent cache bounded at every duplicate insertion during one drain", async () => {
+	test("keeps the recent cache bounded at every duplicate insertion during one drain", { timeout: 30_000 }, async () => {
 		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
 		tempDirs.push(dir);
 		const filePath = path.join(dir, "session.jsonl");

@@ -47,8 +47,8 @@ async function advance(authority: { acquireReservation(): Promise<any> }, pairs:
   }
 }
 async function publishCheckpoint(authority: { acquireReservation(): Promise<any>; authorityDir: string }): Promise<void> {
-  await advance(authority, 64); // generation 128, before automatic compaction
-  const lease = await authority.acquireReservation(); // compacts then appends generation 129
+  await writeFiles(authority.authorityDir, await validStateFiles(authority, 128)); // fixture: valid legacy history through generation 128
+  const lease = await authority.acquireReservation(); // real compaction then appends generation 129
   assert.ok(lease);
   assert.equal(await lease.release(), true);
 }
@@ -659,7 +659,7 @@ describe("tree permit authority immutable CAS snapshots", () => {
     const owner = { pid: 811, startedAt: 1 };
     const ids = identities({ "811:1": "live" });
     const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
-    await advance(authority, 64);
+    await writeFiles(authority.authorityDir, await validStateFiles(authority, 128));
     const head = await latest(authority);
     const digest = crypto.createHash("sha256").update(`${JSON.stringify(head)}\n`).digest("hex");
     const payload = { version: 1, kind: "pi-subagent-tree-permit-checkpoint", rootIdentity: authority.rootIdentity, maxActive: authority.maxActive, generation: head.generation, state: head, stateDigest: digest };
@@ -697,7 +697,7 @@ describe("tree permit authority immutable CAS snapshots", () => {
     const owner = { pid: 841, startedAt: 1 };
     const ids = identities({ "841:1": "live" });
     const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
-    await advance(authority, 64);
+    await writeFiles(authority.authorityDir, await validStateFiles(authority, 128));
     const leases = await Promise.all(Array.from({ length: 8 }, () => authority.acquireReservation()));
     assert.equal(leases.filter(Boolean).length, 8);
     assert.equal(new Set(leases.filter(Boolean).map((lease: any) => lease.id)).size, 8);
@@ -770,7 +770,7 @@ describe("tree permit authority immutable CAS snapshots", () => {
     const owner = { pid: 856, startedAt: 1 };
     const ids = identities({ "856:1": "live" });
     const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
-    await advance(authority, 64); // valid immutable states 0 through 128
+    await writeFiles(authority.authorityDir, await validStateFiles(authority, 128)); // valid immutable states 0 through 128
     const head = await latest(authority);
     let previous = crypto.createHash("sha256").update(`${JSON.stringify(head)}\n`).digest("hex");
     for (let generation = 129; generation <= 136; generation += 1) {
@@ -815,12 +815,19 @@ describe("tree permit authority immutable CAS snapshots", () => {
     const owner = { pid: 861, startedAt: 1 };
     const ids = identities({ "861:1": "live" });
     const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
-    await advance(authority, 64);
+    await writeFiles(authority.authorityDir, await validStateFiles(authority, 128));
+    assert.equal((await generations(authority)).length, 129, "the fixture is a complete genesis-through-128 legacy chain");
     assert.deepEqual(await checkpoints(authority), []);
-    assert.ok(await adoptTreePermitAuthority({ env: authority.exportChildEnv(), classifyIdentity: ids.classify, currentIdentity: () => owner }).then(() => true));
-    assert.ok(await authority.acquireReservation());
-    assert.equal((await checkpoints(authority)).length, 1);
-    assert.ok((await generations(authority)).length < 3);
+    assert.ok(await adoptTreePermitAuthority({ env: authority.exportChildEnv(), classifyIdentity: ids.classify, currentIdentity: () => owner }), "adoption validates the complete legacy chain");
+
+    const lease = await authority.acquireReservation();
+    assert.ok(lease, "the real mutation checkpoints generation 128 and appends its successor");
+    assert.deepEqual(await checkpoints(authority), ["checkpoint-00000000000000000128.json"]);
+    assert.deepEqual(await generations(authority), ["state-00000000000000000129.json"]);
+    const durable = await latest(authority);
+    assert.equal(durable.generation, 129);
+    assert.ok(durable.leases.some((stored: any) => stored.id === lease.id && stored.token === lease.token && stored.state === "RESERVED"), "the reservation is durably read back from the successor");
+    assert.ok(await adoptTreePermitAuthority({ env: authority.exportChildEnv(), classifyIdentity: ids.classify, currentIdentity: () => owner }), "the compacted checkpoint and successor remain adoptable");
   });
 
   test("fails closed for malformed generations and reconciles only exact-dead complete or recoverable incomplete authorities", async () => {

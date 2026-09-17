@@ -61,19 +61,48 @@ function indexBucketPath(indexPath: string, id: string): string {
 	return path.join(indexPath, `${crypto.createHash("sha256").update(id).digest("hex").slice(0, 3)}.jsonl`);
 }
 
+function idsOutsideIndexBucket(id: string, count: number, prefix: string): string[] {
+	const bucket = crypto.createHash("sha256").update(id).digest("hex").slice(0, 3);
+	const ids: string[] = [];
+	for (let index = 0; ids.length < count; index += 1) {
+		const candidate = `${prefix}-${index}`;
+		if (crypto.createHash("sha256").update(candidate).digest("hex").slice(0, 3) !== bucket) ids.push(candidate);
+	}
+	return ids;
+}
+
 async function indexedDuplicateFixture() {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
 	tempDirs.push(dir);
 	const filePath = path.join(dir, "session.jsonl");
 	const id = "old-indexed-id";
-	await fs.promises.writeFile(filePath, [
-		`${JSON.stringify(assistantEntry(id, "first"))}\n`,
-		...Array.from({ length: SESSION_TAIL_RECENT_ID_LIMIT * 2 + 1 }, (_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "filler"))}\n`),
-	].join(""));
+	await fs.promises.writeFile(filePath, `${JSON.stringify(assistantEntry(id, "first"))}\n`);
 	const result = makeResult();
-	const drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
-	assert.equal(drained.state.seenEntryIds.has(id), false);
-	return { dir, filePath, id, result, state: drained.state, indexPath: drained.state.indexPath! };
+	let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+	const indexPath = drained.state.indexPath!;
+	assert.ok(drained.state.indexBloom.some((byte) => byte !== 0), "the published seed must populate the Bloom prefilter");
+
+	// Tamper tests need the disk path, not the bounded recent-ID accelerator.
+	drained.state.seenEntryIds.clear();
+	await fs.promises.appendFile(filePath, `${JSON.stringify(assistantEntry(id, "lookup proof"))}\n`);
+	const bucketPath = indexBucketPath(indexPath, id);
+	const promises = fs.promises as any;
+	const originalOpen = promises.open;
+	let bucketReadOpens = 0;
+	promises.open = (target: fs.PathLike, flags: number | string, ...args: unknown[]) => {
+		if (target === bucketPath && typeof flags === "number" && (flags & 3) === fs.constants.O_RDONLY) bucketReadOpens += 1;
+		return originalOpen(target, flags, ...args);
+	};
+	try {
+		drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
+	} finally {
+		promises.open = originalOpen;
+	}
+	assert.equal(bucketReadOpens, 1, "a Bloom-positive evicted ID must be resolved from the published disk index");
+	assert.equal(drained.resultChanged, false);
+	assert.equal(result.messages.length, 1);
+	drained.state.seenEntryIds.clear();
+	return { dir, filePath, id, result, state: drained.state, indexPath };
 }
 
 function assistantEntry(id: string, text: string) {
@@ -517,14 +546,13 @@ describe("session JSONL tail", () => {
 		tempDirs.push(dir);
 		const filePath = path.join(dir, "session.jsonl");
 		const ids = idsSharingIndexBucket(8);
-		const initial = [
-			...ids.map((id) => `${JSON.stringify(assistantEntry(id, "first"))}\n`),
-			...Array.from({ length: SESSION_TAIL_RECENT_ID_LIMIT + 1 }, (_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "filler"))}\n`),
-		];
+		const initial = ids.map((id) => `${JSON.stringify(assistantEntry(id, "first"))}\n`);
 		await fs.promises.writeFile(filePath, initial.join(""));
 		const result = makeResult();
 		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
-		assert.ok(ids.every((id) => !drained.state.seenEntryIds.has(id)));
+		// This test isolates bucket grouping, so deliberately bypass the recent-ID
+		// accelerator instead of writing unrelated entries solely to evict these IDs.
+		drained.state.seenEntryIds.clear();
 		const indexPath = drained.state.indexPath!;
 		const bucketPath = indexBucketPath(indexPath, ids[0]);
 		await fs.promises.appendFile(filePath, ids.flatMap((id) => [
@@ -549,20 +577,43 @@ describe("session JSONL tail", () => {
 	});
 
 	test("suppresses exact duplicates across a bounded lookup-batch boundary", async () => {
-		const fixture = await indexedDuplicateFixture();
-		const fillers = Array.from(
-			{ length: SESSION_TAIL_RECENT_ID_LIMIT + 1 },
-			(_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "duplicate"))}\n`,
-		);
-		const crossBatch = [
-			`${JSON.stringify(assistantEntry(fixture.id, "first duplicate"))}\n`,
-			...fillers,
-			...Array.from({ length: 16 * 1024 - fillers.length - 1 }, () => `${JSON.stringify(assistantEntry("evict-0", "repeat"))}\n`),
-			`${JSON.stringify(assistantEntry(fixture.id, "cross-batch duplicate"))}\n`,
-		].join("");
-		await fs.promises.appendFile(fixture.filePath, crossBatch);
-		const drained = await drainSessionJsonl({ filePath: fixture.filePath, state: fixture.state, result: fixture.result as any });
-		assert.equal(fixture.result.messages.length, SESSION_TAIL_RECENT_ID_LIMIT * 2 + 2);
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const id = "boundary-target";
+		const evictIds = idsOutsideIndexBucket(id, SESSION_TAIL_RECENT_ID_LIMIT + 1, "boundary-evict");
+		await fs.promises.writeFile(filePath, [
+			`${JSON.stringify(assistantEntry(id, "seed"))}\n`,
+			...evictIds.map((evictId) => `${JSON.stringify(assistantEntry(evictId, "seed"))}\n`),
+		].join(""));
+		const result = makeResult();
+		let seeded = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+		assert.equal(seeded.state.seenEntryIds.has(id), false, "the target must naturally leave the 1024-entry accelerator");
+
+		const firstBatchCount = 16 * 1024;
+		await fs.promises.appendFile(filePath, [
+			`${JSON.stringify(assistantEntry(id, "first duplicate"))}\n`,
+			...evictIds.map((evictId) => `${JSON.stringify(assistantEntry(evictId, "evict target"))}\n`),
+			...Array.from({ length: firstBatchCount - evictIds.length - 1 }, () => `${JSON.stringify(assistantEntry(evictIds[0], "repeat"))}\n`),
+			`${JSON.stringify(assistantEntry(id, "cross-batch duplicate"))}\n`,
+		].join(""));
+		const bucketPath = indexBucketPath(seeded.state.indexPath!, id);
+		const promises = fs.promises as any;
+		const originalOpen = promises.open;
+		let bucketReadOpens = 0;
+		promises.open = (target: fs.PathLike, flags: number | string, ...args: unknown[]) => {
+			if (target === bucketPath && typeof flags === "number" && (flags & 3) === fs.constants.O_RDONLY) bucketReadOpens += 1;
+			return originalOpen(target, flags, ...args);
+		};
+		let drained;
+		try {
+			drained = await drainSessionJsonl({ filePath, state: seeded.state, result: result as any });
+		} finally {
+			promises.open = originalOpen;
+		}
+		assert.equal(drained.entriesRead, firstBatchCount + 1);
+		assert.equal(bucketReadOpens, 2, "the target must use exact disk lookup in both batches, not a recent-cache hit");
+		assert.equal(result.messages.length, evictIds.length + 1);
 		assert.equal(drained.resultChanged, false);
 		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
 	});
@@ -687,18 +738,66 @@ describe("session JSONL tail", () => {
 		tempDirs.push(dir);
 		const filePath = path.join(dir, "session.jsonl");
 		const indexPath = path.join(dir, "entry.index");
+		const fallbackIndexPath = `${indexPath}.fallback`;
+		const id = "fallback-target";
+		const evictIds = idsOutsideIndexBucket(id, SESSION_TAIL_RECENT_ID_LIMIT, "fallback-evict");
+		const uniqueCount = evictIds.length + 1;
+		const firstBatchCount = 16 * 1024;
+		const inputCount = firstBatchCount + 1;
 		await fs.promises.writeFile(indexPath, "not a directory", { mode: 0o600 });
-		// Keep the one-entry-over lookup-batch boundary: the final duplicate must
-		// resolve through the fallback index published by the preceding batch.
-		const count = 16 * 1024;
+		// The target plus the minimum 1024 later distinct IDs evicts it from the
+		// 1024-entry accelerator; repeated known IDs fill the batch without excess index writes.
 		await fs.promises.writeFile(filePath, [
-			...Array.from({ length: count }, (_, index) => `${JSON.stringify(assistantEntry(`fallback-${index}`, "once"))}\n`),
-			`${JSON.stringify(assistantEntry("fallback-0", "duplicate"))}\n`,
+			`${JSON.stringify(assistantEntry(id, "once"))}\n`,
+			...evictIds.map((evictId) => `${JSON.stringify(assistantEntry(evictId, "once"))}\n`),
+			...Array.from({ length: firstBatchCount - uniqueCount }, () => `${JSON.stringify(assistantEntry(evictIds[0], "repeat"))}\n`),
+			`${JSON.stringify(assistantEntry(id, "duplicate"))}\n`,
 		].join(""));
+		const bucketPath = indexBucketPath(fallbackIndexPath, id);
+		const promises = fs.promises as any;
+		const originalOpen = promises.open;
+		let fallbackTargetPublished = false;
+		let publicationReadbackOpens = 0;
+		let finalLookupReadOpens = 0;
+		let awaitingPublicationReadback = false;
+		promises.open = async (target: fs.PathLike, flags: number | string, ...args: unknown[]) => {
+			const handle = await originalOpen(target, flags, ...args);
+			if (target !== bucketPath || typeof flags !== "number") return handle;
+			const access = flags & 3;
+			if (access === fs.constants.O_WRONLY) {
+				awaitingPublicationReadback = true;
+				return handle;
+			}
+			if (access !== fs.constants.O_RDONLY) return handle;
+			if (!awaitingPublicationReadback) {
+				if (fallbackTargetPublished) finalLookupReadOpens += 1;
+				return handle;
+			}
+			publicationReadbackOpens += 1;
+			const originalClose = handle.close.bind(handle);
+			handle.close = async () => {
+				await originalClose();
+				awaitingPublicationReadback = false;
+				fallbackTargetPublished = true;
+			};
+			return handle;
+		};
 		const result = makeResult();
-		const drained = await drainSessionJsonl({ filePath, indexPath, state: createSessionTailState(), result: result as any });
-		assert.equal(drained.state.indexPath, `${indexPath}.fallback`);
-		assert.equal(result.messages.length, count);
+		let drained;
+		try {
+			drained = await drainSessionJsonl({ filePath, indexPath, state: createSessionTailState(), result: result as any });
+		} finally {
+			promises.open = originalOpen;
+		}
+		assert.equal(drained.entriesRead, inputCount);
+		assert.equal(drained.state.indexPath, fallbackIndexPath);
+		assert.equal((await fs.promises.stat(fallbackIndexPath)).mode & 0o777, 0o700);
+		assert.ok((await fs.promises.readdir(fallbackIndexPath)).length > 0, "the first batch must publish fallback records before the final lookup");
+		assert.equal(publicationReadbackOpens, 1, "the target publication must perform its mandatory read-back");
+		assert.equal(fallbackTargetPublished, true, "the first batch must verify and publish the target into the fallback index");
+		assert.equal(finalLookupReadOpens, 1, "the naturally evicted final duplicate must perform its own exact fallback lookup");
+		assert.equal(result.messages.length, uniqueCount);
+		assert.equal(drained.resultChanged, true);
 	});
 
 	test("calls observers before classification, honors mutations, and preserves callback order", async () => {

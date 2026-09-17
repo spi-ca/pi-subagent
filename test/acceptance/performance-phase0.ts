@@ -221,39 +221,114 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
-  return Promise.race([promise, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), 5_000))]);
+export type TimeoutHooks = { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+
+/** Always clears the guard on both settlement paths; benchmark cleanup cannot inherit a live timer. */
+export function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 5_000, timers: TimeoutHooks = globalThis): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => { timer = timers.setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs); }),
+  ]).finally(() => {
+    if (timer) timers.clearTimeout(timer);
+  });
 }
 
-type LocalChild = { child: ChildProcess; ready: Promise<void>; started: Promise<void>; closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }> };
+export type LocalChild = {
+  child: ChildProcess;
+  ready: Promise<void>;
+  started: Promise<void>;
+  /** Failure is observed at construction; close stays a real close latch. */
+  failure?: Promise<never>;
+  closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  stdoutClosed: Promise<void>;
+  abort?: (reason: Error) => void;
+};
 
-function spawnFixedChild(workload: Workload): LocalChild {
+function observeRejection<T>(promise: Promise<T>): Promise<T> {
+  // Spawn and stream errors can arrive before measureSample reaches its barrier.
+  // Attach an observer now while preserving the original rejection for the barrier.
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+export function createLocalChild(child: ChildProcess): LocalChild {
   const ready = deferred<void>();
   const started = deferred<void>();
+  const failure = deferred<never>();
   const closed = deferred<{ code: number | null; signal: NodeJS.Signals | null }>();
-  const child = spawn(process.execPath, ["-e", CHILD_PROGRAM, workload], { cwd: ROOT, env: {}, stdio: ["pipe", "pipe", "ignore"] });
+  let failed = false;
+  const fail = (error: Error) => {
+    if (failed) return;
+    failed = true;
+    ready.reject(error);
+    started.reject(error);
+    failure.reject(error);
+  };
   let buffer = "";
-  child.stdout!.setEncoding("utf8");
-  child.stdout!.on("data", (chunk: string) => {
-    buffer += chunk;
-    let newline: number;
-    while ((newline = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      if (line === "ready") ready.resolve();
-      else if (line === "started") started.resolve();
-    }
+  const stdout = child.stdout;
+  const stdoutClosed = new Promise<void>((resolve) => {
+    if (!stdout) return resolve();
+    stdout.once("close", resolve);
   });
-  child.once("error", (error) => { ready.reject(error); started.reject(error); closed.reject(error); });
+  if (stdout) {
+    stdout.setEncoding("utf8");
+    stdout.on("error", fail);
+    stdout.on("data", (chunk: string) => {
+      buffer += chunk;
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line === "ready") ready.resolve();
+        else if (line === "started") started.resolve();
+      }
+    });
+  } else fail(new Error("local benchmark child has no stdout stream"));
+  child.once("error", fail);
+  // Do not reject this latch on spawn/stream error: cleanup must still wait for
+  // the ChildProcess close event and its stdout close event.
   child.once("close", (code, signal) => closed.resolve({ code, signal }));
-  return { child, ready: ready.promise, started: started.promise, closed: closed.promise };
+  const abort = (reason: Error) => {
+    fail(reason);
+    child.stdin?.destroy();
+  };
+  return {
+    child,
+    ready: observeRejection(ready.promise),
+    started: observeRejection(started.promise),
+    failure: observeRejection(failure.promise),
+    closed: closed.promise,
+    stdoutClosed,
+    abort,
+  };
+}
+
+export function spawnFixedChild(workload: Workload): LocalChild {
+  return createLocalChild(spawn(process.execPath, ["-e", CHILD_PROGRAM, workload], { cwd: ROOT, env: {}, stdio: ["pipe", "pipe", "ignore"] }));
 }
 
 function writeCommand(child: ChildProcess, command: "start" | "cancel"): void {
   if (!child.stdin || child.stdin.destroyed || !child.stdin.write(`${command}\n`)) return;
 }
 
-async function measureSample(activeRuns: number, workload: Workload): Promise<Sample> {
+export type MeasureSampleOptions = {
+  spawnChild?: (workload: Workload) => LocalChild;
+  timeoutMs?: number;
+  afterStarted?: (children: readonly LocalChild[]) => void | Promise<void>;
+};
+
+async function stopAndReapLocalChild(local: LocalChild): Promise<void> {
+  const { child } = local;
+  // Reject pending readiness/start waiters before ending only this sample's child.
+  local.abort?.(new Error("local benchmark sample aborted during cleanup"));
+  // This ChildProcess was created by this sample; never target a PID or group.
+  child.stdin?.destroy();
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  await Promise.allSettled([local.closed, local.stdoutClosed]);
+}
+
+export async function measureSample(activeRuns: number, workload: Workload, options: MeasureSampleOptions = {}): Promise<Sample> {
   const cpuStart = process.cpuUsage();
   const durationStart = performance.now();
   const loop = monitorEventLoopDelay({ resolution: 1 });
@@ -265,17 +340,21 @@ async function measureSample(activeRuns: number, workload: Workload): Promise<Sa
   const children: LocalChild[] = [];
   try {
     for (let index = 0; index < activeRuns; index += 1) {
-      children.push(spawnFixedChild(workload));
+      children.push((options.spawnChild ?? spawnFixedChild)(workload));
       activeChildren += 1;
       peakChildren = Math.max(peakChildren, activeChildren);
     }
-    await withTimeout(Promise.all(children.map((child) => child.ready)), "barrier readiness");
+    await withTimeout(Promise.all(children.map((child) => child.ready)), "barrier readiness", options.timeoutMs);
     const releaseAt = performance.now();
     children.forEach(({ child }) => writeCommand(child, "start"));
-    await withTimeout(Promise.all(children.map((child) => child.started)), "barrier start");
+    await withTimeout(Promise.all(children.map((child) => child.started)), "barrier start", options.timeoutMs);
+    await options.afterStarted?.(children);
     if (workload === "cancel") children.forEach(({ child }) => writeCommand(child, "cancel"));
     if (workload === "external-close") children.forEach(({ child }) => child.kill("SIGTERM"));
-    const exits = await withTimeout(Promise.all(children.map((child) => child.closed)), "child settlement");
+    const exits = await withTimeout(Promise.race([
+      Promise.all(children.map((child) => child.closed)),
+      ...children.flatMap((child) => child.failure ? [child.failure] : []),
+    ]), "child settlement", options.timeoutMs);
     activeChildren = 0;
     for (const exit of exits) {
       const expectedSignal = workload === "external-close" ? "SIGTERM" : null;
@@ -301,7 +380,9 @@ async function measureSample(activeRuns: number, workload: Workload): Promise<Sa
   } finally {
     clearInterval(rssSampler);
     loop.disable();
-    for (const { child } of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    // Abort local work before cleanup and do not return while an owned child or
+    // its stdout stream can outlive this sample/root.
+    await Promise.all(children.map(stopAndReapLocalChild));
   }
 }
 

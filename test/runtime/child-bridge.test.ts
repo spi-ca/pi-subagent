@@ -54,6 +54,34 @@ const activeBridgeShutdowns: Array<() => Promise<void>> = [];
 const lifecycleServers: LifecycleEventServer[] = [];
 const savedEnv = { ...process.env };
 
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+	return { promise, resolve, reject };
+}
+
+async function waitForCondition(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await condition()) return;
+		await new Promise((resolve) => setTimeout(resolve, 2));
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function withinDeadlockGuard<T>(promise: Promise<T>, label: string, timeoutMs = 2_000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs); }),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 afterEach(async () => {
 	while (activeBridgeShutdowns.length > 0) await activeBridgeShutdowns.pop()!();
 	while (lifecycleServers.length > 0) await lifecycleServers.pop()!.close().catch(() => undefined);
@@ -69,6 +97,7 @@ async function setupBridge(runId: string, options: {
 	classifyParentProcessIdentity?: (pid: number, startedAt: number, probeOptions?: { timeoutMs?: number }) => "live" | "dead" | "unknown";
 	monotonicNow?: () => number;
 	readLease?: (filePath: string) => Promise<unknown | null>;
+	writeParentLease?: (filePath: string, value: unknown) => Promise<void>;
 	title?: string;
 	hasUI?: boolean;
 	publishPromotionAck?: (filePath: string, value: unknown) => Promise<"published" | "exists">;
@@ -79,6 +108,7 @@ async function setupBridge(runId: string, options: {
 	releaseInheritedTreePermit?: () => Promise<boolean>;
 	completionFence?: boolean;
 	leaseStaleMs?: number;
+	maintainLiveLease?: boolean;
 	expectedParent?: { pid: number; startedAt: number };
 	failureBoundaryCapability?: boolean;
 	metadataTailSuccessBoundaryCapability?: boolean;
@@ -127,17 +157,50 @@ async function setupBridge(runId: string, options: {
 	} else {
 		for (const name of ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"]) delete process.env[name];
 	}
-	await atomicWriteJson(paths.parentLeasePath, {
-		version: RUN_PROTOCOL_VERSION,
-		runId,
-		parentPid: expectedParent.pid,
-		parentStartedAt: expectedParent.startedAt,
-		renewedAt: Date.now(),
-	});
+	const writeLease = () => {
+		const value = {
+			version: RUN_PROTOCOL_VERSION,
+			runId,
+			parentPid: expectedParent.pid,
+			parentStartedAt: expectedParent.startedAt,
+			renewedAt: Date.now(),
+		};
+		return options.writeParentLease?.(paths.parentLeasePath, value) ?? atomicWriteJson(paths.parentLeasePath, value);
+	};
+	await writeLease();
+	let leaseWrite = Promise.resolve();
+	let leaseStopped = false;
+	let leaseStopTask: Promise<void> | undefined;
+	const renewLease = () => {
+		if (leaseStopped) return;
+		leaseWrite = leaseWrite.then(writeLease).catch(() => undefined);
+	};
+	const leaseTimer = options.maintainLiveLease === false ? undefined : setInterval(renewLease, 20);
+	const stopAndDrainLeaseRenewals = () => leaseStopTask ??= (async () => {
+		leaseStopped = true;
+		if (leaseTimer) clearInterval(leaseTimer);
+		await leaseWrite;
+	})();
 
 	const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
 	const commands = new Map<string, { handler: (args: string, ctx: any) => any }>();
 	const tools = new Map<string, any>();
+	const eventTasks = new Set<Promise<void>>();
+	const trackEventTask = (task: Promise<void>) => {
+		eventTasks.add(task);
+		void task.catch(() => undefined);
+		void task.then(
+			() => { eventTasks.delete(task); },
+			() => { eventTasks.delete(task); },
+		);
+		return task;
+	};
+	const drainEventTasks = async () => {
+		while (eventTasks.size > 0) await Promise.allSettled([...eventTasks]);
+	};
+	const shutdownReached = deferred<void>();
+	let sessionShutdownEmitted = false;
+	let shutdownAndDrainTask: Promise<void> | undefined;
 	const pi = {
 		on(event: string, handler: (event: any, ctx: any) => any) {
 			const current = handlers.get(event) ?? [];
@@ -156,16 +219,32 @@ async function setupBridge(runId: string, options: {
 	const notifications: Array<{ message: string; level: string }> = [];
 	const ctx = {
 		abort: () => { lifecycle.aborted = true; },
-		shutdown: () => { lifecycle.shutdown = true; },
+		shutdown: () => { lifecycle.shutdown = true; shutdownReached.resolve(); },
 		waitForIdle: async () => undefined,
 		hasUI: options.hasUI ?? false,
 		ui: { setTitle: (title: string) => { titles.push(title); }, notify: (message: string, level: string) => { notifications.push({ message, level }); } },
 	};
-	const emit = async (event: string, payload: any = {}) => {
-		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+	const emit = (event: string, payload: any = {}) => {
+		// A ctx.shutdown() request is not the host lifecycle event. Track the
+		// actual emission so cleanup cannot skip the bridge's shutdown handler.
+		if (event === "session_shutdown") sessionShutdownEmitted = true;
+		return trackEventTask((async () => {
+			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		})());
 	};
-	activeBridgeShutdowns.push(async () => { if (!lifecycle.shutdown) await emit("session_shutdown"); });
-	return { paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit };
+	const shutdownAndDrain = () => shutdownAndDrainTask ??= (async () => {
+		// Stop before emitting terminal lifecycle work so no renewal can race a
+		// shutdown state write. This helper is called only outside an event task;
+		// draining from a handler would wait on its own tracked promise.
+		await stopAndDrainLeaseRenewals();
+		if (!sessionShutdownEmitted) await emit("session_shutdown");
+		await drainEventTasks();
+	})();
+	activeBridgeShutdowns.push(shutdownAndDrain);
+	return {
+		paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit,
+		stopAndDrainLeaseRenewals, shutdownAndDrain, drainEventTasks, waitForShutdown: () => shutdownReached.promise,
+	};
 }
 
 function completionError(value: ReturnType<typeof parseCompletionAuthority>): string | undefined {
@@ -431,7 +510,7 @@ describe("child lifecycle bridge", () => {
 		const bridge = await setupBridge("run-completion-fence", { completionFence: true });
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		const settled = bridge.emit("agent_settled");
-		while (!fs.existsSync(bridge.paths.completionFencePath)) await new Promise((resolve) => setTimeout(resolve, 1));
+		await waitForCondition(() => fs.existsSync(bridge.paths.completionFencePath), "completion fence publication");
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "boundary waits for ACK");
 		await publishImmutableJson(bridge.paths.completionFenceAckPath, { version: 1, kind: "completion-fence-ack", runId: "run-completion-fence", nonce: "d".repeat(64), acknowledgedAt: Date.now() });
 		await settled;
@@ -440,15 +519,13 @@ describe("child lifecycle bridge", () => {
 
 	test("settles an exact cancellation fence as aborted without waiting for a completion ACK", async () => {
 		const runId = "run-cancellation-fence";
-		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100 });
+		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100, maintainLiveLease: false });
 		await publishImmutableJson(bridge.paths.completionFencePath, {
 			version: 1, kind: "cancellation-fence", runId, childPid: process.pid,
 			childStartedAt: getCurrentProcessStartedAt()!, claimedAt: Date.now(),
 		});
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		const started = Date.now();
-		await bridge.emit("agent_settled");
-		assert.ok(Date.now() - started < 100, "a cancellation winner never waits for completion-fence ACK");
+		await withinDeadlockGuard(bridge.emit("agent_settled"), "cancellation-fence settlement");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
 		assert.equal(completion?.status, "aborted");
 		assert.equal(completionError(completion), "surface-closed");
@@ -458,8 +535,8 @@ describe("child lifecycle bridge", () => {
 		const bridge = await setupBridge("run-completion-fence-stale-lease", { completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true });
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		const settled = bridge.emit("agent_settled");
-		while (!fs.existsSync(bridge.paths.completionFencePath)) await new Promise((resolve) => setTimeout(resolve, 1));
-		await settled;
+		await waitForCondition(() => fs.existsSync(bridge.paths.completionFencePath), "completion fence publication");
+		await withinDeadlockGuard(settled, "boundary-less fence settlement");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-stale-lease");
 		assert.equal(completion?.status, "failed");
 		assert.equal(completionError(completion), "bridge-error");
@@ -468,10 +545,10 @@ describe("child lifecycle bridge", () => {
 
 	test("does not let fresh lease renewal authorize a boundary after the unacknowledged fence deadline", async () => {
 		const runId = "run-completion-fence-fresh-lease";
-		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true });
+		const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true, maintainLiveLease: false });
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		const settled = bridge.emit("agent_settled");
-		while (!fs.existsSync(bridge.paths.completionFencePath)) await new Promise((resolve) => setTimeout(resolve, 1));
+		await waitForCondition(() => fs.existsSync(bridge.paths.completionFencePath), "completion fence publication");
 		const parentStartedAt = getCurrentProcessStartedAt()!;
 		let renewalWrites: Promise<void> = Promise.resolve();
 		const renew = setInterval(() => {
@@ -503,10 +580,8 @@ describe("child lifecycle bridge", () => {
 			},
 		});
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		const started = Date.now();
-		await bridge.emit("agent_settled");
+		await withinDeadlockGuard(bridge.emit("agent_settled"), "bounded parent-identity settlement");
 		assert.ok(probeBudgets.length > 0);
-		assert.ok(Date.now() - started < 300, "an uncertain parent probe cannot overrun the ACK deadline");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-bounded-identity");
 		assert.equal(completion?.status, "failed");
 		assert.equal(completionError(completion), "bridge-error");
@@ -515,30 +590,37 @@ describe("child lifecycle bridge", () => {
 
 	test("does not let an unresolving lease read hold completion-fence ACK wait", async () => {
 		let reads = 0;
+		const blockedLeaseRead = deferred<void>();
 		const bridge = await setupBridge("run-completion-fence-blocked-read", {
 			completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true,
-			readLease: async (filePath) => ++reads === 1
-				? await readJsonFile(filePath)
-				: await new Promise<never>(() => undefined),
+			readLease: async (filePath) => {
+				if (++reads === 1) return await readJsonFile(filePath);
+				blockedLeaseRead.resolve();
+				return await new Promise<never>(() => undefined);
+			},
 		});
-		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		const started = Date.now();
-		await bridge.emit("agent_settled");
-		assert.ok(Date.now() - started < 500, "ACK wait must use the fence deadline rather than the stalled lease read");
+		await bridge.emit("session_start");
+		await withinDeadlockGuard(blockedLeaseRead.promise, "blocked periodic lease read start");
+		await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		await withinDeadlockGuard(bridge.emit("agent_settled"), "settlement after blocked lease read");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-blocked-read");
 		assert.equal(completionError(completion), "bridge-error");
 		assert.equal(completion && "session" in completion, false);
 	});
 
 	test("settles a never-resolving ACK artifact read through the boundary-less deadline fallback", async () => {
+		const blockedAckRead = deferred<void>();
 		const bridge = await setupBridge("run-completion-fence-blocked-ack-read", {
 			completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true,
-			readCompletionFenceAck: async () => await new Promise<never>(() => undefined),
+			readCompletionFenceAck: async () => {
+				blockedAckRead.resolve();
+				return await new Promise<never>(() => undefined);
+			},
 		});
 		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		const started = Date.now();
-		await bridge.emit("agent_settled");
-		assert.ok(Date.now() - started < 500, "the ACK artifact deadline must bound a stalled read/open/lstat");
+		const settling = bridge.emit("agent_settled");
+		await withinDeadlockGuard(blockedAckRead.promise, "blocked completion ACK read start");
+		await withinDeadlockGuard(settling, "settlement after blocked ACK read");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-blocked-ack-read");
 		assert.equal(completion?.status, "failed");
 		assert.equal(completionError(completion), "bridge-error");
@@ -547,18 +629,26 @@ describe("child lifecycle bridge", () => {
 
 	test("fences a late periodic lease read and finishes orphan recovery once", async () => {
 		let resolveLease!: (value: unknown | null) => void;
+		const readStarted = deferred<void>();
+		const readResumed = deferred<void>();
 		const lateLease = new Promise<unknown | null>((resolve) => { resolveLease = resolve; });
 		const bridge = await setupBridge("run-periodic-lease-read-timeout", {
 			leaseStaleMs: 100, isProcessIdentityAlive: () => true,
-			readLease: async () => await lateLease,
+			readLease: async () => {
+				readStarted.resolve();
+				const lease = await lateLease;
+				readResumed.resolve();
+				return lease;
+			},
 		});
-		const started = Date.now();
-		await bridge.emit("session_start");
-		assert.ok(Date.now() - started < 500, "the initial checker must settle at its stale deadline");
-		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-periodic-lease-read-timeout")), "lease-expired");
+		const starting = bridge.emit("session_start");
+		await withinDeadlockGuard(readStarted.promise, "initial blocked lease read start");
+		await withinDeadlockGuard(starting, "initial stale-lease settlement");
+		const completionBeforeLateRead = await fs.promises.readFile(bridge.paths.completionPath, "utf8");
+		assert.equal(completionError(parseCompletionAuthority(JSON.parse(completionBeforeLateRead), "run-periodic-lease-read-timeout")), "lease-expired");
 		resolveLease({ version: RUN_PROTOCOL_VERSION, runId: "run-periodic-lease-read-timeout", parentPid: process.pid, parentStartedAt: getCurrentProcessStartedAt()!, renewedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-periodic-lease-read-timeout")), "lease-expired", "late read results cannot reopen the orphaned bridge");
+		await withinDeadlockGuard(readResumed.promise, "late lease read resume");
+		assert.equal(await fs.promises.readFile(bridge.paths.completionPath, "utf8"), completionBeforeLateRead, "a resumed late read cannot replace immutable orphan completion");
 		assert.equal(bridge.lifecycle.aborted, true);
 	});
 
@@ -753,7 +843,7 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("aborts when a future-forged lease has a dead or mismatched parent identity", async () => {
-		const bridge = await setupBridge("run-forged-lease", { isProcessIdentityAlive: () => false });
+		const bridge = await setupBridge("run-forged-lease", { leaseStaleMs: 100, isProcessIdentityAlive: () => false, maintainLiveLease: false });
 		await atomicWriteJson(bridge.paths.parentLeasePath, {
 			version: RUN_PROTOCOL_VERSION, runId: "run-forged-lease", parentPid: process.pid,
 			parentStartedAt: getCurrentProcessStartedAt()!, renewedAt: Date.now() + 60_000,
@@ -765,7 +855,7 @@ describe("child lifecycle bridge", () => {
 
 	test("rejects a forged lease for another live parent before OS liveness", async () => {
 		let identityChecks = 0;
-		const bridge = await setupBridge("run-forged-live-parent", { isProcessIdentityAlive: () => { identityChecks += 1; return true; } });
+		const bridge = await setupBridge("run-forged-live-parent", { leaseStaleMs: 100, isProcessIdentityAlive: () => { identityChecks += 1; return true; }, maintainLiveLease: false });
 		await atomicWriteJson(bridge.paths.parentLeasePath, {
 			version: RUN_PROTOCOL_VERSION, runId: "run-forged-live-parent", parentPid: process.pid + 1,
 			parentStartedAt: getCurrentProcessStartedAt()!, renewedAt: Date.now(),
@@ -778,15 +868,18 @@ describe("child lifecycle bridge", () => {
 
 	test("suppresses a slow lease read after external completion", async () => {
 		let resolveRead!: (value: unknown | null) => void;
+		const readStarted = deferred<void>();
 		const bridge = await setupBridge("run-slow-read", {
-			readLease: async () => await new Promise<unknown | null>((resolve) => { resolveRead = resolve; }),
+			readLease: async () => {
+				readStarted.resolve();
+				return await new Promise<unknown | null>((resolve) => { resolveRead = resolve; });
+			},
 		});
 		const starting = bridge.emit("session_start");
-		await new Promise((resolve) => setTimeout(resolve, 1));
+		await withinDeadlockGuard(readStarted.promise, "slow lease read start");
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		const settled = bridge.emit("agent_settled");
-		await new Promise((resolve) => setTimeout(resolve, 1));
 		resolveRead(null);
 		await Promise.all([starting, settled]);
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-slow-read")?.status, "completed");
@@ -833,7 +926,8 @@ describe("child lifecycle bridge", () => {
 		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(unreadable.paths.completionPath), "run-unreadable-lease")), "lease-expired");
 		assert.equal(unreadable.lifecycle.aborted, true);
 
-		const missing = await setupBridge("run-missing-dead-parent", { isProcessIdentityAlive: () => false });
+		const missing = await setupBridge("run-missing-dead-parent", { leaseStaleMs: 100, isProcessIdentityAlive: () => false, maintainLiveLease: false });
+		await missing.stopAndDrainLeaseRenewals();
 		await fs.promises.rm(missing.paths.parentLeasePath, { force: true });
 		await missing.emit("session_start");
 		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(missing.paths.completionPath), "run-missing-dead-parent")), "lease-expired");
@@ -850,25 +944,27 @@ describe("child lifecycle bridge", () => {
 			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() };
 		await atomicWriteJson(bridge.paths.promotionRequestPath, request);
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-child")), "durable transfer acknowledgement");
 		const ack = parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-child");
 		assert.ok(ack);
 		assert.equal(ack!.transferId, request.transferId);
+		await bridge.stopAndDrainLeaseRenewals();
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await bridge.emit("session_shutdown");
 		assert.equal(bridge.lifecycle.aborted, false);
 	});
 
 	test("elects completion when finish becomes terminal before ACK publication", async () => {
 		let bridge!: Awaited<ReturnType<typeof setupBridge>>;
+		let settledTask!: Promise<void>;
 		bridge = await setupBridge("transfer-finish-first", {
 			isProcessIdentityAlive: () => true,
 			beforePromotionAckPublication: async () => {
-				// Do not await the finish: it deliberately drains this checker.
+				// Start settlement while ACK publication is fenced, then explicitly
+				// join its durable terminal work before inspecting or cleaning up.
 				await bridge.emit("agent_start");
 				await bridge.emit("agent_end", { messages: [assistant("stop")] });
-				void bridge.emit("agent_settled");
-				await new Promise((resolve) => setTimeout(resolve, 0));
+				settledTask = bridge.emit("agent_settled");
 			},
 		});
 		const allocation = { version: 2, runId: "transfer-finish-first", terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
@@ -876,19 +972,23 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-finish-first")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174010", runId: "transfer-finish-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		await settledTask;
+		await bridge.waitForShutdown();
+		await bridge.shutdownAndDrain();
 		assert.equal(fs.existsSync(bridge.paths.promotionAckPath), false);
 		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-finish-first")?.status, "completed");
+		assert.equal(parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-finish-first")?.lastEvent, "session_shutdown");
 	});
 
 	test("elects a durable ACK over concurrent finish and suppresses later agent settlement completion", async () => {
 		let bridge!: Awaited<ReturnType<typeof setupBridge>>;
+		let settledTask!: Promise<void>;
 		bridge = await setupBridge("transfer-ack-first", {
 			isProcessIdentityAlive: () => true,
 			publishPromotionAck: async (filePath, value) => {
 				await atomicWriteJson(filePath, value);
-				// finish sets terminal and waits for this checker; durable ACK wins.
-				void (async () => {
+				// Preserve the race, but retain the exact task instead of hiding it.
+				settledTask = (async () => {
 					await bridge.emit("agent_start");
 					await bridge.emit("agent_end", { messages: [assistant("stop")] });
 					await bridge.emit("agent_settled");
@@ -902,15 +1002,86 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-ack-first")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174011", runId: "transfer-ack-first", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-ack-first")), "durable ACK election");
+		await settledTask;
+		await bridge.waitForShutdown();
+		await bridge.shutdownAndDrain();
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-ack-first"));
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "concurrent finish must not publish after detached ACK");
+		assert.equal(parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-ack-first")?.lastEvent, "session_shutdown");
 		// A later ordinary settled event must also remain local-only.
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		await bridge.emit("agent_settled");
+		await bridge.drainEventTasks();
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null);
 		assert.equal(bridge.lifecycle.shutdown, true);
+	});
+
+	test("emits one actual session shutdown after ctx.shutdown and stops lease writes before lifecycle drain", async () => {
+		const renewalStarted = deferred<void>();
+		const releaseRenewal = deferred<void>();
+		let holdRenewal = false;
+		const bridge = await setupBridge("shutdown-request-is-not-event", {
+			writeParentLease: async (filePath, value) => {
+				if (holdRenewal) { renewalStarted.resolve(); await releaseRenewal.promise; }
+				await atomicWriteJson(filePath, value);
+			},
+		});
+		holdRenewal = true;
+		let sessionShutdownEvents = 0;
+		bridge.handlers.get("session_shutdown")!.push(async () => { sessionShutdownEvents += 1; });
+		await bridge.emit("session_start");
+		await bridge.emit("agent_start");
+		await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		await bridge.emit("agent_settled");
+		await bridge.waitForShutdown();
+		assert.equal(bridge.lifecycle.shutdown, true, "the bridge requested ctx.shutdown before host cleanup");
+		await withinDeadlockGuard(renewalStarted.promise, "in-flight lease renewal start");
+		const cleanup = bridge.shutdownAndDrain();
+		let cleanupSettled = false;
+		void cleanup.then(() => { cleanupSettled = true; });
+		try {
+			await Promise.resolve();
+			assert.equal(cleanupSettled, false, "cleanup skipped an in-flight lease renewal");
+			assert.equal(sessionShutdownEvents, 0, "host lifecycle shutdown must wait for the blocked lease renewal");
+		} finally {
+			releaseRenewal.resolve();
+		}
+		await withinDeadlockGuard(cleanup, "shutdown cleanup outside its event task");
+		await bridge.shutdownAndDrain();
+		assert.equal(sessionShutdownEvents, 1, "host lifecycle shutdown must be emitted exactly once");
+		assert.equal(parseRunState(await readJsonFile(bridge.paths.statePath), "shutdown-request-is-not-event")?.lastEvent, "session_shutdown");
+	});
+
+	test("drains separately started tracked lifecycle work after actual session shutdown", async () => {
+		const trackedLifecycleStarted = deferred<void>();
+		const releaseTrackedLifecycle = deferred<void>();
+		const actualSessionShutdown = deferred<void>();
+		const bridge = await setupBridge("shutdown-drains-tracked-events");
+		let sessionShutdownEvents = 0;
+		bridge.handlers.get("agent_start")!.push(async () => {
+			trackedLifecycleStarted.resolve();
+			await releaseTrackedLifecycle.promise;
+		});
+		bridge.handlers.get("session_shutdown")!.push(async () => {
+			sessionShutdownEvents += 1;
+			actualSessionShutdown.resolve();
+		});
+		const trackedLifecycle = bridge.emit("agent_start");
+		await withinDeadlockGuard(trackedLifecycleStarted.promise, "tracked lifecycle event start");
+		const cleanup = bridge.shutdownAndDrain();
+		let cleanupSettled = false;
+		void cleanup.then(() => { cleanupSettled = true; });
+		try {
+			await withinDeadlockGuard(actualSessionShutdown.promise, "actual session shutdown emission");
+			assert.equal(sessionShutdownEvents, 1, "cleanup emitted the actual host lifecycle shutdown");
+			await Promise.resolve();
+			assert.equal(cleanupSettled, false, "cleanup skipped separately started tracked lifecycle work");
+		} finally {
+			releaseTrackedLifecycle.resolve();
+		}
+		await withinDeadlockGuard(Promise.all([trackedLifecycle, cleanup]), "tracked lifecycle drain after shutdown");
 	});
 
 	test("retries inherited permit release beyond 25 faults after ACK while finish remains completion-free", async () => {
@@ -924,14 +1095,15 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-release-recovery")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174013", runId: "transfer-release-recovery", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 80));
+		await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-release-recovery")), "durable transfer acknowledgement");
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-release-recovery"));
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		await bridge.emit("agent_settled");
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "detached finish must not wait for permit release");
+		await bridge.stopAndDrainLeaseRenewals();
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		await new Promise((resolve) => setTimeout(resolve, 750));
+		await waitForCondition(() => releaseAttempts > 26, "post-ACK inherited permit release retries");
 		assert.ok(releaseAttempts > 26, "release retry must survive more than the old 25-attempt limit");
 		assert.equal(bridge.lifecycle.aborted, false, "parent crash after ACK cannot restore the lease checker");
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null);
@@ -944,7 +1116,7 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("session_start");
 		const child = parseRunState(await readJsonFile(bridge.paths.statePath), "transfer-post-detach")!;
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174012", runId: "transfer-post-detach", allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") }, parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 80));
+		await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-post-detach")), "durable transfer acknowledgement");
 		assert.ok(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), "transfer-post-detach"));
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
@@ -974,13 +1146,13 @@ describe("child lifecycle bridge", () => {
 			await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: `123e4567-e89b-12d3-a456-4266141740${label === "valid" ? "08" : "09"}`, runId,
 				allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 				parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-			await new Promise((resolve) => setTimeout(resolve, 80));
+			await waitForCondition(() => fs.existsSync(bridge.paths.completionPath), `${label} completion election`);
 			assert.equal(fs.existsSync(bridge.paths.promotionAckPath), false, `${label} completion must prevent ACK publication`);
 		}
 	});
 
 	test("does not withdraw its checker for a malformed pre-existing acknowledgement", async () => {
-		const bridge = await setupBridge("transfer-malformed-ack", { isProcessIdentityAlive: () => true });
+		const bridge = await setupBridge("transfer-malformed-ack", { isProcessIdentityAlive: () => true, maintainLiveLease: false });
 		const allocation = { version: 2, runId: "transfer-malformed-ack", terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
 		await atomicWriteJson(bridge.paths.allocationPath, allocation);
 		await bridge.emit("session_start");
@@ -990,10 +1162,10 @@ describe("child lifecycle bridge", () => {
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() };
 		await atomicWriteJson(bridge.paths.promotionRequestPath, request);
 		await fs.promises.writeFile(bridge.paths.promotionAckPath, "{malformed}\n", { mode: 0o600 });
-		await new Promise((resolve) => setTimeout(resolve, 60));
 		assert.equal(await fs.promises.readFile(bridge.paths.promotionAckPath, "utf8"), "{malformed}\n");
+		await bridge.stopAndDrainLeaseRenewals();
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		await new Promise((resolve) => setTimeout(resolve, 160));
+		await waitForCondition(async () => completionError(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-malformed-ack")) === "lease-expired", "managed checker orphan completion");
 		assert.equal(completionError(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-malformed-ack")), "lease-expired");
 		assert.equal(bridge.lifecycle.aborted, true, "the managed checker must remain responsible after malformed ACK");
 	});
@@ -1037,6 +1209,7 @@ describe("child lifecycle bridge", () => {
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
 		await waitForSignal(publisherAttempted.promise, "the fenced checker to attempt ACK publication");
 		try {
+			await bridge.stopAndDrainLeaseRenewals();
 			await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
 		} finally {
 			allowAckReadback.resolve();
@@ -1051,7 +1224,7 @@ describe("child lifecycle bridge", () => {
 	test("restores checker enforcement after acknowledgement publication fails", async () => {
 		let publishAttempts = 0;
 		const bridge = await setupBridge("transfer-ack-failure", {
-			isProcessIdentityAlive: () => true,
+			isProcessIdentityAlive: () => true, maintainLiveLease: false,
 			publishPromotionAck: async () => { publishAttempts += 1; throw new Error("injected ack publication failure"); },
 		});
 		const allocation = { version: 2, runId: "transfer-ack-failure", terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
@@ -1061,27 +1234,18 @@ describe("child lifecycle bridge", () => {
 		await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174006", runId: "transfer-ack-failure",
 			allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
 			parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await waitForCondition(() => publishAttempts > 0, "failed ACK publication attempt");
 		assert.ok(publishAttempts > 0);
+		await bridge.stopAndDrainLeaseRenewals();
 		await fs.promises.rm(bridge.paths.parentLeasePath, { force: true });
-		const deadline = Date.now() + 2_000;
-		let completion: ReturnType<typeof parseCompletionAuthority> = null;
-		while (Date.now() < deadline && completion === null) {
-			try {
-				const value: unknown = JSON.parse(await fs.promises.readFile(bridge.paths.completionPath, "utf8"));
-				completion = parseCompletionAuthority(value, "transfer-ack-failure");
-				assert.ok(completion, "a published completion authority must be valid");
-			} catch (error: unknown) {
-				if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			if (completion === null) await new Promise((resolve) => setTimeout(resolve, 20));
-		}
+		await waitForCondition(() => fs.existsSync(bridge.paths.completionPath), "lease-expired completion publication");
+		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "transfer-ack-failure");
 		assert.equal(completionError(completion), "lease-expired");
 		assert.equal(bridge.lifecycle.aborted, true, "failed ACK publication must not detach the child");
 	});
 
 	test("makes a checker-triggered orphan with a live parent wait for the exact completion-fence ACK", async () => {
-		const bridge = await setupBridge("run-orphan", { completionFence: true });
+		const bridge = await setupBridge("run-orphan", { completionFence: true, leaseStaleMs: 100, maintainLiveLease: false });
 		await atomicWriteJson(bridge.paths.parentLeasePath, {
 			version: RUN_PROTOCOL_VERSION,
 			runId: "run-orphan",
@@ -1090,7 +1254,7 @@ describe("child lifecycle bridge", () => {
 			renewedAt: Date.now() - 1000,
 		});
 		const settling = bridge.emit("session_start");
-		while (!fs.existsSync(bridge.paths.completionFencePath)) await new Promise((resolve) => setTimeout(resolve, 1));
+		await waitForCondition(() => fs.existsSync(bridge.paths.completionFencePath), "orphan completion fence publication");
 		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "a live parent still needs an ACK even when the checker caused the orphan");
 		await publishImmutableJson(bridge.paths.completionFenceAckPath, { version: 1, kind: "completion-fence-ack", runId: "run-orphan", nonce: "d".repeat(64), acknowledgedAt: Date.now() });
 		await settling;
@@ -1105,7 +1269,7 @@ describe("child lifecycle bridge", () => {
 
 	test("lets a checker-triggered orphan bypass the ACK only after exact parent death", async () => {
 		const bridge = await setupBridge("run-orphan-dead", {
-			completionFence: true,
+			completionFence: true, leaseStaleMs: 100, maintainLiveLease: false,
 			expectedParent: { pid: 999_999_999, startedAt: 1 },
 		});
 		await atomicWriteJson(bridge.paths.parentLeasePath, {

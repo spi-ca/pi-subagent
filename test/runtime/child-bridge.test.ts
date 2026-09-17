@@ -732,7 +732,15 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("does not complete an aborted turn", async () => {
-		const bridge = await setupBridge("run-aborted-turn");
+		const fakeMonotonicNow = () => 0;
+		const bridge = await setupBridge("run-aborted-turn", {
+			leaseStaleMs: 10_000,
+			isProcessIdentityAlive: () => true,
+			monotonicNow: fakeMonotonicNow,
+		});
+		// This lifecycle behavior is independent of OS identity probing and must
+		// survive a scheduler delay after the fixture creates its valid lease.
+		await new Promise((resolve) => setTimeout(resolve, 150));
 		await bridge.emit("session_start");
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("aborted", "")] });

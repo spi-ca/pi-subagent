@@ -52,6 +52,32 @@ async function publishCheckpoint(authority: { acquireReservation(): Promise<any>
   assert.ok(lease);
   assert.equal(await lease.release(), true);
 }
+async function writeFiles(directory: string, files: readonly [string, string][]): Promise<void> {
+  // Keep real filesystem entries but avoid serial writes and redundant chmod:
+  // writeFile's 0600 creation mode is already the authority's required mode.
+  for (let first = 0; first < files.length; first += 128) {
+    await Promise.all(files.slice(first, first + 128).map(([name, content]) => fs.promises.writeFile(path.join(directory, name), content, { mode: 0o600 })));
+  }
+}
+async function validStateFiles(authority: { authorityDir: string }, lastGeneration: number): Promise<[string, string][]> {
+  let state = await latest(authority);
+  let previousDigest = crypto.createHash("sha256").update(`${JSON.stringify(state)}\n`).digest("hex");
+  const files: [string, string][] = [];
+  for (let generation = 1; generation <= lastGeneration; generation += 1) {
+    state = { ...state, generation, previousDigest };
+    const content = `${JSON.stringify(state)}\n`;
+    previousDigest = crypto.createHash("sha256").update(content).digest("hex");
+    files.push([`state-${String(generation).padStart(20, "0")}.json`, content]);
+  }
+  return files;
+}
+async function writeGenesisCheckpoint(authority: { authorityDir: string; rootIdentity: string; maxActive: number; token: string }): Promise<void> {
+  const state = await latest(authority);
+  const stateDigest = crypto.createHash("sha256").update(`${JSON.stringify(state)}\n`).digest("hex");
+  const payload = { version: 1, kind: "pi-subagent-tree-permit-checkpoint", rootIdentity: authority.rootIdentity, maxActive: authority.maxActive, generation: 0, state, stateDigest };
+  const checkpoint = { ...payload, hmac: crypto.createHmac("sha256", authority.token).update(JSON.stringify(payload)).digest("hex") };
+  await writeFiles(authority.authorityDir, [["checkpoint-00000000000000000000.json", `${JSON.stringify(checkpoint)}\n`]]);
+}
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!predicate()) {
@@ -679,34 +705,64 @@ describe("tree permit authority immutable CAS snapshots", () => {
     assert.ok(await adoptTreePermitAuthority({ env: authority.exportChildEnv(), classifyIdentity: ids.classify, currentIdentity: () => owner }).then(() => true));
   });
 
-  test("rejects oversized and excessive authority snapshot files before adoption", async () => {
-    const setup = async (pid: number) => {
-      const base = await root();
-      const owner = { pid, startedAt: 1 };
-      const ids = identities({ [`${pid}:1`]: "live" });
-      const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
-      return { authority, owner, ids };
+  const setupSnapshotBoundary = async (pid: number) => {
+    const base = await root();
+    const owner = { pid, startedAt: 1 };
+    const ids = identities({ [`${pid}:1`]: "live" });
+    const authority = await createTreePermitAuthority({ rootDir: base, maxActive: 16, classifyIdentity: ids.classify, currentIdentity: () => owner });
+    return { authority, owner, ids };
+  };
+
+  test("rejects a snapshot one byte beyond the production file-size cap without retrying a stable invalid node", async () => {
+    const oversized = await setupSnapshotBoundary(851);
+    const snapshotPath = path.join(oversized.authority.authorityDir, "state-00000000000000000001.json");
+    await fs.promises.writeFile(snapshotPath, "x".repeat(4 * 1024 * 1024 + 1), { mode: 0o600 });
+    const lstat = fs.promises.lstat;
+    let inspected = 0;
+    (fs.promises as any).lstat = async (file: string, ...args: any[]) => {
+      if (file === snapshotPath) inspected += 1;
+      return await lstat(file, ...args);
     };
-    const oversized = await setup(851);
-    await fs.promises.writeFile(path.join(oversized.authority.authorityDir, "state-00000000000000000001.json"), "x".repeat(64 * 1024 + 1), { mode: 0o600 });
-    await fs.promises.chmod(path.join(oversized.authority.authorityDir, "state-00000000000000000001.json"), 0o600);
-    await assert.rejects(adoptTreePermitAuthority({ env: oversized.authority.exportChildEnv(), classifyIdentity: oversized.ids.classify, currentIdentity: () => oversized.owner }), /state chain is invalid/);
+    try {
+      await assert.rejects(adoptTreePermitAuthority({ env: oversized.authority.exportChildEnv(), classifyIdentity: oversized.ids.classify, currentIdentity: () => oversized.owner }), /state chain is invalid/);
+      await assert.rejects(oversized.authority.acquireReservation(), /state chain is invalid/);
+      assert.equal(inspected, 2, "stable invalid snapshots stop both adoption and mutation after one inspection, not their retry limits");
+    } finally { (fs.promises as any).lstat = lstat; }
+  });
 
-    const excessive = await setup(852);
-    await Promise.all(Array.from({ length: 140 }, async (_, generation) => {
-      const name = `checkpoint-${String(generation).padStart(20, "0")}.json`;
-      await fs.promises.writeFile(path.join(excessive.authority.authorityDir, name), "{}\n", { mode: 0o600 });
-      await fs.promises.chmod(path.join(excessive.authority.authorityDir, name), 0o600);
-    }));
+  test("rejects a valid checkpoint tail beyond the steady-state snapshot-count guard", async () => {
+    const excessive = await setupSnapshotBoundary(852);
+    const tail = await validStateFiles(excessive.authority, 136);
+    await writeGenesisCheckpoint(excessive.authority);
+    await fs.promises.rm(path.join(excessive.authority.authorityDir, "state-00000000000000000000.json"));
+    await writeFiles(excessive.authority.authorityDir, tail);
     await assert.rejects(adoptTreePermitAuthority({ env: excessive.authority.exportChildEnv(), classifyIdentity: excessive.ids.classify, currentIdentity: () => excessive.owner }), /state chain is invalid/);
+  });
 
-    const legacyExcessive = await setup(853);
-    for (let generation = 1; generation <= 8192; generation += 1) {
-      const name = `state-${String(generation).padStart(20, "0")}.json`;
-      await fs.promises.writeFile(path.join(legacyExcessive.authority.authorityDir, name), "{}\n", { mode: 0o600 });
-      await fs.promises.chmod(path.join(legacyExcessive.authority.authorityDir, name), 0o600);
-    }
-    await assert.rejects(adoptTreePermitAuthority({ env: legacyExcessive.authority.exportChildEnv(), classifyIdentity: legacyExcessive.ids.classify, currentIdentity: () => legacyExcessive.owner }), /state chain is invalid/);
+  test("rejects a valid legacy chain beyond its migration file-count guard", { timeout: 15_000 }, async () => {
+    const excessive = await setupSnapshotBoundary(853);
+    // This needs 8,193 real immutable states to exercise the legacy guard;
+    // batched 0600 writes retain filesystem coverage within the CI timeout.
+    await writeFiles(excessive.authority.authorityDir, await validStateFiles(excessive.authority, 8192));
+    await assert.rejects(adoptTreePermitAuthority({ env: excessive.authority.exportChildEnv(), classifyIdentity: excessive.ids.classify, currentIdentity: () => excessive.owner }), /state chain is invalid/);
+  });
+
+  test("retries an enumerated snapshot that concurrent compaction removes", async () => {
+    const raced = await setupSnapshotBoundary(854);
+    const genesisPath = path.join(raced.authority.authorityDir, "state-00000000000000000000.json");
+    const lstat = fs.promises.lstat;
+    let misses = 0;
+    (fs.promises as any).lstat = async (file: string, ...args: any[]) => {
+      if (file === genesisPath && misses++ === 0) {
+        const error = Object.assign(new Error("simulated compaction unlink"), { code: "ENOENT" });
+        throw error;
+      }
+      return await lstat(file, ...args);
+    };
+    try {
+      assert.ok(await adoptTreePermitAuthority({ env: raced.authority.exportChildEnv(), classifyIdentity: raced.ids.classify, currentIdentity: () => raced.owner }));
+      assert.equal(misses, 3, "the transient missing immutable node is retried once and then read");
+    } finally { (fs.promises as any).lstat = lstat; }
   });
 
   test("recovers a 137-state checkpoint crash before unlink and rejects oversized parked admission", async () => {

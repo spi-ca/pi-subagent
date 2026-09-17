@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import {
 	createSessionTailState,
 	drainSessionJsonl,
@@ -42,6 +43,37 @@ function toolResultEntry(id: string, toolCallId: string, input: number) {
 			usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: input, cost: { input, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		},
 	};
+}
+
+function idsSharingIndexBucket(count: number): string[] {
+	const buckets = new Map<string, string[]>();
+	for (let index = 0; ; index += 1) {
+		const id = `bucket-id-${index}`;
+		const bucket = crypto.createHash("sha256").update(id).digest("hex").slice(0, 3);
+		const ids = buckets.get(bucket) ?? [];
+		ids.push(id);
+		buckets.set(bucket, ids);
+		if (ids.length === count) return ids;
+	}
+}
+
+function indexBucketPath(indexPath: string, id: string): string {
+	return path.join(indexPath, `${crypto.createHash("sha256").update(id).digest("hex").slice(0, 3)}.jsonl`);
+}
+
+async function indexedDuplicateFixture() {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+	tempDirs.push(dir);
+	const filePath = path.join(dir, "session.jsonl");
+	const id = "old-indexed-id";
+	await fs.promises.writeFile(filePath, [
+		`${JSON.stringify(assistantEntry(id, "first"))}\n`,
+		...Array.from({ length: SESSION_TAIL_RECENT_ID_LIMIT * 2 + 1 }, (_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "filler"))}\n`),
+	].join(""));
+	const result = makeResult();
+	const drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+	assert.equal(drained.state.seenEntryIds.has(id), false);
+	return { dir, filePath, id, result, state: drained.state, indexPath: drained.state.indexPath! };
 }
 
 function assistantEntry(id: string, text: string) {
@@ -478,6 +510,250 @@ describe("session JSONL tail", () => {
 		drained = await drainSessionJsonl({ filePath, indexPath, state: drained.state, result: result as any });
 		assert.equal(result.messages.length, 1);
 		assert.equal(getFinalOutput(result.messages as any), "once");
+	});
+
+	test("groups Bloom-positive duplicates from one bucket into one exact lookup", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const ids = idsSharingIndexBucket(8);
+		const initial = [
+			...ids.map((id) => `${JSON.stringify(assistantEntry(id, "first"))}\n`),
+			...Array.from({ length: SESSION_TAIL_RECENT_ID_LIMIT + 1 }, (_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "filler"))}\n`),
+		];
+		await fs.promises.writeFile(filePath, initial.join(""));
+		const result = makeResult();
+		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+		assert.ok(ids.every((id) => !drained.state.seenEntryIds.has(id)));
+		const indexPath = drained.state.indexPath!;
+		const bucketPath = indexBucketPath(indexPath, ids[0]);
+		await fs.promises.appendFile(filePath, ids.flatMap((id) => [
+			`${JSON.stringify(assistantEntry(id, "duplicate"))}\n`,
+			`${JSON.stringify(assistantEntry(id, "same-batch duplicate"))}\n`,
+		]).join(""));
+		const promises = fs.promises as any;
+		const originalOpen = promises.open;
+		let bucketReadOpens = 0;
+		promises.open = (target: fs.PathLike, flags: number | string, ...args: unknown[]) => {
+			if (target === bucketPath && typeof flags === "number" && (flags & 3) === fs.constants.O_RDONLY) bucketReadOpens += 1;
+			return originalOpen(target, flags, ...args);
+		};
+		try {
+			drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
+		} finally {
+			promises.open = originalOpen;
+		}
+		assert.equal(bucketReadOpens, 1, "one bucket read must resolve all Bloom-positive IDs in this drain batch");
+		assert.equal(result.messages.length, initial.length);
+		assert.equal(drained.resultChanged, false);
+	});
+
+	test("suppresses exact duplicates across a bounded lookup-batch boundary", async () => {
+		const fixture = await indexedDuplicateFixture();
+		const fillers = Array.from(
+			{ length: SESSION_TAIL_RECENT_ID_LIMIT + 1 },
+			(_, index) => `${JSON.stringify(assistantEntry(`evict-${index}`, "duplicate"))}\n`,
+		);
+		const crossBatch = [
+			`${JSON.stringify(assistantEntry(fixture.id, "first duplicate"))}\n`,
+			...fillers,
+			...Array.from({ length: 16 * 1024 - fillers.length - 1 }, () => `${JSON.stringify(assistantEntry("evict-0", "repeat"))}\n`),
+			`${JSON.stringify(assistantEntry(fixture.id, "cross-batch duplicate"))}\n`,
+		].join("");
+		await fs.promises.appendFile(fixture.filePath, crossBatch);
+		const drained = await drainSessionJsonl({ filePath: fixture.filePath, state: fixture.state, result: fixture.result as any });
+		assert.equal(fixture.result.messages.length, SESSION_TAIL_RECENT_ID_LIMIT * 2 + 2);
+		assert.equal(drained.resultChanged, false);
+		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
+	});
+
+	test("fails closed when an exact lookup sees a malformed index path", async () => {
+		const malformed = await indexedDuplicateFixture();
+		await fs.promises.writeFile(indexBucketPath(malformed.indexPath, malformed.id), "not-json\n");
+		await fs.promises.appendFile(malformed.filePath, `${JSON.stringify(assistantEntry(malformed.id, "duplicate"))}\n`);
+		await assert.rejects(
+			() => drainSessionJsonl({ filePath: malformed.filePath, state: malformed.state, result: malformed.result as any }),
+			/malformed/,
+		);
+	});
+
+	test("fails closed when an exact lookup sees a symlinked index path", async () => {
+		if (process.platform === "win32") return;
+
+		const symlinked = await indexedDuplicateFixture();
+		const symlinkBucket = indexBucketPath(symlinked.indexPath, symlinked.id);
+		await fs.promises.rm(symlinkBucket);
+		await fs.promises.symlink(symlinked.filePath, symlinkBucket);
+		await fs.promises.appendFile(symlinked.filePath, `${JSON.stringify(assistantEntry(symlinked.id, "duplicate"))}\n`);
+		await assert.rejects(() => drainSessionJsonl({ filePath: symlinked.filePath, state: symlinked.state, result: symlinked.result as any }));
+	});
+
+	test("fails closed when an exact lookup sees a replaced index path", async () => {
+		if (process.platform === "win32") return;
+
+		const replaced = await indexedDuplicateFixture();
+		const replacedBucket = indexBucketPath(replaced.indexPath, replaced.id);
+		const bucketContents = await fs.promises.readFile(replacedBucket);
+		await fs.promises.appendFile(replaced.filePath, `${JSON.stringify(assistantEntry(replaced.id, "duplicate"))}\n`);
+		const promises = fs.promises as any;
+		const originalOpen = promises.open;
+		let swapped = false;
+		promises.open = async (target: fs.PathLike, flags: number | string, ...args: unknown[]) => {
+			const handle = await originalOpen(target, flags, ...args);
+			if (!swapped && target === replacedBucket && typeof flags === "number" && (flags & 3) === fs.constants.O_RDONLY) {
+				swapped = true;
+				const oldDirectory = `${replaced.indexPath}.old`;
+				await fs.promises.rename(replaced.indexPath, oldDirectory);
+				await fs.promises.mkdir(replaced.indexPath, { mode: 0o700 });
+				await fs.promises.writeFile(replacedBucket, bucketContents, { mode: 0o600 });
+			}
+			return handle;
+		};
+		try {
+			await assert.rejects(() => drainSessionJsonl({ filePath: replaced.filePath, state: replaced.state, result: replaced.result as any }));
+		} finally {
+			promises.open = originalOpen;
+		}
+		assert.equal(swapped, true);
+	});
+
+	test("snapshots initially recent IDs before new entries can evict them", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const old = `${JSON.stringify(assistantEntry("recent", "once"))}\n`;
+		await fs.promises.writeFile(filePath, old);
+		const result = makeResult();
+		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+		await fs.promises.appendFile(filePath, [
+			...Array.from({ length: SESSION_TAIL_RECENT_ID_LIMIT }, (_, index) => `${JSON.stringify(assistantEntry(`new-${index}`, "new"))}\n`),
+			`${JSON.stringify(assistantEntry("recent", "must remain duplicate"))}\n`,
+		].join(""));
+		drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
+		assert.equal(result.messages.length, SESSION_TAIL_RECENT_ID_LIMIT + 1);
+		assert.equal(drained.resultChanged, true);
+	});
+
+	test("keeps the recent cache bounded at every duplicate insertion during one drain", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const count = SESSION_TAIL_RECENT_ID_LIMIT * 2 + 1;
+		const lines = Array.from({ length: count }, (_, index) => `${JSON.stringify(assistantEntry(`known-${index}`, "once"))}\n`);
+		await fs.promises.writeFile(filePath, lines.join(""));
+		const result = makeResult();
+		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+
+		let peak = 0;
+		class TrackingSet extends Set<string> {
+			override add(value: string): this {
+				const added = super.add(value);
+				peak = Math.max(peak, this.size);
+				return added;
+			}
+		}
+		const tracked = new TrackingSet(drained.state.seenEntryIds);
+		peak = tracked.size;
+		drained.state.seenEntryIds = tracked;
+		await fs.promises.appendFile(filePath, lines.join(""));
+		drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
+		assert.equal(result.messages.length, count);
+		assert.ok(peak <= SESSION_TAIL_RECENT_ID_LIMIT, `in-drain recent cache peak was ${peak}`);
+		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
+	});
+
+	test("persists digests from original live-read bytes without retaining read-buffer slices", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const first = Buffer.from(JSON.stringify(assistantEntry("first-source", "first")));
+		const filler = Buffer.from(`${JSON.stringify(assistantEntry("filler-source", "x".repeat(SESSION_TAIL_MAX_REMAINDER_BYTES - 768)))}\n`);
+		const last = Buffer.from(`${JSON.stringify(assistantEntry("last-source", "last"))}\n`);
+		const source = Buffer.concat([first, Buffer.from("\n"), filler, last]);
+		assert.ok(source.length > SESSION_TAIL_MAX_REMAINDER_BYTES, "the first staging buffer must be overwritten by a later live read");
+		await fs.promises.writeFile(filePath, source);
+		const result = makeResult();
+		const drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+		const buckets = await fs.promises.readdir(drained.state.indexPath!);
+		const records = (await Promise.all(buckets.map(async (bucket) => (await fs.promises.readFile(path.join(drained.state.indexPath!, bucket), "utf8")).trim().split("\n"))))
+			.flat().filter(Boolean).map((line) => JSON.parse(line));
+		const firstIndex = records.find((record) => record.id === "first-source");
+		assert.equal(firstIndex.digest, crypto.createHash("sha256").update(first).digest("hex"));
+		assert.equal(result.messages.length, 3);
+	});
+
+	test("uses the published fallback index for lookup batches later in the same drain", { timeout: 30_000 }, async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		const indexPath = path.join(dir, "entry.index");
+		await fs.promises.writeFile(indexPath, "not a directory", { mode: 0o600 });
+		// Keep the one-entry-over lookup-batch boundary: the final duplicate must
+		// resolve through the fallback index published by the preceding batch.
+		const count = 16 * 1024;
+		await fs.promises.writeFile(filePath, [
+			...Array.from({ length: count }, (_, index) => `${JSON.stringify(assistantEntry(`fallback-${index}`, "once"))}\n`),
+			`${JSON.stringify(assistantEntry("fallback-0", "duplicate"))}\n`,
+		].join(""));
+		const result = makeResult();
+		const drained = await drainSessionJsonl({ filePath, indexPath, state: createSessionTailState(), result: result as any });
+		assert.equal(drained.state.indexPath, `${indexPath}.fallback`);
+		assert.equal(result.messages.length, count);
+	});
+
+	test("calls observers before classification, honors mutations, and preserves callback order", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		await fs.promises.writeFile(filePath, [
+			`${JSON.stringify(assistantEntry("before", "original"))}\n`,
+			"null\n",
+			`${JSON.stringify(assistantEntry("second", "second"))}\n`,
+		].join(""));
+		const result = makeResult();
+		const observed: Array<{ entry: unknown; messages: number }> = [];
+		const drained = await drainSessionJsonl({
+			filePath, state: createSessionTailState(), result: result as any,
+			onEntry(entry) {
+				observed.push({ entry, messages: result.messages.length });
+				if (entry && typeof entry === "object" && (entry as { id?: string }).id === "before") {
+					const record = entry as { id: string; message: { content: Array<{ text: string }> } };
+					record.id = "after";
+					record.message.content[0].text = "mutated";
+				}
+			},
+		});
+		assert.equal(getFinalOutput(result.messages as any), "second");
+		assert.equal(getFinalOutput([result.messages[0]] as any), "mutated");
+		assert.deepEqual(observed.map(({ entry }) => entry === null ? null : (entry as { id: string }).id), ["after", null, "second"]);
+		assert.deepEqual(observed.map(({ messages }) => messages), [0, 1, 1]);
+		const indexContents = await Promise.all((await fs.promises.readdir(drained.state.indexPath!)).map((bucket) => fs.promises.readFile(path.join(drained.state.indexPath!, bucket), "utf8"))).then((parts) => parts.join(""));
+		assert.match(indexContents, /"id":"after"/);
+		assert.doesNotMatch(indexContents, /"id":"before"/);
+	});
+
+	test("preserves prior observer effects when a later observer throws", async () => {
+		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, "session.jsonl");
+		await fs.promises.writeFile(filePath, `${JSON.stringify(assistantEntry("first", "first"))}\n${JSON.stringify(assistantEntry("second", "second"))}\n`);
+		const result = makeResult();
+		await assert.rejects(() => drainSessionJsonl({
+			filePath, state: createSessionTailState(), result: result as any,
+			onEntry(entry) { if ((entry as { id?: string }).id === "second") throw new Error("observer failure"); },
+		}), /observer failure/);
+		assert.equal(getFinalOutput(result.messages as any), "first");
+	});
+
+	test("rejects an exact lookup bucket whose permissions were broadened", async () => {
+		if (process.platform === "win32") return;
+		const fixture = await indexedDuplicateFixture();
+		await fs.promises.chmod(indexBucketPath(fixture.indexPath, fixture.id), 0o644);
+		await fs.promises.appendFile(fixture.filePath, `${JSON.stringify(assistantEntry(fixture.id, "duplicate"))}\n`);
+		await assert.rejects(
+			() => drainSessionJsonl({ filePath: fixture.filePath, state: fixture.state, result: fixture.result as any }),
+			/not private/,
+		);
 	});
 
 	test("replays 100,000 old IDs in reverse without growing messages or auxiliary state", { timeout: 240_000 }, async () => {

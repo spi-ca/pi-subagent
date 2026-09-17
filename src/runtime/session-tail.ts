@@ -12,6 +12,10 @@ export const SESSION_TAIL_READ_CHUNK_BYTES = 64 * 1024;
 /** Recent IDs are only an accelerator; the on-disk index is authoritative. */
 export const SESSION_TAIL_RECENT_ID_LIMIT = 1_024;
 const SESSION_TAIL_INDEX_BATCH_BYTES = 64 * 1024;
+// Each lookup batch is bounded by source JSON bytes and parsed records. It
+// retains no input Buffer slices; parsed object heap remains input-dependent.
+const SESSION_TAIL_INDEX_LOOKUP_BATCH_BYTES = 8 * 1024 * 1024;
+const SESSION_TAIL_INDEX_LOOKUP_BATCH_ENTRIES = 16 * 1024;
 const SESSION_TAIL_INDEX_BLOOM_BYTES = 1024 * 1024;
 let nextTailNamespace = 0;
 
@@ -139,14 +143,31 @@ function addToBloom(state: SessionTailState, id: string): void {
 
 function rememberRecentId(state: SessionTailState, id: string): void {
 	state.seenEntryIds.delete(id);
+	// Make room before insertion so even an instrumented cache never exceeds
+	// its public bound. Pending IDs remain resident until their disk flush.
+	evictRecentIds(state, SESSION_TAIL_RECENT_ID_LIMIT - 1);
 	state.seenEntryIds.add(id);
 }
 
-function evictRecentIds(state: SessionTailState): void {
-	while (state.seenEntryIds.size > SESSION_TAIL_RECENT_ID_LIMIT) {
+function evictRecentIds(state: SessionTailState, maximum = SESSION_TAIL_RECENT_ID_LIMIT): void {
+	// Entries not yet published cannot be evicted: the Bloom filter does not
+	// cover them, so a later lookup could not recover their identity from disk.
+	const pendingIds = new Set(state.pendingIndexEntries.map((entry) => entry.id));
+	let inspected = 0;
+	while (state.seenEntryIds.size > maximum) {
 		const oldest = state.seenEntryIds.values().next().value;
 		if (oldest === undefined) return;
+		if (pendingIds.has(oldest)) {
+			state.seenEntryIds.delete(oldest);
+			state.seenEntryIds.add(oldest);
+			inspected += 1;
+			if (inspected >= state.seenEntryIds.size) {
+				throw new Error("Session tail pending entry-ID cache exceeds its bound.");
+			}
+			continue;
+		}
 		state.seenEntryIds.delete(oldest);
+		inspected = 0;
 	}
 }
 
@@ -175,7 +196,7 @@ function indexBucketPath(indexPath: string, id: string): string {
 	return path.join(indexPath, `${crypto.createHash("sha256").update(id).digest("hex").slice(0, 3)}.jsonl`);
 }
 
-async function openPrivateIndexDirectory(indexPath: string, create: boolean): Promise<void> {
+async function openPrivateIndexDirectory(indexPath: string, create: boolean): Promise<fs.Stats> {
 	if (create) await fs.promises.mkdir(indexPath, { mode: 0o700, recursive: false }).catch((error: NodeJS.ErrnoException) => {
 		if (error.code !== "EEXIST") throw error;
 	});
@@ -187,6 +208,7 @@ async function openPrivateIndexDirectory(indexPath: string, create: boolean): Pr
 		if (!descriptorStat.isDirectory() || pathnameStat.isSymbolicLink() || (uid !== undefined && descriptorStat.uid !== uid) || (descriptorStat.mode & 0o777) !== 0o700 || !sameIdentity(identityFrom(descriptorStat), identityFrom(pathnameStat))) {
 			throw new Error("Session tail entry-ID index directory is not run-private.");
 		}
+		return descriptorStat;
 	} finally {
 		await handle.close();
 	}
@@ -199,9 +221,7 @@ async function prepareIndexDirectory(state: SessionTailState, indexPath: string)
 	state.indexBucketDirectory = indexPath;
 }
 
-async function scanIndex(indexPath: string, namespace: string, id: string): Promise<boolean> {
-	await openPrivateIndexDirectory(indexPath, false);
-	const bucketPath = indexBucketPath(indexPath, id);
+async function scanIndexBucket(namespace: string, bucketPath: string, ids: ReadonlySet<string>): Promise<{ found: Set<string>; stat: fs.Stats }> {
 	let opened: { handle: fs.promises.FileHandle; stat: fs.Stats };
 	try {
 		opened = await openNoFollow(bucketPath, fs.constants.O_RDONLY);
@@ -211,6 +231,11 @@ async function scanIndex(indexPath: string, namespace: string, id: string): Prom
 	}
 	const { handle, stat } = opened;
 	try {
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if ((uid !== undefined && stat.uid !== uid) || (stat.mode & 0o777) !== 0o600) {
+			throw new Error("Session tail entry-ID index bucket is not private.");
+		}
+		const found = new Set<string>();
 		const chunk = Buffer.alloc(SESSION_TAIL_READ_CHUNK_BYTES);
 		let position = 0;
 		let remainder = Buffer.alloc(0);
@@ -223,11 +248,7 @@ async function scanIndex(indexPath: string, namespace: string, id: string): Prom
 			for (let index = 0; index < combined.length; index += 1) {
 				if (combined[index] !== 0x0a) continue;
 				const entry = parseIndexEntry(combined.subarray(start, index));
-				if (entry.generation.startsWith(`${namespace}:`) && entry.id === id) {
-					await assertPathStillMatches(bucketPath, stat);
-					await openPrivateIndexDirectory(indexPath, false);
-					return true;
-				}
+				if (entry.generation.startsWith(`${namespace}:`) && ids.has(entry.id)) found.add(entry.id);
 				start = index + 1;
 			}
 			remainder = Buffer.from(combined.subarray(start));
@@ -235,13 +256,11 @@ async function scanIndex(indexPath: string, namespace: string, id: string): Prom
 		}
 		if (remainder.length > 0) throw new Error("Session tail entry-ID index is incomplete.");
 		await assertPathStillMatches(bucketPath, stat);
-		await openPrivateIndexDirectory(indexPath, false);
-		return false;
+		return { found, stat };
 	} finally {
 		await handle.close();
 	}
 }
-
 function publicationStarted(error: unknown): boolean {
 	return Boolean((error as { sessionTailPublicationStarted?: unknown } | undefined)?.sessionTailPublicationStarted);
 }
@@ -351,94 +370,76 @@ async function flushPendingIndex(state: SessionTailState): Promise<void> {
 	for (const entry of pending) addToBloom(state, entry.id);
 }
 
-async function registerEntryIdentity(state: SessionTailState, id: string, line: Buffer, start: number, end: number, indexPath: string): Promise<boolean> {
-	state.indexPath ??= indexPath;
+async function registerNewEntryIdentity(state: SessionTailState, id: string, entryDigest: string, start: number, end: number): Promise<void> {
 	if (state.indexWriteDisabled) throw new Error("Session tail exact entry-ID index is unavailable.");
-	const generation = indexGeneration(state);
-	if (state.seenEntryIds.has(id)) {
-		rememberRecentId(state, id);
-		return true;
-	}
-	if (bloomMayContain(state, id) && await scanIndex(state.indexPath, state.indexNamespace, id)) return true;
-
-	const entry: SessionTailIndexEntry = { generation, id, start, end, digest: digest(line) };
+	const entry: SessionTailIndexEntry = { generation: indexGeneration(state), id, start, end, digest: entryDigest };
 	const encodedBytes = Buffer.byteLength(`${JSON.stringify(entry)}\n`, "utf-8");
 	if (encodedBytes > SESSION_TAIL_INDEX_BATCH_BYTES) throw new Error("Session tail entry-ID index record exceeds the bound.");
 	if (state.pendingIndexBytes + encodedBytes > SESSION_TAIL_INDEX_BATCH_BYTES) await flushPendingIndex(state);
 	state.pendingIndexEntries.push(entry);
 	state.pendingIndexBytes += encodedBytes;
 	rememberRecentId(state, id);
-	if (state.seenEntryIds.size > SESSION_TAIL_RECENT_ID_LIMIT) {
-		await flushPendingIndex(state);
-		evictRecentIds(state);
-	}
-	return false;
 }
 
-async function processSessionLine(
-	lineBuffer: Buffer,
-	lineStart: number,
-	lineEnd: number,
-	result: SingleResult,
-	state: SessionTailState,
-	indexPath: string,
-	onEntry?: (entry: unknown) => void,
-): Promise<{ parsed: boolean; changed: boolean }> {
+type StagedSessionEntry = {
+	start: number;
+	end: number;
+	byteLength: number;
+	digest: string;
+	id?: string;
+	record: Record<string, unknown>;
+	message?: Record<string, unknown>;
+};
+
+type ParsedSessionLine = { parsed: true; hasEntry: boolean; entry?: unknown } | { parsed: false };
+
+function parseSessionLine(line: Buffer): ParsedSessionLine {
 	let text: string;
 	try {
-		text = new TextDecoder("utf-8", { fatal: true }).decode(lineBuffer).replace(/\r$/, "");
+		text = new TextDecoder("utf-8", { fatal: true }).decode(line).replace(/\r$/, "");
 	} catch {
 		throw new Error("Session JSONL contains malformed UTF-8.");
 	}
-	if (!text.trim()) return { parsed: true, changed: false };
-	let entry: unknown;
+	if (!text.trim()) return { parsed: true, hasEntry: false };
 	try {
-		entry = JSON.parse(text);
+		return { parsed: true, hasEntry: true, entry: JSON.parse(text) };
 	} catch {
-		return { parsed: false, changed: false };
+		return { parsed: false };
 	}
-	onEntry?.(entry);
-	if (!entry || typeof entry !== "object") return { parsed: true, changed: false };
+}
+
+function classifySessionEntry(entry: unknown, line: Buffer, start: number, end: number): StagedSessionEntry | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
 	const record = entry as Record<string, unknown>;
-	const entryId = typeof record.id === "string" && /^[^\u0000-\u001f\u007f]{1,512}$/.test(record.id) ? record.id : undefined;
-
+	const id = typeof record.id === "string" && /^[^\u0000-\u001f\u007f]{1,512}$/.test(record.id) ? record.id : undefined;
 	if (record.type === "compaction" || record.type === "branch_summary") {
-		// Compaction retainedTail replays prior context and must never be counted.
-		// Only the persisted summary-generation usage on this entry belongs to
-		// the child total, under the same exact entry-ID de-duplication as messages.
-		const duplicate = entryId ? await registerEntryIdentity(state, entryId, lineBuffer, lineStart, lineEnd, indexPath) : false;
-		if (!duplicate) {
-			processPiEvent(
-				record.type === "compaction"
-					? { type: "session_compact", compactionEntry: record }
-					: { type: "session_tree", summaryEntry: record },
-				result,
-			);
-		}
-		return { parsed: true, changed: false };
+		return { start, end, byteLength: line.length, digest: digest(line), id, record };
 	}
-
-	if (record.type !== "message" || !record.message || typeof record.message !== "object") return { parsed: true, changed: false };
+	if (record.type !== "message" || !record.message || typeof record.message !== "object") return undefined;
 	const message = record.message as Record<string, unknown>;
-	// Session tails retain only assistant messages publicly, but tool-result
-	// usage is still accounted after the same entry-ID de-duplication.
-	if (message.role !== "assistant" && message.role !== "toolResult") return { parsed: true, changed: false };
-	const duplicate = entryId ? await registerEntryIdentity(state, entryId, lineBuffer, lineStart, lineEnd, indexPath) : false;
-	if (duplicate) return { parsed: true, changed: false };
-	return {
-		parsed: true,
-		changed: processPiEvent(
-			{ type: "message_end", message },
+	if (message.role !== "assistant" && message.role !== "toolResult") return undefined;
+	return { start, end, byteLength: line.length, digest: digest(line), id, record, message };
+}
+
+function applyStagedSessionEntry(entry: StagedSessionEntry, duplicate: boolean, result: SingleResult, state: SessionTailState): boolean {
+	if (duplicate) return false;
+	if (entry.record.type === "compaction" || entry.record.type === "branch_summary") {
+		processPiEvent(
+			entry.record.type === "compaction"
+				? { type: "session_compact", compactionEntry: entry.record }
+				: { type: "session_tree", summaryEntry: entry.record },
 			result,
-			{
-				trackAssistantSignatures: false,
-				// The persisted SessionEntry ID, scoped to this tail, is the
-				// authoritative accounting identity. toolCallId only pairs one
-				// lifecycle copy with one persisted execution.
-				toolResultIdentity: entryId ? `session-entry:${state.indexNamespace}:${entryId}` : undefined,
-			},
-		),
-	};
+		);
+		return false;
+	}
+	return processPiEvent(
+		{ type: "message_end", message: entry.message! },
+		result,
+		{
+			trackAssistantSignatures: false,
+			toolResultIdentity: entry.id ? `session-entry:${state.indexNamespace}:${entry.id}` : undefined,
+		},
+	);
 }
 
 export async function drainSessionJsonl(options: {
@@ -525,6 +526,103 @@ export async function drainSessionJsonl(options: {
 		let entriesRead = 0;
 		let resultChanged = false;
 		let malformedLines = state.malformedLines;
+		let stagedEntries: StagedSessionEntry[] = [];
+		let stagedBytes = 0;
+
+		const applyStagedEntries = async (entries: readonly StagedSessionEntry[]): Promise<void> => {
+			// This immutable snapshot closes the gap where new IDs inserted earlier
+			// in this batch evict a recent pre-existing ID before it is applied.
+			const initiallyRecentIds = new Set(state.seenEntryIds);
+			const activeIndexPath = state.indexPath!;
+			const lookupIdsByBucket = new Map<string, Set<string>>();
+			const batchIds = new Set<string>();
+			for (const entry of entries) {
+				if (!entry.id || batchIds.has(entry.id) || initiallyRecentIds.has(entry.id) || !bloomMayContain(state, entry.id)) continue;
+				batchIds.add(entry.id);
+				const bucketPath = indexBucketPath(activeIndexPath, entry.id);
+				const ids = lookupIdsByBucket.get(bucketPath) ?? new Set<string>();
+				ids.add(entry.id);
+				lookupIdsByBucket.set(bucketPath, ids);
+			}
+
+			const indexedIds = new Set<string>();
+			if (lookupIdsByBucket.size > 0) {
+				const initialDirectory = await openPrivateIndexDirectory(activeIndexPath, false);
+				const consultedBuckets: Array<{ path: string; stat: fs.Stats }> = [];
+				for (const [bucketPath, ids] of lookupIdsByBucket) {
+					const scanned = await scanIndexBucket(state.indexNamespace, bucketPath, ids);
+					consultedBuckets.push({ path: bucketPath, stat: scanned.stat });
+					for (const id of scanned.found) indexedIds.add(id);
+				}
+				for (const bucket of consultedBuckets) await assertPathStillMatches(bucket.path, bucket.stat);
+				const finalDirectory = await openPrivateIndexDirectory(activeIndexPath, false);
+				if (!sameIdentity(identityFrom(initialDirectory), identityFrom(finalDirectory))) {
+					throw new Error("Session tail entry-ID index directory changed while reading.");
+				}
+			}
+
+			const appliedIds = new Set<string>();
+			for (const entry of entries) {
+				let duplicate = false;
+				if (entry.id) {
+					if (state.indexWriteDisabled) throw new Error("Session tail exact entry-ID index is unavailable.");
+					if (appliedIds.has(entry.id)) {
+						duplicate = true;
+						rememberRecentId(state, entry.id);
+					} else {
+						appliedIds.add(entry.id);
+						duplicate = initiallyRecentIds.has(entry.id) || indexedIds.has(entry.id);
+						if (duplicate) rememberRecentId(state, entry.id);
+						else await registerNewEntryIdentity(state, entry.id, entry.digest, entry.start, entry.end);
+					}
+				}
+				if (applyStagedSessionEntry(entry, duplicate, options.result, state)) resultChanged = true;
+			}
+		};
+
+		const flushStagedEntries = async (): Promise<void> => {
+			if (stagedEntries.length === 0) return;
+			const entries = stagedEntries;
+			stagedEntries = [];
+			stagedBytes = 0;
+			await applyStagedEntries(entries);
+		};
+
+		const stageSessionLine = async (line: Buffer, start: number, end: number): Promise<void> => {
+			let parsed: ParsedSessionLine;
+			try {
+				parsed = parseSessionLine(line);
+			} catch (error) {
+				await flushStagedEntries();
+				throw error;
+			}
+			if (!parsed.parsed) {
+				malformedLines += 1;
+				return;
+			}
+			entriesRead += 1;
+			if (!parsed.hasEntry) return;
+			if (options.onEntry) {
+				// Preserve original observer ordering: prior effects are visible, then
+				// the callback can mutate this entry before it is classified.
+				await flushStagedEntries();
+				options.onEntry(parsed.entry);
+			}
+			const entry = classifySessionEntry(parsed.entry, line, start, end);
+			if (!entry) return;
+			if (entry.byteLength > SESSION_TAIL_INDEX_LOOKUP_BATCH_BYTES) {
+				// Do not retain an oversize verified record after its input buffer is
+				// reused; its digest was captured while those source bytes were stable.
+				await flushStagedEntries();
+				await applyStagedEntries([entry]);
+				return;
+			}
+			if (stagedEntries.length >= SESSION_TAIL_INDEX_LOOKUP_BATCH_ENTRIES || stagedBytes + entry.byteLength > SESSION_TAIL_INDEX_LOOKUP_BATCH_BYTES) {
+				await flushStagedEntries();
+			}
+			stagedEntries.push(entry);
+			stagedBytes += entry.byteLength;
+		};
 
 		const consume = async (incoming: Buffer, incomingStart: number): Promise<void> => {
 			let combined: Buffer;
@@ -555,10 +653,7 @@ export async function drainSessionJsonl(options: {
 					start = index + 1;
 					continue;
 				}
-				const processed = await processSessionLine(combined.subarray(start, index), combinedStart + start, combinedStart + index + 1, options.result, state, indexPath, options.onEntry);
-				if (processed.parsed) entriesRead += 1;
-				else malformedLines += 1;
-				if (processed.changed) resultChanged = true;
+				await stageSessionLine(combined.subarray(start, index), combinedStart + start, combinedStart + index + 1);
 				start = index + 1;
 			}
 			remainder = Buffer.from(combined.subarray(start));
@@ -604,10 +699,7 @@ export async function drainSessionJsonl(options: {
 					malformedLines += 1;
 				} else {
 					const line = Buffer.concat([remainder, incoming.subarray(start, newline)]);
-					const processed = await processSessionLine(line, remainderStart, incomingStart + newline + 1, options.result, state, indexPath, options.onEntry);
-					if (processed.parsed) entriesRead += 1;
-					else malformedLines += 1;
-					if (processed.changed) resultChanged = true;
+					await stageSessionLine(line, remainderStart, incomingStart + newline + 1);
 				}
 				remainder = Buffer.alloc(0);
 				start = newline + 1;
@@ -629,10 +721,7 @@ export async function drainSessionJsonl(options: {
 				if (newline - start > maxCompleteEntryBytes) {
 					malformedLines += 1;
 				} else {
-					const processed = await processSessionLine(incoming.subarray(start, newline), incomingStart + start, incomingStart + newline + 1, options.result, state, indexPath, options.onEntry);
-					if (processed.parsed) entriesRead += 1;
-					else malformedLines += 1;
-					if (processed.changed) resultChanged = true;
+					await stageSessionLine(incoming.subarray(start, newline), incomingStart + start, incomingStart + newline + 1);
 				}
 				start = newline + 1;
 			}
@@ -658,6 +747,7 @@ export async function drainSessionJsonl(options: {
 		// Do not turn a malformed, discarded, or unterminated record into a
 		// terminal result: the caller must retain recovery authority instead.
 		if (options.final && options.verifiedBytes && (malformedLines > 0 || discardingOverlongLine || remainder.length > 0)) {
+			await flushStagedEntries();
 			throw new Error("Verified session replay contains malformed or incomplete entries.");
 		}
 		if (options.final && discardingOverlongLine) {
@@ -665,12 +755,10 @@ export async function drainSessionJsonl(options: {
 			discardingOverlongLine = false;
 		}
 		if (options.final && remainder.length > 0) {
-			const processed = await processSessionLine(remainder, remainderStart, effectiveSize, options.result, state, indexPath, options.onEntry);
-			if (processed.parsed) entriesRead += 1;
-			else malformedLines += 1;
-			if (processed.changed) resultChanged = true;
+			await stageSessionLine(remainder, remainderStart, effectiveSize);
 			remainder = Buffer.alloc(0);
 		}
+		await flushStagedEntries();
 		// A descriptor can keep yielding the old inode after an atomic pathname
 		// replacement. Do not publish those bytes as a live-generation result.
 		if (descriptor) await assertPathStillMatches(options.filePath, descriptor.stat);

@@ -567,9 +567,7 @@ describe("session JSONL tail", () => {
 		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
 	});
 
-	test("fails closed when an exact lookup sees malformed, symlinked, or replaced index paths", async () => {
-		if (process.platform === "win32") return;
-
+	test("fails closed when an exact lookup sees a malformed index path", async () => {
 		const malformed = await indexedDuplicateFixture();
 		await fs.promises.writeFile(indexBucketPath(malformed.indexPath, malformed.id), "not-json\n");
 		await fs.promises.appendFile(malformed.filePath, `${JSON.stringify(assistantEntry(malformed.id, "duplicate"))}\n`);
@@ -577,6 +575,10 @@ describe("session JSONL tail", () => {
 			() => drainSessionJsonl({ filePath: malformed.filePath, state: malformed.state, result: malformed.result as any }),
 			/malformed/,
 		);
+	});
+
+	test("fails closed when an exact lookup sees a symlinked index path", async () => {
+		if (process.platform === "win32") return;
 
 		const symlinked = await indexedDuplicateFixture();
 		const symlinkBucket = indexBucketPath(symlinked.indexPath, symlinked.id);
@@ -584,6 +586,10 @@ describe("session JSONL tail", () => {
 		await fs.promises.symlink(symlinked.filePath, symlinkBucket);
 		await fs.promises.appendFile(symlinked.filePath, `${JSON.stringify(assistantEntry(symlinked.id, "duplicate"))}\n`);
 		await assert.rejects(() => drainSessionJsonl({ filePath: symlinked.filePath, state: symlinked.state, result: symlinked.result as any }));
+	});
+
+	test("fails closed when an exact lookup sees a replaced index path", async () => {
+		if (process.platform === "win32") return;
 
 		const replaced = await indexedDuplicateFixture();
 		const replacedBucket = indexBucketPath(replaced.indexPath, replaced.id);

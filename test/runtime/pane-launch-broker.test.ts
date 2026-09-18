@@ -428,10 +428,10 @@ describe("pane launch broker", () => {
 		}
 	});
 
-	test("records negotiated Herdr protocols 19, 20, and 22 in allocation and gate authority", async () => {
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
-		const runtime = fs.realpathSync(process.execPath);
-		for (const protocol of [19, 20, 22] as const) {
+	for (const protocol of [19, 20, 22] as const) {
+		test(`records negotiated Herdr protocol ${protocol} in allocation and gate authority`, async () => {
+			const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+			const runtime = fs.realpathSync(process.execPath);
 			const server = await fakeHerdrBrokerServer(root, "success", protocol);
 			try {
 				const stateRoot = path.join(root, `state-protocol-${protocol}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
@@ -442,8 +442,8 @@ describe("pane launch broker", () => {
 				assert.equal(await waitForExit(broker), 0);
 				assert.equal((await readBrokerJson(paths.allocationPath) as { target?: { protocol?: number } })?.target?.protocol, protocol);
 			} finally { await server.close(); }
-		}
-	});
+		});
+	}
 
 	test("rejects a broker intent when the live Herdr protocol no longer matches", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);

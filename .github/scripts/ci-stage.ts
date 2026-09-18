@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseJUnitXml, type JUnitTestOutcome } from "./junit-report";
 
 export const HEAVY_STAGE_FILES = {
 	phase0: ["test/acceptance/performance-phase0.test.ts"],
@@ -22,7 +24,7 @@ type ProcessResource = {
 	observedPeakCumulativeWriteBytes: number | null;
 };
 
-export type TestOutcome = { tests: number; passed: number; skipped: number; failures: number; errors: number };
+export type TestOutcome = JUnitTestOutcome;
 type SupervisorRecord = { exitCode: number | null; signal: NodeJS.Signals | null; spawnError: boolean; cleanupComplete: boolean; cleanupErrors: string[] };
 export type SecureDiagnosticDirectory = { directory: string; dev: number; ino: number };
 type ProcessIdentity = { pid: number; startTicks: number; session: number };
@@ -448,7 +450,9 @@ try:
     # bounded once Popen returns rather than claiming an atomic no-spawn edge.
     bootstrapping = False
     if stopping: raise SafeAbort("cancelled-before-workload-spawn")
-    child = subprocess.Popen(sys.argv[1:], env={key: value for key, value in os.environ.items() if key != "CI_STAGE_DIAGNOSTICS_DIR"})
+    # Reserve standard stdout for the bounded terminal record. Workload output
+    # remains visible on inherited stderr, without an extra Bun stdio pipe.
+    child = subprocess.Popen(sys.argv[1:], stdout=sys.stderr, stderr=sys.stderr, env={key: value for key, value in os.environ.items() if key != "CI_STAGE_DIAGNOSTICS_DIR"})
     while child.poll() is None and not stopping:
         after_direct_poll_test_barrier()
         table = observe(); reap_adopted(table); time.sleep(.02)
@@ -465,7 +469,7 @@ except Exception as exc:
     record["spawnError"] = True
     errors.append("supervisor:%s" % type(exc).__name__)
     record["cleanupComplete"] = cleanup()
-os.write(3, (json.dumps(record, separators=(",", ":")) + "\n").encode())
+os.write(1, (json.dumps(record, separators=(",", ":")) + "\n").encode())
 sys.exit(0 if record["cleanupComplete"] else 75)
 `;
 
@@ -481,13 +485,26 @@ function parseSupervisorRecord(value: string): SupervisorRecord | null {
 	} catch { return null; }
 }
 
-async function collectBounded(stream: import("node:stream").Readable, limit: number): Promise<string> {
-	let value = "";
-	for await (const chunk of stream) {
-		value += Buffer.from(chunk).toString("utf8");
-		if (Buffer.byteLength(value) > limit) throw new Error("supervisor terminal record exceeded its cap");
-	}
-	return value;
+function collectBounded(stream: import("node:stream").Readable, limit: number, closed: Promise<void>): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let value = "", settled = false;
+		const finish = (error?: Error) => {
+			if (settled) return;
+			settled = true;
+			stream.off("data", onData); stream.off("end", onEnd); stream.off("error", onError);
+			if (error) reject(error); else resolve(value);
+		};
+		const onData = (chunk: Buffer) => {
+			value += Buffer.from(chunk).toString("utf8");
+			if (Buffer.byteLength(value) > limit) finish(new Error("supervisor terminal record exceeded its cap"));
+		};
+		const onEnd = () => finish();
+		const onError = (error: Error) => finish(error);
+		stream.on("data", onData); stream.once("end", onEnd); stream.once("error", onError);
+		// Child close follows stdio closure. Missing terminal stream events must
+		// never leave a dead supervisor's reader pending; absent data fails parsing.
+		void closed.then(() => { finish(); if (!stream.destroyed) stream.destroy(); });
+	});
 }
 
 /** Request bounded supervisor cleanup, then only escalate while its original Linux identity still exists. */
@@ -594,16 +611,9 @@ async function readBoundedFile(file: string, limit: number): Promise<string> {
 	} finally { await handle.close(); }
 }
 
-/** Parse only JUnit aggregate attributes; raw XML is bounded, never diagnosed, and deleted by the caller. */
+/** Parse a bounded, structurally well-formed JUnit aggregate. */
 export async function parseJUnitReport(file: string): Promise<TestOutcome> {
-	const xml = await readBoundedFile(file, RAW_REPORT_MAX_BYTES);
-	const root = /<testsuites\b([^>]*)>/.exec(xml);
-	if (!root) throw new Error("invalid JUnit reporter outcome");
-	const attributes = root[1]!;
-	const number = (name: string) => Number(new RegExp(`\\b${name}=["'](\\d+)["']`).exec(attributes)?.[1] ?? "0");
-	const tests = number("tests"), skipped = number("skipped"), failures = number("failures"), errors = number("errors");
-	if (![tests, skipped, failures, errors].every(Number.isSafeInteger) || tests < skipped + failures + errors) throw new Error("invalid JUnit reporter outcome");
-	return { tests, skipped, failures, errors, passed: tests - skipped - failures - errors };
+	return parseJUnitXml(await readBoundedFile(file, RAW_REPORT_MAX_BYTES));
 }
 
 /** Reject empty executions everywhere and skipped reporter outcomes in required heavy stages. */
@@ -659,8 +669,8 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	if (options.testBootstrapBarrierPath !== undefined && !path.isAbsolute(options.testBootstrapBarrierPath)) throw new Error("test bootstrap barrier path must be absolute");
 	if (options.testBootstrapResultPath !== undefined && !path.isAbsolute(options.testBootstrapResultPath)) throw new Error("test bootstrap result path must be absolute");
 	const supervisorStdio: import("node:child_process").StdioOptions = options.testSupervisorHooks?.afterDirectPollBeforeReap
-		? ["ignore", "inherit", "inherit", "pipe", "pipe"]
-		: ["ignore", "inherit", "inherit", "pipe"]; 
+		? ["ignore", "pipe", "inherit", "ignore", "pipe"]
+		: ["ignore", "pipe", "inherit"];
 	const child = spawn("python3", ["-c", PYTHON_SUPERVISOR, ...options.command], {
 		cwd, stdio: supervisorStdio, detached: true,
 		env: {
@@ -673,7 +683,7 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	let closeCode: number | null = null, closeSignal: NodeJS.Signals | null = null;
 	const closed = new Promise<void>((resolve) => child.once("close", (code, signal) => { closeCode = code; closeSignal = signal; resolve(); }));
 	child.once("error", () => { spawnError = true; });
-	const recordText = collectBounded(child.stdio[3]! as import("node:stream").Readable, 4 * 1024).catch(() => "");
+	const recordText = collectBounded(child.stdout!, 4 * 1024, closed).catch(() => "");
 	const testHook = options.testSupervisorHooks?.afterDirectPollBeforeReap;
 	const afterDirectPollHook = testHook ? (async () => {
 		const pipe = child.stdio[4] as import("node:stream").Duplex | null;
@@ -743,49 +753,83 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	return output;
 }
 
-async function createOwnedReportDirectory(): Promise<SecureDiagnosticDirectory> {
-	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ci-junit-"));
-	const stat = await fs.promises.lstat(directory);
+type PinnedReport = { path: string; handle: fs.promises.FileHandle; identity: { dev: number; ino: number } };
+type OwnedReportDirectory = { directory: SecureDiagnosticDirectory; report: PinnedReport };
+
+/** Create and retain the final aggregate inode before the coordinator launches. */
+async function createOwnedReportDirectory(): Promise<OwnedReportDirectory> {
+	const rawDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-ci-junit-"));
+	const stat = await fs.promises.lstat(rawDirectory);
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("raw JUnit directory is not a regular directory");
-	return { directory, dev: stat.dev, ino: stat.ino };
+	const directory = { directory: rawDirectory, dev: stat.dev, ino: stat.ino };
+	const reportPath = path.join(rawDirectory, "report.xml");
+	const handle = await fs.promises.open(reportPath, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+	try {
+		const report = await handle.stat();
+		if (!report.isFile()) throw new Error("raw JUnit report is not a regular file");
+		return { directory, report: { path: reportPath, handle, identity: { dev: report.dev, ino: report.ino } } };
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
 }
 
-/** Delete only the report file whose identity was observed; retain replacements for inspection. */
-export async function cleanupOwnedReportDirectory(directory: SecureDiagnosticDirectory, reportPath: string, reportIdentity?: { dev: number; ino: number }): Promise<void> {
-	try { await verifyDiagnosticDirectory(directory); }
-	catch { throw new Error("raw JUnit directory identity changed; retained without deletion"); }
-	const entries = await fs.promises.readdir(directory.directory, { withFileTypes: true });
-	if (entries.length === 0) { await fs.promises.rmdir(directory.directory); return; }
-	if (entries.length !== 1 || entries[0]!.name !== path.basename(reportPath) || !entries[0]!.isFile() || entries[0]!.isSymbolicLink() || !reportIdentity) throw new Error("raw JUnit directory contents are unexpected; retained without deletion");
-	const current = await fs.promises.lstat(reportPath);
-	if (current.isSymbolicLink() || current.dev !== reportIdentity.dev || current.ino !== reportIdentity.ino) throw new Error("raw JUnit report identity changed; retained without deletion");
-	await fs.promises.unlink(reportPath);
-	await verifyDiagnosticDirectory(directory);
-	await fs.promises.rmdir(directory.directory);
+async function verifyPinnedReport(report: PinnedReport): Promise<void> {
+	const pinned = await report.handle.stat();
+	if (!pinned.isFile() || pinned.dev !== report.identity.dev || pinned.ino !== report.identity.ino) throw new Error("raw JUnit pinned report identity changed");
+	const current = await fs.promises.lstat(report.path);
+	if (!current.isFile() || current.isSymbolicLink() || current.dev !== report.identity.dev || current.ino !== report.identity.ino) throw new Error("raw JUnit report identity changed; retained without deletion");
+}
+
+/** Delete only the parent-pinned final report; retain replacement or scratch evidence. */
+export async function cleanupOwnedReportDirectory(directory: SecureDiagnosticDirectory, reportPath: string, reportIdentity?: { dev: number; ino: number }, pinnedHandle?: fs.promises.FileHandle): Promise<void> {
+	try {
+		try { await verifyDiagnosticDirectory(directory); }
+		catch { throw new Error("raw JUnit directory identity changed; retained without deletion"); }
+		const entries = await fs.promises.readdir(directory.directory, { withFileTypes: true });
+		if (entries.length === 0) { await fs.promises.rmdir(directory.directory); return; }
+		if (entries.length !== 1 || entries[0]!.name !== path.basename(reportPath) || !entries[0]!.isFile() || entries[0]!.isSymbolicLink() || !reportIdentity) throw new Error("raw JUnit directory contents are unexpected; retained without deletion");
+		if (pinnedHandle) {
+			const pinned = await pinnedHandle.stat();
+			if (!pinned.isFile() || pinned.dev !== reportIdentity.dev || pinned.ino !== reportIdentity.ino) throw new Error("raw JUnit pinned report identity changed; retained without deletion");
+		}
+		const current = await fs.promises.lstat(reportPath);
+		if (current.isSymbolicLink() || current.dev !== reportIdentity.dev || current.ino !== reportIdentity.ino) throw new Error("raw JUnit report identity changed; retained without deletion");
+		await fs.promises.unlink(reportPath);
+		await verifyDiagnosticDirectory(directory);
+		await fs.promises.rmdir(directory.directory);
+	} finally {
+		if (pinnedHandle) await pinnedHandle.close();
+	}
 }
 
 export async function runCiStage(stage: CiStage, root = process.cwd(), strictLinux = false): Promise<OwnedStageResult> {
 	const inventory = await createCiInventory(root);
-	const reportDirectory = await createOwnedReportDirectory();
-	const reportPath = path.join(reportDirectory.directory, "report.xml");
-	let reportIdentity: { dev: number; ino: number } | undefined;
+	const reports = await createOwnedReportDirectory();
+	const { directory: reportDirectory, report } = reports;
 	try {
-		const command = [process.execPath, "test", "--isolate", "--max-concurrency", "1", "--bail=1", "--reporter=junit", `--reporter-outfile=${reportPath}`, ...inventory[stage]];
+		const coordinator = fileURLToPath(new URL("./ci-test-coordinator.ts", import.meta.url));
+		const command = [process.execPath, coordinator, "--expected-report-identity", String(report.identity.dev), String(report.identity.ino), report.path, ...inventory[stage]];
 		return await runOwnedStage({
 			stage, command, cwd: root, timeoutMs: STAGE_TIMEOUT_MS[stage], diagnosticsDirectory: process.env.CI_STAGE_DIAGNOSTICS_DIR,
 			strictLinux,
 			testOutcomeLoader: async () => {
-				const stat = await fs.promises.lstat(reportPath);
-				if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("raw JUnit report is not a regular file");
-				reportIdentity = { dev: stat.dev, ino: stat.ino };
-				const outcome = await parseJUnitReport(reportPath);
+				// The coordinator may never hand off a replacement inode. Read through
+				// the parent-held descriptor, then re-check the pathname before cleanup.
+				await verifyDiagnosticDirectory(reportDirectory);
+				await verifyPinnedReport(report);
+				const stat = await report.handle.stat();
+				if (stat.size > RAW_REPORT_MAX_BYTES) throw new Error("raw report exceeded its cap");
+				const outcome = parseJUnitXml(await report.handle.readFile({ encoding: "utf8" }));
+				await verifyDiagnosticDirectory(reportDirectory);
+				await verifyPinnedReport(report);
 				validateTestOutcomePolicy(stage, outcome);
 				return outcome;
 			},
 		});
 	} finally {
 		// The stage waits for its direct/adopted descendants before this identity check.
-		await cleanupOwnedReportDirectory(reportDirectory, reportPath, reportIdentity);
+		await cleanupOwnedReportDirectory(reportDirectory, report.path, report.identity, report.handle);
 	}
 }
 

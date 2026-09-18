@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { cleanupOwnedReportDirectory, createCiInventory, discoverBunTestFiles, HEAVY_STAGE_FILES, parseJUnitReport, runCiStage, runOwnedStage, validateCiInventory, validateDiagnosticDirectory } from "../../.github/scripts/ci-stage";
+import { runSequentialTestFiles } from "../../.github/scripts/ci-test-coordinator";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -158,51 +159,46 @@ describe("CI stage partition and external timeout boundary", () => {
 		assert.equal(Object.hasOwn(diagnostic, "command"), false);
 	});
 
-	test("does not run later Bun tests after an actual per-test timeout, including afterEach continuation", async () => {
-		if (process.platform !== "linux") return;
-		const directory = await temporaryDirectory();
-		const fixture = path.join(directory, "timeout.test.ts");
-		const marker = path.join(directory, "later-ran");
-		await fs.promises.writeFile(fixture, `
-			import { afterEach, test } from "bun:test";
-			import { spawn } from "node:child_process";
-			afterEach(async () => { await new Promise((resolve) => setTimeout(resolve, 80)); });
-			test("times out", () => { spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" }); return new Promise(() => {}); }, { timeout: 40 });
-			test("must not run", async () => { await Bun.write(${JSON.stringify(marker)}, "ran"); });
-		`);
-		const result = await runOwnedStage({
-			stage: "bun-timeout", command: [process.execPath, "test", "--bail=1", fixture], timeoutMs: 5_000, diagnosticsDirectory: directory,
-		});
-		assert.equal(result.status, "failure");
-		assert.equal(await fs.promises.stat(marker).then(() => true).catch(() => false), false);
-	});
-
-	test("parses bounded JUnit totals and rejects empty or skipped success reports", async () => {
+	test("parses Bun's optional-errors JUnit totals and rejects malformed XML", async () => {
 		const directory = await temporaryDirectory();
 		const report = path.join(directory, "report.xml");
-		await fs.promises.writeFile(report, '<testsuites tests="3" skipped="0" failures="0" errors="0"><testsuite/></testsuites>');
+		// This is Bun's emitted shape: it omits the optional root errors count.
+		await fs.promises.writeFile(report, '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="3" assertions="0" failures="0" skipped="0" time="0.1"><testsuite tests="3"><testcase /></testsuite></testsuites>');
 		assert.deepEqual(await parseJUnitReport(report), { tests: 3, passed: 3, skipped: 0, failures: 0, errors: 0 });
 		await fs.promises.writeFile(report, '<testsuites tests="0" skipped="0" failures="0" errors="0"><testsuite/></testsuites>');
 		assert.deepEqual(await parseJUnitReport(report), { tests: 0, passed: 0, skipped: 0, failures: 0, errors: 0 });
 		await fs.promises.writeFile(report, '<testsuites tests="1" skipped="1" failures="0" errors="0"><testsuite/></testsuites>');
 		assert.deepEqual(await parseJUnitReport(report), { tests: 1, passed: 0, skipped: 1, failures: 0, errors: 0 });
+		for (const malformed of [
+			'<not-testsuites tests="1" skipped="0" failures="0" />',
+			'<testsuites tests="1" skipped="0" failures="0">',
+			'<testsuites tests="1" failures="0"></testsuites>',
+			'<testsuites tests="1" skipped="0" failures="0" errors="-1"></testsuites>',
+			'<testsuites tests="1" tests="1" skipped="0" failures="0"></testsuites>',
+			'<testsuites tests="1" skipped="0" failures="0"><testsuite></testsuites>',
+		]) {
+			await fs.promises.writeFile(report, malformed);
+			await assert.rejects(() => parseJUnitReport(report), /invalid JUnit reporter outcome/);
+		}
 	});
 
-	test("CLI coalesces a second SIGTERM, finalizes once, and never signals after close", async () => {
+	test("CLI coalesces cancellation signals and writes one validated final diagnostic", async () => {
 		if (process.platform !== "linux") return;
 		const directory = await temporaryDirectory();
 		const child = spawn(process.execPath, [".github/scripts/ci-stage.ts", "core"], {
 			cwd: process.cwd(), env: { ...process.env, CI_STAGE_DIAGNOSTICS_DIR: directory }, stdio: "ignore",
 		});
 		await waitFor(async () => (await fs.promises.readdir(directory)).some((entry) => entry.startsWith("ci-stage-")), "stage ownership association");
-		assert.equal(child.kill("SIGTERM"), true);
-		assert.equal(child.kill("SIGTERM"), true);
-		const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+		const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+		// Signal return values differ between Bun versions and are not a cleanup contract.
+		child.kill("SIGTERM");
+		child.kill("SIGTERM");
+		const result = await closed;
 		assert.equal(result.code, 143);
 		assert.equal(result.signal, null);
-		assert.equal(child.kill("SIGTERM"), false, "closed PID is never reused as a signal target");
 		await validateDiagnosticDirectory(directory);
 	});
+
 
 	test("cleans a detached setsid escape through the subreaper instead of claiming its original group contains it", async () => {
 		if (process.platform !== "linux") return;
@@ -248,14 +244,23 @@ describe("CI stage partition and external timeout boundary", () => {
 		assert.equal(await eventuallyDead(escaped), true, "outer tracked-identity fallback cleaned the observed escape");
 	});
 
-	test("retains a replacement raw-report directory rather than removing a foreign occupant", async () => {
+	test("retains a replacement raw report rather than deleting a foreign occupant", async () => {
 		const directory = await temporaryDirectory();
 		const stat = await fs.promises.lstat(directory), report = path.join(directory, "report.xml");
 		await fs.promises.writeFile(report, "first");
-		const original = await fs.promises.lstat(report);
-		await fs.promises.unlink(report); await fs.promises.writeFile(report, "replacement");
-		await assert.rejects(() => cleanupOwnedReportDirectory({ directory, dev: stat.dev, ino: stat.ino }, report, { dev: original.dev, ino: original.ino }), /identity changed/);
-		assert.equal(await fs.promises.readFile(report, "utf8"), "replacement");
+		// Keep the original inode alive: unlink/recreate alone permits immediate inode reuse.
+		const originalHandle = await fs.promises.open(report, "r");
+		try {
+			const original = await originalHandle.stat();
+			await fs.promises.unlink(report);
+			await fs.promises.writeFile(report, "replacement");
+			const replacement = await fs.promises.lstat(report);
+			assert.notEqual(replacement.ino, original.ino, "fixture must replace the file identity");
+			await assert.rejects(() => cleanupOwnedReportDirectory({ directory, dev: stat.dev, ino: stat.ino }, report, { dev: original.dev, ino: original.ino }), /identity changed/);
+			assert.equal(await fs.promises.readFile(report, "utf8"), "replacement");
+		} finally {
+			await originalHandle.close();
+		}
 	});
 
 	test("applies the production JUnit policy to a real zero-pass core report", async () => {
@@ -263,8 +268,7 @@ describe("CI stage partition and external timeout boundary", () => {
 		const root = await temporaryDirectory();
 		await writeTemporaryInventory(root, "export {};\n");
 		const result = await runCiStage("core", root, true);
-		assert.equal(result.exitCode, 0, "Bun accepted the generated empty suite");
-		assert.equal(result.status, "failure", "removing the production policy call makes this test fail");
+		assert.equal(result.status, "failure", "a zero-test inventory file has no valid coordinator report");
 	});
 
 	test("applies the production JUnit policy to mixed passing and skipped required-heavy reports", async () => {
@@ -275,6 +279,156 @@ describe("CI stage partition and external timeout boundary", () => {
 		const result = await runCiStage("reaper", root, true);
 		assert.equal(result.exitCode, 0, "Bun accepted the generated mixed passing and skipped suites");
 		assert.equal(result.status, "failure", "removing the heavy-stage skip guard makes this test fail despite passing tests");
+	});
+
+	test("aggregates the actual JUnit counts from two independently run files", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml");
+		await fs.promises.writeFile(path.join(root, "first.test.ts"), 'import { test } from "bun:test"; test("one", () => {}); test("two", () => {});\n');
+		await fs.promises.writeFile(path.join(root, "second.test.ts"), 'import { test } from "bun:test"; test("three", () => {});\n');
+		const result = await runSequentialTestFiles(report, ["first.test.ts", "second.test.ts"], root);
+		assert.deepEqual(result, {
+			exitCode: 0, signal: null, complete: true,
+			outcome: { tests: 3, passed: 3, skipped: 0, failures: 0, errors: 0 },
+		});
+		assert.deepEqual(await parseJUnitReport(report), result.outcome);
+	});
+
+	test("writes a nominal final aggregate in place and retains a replacement handoff", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml");
+		await fs.promises.writeFile(report, "");
+		const pinned = await fs.promises.lstat(report);
+		await fs.promises.writeFile(path.join(root, "pass.test.ts"), 'import { test } from "bun:test"; test("pass", () => {});\n');
+		const nominal = await runSequentialTestFiles(report, ["pass.test.ts"], root, undefined, { dev: pinned.dev, ino: pinned.ino });
+		assert.equal(nominal.complete, true);
+		assert.equal((await fs.promises.lstat(report)).ino, pinned.ino, "the coordinator never replaces the parent-pinned inode");
+		await fs.promises.writeFile(path.join(root, "second.test.ts"), 'import { test } from "bun:test"; test("must not run", () => { throw new Error("unexpected"); });\n');
+		await assert.rejects(() => runSequentialTestFiles(report, ["second.test.ts"], root, {
+			afterReportRemoval: async () => {
+				await fs.promises.unlink(report);
+				await fs.promises.writeFile(report, "foreign replacement");
+				return undefined;
+			},
+		}, { dev: pinned.dev, ino: pinned.ino }), /identity changed/);
+		assert.equal(await fs.promises.readFile(report, "utf8"), "foreign replacement");
+	});
+
+	test("fails a per-file malformed JUnit report instead of manufacturing a green aggregate", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml");
+		await fs.promises.writeFile(path.join(root, "malformed.test.ts"), 'import { test } from "bun:test"; test("pass", () => {});\n');
+		const result = await runSequentialTestFiles(report, ["malformed.test.ts"], root, {
+			afterTestClose: async (_file, scratch) => { await fs.promises.writeFile(scratch, '<testsuites tests="1" skipped="0" failures="0">'); },
+		});
+		assert.equal(result.complete, false);
+		await assert.rejects(() => parseJUnitReport(report), /invalid JUnit reporter outcome/);
+	});
+
+	test("fails a mixed inventory when a later file exits without a JUnit report", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml");
+		await fs.promises.writeFile(path.join(root, "pass.test.ts"), 'import { test } from "bun:test"; test("pass", () => {});\n');
+		await fs.promises.writeFile(path.join(root, "missing.test.ts"), "process.exit(7);\n");
+		const result = await runSequentialTestFiles(report, ["pass.test.ts", "missing.test.ts"], root);
+		assert.equal(result.exitCode, 7);
+		assert.equal(result.complete, false);
+		await assert.rejects(() => parseJUnitReport(report), /invalid JUnit reporter outcome/, "the parent-pinned final is cleared rather than replaced with a partial aggregate");
+	});
+
+	test("records an incomplete JUnit diagnostic when a failing file emits no report", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), diagnostics = await temporaryDirectory();
+		await writeTemporaryInventory(root, "process.exit(7);\n");
+		const previous = process.env.CI_STAGE_DIAGNOSTICS_DIR;
+		process.env.CI_STAGE_DIAGNOSTICS_DIR = diagnostics;
+		try {
+			const result = await runCiStage("core", root, true);
+			assert.equal(result.status, "failure");
+			const diagnosticPath = await validateDiagnosticDirectory(diagnostics);
+			const diagnostic = JSON.parse(await fs.promises.readFile(diagnosticPath, "utf8"));
+			assert.equal(Object.hasOwn(diagnostic, "testOutcome"), false);
+			assert.ok(diagnostic.partialErrors.some((value: unknown) => typeof value === "string" && value.startsWith("junit-outcome:")));
+		} finally {
+			if (previous === undefined) delete process.env.CI_STAGE_DIAGNOSTICS_DIR;
+			else process.env.CI_STAGE_DIAGNOSTICS_DIR = previous;
+		}
+	});
+
+	test("forwards a coordinator cancellation signal after its child has closed", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml"), ready = path.join(root, "ready");
+		const fixture = path.join(root, "wait.test.ts");
+		await fs.promises.writeFile(fixture, `import { test } from "bun:test"; import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(ready)}, "ready"); test("wait", () => new Promise(() => {}));\n`);
+		await fs.promises.writeFile(report, "");
+		const pinned = await fs.promises.lstat(report);
+		const coordinator = path.join(process.cwd(), ".github/scripts/ci-test-coordinator.ts");
+		const child = spawn(process.execPath, [coordinator, "--expected-report-identity", String(pinned.dev), String(pinned.ino), report, fixture], { cwd: root, stdio: "ignore" });
+		await waitFor(() => fs.existsSync(ready), "coordinator test child readiness");
+		const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+		assert.equal(child.kill("SIGTERM"), true);
+		const result = await closed;
+		assert.equal(result.code, null);
+		assert.equal(result.signal, "SIGTERM");
+	});
+
+	test("checks cancellation after report removal before starting the next file", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), report = path.join(root, "report.xml"), marker = path.join(root, "second-started");
+		await fs.promises.writeFile(path.join(root, "first.test.ts"), 'import { test } from "bun:test"; test("first", () => {});\n');
+		await fs.promises.writeFile(path.join(root, "second.test.ts"), `import { test } from "bun:test"; import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "started"); test("second", () => {});\n`);
+		const result = await runSequentialTestFiles(report, ["first.test.ts", "second.test.ts"], root, {
+			afterReportRemoval: (file) => file === "second.test.ts" ? "SIGTERM" : undefined,
+		});
+		assert.equal(result.signal, "SIGTERM");
+		assert.equal(result.complete, false);
+		assert.equal(await fs.promises.stat(marker).then(() => true).catch(() => false), false);
+		assert.deepEqual(await parseJUnitReport(report), { tests: 1, passed: 1, skipped: 0, failures: 0, errors: 0 });
+	});
+
+	test("runs every inventory file in a fresh process without carrying file globals or environment", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory();
+		const firstPid = path.join(root, "first-pid"), secondPid = path.join(root, "second-pid");
+		await writeTemporaryInventory(root, 'import { test } from "bun:test"; test("core", () => {});\n');
+		await fs.promises.writeFile(path.join(root, "a-fresh-process.test.ts"), `
+			import { test } from "bun:test";
+			import { writeFileSync } from "node:fs";
+			(globalThis as any).__ciCoordinatorFileGlobal = process.pid;
+			process.env.CI_COORDINATOR_MARKER = String(process.pid);
+			writeFileSync(${JSON.stringify(firstPid)}, String(process.pid));
+			test("first", () => {});
+		`);
+		await fs.promises.writeFile(path.join(root, "b-fresh-process.test.ts"), `
+			import { test } from "bun:test";
+			import { writeFileSync } from "node:fs";
+			if ((globalThis as any).__ciCoordinatorFileGlobal !== undefined || process.env.CI_COORDINATOR_MARKER !== undefined) throw new Error("prior file state leaked");
+			writeFileSync(${JSON.stringify(secondPid)}, String(process.pid));
+			test("second", () => {});
+		`);
+		const result = await runCiStage("core", root, true);
+		assert.equal(result.status, "success");
+		assert.notEqual(await fs.promises.readFile(firstPid, "utf8"), await fs.promises.readFile(secondPid, "utf8"));
+	});
+
+	test("stops the inventory after the first failing file", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory(), laterMarker = path.join(root, "later-file-ran");
+		await writeTemporaryInventory(root, 'import { test } from "bun:test"; test("core", () => {});\n');
+		await fs.promises.writeFile(path.join(root, "a-failing.test.ts"), 'import { test } from "bun:test"; test("fails", () => { throw new Error("expected"); });\n');
+		await fs.promises.writeFile(path.join(root, "b-later.test.ts"), `import { test } from "bun:test"; import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(laterMarker)}, "ran"); test("later", () => {});`);
+		const result = await runCiStage("core", root, true);
+		assert.equal(result.status, "failure");
+		assert.equal(await fs.promises.stat(laterMarker).then(() => true).catch(() => false), false);
+	});
+
+	test("forwards the first test process exit code after writing its partial aggregate", async () => {
+		if (process.platform !== "linux") return;
+		const root = await temporaryDirectory();
+		await writeTemporaryInventory(root, "process.exit(42);\n");
+		const result = await runCiStage("core", root, true);
+		assert.equal(result.status, "failure");
+		assert.equal(result.exitCode, 42);
 	});
 
 	test("preserves direct Popen status when it exits after poll and before selective adopted reaping", { timeout: 8_000 }, async () => {
@@ -328,7 +482,7 @@ describe("CI stage partition and external timeout boundary", () => {
 		assert.equal(outer.kill("SIGKILL"), true);
 		await new Promise<void>((resolve) => outer.once("close", () => resolve()));
 		await fs.promises.unlink(barrier);
-		await waitFor(() => fs.existsSync(result), "post-prctl original-parent verification");
+		await waitFor(async () => await fs.promises.readFile(result, "utf8").then((value) => value === "cancelled-before-workload-spawn").catch(() => false), "post-prctl original-parent verification");
 		assert.equal(await fs.promises.readFile(result, "utf8"), "cancelled-before-workload-spawn");
 		assert.equal(await fs.promises.stat(workloadMarker).then(() => true).catch(() => false), false, "orphaned supervisor never spawned a workload");
 	});

@@ -22,26 +22,47 @@ function assistantEntry(id: string, text: string) {
 	};
 }
 
+function logPhase(phase: string, startedAt: number, count: number, sessionBytes: number, bucketCount?: number): void {
+	console.info(JSON.stringify({ workload: "session-tail-heavy", phase, durationMs: Math.round(performance.now() - startedAt), count, sessionBytes, ...(bucketCount === undefined ? {} : { bucketCount }) }));
+}
+
 describe("session JSONL tail heavy workload", () => {
-	test("replays 100,000 old IDs in reverse without growing messages or auxiliary state", { timeout: 240_000 }, async () => {
+	test("replays 4 recent-cache windows of old IDs in reverse without growing messages or auxiliary state", { timeout: 240_000 }, async () => {
 		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
 		tempDirs.push(dir);
 		const filePath = path.join(dir, "session.jsonl");
-		const count = 100_000;
+		const count = 4 * SESSION_TAIL_RECENT_ID_LIMIT;
 		const lines: string[] = [];
 		for (let index = 0; index < count; index += 1) lines.push(`${JSON.stringify(assistantEntry(`metric-${index}`, "x"))}\n`);
-		await fs.promises.writeFile(filePath, lines.join(""));
+		const initialSession = lines.join("");
+		const initialSessionBytes = Buffer.byteLength(initialSession);
+		await fs.promises.writeFile(filePath, initialSession);
 		const result = makeResult();
+		const initialStartedAt = performance.now();
 		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
+		const indexPath = drained.state.indexPath;
+		const bucketCount = indexPath ? (await fs.promises.readdir(indexPath)).length : undefined;
+		logPhase("initial-drain", initialStartedAt, count, initialSessionBytes, bucketCount);
 		assert.equal(result.messages.length, count);
+		assert.equal(drained.state.seenEntryIds.size, SESSION_TAIL_RECENT_ID_LIMIT);
+		assert.equal(drained.state.seenEntryIds.has("metric-0"), false, "the first drain must evict old IDs from the recent cache");
+		assert.equal(drained.state.seenEntryIds.has(`metric-${count - 1}`), true);
+		assert.ok(indexPath && (await fs.promises.stat(indexPath)).isDirectory());
+		assert.ok(bucketCount && bucketCount <= 4096);
+		const usageAfterInitialDrain = structuredClone(result.usage);
 		await fs.promises.appendFile(filePath, lines.reverse().join(""));
+		const reverseStartedAt = performance.now();
 		drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
+		logPhase("reverse-drain", reverseStartedAt, count, initialSessionBytes * 2, bucketCount);
+		assert.equal(drained.resultChanged, false);
 		assert.equal(result.messages.length, count);
+		assert.deepEqual(result.usage, usageAfterInitialDrain);
 		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
 		assert.equal(drained.state.remainder.length, 0);
 		assert.equal(drained.state.pendingIndexEntries.length, 0);
 		assert.equal(drained.state.indexWriteDisabled, false);
 		assert.equal(drained.state.fallbackIndexPath, undefined);
+		assert.equal(drained.state.indexPath, indexPath, "reverse replay must retain the exact published disk index path");
 		assert.ok(drained.state.indexPath && (await fs.promises.stat(drained.state.indexPath)).isDirectory());
 		assert.ok(drained.state.indexBloom.length > 0 && drained.state.indexBloom.length <= 1024 * 1024);
 		assert.equal((result as any).__processedAssistantSignatures, undefined);

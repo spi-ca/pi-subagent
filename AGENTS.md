@@ -29,8 +29,9 @@ bun run ci
 
 `bun run ci` runs `bun run check` (type check via `tsc --noEmit`) followed by
 the core and three explicit heavy test stages. It is the required check before
-treating a change as verified. File isolation is required because tests
-intentionally use file-global Bun mocks and process globals. `bun run test` and
+treating a change as verified. Each inventory file runs sequentially in a fresh
+OS process because tests intentionally use file-global Bun mocks and process
+globals. `bun run test` and
 `bun run check` also exist individually as defined in `package.json`.
 Live/acceptance/benchmark scripts
 (`acceptance:*`, `benchmark:*`) are opt-in and gated by explicit environment

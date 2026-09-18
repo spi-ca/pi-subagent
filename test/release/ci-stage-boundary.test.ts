@@ -297,21 +297,30 @@ describe("CI stage partition and external timeout boundary", () => {
 	test("writes a nominal final aggregate in place and retains a replacement handoff", async () => {
 		if (process.platform !== "linux") return;
 		const root = await temporaryDirectory(), report = path.join(root, "report.xml");
-		await fs.promises.writeFile(report, "");
-		const pinned = await fs.promises.lstat(report);
-		await fs.promises.writeFile(path.join(root, "pass.test.ts"), 'import { test } from "bun:test"; test("pass", () => {});\n');
-		const nominal = await runSequentialTestFiles(report, ["pass.test.ts"], root, undefined, { dev: pinned.dev, ino: pinned.ino });
-		assert.equal(nominal.complete, true);
-		assert.equal((await fs.promises.lstat(report)).ino, pinned.ino, "the coordinator never replaces the parent-pinned inode");
-		await fs.promises.writeFile(path.join(root, "second.test.ts"), 'import { test } from "bun:test"; test("must not run", () => { throw new Error("unexpected"); });\n');
-		await assert.rejects(() => runSequentialTestFiles(report, ["second.test.ts"], root, {
-			afterReportRemoval: async () => {
-				await fs.promises.unlink(report);
-				await fs.promises.writeFile(report, "foreign replacement");
-				return undefined;
-			},
-		}, { dev: pinned.dev, ino: pinned.ino }), /identity changed/);
-		assert.equal(await fs.promises.readFile(report, "utf8"), "foreign replacement");
+		// Match runCiStage: the parent holds the original inode open throughout
+		// publication and handoff, preventing inode reuse after an unlink.
+		const parentHandle = await fs.promises.open(report, "wx+", 0o600);
+		try {
+			const pinned = await parentHandle.stat();
+			await fs.promises.writeFile(path.join(root, "pass.test.ts"), 'import { test } from "bun:test"; test("pass", () => {});\n');
+			const nominal = await runSequentialTestFiles(report, ["pass.test.ts"], root, undefined, { dev: pinned.dev, ino: pinned.ino });
+			assert.equal(nominal.complete, true);
+			assert.equal((await fs.promises.lstat(report)).ino, pinned.ino, "the coordinator never replaces the parent-pinned inode");
+			const marker = path.join(root, "unexpected-execution");
+			await fs.promises.writeFile(path.join(root, "second.test.ts"), `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");`);
+			await assert.rejects(() => runSequentialTestFiles(report, ["second.test.ts"], root, {
+				afterReportRemoval: async () => {
+					await fs.promises.unlink(report);
+					await fs.promises.writeFile(report, "foreign replacement");
+					assert.notEqual((await fs.promises.lstat(report)).ino, pinned.ino, "fixture must replace the parent-pinned identity");
+					return undefined;
+				},
+			}, { dev: pinned.dev, ino: pinned.ino }), /identity changed/);
+			assert.equal(await fs.promises.readFile(report, "utf8"), "foreign replacement");
+			assert.equal(fs.existsSync(marker), false, "a replaced handoff is rejected before the next file executes");
+		} finally {
+			await parentHandle.close();
+		}
 	});
 
 	test("fails a per-file malformed JUnit report instead of manufacturing a green aggregate", async () => {

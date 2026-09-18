@@ -46,6 +46,19 @@ async function waitForFile(file: string): Promise<void> {
 	});
 }
 
+async function pythonSupervisorWithSecondCleanupSignal(): Promise<string> {
+	const source = await fs.promises.readFile(path.join(process.cwd(), ".github/scripts/ci-stage.ts"), "utf8");
+	const match = /const PYTHON_SUPERVISOR = String\.raw`([\s\S]*?)`;\n\nfunction parseSupervisorRecord/.exec(source);
+	if (!match) throw new Error("unable to extract the production Python supervisor");
+	// This is a test-only synchronization point around the unmodified production
+	// handler: the first SIGTERM enters SafeAbort, then this emits the second
+	// signal from its actual except-path marker write.
+	return match[1]!.replace(
+		"def write_test_bootstrap_result(value):\n    if not test_bootstrap_result: return\n",
+		"def write_test_bootstrap_result(value):\n    if not test_bootstrap_result: return\n    second = os.environ.pop(\"CI_STAGE_TEST_SECOND_CLEANUP_SIGNAL\", \"\")\n    if second: os.kill(SELF, getattr(signal, second))\n",
+	);
+}
+
 async function writeTemporaryInventory(root: string, coreSource: string, sources: Partial<Record<keyof typeof HEAVY_STAGE_FILES, string>> = {}): Promise<void> {
 	await fs.promises.writeFile(path.join(root, "core.test.ts"), coreSource);
 	for (const [stage, files] of Object.entries(HEAVY_STAGE_FILES) as [keyof typeof HEAVY_STAGE_FILES, readonly string[]][]) {
@@ -494,6 +507,34 @@ describe("CI stage partition and external timeout boundary", () => {
 		await waitFor(async () => await fs.promises.readFile(result, "utf8").then((value) => value === "cancelled-before-workload-spawn").catch(() => false), "post-prctl original-parent verification");
 		assert.equal(await fs.promises.readFile(result, "utf8"), "cancelled-before-workload-spawn");
 		assert.equal(await fs.promises.stat(workloadMarker).then(() => true).catch(() => false), false, "orphaned supervisor never spawned a workload");
+	});
+
+	test("keeps bootstrap SafeAbort cleanup idempotent when a second signal arrives", async () => {
+		if (process.platform !== "linux") return;
+		const supervisor = await pythonSupervisorWithSecondCleanupSignal();
+		const run = async (source: string, secondSignal: "SIGTERM" | "SIGINT") => {
+			const directory = await temporaryDirectory();
+			const barrier = path.join(directory, "bootstrap-barrier"), result = path.join(directory, "bootstrap-result"), workloadMarker = path.join(directory, "workload-ran");
+			const child = spawn("python3", ["-c", source, process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(workloadMarker)}, "ran")`], {
+				cwd: process.cwd(), detached: true, env: { ...process.env, CI_STAGE_EXPECTED_PARENT_PID: String(process.pid), CI_STAGE_TEST_BOOTSTRAP_BARRIER: barrier, CI_STAGE_TEST_BOOTSTRAP_RESULT: result, CI_STAGE_TEST_SECOND_CLEANUP_SIGNAL: secondSignal }, stdio: "ignore",
+			});
+			await waitFor(() => fs.existsSync(barrier), "isolated supervisor bootstrap barrier");
+			const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.once("close", (code, signal) => resolve({ code, signal })));
+			assert.equal(child.kill("SIGTERM"), true);
+			return { closed: await closed, result: await fs.promises.readFile(result, "utf8").catch(() => ""), workloadRan: fs.existsSync(workloadMarker) };
+		};
+		for (const secondSignal of ["SIGTERM", "SIGINT"] as const) {
+			const result = await run(supervisor, secondSignal);
+			assert.deepEqual(result.closed, { code: 0, signal: null });
+			assert.equal(result.result, "cancelled-before-workload-spawn");
+			assert.equal(result.workloadRan, false);
+		}
+		// This narrow mutant is the pre-fix handler: without the early return, the
+		// injected second SIGINT escapes the SafeAbort except path before its marker.
+		const preFix = supervisor.replace("if stopping: return\n    stopping = True", "stopping = True");
+		assert.notEqual(preFix, supervisor, "the mutation must remove the idempotence guard");
+		const mutant = await run(preFix, "SIGINT");
+		assert.notEqual(mutant.result, "cancelled-before-workload-spawn");
 	});
 
 	test("keeps the close latch when a child exits near the timeout boundary", async () => {

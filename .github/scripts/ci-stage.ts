@@ -391,6 +391,10 @@ def cleanup():
 
 def stop(signum, frame):
     global stopping
+    # A parent-death SIGTERM can be followed by another cancellation signal
+    # while SafeAbort cleanup runs. The first signal owns that transition;
+    # later signals must not interrupt its marker or bounded cleanup.
+    if stopping: return
     stopping = True
     # Before Popen, abort synchronously instead of falling through to launch.
     # Once Popen begins, retain its child handle and use bounded cleanup.

@@ -21,9 +21,14 @@
     ]
   },
   "scripts": {
-    "test": "bun test --isolate --pass-with-no-tests --max-concurrency 1",
+    "test": "bun run test:core",
+    "test:core": "bun .github/scripts/ci-stage.ts core",
+    "test:phase0": "bun .github/scripts/ci-stage.ts phase0",
+    "test:reaper": "bun .github/scripts/ci-stage.ts reaper",
+    "test:session-tail": "bun .github/scripts/ci-stage.ts sessionTail",
+    "ci:stage": "bun .github/scripts/ci-stage.ts",
     "check": "bunx tsc --noEmit",
-    "ci": "bun run check && bun run test",
+    "ci": "bun run check && bun run test:core && bun run test:phase0 && bun run test:reaper && bun run test:session-tail",
     "acceptance:dry-run": "bun run test/acceptance/live-harness.ts tmux --dry-run && bun run test/acceptance/live-harness.ts cmux --dry-run && bun run test/acceptance/live-harness.ts package --dry-run && bun run acceptance:cmux-layout-phase0:dry-run && bun run title:live:dry-run && bun run benchmark:phase0:preflight && bun run benchmark:phase0:verify && bun run benchmark:phase0:live:preflight && bun run benchmark:phase0:live:routine:verify && bun run benchmark:phase0:live:concurrency:verify && bun run benchmark:phase7:preflight && bun run benchmark:phase7:verify",
     "acceptance:layout:dry-run": "bun run test/acceptance/live-harness.ts tmux --dry-run && bun run test/acceptance/live-harness.ts cmux --dry-run",
     "acceptance:layout": "bun run test/acceptance/live-harness.ts tmux && bun run test/acceptance/live-harness.ts cmux",

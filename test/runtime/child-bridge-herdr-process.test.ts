@@ -92,7 +92,8 @@ if (extensionError) throw new Error(JSON.stringify(extensionError));
 }
 
 const unixTest = process.platform === "win32" ? test.skip : test;
-unixTest("holds process exit until the source-scoped Herdr shutdown clear is acknowledged", { timeout: 10_000 }, async () => {
+
+async function runHerdrFixture(afterSpawn?: () => Promise<void> | void, cleanupAudit: string[] = []): Promise<void> {
 	const runId = "shutdown-hold";
 	const pane = { workspace_id: "workspace-exact", tab_id: "tab-exact", pane_id: "pane-exact", terminal_id: "terminal-exact" };
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-shutdown-"));
@@ -104,6 +105,8 @@ unixTest("holds process exit until the source-scoped Herdr shutdown clear is ack
 	const waiters: Array<{ resolve(value: PendingRequest): void; reject(error: Error): void }> = [];
 	const queuedLines: string[] = [];
 	const lineWaiters: Array<{ resolve(value: string): void; reject(error: Error): void }> = [];
+	let acceptConnection!: () => void;
+	const childConnection = new Promise<void>((resolve) => { acceptConnection = resolve; });
 	let channelError: Error | null = null;
 	const failChannel = (error: Error) => {
 		channelError ??= error;
@@ -132,6 +135,7 @@ unixTest("holds process exit until the source-scoped Herdr shutdown clear is ack
 	};
 	const server = net.createServer((socket) => {
 		sockets.add(socket);
+		acceptConnection();
 		let resolveSocketCompletion!: () => void;
 		socketCompletions.push(new Promise<void>((resolve) => { resolveSocketCompletion = resolve; }));
 		socket.once("close", () => { sockets.delete(socket); resolveSocketCompletion(); });
@@ -157,6 +161,7 @@ unixTest("holds process exit until the source-scoped Herdr shutdown clear is ack
 	let childFinished = false;
 	let childClosed: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null;
 	let stdoutClosed: Promise<void> | null = null;
+	let stderrClosed: Promise<void> | null = null;
 	let stderr = "";
 	try {
 		await withTimeout(new Promise<void>((resolve, reject) => {
@@ -220,10 +225,15 @@ unixTest("holds process exit until the source-scoped Herdr shutdown clear is ack
 		});
 		child.stderr!.setEncoding("utf8");
 		child.stderr!.on("data", (chunk: string) => { if (stderr.length < 16_384) stderr += chunk.slice(0, 16_384 - stderr.length); });
+		stderrClosed = new Promise((resolve) => { child!.stderr!.once("close", resolve); });
 		childClosed = new Promise((resolve) => {
 			child!.once("error", (error) => { stderr += `${error.message}\n`; });
 			child!.once("close", (code, signal) => { childFinished = true; resolve({ code, signal }); });
 		});
+		if (afterSpawn) {
+			await withTimeout(childConnection, "actual Herdr child connection");
+			await afterSpawn();
+		}
 
 		const next = async (method: string, params: Record<string, unknown>) => {
 			const pending = await withTimeout(receive(), `${method} request`);
@@ -265,17 +275,41 @@ unixTest("holds process exit until the source-scoped Herdr shutdown clear is ack
 		const outcome = await withTimeout(childClosed, "clean child exit");
 		assert.deepEqual(outcome, { code: 0, signal: null }, stderr);
 		await withTimeout(stdoutClosed, "child stdout completion");
+		await withTimeout(stderrClosed, "child stderr completion");
 		await withTimeout(Promise.all(socketCompletions).then(() => undefined), "Herdr socket completion");
 		assert.equal(queued.length, 0, "child sent an unexpected Herdr request");
 		assert.equal(queuedLines.length, 0, "child sent an unexpected lifecycle milestone");
 		assert.equal(channelError, null, String(channelError));
 	} finally {
 		if (child && !childFinished) {
+			// This fixture owns only this ChildProcess object; never signal a PID/group.
+			child.stdin?.destroy();
 			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			if (childClosed) await withTimeout(childClosed, "failed child cleanup");
 		}
+		if (childClosed) { await withTimeout(childClosed, "failed child cleanup"); cleanupAudit.push("actual-child-closed"); }
+		if (stdoutClosed) { await withTimeout(stdoutClosed, "failed child stdout drain"); cleanupAudit.push("actual-stdout-closed"); }
+		if (stderrClosed) { await withTimeout(stderrClosed, "failed child stderr drain"); cleanupAudit.push("actual-stderr-closed"); }
 		for (const socket of sockets) socket.destroy();
+		await withTimeout(Promise.all(socketCompletions).then(() => undefined), "failed Herdr socket drain");
+		cleanupAudit.push("actual-socket-closed");
 		await withTimeout(new Promise<void>((resolve) => server.close(() => resolve())), "Herdr fixture close");
+		cleanupAudit.push("fixture-server-closed");
 		await fs.promises.rm(root, { recursive: true, force: true });
+		cleanupAudit.push("private-root-removed");
 	}
+}
+
+unixTest("holds process exit until the source-scoped Herdr shutdown clear is acknowledged", { timeout: 10_000 }, async () => {
+	await runHerdrFixture();
+});
+
+unixTest("drains the primary Herdr fixture child after a post-spawn assertion failure", { timeout: 10_000 }, async () => {
+	const cleanupAudit: string[] = [];
+	await assert.rejects(
+		() => runHerdrFixture(() => { throw new Error("injected Herdr fixture assertion failure"); }, cleanupAudit),
+		/injected Herdr fixture assertion failure/,
+	);
+	assert.deepEqual(cleanupAudit, [
+		"actual-child-closed", "actual-stdout-closed", "actual-stderr-closed", "actual-socket-closed", "fixture-server-closed", "private-root-removed",
+	], "the primary fixture must close its actual child, streams, and socket before removing private state");
 });

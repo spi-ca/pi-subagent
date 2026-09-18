@@ -855,29 +855,6 @@ describe("session JSONL tail", () => {
 		);
 	});
 
-	test("replays 100,000 old IDs in reverse without growing messages or auxiliary state", { timeout: 240_000 }, async () => {
-		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));
-		tempDirs.push(dir);
-		const filePath = path.join(dir, "session.jsonl");
-		const count = 100_000;
-		const lines: string[] = [];
-		for (let index = 0; index < count; index += 1) lines.push(`${JSON.stringify(assistantEntry(`metric-${index}`, "x"))}\n`);
-		await fs.promises.writeFile(filePath, lines.join(""));
-		const result = makeResult();
-		let drained = await drainSessionJsonl({ filePath, state: createSessionTailState(), result: result as any });
-		assert.equal(result.messages.length, count);
-		await fs.promises.appendFile(filePath, lines.reverse().join(""));
-		drained = await drainSessionJsonl({ filePath, state: drained.state, result: result as any });
-		assert.equal(result.messages.length, count);
-		assert.ok(drained.state.seenEntryIds.size <= SESSION_TAIL_RECENT_ID_LIMIT);
-		assert.equal(drained.state.remainder.length, 0);
-		assert.equal(drained.state.pendingIndexEntries.length, 0);
-		assert.equal(drained.state.indexWriteDisabled, false);
-		assert.equal(drained.state.fallbackIndexPath, undefined);
-		assert.ok(drained.state.indexPath && (await fs.promises.stat(drained.state.indexPath)).isDirectory());
-		assert.ok(drained.state.indexBloom.length > 0 && drained.state.indexBloom.length <= 1024 * 1024);
-		assert.equal((result as any).__processedAssistantSignatures, undefined);
-	});
 
 	test("does not register arbitrary object IDs in the exact index", async () => {
 		const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-"));

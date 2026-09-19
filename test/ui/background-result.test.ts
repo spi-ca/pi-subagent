@@ -238,7 +238,19 @@ describe("background result renderer", () => {
     assert.doesNotMatch(card.render(120).join("\n"), /row 9/);
     assert.equal(card.handleMouse({ type: "drag", button: "left" }), undefined);
     assert.equal(card.handleMouse({ type: "click", button: "right" }), undefined);
-    assert.deepEqual(card.handleMouse({ type: "click", button: "left" }), { handled: true });
+    assert.deepEqual(card.handleMouse({
+      type: "click",
+      button: "left",
+      x: 4,
+      y: 3,
+      screenX: 24,
+      screenY: 13,
+      width: 120,
+      height: 10,
+    }), {
+      handled: true,
+      target: { component: card, originX: 20, originY: 10, width: 120, height: 10 },
+    });
     assert.match(card.render(120).join("\n"), /row 9/);
     const otherCard = renderer(message(Array.from({ length: 9 }, (_, index) => `row ${index + 1}`).join("\n")), { expanded: false, outputPad: 0 }, theme as never);
     assert.doesNotMatch(otherCard.render(120).join("\n"), /row 9/, "clicking one result card does not expand another");
@@ -264,12 +276,12 @@ describe("background result renderer", () => {
       const card = renderer(message(output), { expanded: false, outputPad: 0 }, theme as never);
       const before = card.render(120).join("\n");
       assert.ok(!before.includes(metadata.jobId));
-      assert.deepEqual(card.handleMouse({ type: "click", button: "left" }), { handled: true });
+      assert.equal(card.handleMouse({ type: "click", button: "left" })?.handled, true);
       const expanded = card.render(120).join("\n");
       assert.ok(expanded.includes(metadata.jobId));
       assert.doesNotMatch(expanded, /more lines|Untrusted subagent output:/);
       if (output) assert.match(expanded, /three/);
-      assert.deepEqual(card.handleMouse({ type: "click", button: "left" }), { handled: true });
+      assert.equal(card.handleMouse({ type: "click", button: "left" })?.handled, true);
       assert.equal(card.render(120).join("\n"), before);
     }
   });

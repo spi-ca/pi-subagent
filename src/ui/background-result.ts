@@ -95,6 +95,18 @@ type BackgroundResultTheme = {
   bg: (color: "customMessageBg", text: string) => string;
 };
 
+/** Structural 0.85 mouse-dispatch result; kept local because the locked 0.84 TUI declarations have no mouse types. */
+interface BackgroundResultMouseDispatchResult {
+  handled: true;
+  target: {
+    component: BackgroundResultComponent;
+    originX: number;
+    originY: number;
+    width: number;
+    height: number;
+  };
+}
+
 export interface BackgroundResultRendererOptions {
   /** Compact output-body visual rows. Later configuration can inject this without changing renderer state semantics. */
   previewLines?: number;
@@ -556,13 +568,33 @@ class BackgroundResultComponent extends Box {
   }
 
   /** Structural mouse support keeps typechecking against the package's 0.84 declarations while Pi 0.85.1 supplies mouse events. */
-  handleMouse(event: { type?: unknown; button?: unknown }): { handled: true } | undefined {
+  handleMouse(event: {
+    type?: unknown;
+    button?: unknown;
+    x?: unknown;
+    y?: unknown;
+    screenX?: unknown;
+    screenY?: unknown;
+    width?: unknown;
+    height?: unknown;
+  }): BackgroundResultMouseDispatchResult | undefined {
     // Do not claim presses, drags, releases, wheels, or secondary clicks: the
     // fullscreen transcript must retain its native selection and scroll paths.
     if (event.type !== "click" || event.button !== "left") return undefined;
     this.state.expanded = !this.state.expanded;
     this.rebuild();
-    return { handled: true };
+    const x = finiteMouseCoordinate(event.x);
+    const y = finiteMouseCoordinate(event.y);
+    return {
+      handled: true,
+      target: {
+        component: this,
+        originX: finiteMouseCoordinate(event.screenX) - x,
+        originY: finiteMouseCoordinate(event.screenY) - y,
+        width: finiteMouseCoordinate(event.width),
+        height: finiteMouseCoordinate(event.height),
+      },
+    };
   }
 
   override invalidate(): void {
@@ -583,6 +615,10 @@ class BackgroundResultComponent extends Box {
       this.outputPad,
     ));
   }
+}
+
+function finiteMouseCoordinate(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function normalizePreviewLines(value: number | undefined): number {

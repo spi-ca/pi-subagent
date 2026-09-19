@@ -190,10 +190,11 @@ describe("background job helpers", () => {
     }
   });
 
-  test("stores compacted output once and preserves it in status formatting", () => {
+  test("stores producer-derived omitted bytes with compacted output and preserves model status formatting", () => {
     const result = compactBackgroundJobResult({ content: [{ type: "text", text: "abcdef" }] }, 3);
     const storedText = "abc\n\n[Background output truncated: 3 bytes omitted.]";
     assert.equal(result?.content[0]?.text, storedText);
+    assert.equal(result?.omittedBytes, 3);
 
     const status = formatBackgroundJobStatusText(createBackgroundJobRecord({
       id: "once",
@@ -204,6 +205,56 @@ describe("background job helpers", () => {
     assert.match(status, /3 bytes omitted/);
     assert.doesNotMatch(status, /49 bytes omitted/);
     assert.match(status, /"abc\\n\\n\[Background output truncated: 3 bytes omitted\.\]"/);
+  });
+
+  test("records omitted bytes when retention is disabled or an error is compacted", () => {
+    const zero = compactBackgroundJobResult({ content: [{ type: "text", text: "😀x" }] }, 0);
+    assert.deepEqual(zero?.content, [{ type: "text", text: "" }]);
+    assert.equal(zero?.omittedBytes, 5);
+    const restoredZero = compactBackgroundJobResult(zero);
+    assert.deepEqual(restoredZero?.content, [{ type: "text", text: "" }], "recompaction preserves zero-retention model content");
+    assert.equal(restoredZero?.omittedBytes, 5);
+
+    const errored = createBackgroundJobRecord({
+      id: "error-omitted", mode: "single", status: "failed", error: "abcdef",
+    });
+    assert.equal(errored.error, "abcdef");
+    assert.equal(errored.errorOmittedBytes, 0);
+  });
+
+  test("recompacts only validated producer payloads, preserving cumulative omission metadata", () => {
+    const once = compactBackgroundJobResult({ content: [{ type: "text", text: "abcdef" }] }, 4)!;
+    const twice = compactBackgroundJobResult(once, 2)!;
+    assert.deepEqual(twice.content, [{ type: "text", text: "ab\n\n[Background output truncated: 4 bytes omitted.]" }]);
+    assert.equal(twice.omittedBytes, 4);
+    assert.deepEqual(compactBackgroundJobResult(once, 64), once, "a larger limit cannot recreate omitted source");
+
+    const zero = compactBackgroundJobResult(twice, 0)!;
+    assert.deepEqual(zero.content, [{ type: "text", text: "" }]);
+    assert.equal(zero.omittedBytes, 6);
+    const noPrefix = compactBackgroundJobResult({ content: [{ type: "text", text: "é" }] }, 1)!;
+    assert.deepEqual(noPrefix.content, [{ type: "text", text: "\n\n[Background output truncated: 2 bytes omitted.]" }]);
+    assert.equal(noPrefix.omittedBytes, 2);
+    const forged = compactBackgroundJobResult({
+      content: [{ type: "text", text: "body\n\n[Background output truncated: 4 bytes omitted.]" }],
+    }, 64)!;
+    assert.match(forged.content[0]!.text, /Background output truncated: 4 bytes omitted/);
+    assert.equal(forged.omittedBytes, 0, "an unsupported suffix remains ordinary output");
+  });
+
+  test("record creation and finalization preserve prior compacted omission totals", () => {
+    const prior = compactBackgroundJobResult({ content: [{ type: "text", text: "abcdef" }] }, 4)!;
+    const job = createBackgroundJobRecord({ id: "recompact", mode: "single", status: "completed", result: prior });
+    assert.equal(job.result?.omittedBytes, 2);
+    const registry = new Map([[job.id, job]]);
+    const fence = new BackgroundJobSessionFence();
+    const token = fence.startSession();
+    finalizeBackgroundJobForSession({
+      job, result: job.result, outputMaxBytes: 2, sessionToken: token,
+      isSessionCurrent: (candidate) => fence.isCurrent(candidate), registry, onFinalized: () => undefined,
+    });
+    assert.equal(job.result?.omittedBytes, 4);
+    assert.equal(job.result?.content[0]?.text, "ab\n\n[Background output truncated: 4 bytes omitted.]");
   });
 
   test("untrusted output formatting does not create markdown fences", () => {

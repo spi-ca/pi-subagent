@@ -52,6 +52,8 @@ export type BackgroundJobAction = "status" | "cancel";
 export interface BackgroundJobToolResult {
   content: Array<{ type: "text"; text: string }>;
   details?: unknown;
+  /** Producer-derived byte count not retained in compacted `content`. */
+  omittedBytes?: number;
   /** Internal-only foreground-style accounting; compacted job records omit it. */
   usage?: AccountingUsage;
   isError?: boolean;
@@ -67,6 +69,8 @@ export interface BackgroundJobRecord {
   controller?: AbortController;
   result?: BackgroundJobToolResult;
   error?: string;
+  /** Producer-derived byte count not retained in compacted `error`. */
+  errorOmittedBytes?: number;
   agent?: string;
   task?: string;
   taskCount?: number;
@@ -354,22 +358,33 @@ function scanUtf8Prefix(text: string, maxRetainedBytes: number): ScannedTrimmedT
   return { totalBytes, retainedBytes, retainedText: retainedParts.join("") };
 }
 
+interface CompactedBackgroundText {
+  text: string;
+  /** Exact producer-derived bytes omitted from the retained source body. */
+  omittedBytes: number;
+}
+
 function compactRawUtf8Text(
   text: string,
   maxBytes: number,
   notice: (omittedBytes: number) => string,
   reserveNotice: boolean,
-): string {
+): CompactedBackgroundText {
   const limit = normalizeByteLimit(maxBytes);
-  if (limit === 0) return "";
-
   const initial = scanUtf8Prefix(text, limit);
-  if (initial.totalBytes <= limit) return text;
-  if (!reserveNotice) return `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`;
+  if (initial.totalBytes <= limit) return { text, omittedBytes: 0 };
+  if (limit === 0) return { text: "", omittedBytes: initial.totalBytes };
+  if (!reserveNotice) return {
+    text: `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`,
+    omittedBytes: initial.totalBytes - initial.retainedBytes,
+  };
 
   const suffixBytes = Buffer.byteLength(`\n\n${notice(initial.totalBytes)}`, "utf8");
   const retained = scanUtf8Prefix(text, Math.max(0, limit - suffixBytes));
-  return `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`;
+  return {
+    text: `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`,
+    omittedBytes: retained.totalBytes - retained.retainedBytes,
+  };
 }
 
 function compactScannedText(
@@ -377,24 +392,33 @@ function compactScannedText(
   maxBytes: number,
   notice: (omittedBytes: number) => string,
   reserveNotice: boolean,
-): string {
+): CompactedBackgroundText {
   const limit = normalizeByteLimit(maxBytes);
-  if (limit === 0) return "";
-
   const initial = scanTrimmedUtf8(sources, limit);
-  if (initial.totalBytes <= limit) return initial.retainedText.trimEnd();
+  if (initial.totalBytes <= limit) return { text: initial.retainedText.trimEnd(), omittedBytes: 0 };
+  if (limit === 0) return { text: "", omittedBytes: initial.totalBytes };
   if (!reserveNotice) {
-    return `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`;
+    return {
+      text: `${initial.retainedText}\n\n${notice(initial.totalBytes - initial.retainedBytes)}`,
+      omittedBytes: initial.totalBytes - initial.retainedBytes,
+    };
   }
 
   // Reserve the complete suffix before retaining metadata. The initial total
   // is an upper bound for omitted bytes, so this is safe even at digit edges.
   const suffixBytes = Buffer.byteLength(`\n\n${notice(initial.totalBytes)}`, "utf8");
   const retained = scanTrimmedUtf8(sources, Math.max(0, limit - suffixBytes));
-  return `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`;
+  return {
+    text: `${retained.retainedText}\n\n${notice(retained.totalBytes - retained.retainedBytes)}`,
+    omittedBytes: retained.totalBytes - retained.retainedBytes,
+  };
 }
 
 export function truncateBackgroundText(text: string, maxBytes = 16 * 1024): string {
+  return compactRawUtf8Text(text, maxBytes, (omittedBytes) => `[Background output truncated: ${omittedBytes} bytes omitted.]`, false).text;
+}
+
+function truncateBackgroundTextWithMetadata(text: string, maxBytes = 16 * 1024): CompactedBackgroundText {
   return compactRawUtf8Text(text, maxBytes, (omittedBytes) => `[Background output truncated: ${omittedBytes} bytes omitted.]`, false);
 }
 
@@ -404,7 +428,7 @@ function truncateBackgroundMetadata(text: string): string {
     MAX_SUBAGENT_BACKGROUND_METADATA_BYTES,
     (omittedBytes) => `[Background task metadata truncated: ${omittedBytes} bytes omitted.]`,
     true,
-  );
+  ).text;
 }
 
 function backgroundResultTextSources(content: BackgroundJobToolResult["content"]): (visit: (text: string) => void) => void {
@@ -420,7 +444,7 @@ function backgroundResultTextSources(content: BackgroundJobToolResult["content"]
 }
 
 /** Compacts text chunks without first joining or buffering their full output. */
-function compactBackgroundResultText(content: BackgroundJobToolResult["content"], maxBytes = 16 * 1024): string {
+function compactBackgroundResultText(content: BackgroundJobToolResult["content"], maxBytes = 16 * 1024): CompactedBackgroundText {
   return compactScannedText(backgroundResultTextSources(content), maxBytes, (omittedBytes) => `[Background output truncated: ${omittedBytes} bytes omitted.]`, false);
 }
 
@@ -439,13 +463,63 @@ export function formatStoredBackgroundToolText(text: string): string {
   return formatUntrustedJsonText(text);
 }
 
+const BACKGROUND_OUTPUT_TRUNCATION_SUFFIX = /\n\n\[Background output truncated: ([1-9]\d{0,15}) bytes omitted\.]$/;
+
+/**
+ * Recognizes only our own already-compacted payload: metadata and the final
+ * canonical suffix must agree. Other suffix-looking text remains user output.
+ */
+function readCompactedBackgroundResultSource(result: BackgroundJobToolResult): { body: string; omittedBytes: number; zeroRetention: boolean } | undefined {
+  const omittedBytes = result.omittedBytes;
+  if (omittedBytes === undefined || !Number.isSafeInteger(omittedBytes) || omittedBytes <= 0) return undefined;
+  const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+  // Zero-retention records intentionally have no textual suffix.
+  if (text === "") return { body: "", omittedBytes, zeroRetention: true };
+  const match = BACKGROUND_OUTPUT_TRUNCATION_SUFFIX.exec(text);
+  if (!match || Number(match[1]) !== omittedBytes || String(omittedBytes) !== match[1]) return undefined;
+  return { body: text.slice(0, text.length - match[0].length), omittedBytes, zeroRetention: false };
+}
+
+function backgroundOutputTruncationNotice(omittedBytes: number): string {
+  return `[Background output truncated: ${omittedBytes} bytes omitted.]`;
+}
+
 export function compactBackgroundJobResult(result?: BackgroundJobToolResult, maxBytes?: number): BackgroundJobToolResult | undefined {
   if (!result) return undefined;
-  const sources = backgroundResultTextSources(result.content);
-  const hasText = scanTrimmedUtf8(sources, 0).totalBytes > 0;
-  const text = compactBackgroundResultText(result.content, maxBytes);
+  const previous = readCompactedBackgroundResultSource(result);
+  const compacted = previous
+    ? compactRawUtf8Text(previous.body, maxBytes ?? 16 * 1024, backgroundOutputTruncationNotice, false)
+    : compactBackgroundResultText(result.content, maxBytes);
+  const totalOmittedBytes = previous === undefined
+    ? compacted.omittedBytes
+    : previous.omittedBytes + compacted.omittedBytes;
+  // The metadata schema deliberately accepts only exact safe integers. If a
+  // malicious/restored value makes the sum unrepresentable, treat it as an
+  // ordinary payload instead of emitting a false provenance claim.
+  if (!Number.isSafeInteger(totalOmittedBytes)) {
+    const fallback = compactBackgroundResultText(result.content, maxBytes);
+    return {
+      content: scanTrimmedUtf8(backgroundResultTextSources(result.content), 0).totalBytes > 0
+        ? [{ type: "text", text: fallback.text }]
+        : [],
+      omittedBytes: fallback.omittedBytes,
+      isError: result.isError,
+    };
+  }
+  const hasText = previous !== undefined || scanTrimmedUtf8(backgroundResultTextSources(result.content), 0).totalBytes > 0;
+  const retainedBody = compacted.omittedBytes > 0
+    ? compacted.text.slice(0, compacted.text.length - backgroundOutputTruncationNotice(compacted.omittedBytes).length - 2)
+    : compacted.text;
+  // A prior empty payload with omission metadata is the zero-retention
+  // representation. Recompaction cannot recover a prefix, so keep it empty
+  // rather than inventing a suffix; current metadata carries the notice.
+  const text = totalOmittedBytes === 0
+    || (retainedBody === "" && (normalizeByteLimit(maxBytes ?? 16 * 1024) === 0 || previous?.zeroRetention === true))
+    ? retainedBody
+    : `${retainedBody}\n\n${backgroundOutputTruncationNotice(totalOmittedBytes)}`;
   return {
     content: hasText ? [{ type: "text", text }] : [],
+    omittedBytes: totalOmittedBytes,
     isError: result.isError,
   };
 }
@@ -481,7 +555,12 @@ export function createBackgroundJobRecord(options: {
     // Records are observable through status, so never retain caller-sized
     // output buffers even when a helper constructs a terminal record directly.
     result: compactBackgroundJobResult(options.result),
-    error: options.error ? truncateBackgroundText(options.error) : options.error,
+    ...(options.error === undefined
+      ? { error: undefined, errorOmittedBytes: undefined }
+      : (() => {
+        const compactedError = truncateBackgroundTextWithMetadata(options.error);
+        return { error: compactedError.text, errorOmittedBytes: compactedError.omittedBytes };
+      })()),
     agent: options.agent === undefined ? undefined : truncateBackgroundMetadata(options.agent),
     task: options.task === undefined ? undefined : truncateBackgroundMetadata(options.task),
     taskCount: options.taskCount,
@@ -681,9 +760,14 @@ export function finalizeBackgroundJobForSession(options: {
   // Do not retain a live signal (and its listeners) in completed history.
   delete job.controller;
   job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result, options.outputMaxBytes);
-  job.error = status === "cancelled" || !fallbackError
-    ? undefined
-    : truncateBackgroundText(fallbackError, options.outputMaxBytes);
+  if (status === "cancelled" || !fallbackError) {
+    job.error = undefined;
+    job.errorOmittedBytes = undefined;
+  } else {
+    const compactedError = truncateBackgroundTextWithMetadata(fallbackError, options.outputMaxBytes);
+    job.error = compactedError.text;
+    job.errorOmittedBytes = compactedError.omittedBytes;
+  }
   options.registry.set(job.id, job);
   pruneBackgroundJobs(options.registry, {
     maxCompletedJobs: options.maxCompletedJobs,

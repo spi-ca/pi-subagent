@@ -50,7 +50,16 @@ import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSess
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
-import { renderBackgroundResult } from "./src/ui/background-result.js";
+import { createBackgroundResultRenderer } from "./src/ui/background-result.js";
+import {
+  BACKGROUND_JOB_DETAILS_KIND,
+  BACKGROUND_JOB_DETAILS_VERSION,
+  buildBackgroundJobDetailSummary,
+  buildBackgroundJobResultNotification,
+  type BackgroundJobActionDetails,
+} from "./src/core/background-job-details.js";
+import { loadToolDisplayPreviewLines } from "./src/ui/tool-display-config.js";
+import { formatBackgroundResultSelectionNotice, selectRetainedBackgroundResult, showRetainedBackgroundResult } from "./src/ui/background-result-viewer.js";
 import { formatBoundedForegroundEnvelope, formatBoundedForegroundResultRecordEnvelope, formatBoundedForegroundResultSummary, formatBoundedForegroundThrownError } from "./src/core/foreground-output.js";
 import { emptyAccountingUsage, finalizeForegroundUsage, type AccountingUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
@@ -74,7 +83,6 @@ import {
   createBackgroundJobRecord,
   extractToolText,
   finalizeBackgroundJobForSession,
-  formatStoredBackgroundToolText,
   formatBackgroundJobListEntry,
   formatBackgroundJobStatusText,
   formatSubagentSystemPrompt,
@@ -91,6 +99,7 @@ import {
   releaseBackgroundJobReservation,
   reserveBackgroundJob,
   type BackgroundJobRecord,
+  type BackgroundJobSnapshot,
   type BackgroundJobToolResult,
   SubagentParams,
   getProjectRootFromAgentsDir,
@@ -187,27 +196,77 @@ const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
 const backgroundJobs = new Map<string, BackgroundJobRecord>();
 const backgroundJobSettlements = new Map<string, Promise<void>>();
 
-function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): void {
-  const details = {
-    jobId: job.id,
-    status: job.status,
-    startedAt: job.startedAt,
-    completedAt: job.completedAt,
-  };
-  const detailText = job.status === "cancelled" ? "" : extractToolText(job.result);
-  const untrustedOutput = detailText
-    ? `\n\n${formatStoredBackgroundToolText(detailText)}`
-    : "";
-  const errorText = job.error ? `\n\n${formatStoredBackgroundToolText(job.error)}` : "";
-  const content = `Background subagent job ${job.id} ${job.status}.${untrustedOutput || errorText}`;
+/** Display-only normalization; model-visible content and error semantics remain untouched. */
+function sanitizeBackgroundActionDetail(text: string): string {
+  return text
+    .replace(/\p{Surrogate}/gu, "�")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b/g, "")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "");
+}
 
+function truncateBackgroundActionDetail(text: string, maxCodeUnits = 4 * 1024): string {
+  if (text.length <= maxCodeUnits) return text;
+  let end = maxCodeUnits;
+  const prior = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (prior >= 0xd800 && prior <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
+  return text.slice(0, end);
+}
+
+function backgroundJobActionDetails(
+  event: Exclude<BackgroundJobActionDetails["event"], "error" | "status-list">,
+  job: BackgroundJobSnapshot,
+): BackgroundJobActionDetails {
+  return {
+    kind: BACKGROUND_JOB_DETAILS_KIND,
+    version: BACKGROUND_JOB_DETAILS_VERSION,
+    event,
+    job: buildBackgroundJobDetailSummary(job),
+  };
+}
+
+function backgroundJobStatusListDetails(jobs: BackgroundJobSnapshot[], event: "status-list" | "cancel-list" = "status-list"): BackgroundJobActionDetails {
+  const displayed = jobs.slice(0, 512);
+  return {
+    kind: BACKGROUND_JOB_DETAILS_KIND,
+    version: BACKGROUND_JOB_DETAILS_VERSION,
+    event,
+    jobs: displayed.map(buildBackgroundJobDetailSummary),
+    ...(jobs.length === displayed.length ? {} : { omittedJobCount: jobs.length - displayed.length }),
+  };
+}
+
+function backgroundOperationForStructuredError(input: unknown): "start" | "status" | "cancel" | undefined {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const value = input as { action?: unknown; background?: unknown };
+  if (value.action === "status" || value.action === "cancel") return value.action;
+  return value.background === true ? "start" : undefined;
+}
+
+function boundedBackgroundErrorReason(content: unknown): string {
+  if (!Array.isArray(content)) return "Background subagent operation failed.";
+  const text = content.find((item): item is { type: "text"; text: string } =>
+    item !== null && typeof item === "object"
+    && (item as { type?: unknown }).type === "text"
+    && typeof (item as { text?: unknown }).text === "string",
+  )?.text;
+  return text && text.length > 0
+    ? truncateBackgroundActionDetail(sanitizeBackgroundActionDetail(text))
+    : "Background subagent operation failed.";
+}
+
+function notifyBackgroundJobResult(pi: ExtensionAPI, job: BackgroundJobRecord): void {
+  const notification = buildBackgroundJobResultNotification(job);
   try {
     pi.sendMessage(
       {
         customType: BACKGROUND_RESULT_CUSTOM_TYPE,
-        content,
+        content: notification.content,
         display: true,
-        details,
+        details: notification.details,
       },
       { triggerTurn: true, deliverAs: "steer" },
     );
@@ -527,7 +586,29 @@ async function requestProjectAgentApprovalIfNeeded(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, renderBackgroundResult);
+  // The registered wrapper stays stable while session_start swaps in the current
+  // global tool-display preview budget (including after /reload).
+  let backgroundResultRenderer = createBackgroundResultRenderer();
+  pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
+    backgroundResultRenderer(message, options, theme),
+  );
+  pi.registerCommand("subagent-result", {
+    description: "Open a retained background subagent result by current-branch job ID or unique prefix",
+    handler: async (rawArgs, ctx) => {
+      if (ctx.mode !== "tui" || !ctx.hasUI) {
+        if (ctx.hasUI) ctx.ui.notify("/subagent-result is available only in the interactive terminal UI.", "warning");
+        return;
+      }
+      const selection = selectRetainedBackgroundResult(ctx.sessionManager.getBranch(), rawArgs);
+      if (selection.kind !== "selected") {
+        ctx.ui.notify(formatBackgroundResultSelectionNotice(selection), "warning");
+        return;
+      }
+      // The editor is a viewer only: its return value (including cancellation)
+      // is deliberately ignored and never reaches a shell, clipboard, file, or provider.
+      await showRetainedBackgroundResult(selection.result, ctx.ui);
+    },
+  });
   pi.registerFlag("subagent-max-depth", {
     description: "Maximum allowed subagent delegation depth (default: 5).",
     type: "string",
@@ -568,6 +649,24 @@ export default function (pi: ExtensionAPI) {
   let limits = resolveSubagentLimits({ getFlag: (name) => pi.getFlag(name) });
   const { currentDepth, maxDepth, canDelegate, ancestorAgentStack, preventCycles } =
     depthConfig;
+  // Do not subscribe at a depth where this extension does not own the tool:
+  // another extension's same-named result must retain its own details.
+  if (canDelegate) {
+    pi.on("tool_result", (event) => {
+      if (event.toolName !== "subagent" || !event.isError) return;
+      const operation = backgroundOperationForStructuredError(event.input);
+      if (!operation) return;
+      return {
+        details: {
+          kind: BACKGROUND_JOB_DETAILS_KIND,
+          version: BACKGROUND_JOB_DETAILS_VERSION,
+          event: "error" as const,
+          operation,
+          reason: boundedBackgroundErrorReason(event.content),
+        },
+      };
+    });
+  }
   const scheduler = new ProcessLocalScheduler(limits.maxActive);
   // A scheduler handle is invocation authority. Fork managers never cross this
   // generation:id boundary, including concurrent/background invocations.
@@ -908,6 +1007,10 @@ export default function (pi: ExtensionAPI) {
 
   // Auto-discover agents on session start
   pi.on("session_start", async (_event, ctx) => {
+    // The host rebuilds message components for replacement/reload. Do not let
+    // an old card's local click state cross that session boundary.
+    backgroundResultRenderer.reset();
+    const toolDisplayPreviewLines = loadToolDisplayPreviewLines();
     // This preamble intentionally has no await. A replacement session must
     // fence old finalizers before a slow config read can yield to them.
     const startupGeneration = ++sessionStartupGeneration;
@@ -958,15 +1061,21 @@ export default function (pi: ExtensionAPI) {
       // authorization; explicit inherited denials still take priority.
       { preserveInheritedSessionTrustOnDeny: currentDepth > 0 },
     );
-    const resolvedLimits = await resolveSubagentLimitsForSession({
-      agentDir: getActiveAgentDir(),
-      cwd: ctx.cwd,
-      configDirName: CONFIG_DIR_NAME,
-      projectTrusted: trustedProject,
-      getFlag: (name) => pi.getFlag(name),
-    });
+    const [resolvedLimits, previewLines] = await Promise.all([
+      resolveSubagentLimitsForSession({
+        agentDir: getActiveAgentDir(),
+        cwd: ctx.cwd,
+        configDirName: CONFIG_DIR_NAME,
+        projectTrusted: trustedProject,
+        getFlag: (name) => pi.getFlag(name),
+      }),
+      toolDisplayPreviewLines,
+    ]);
     if (!isStartupCurrent()) return;
 
+    // This session-local renderer factory applies only the documented global
+    // tool-display previewLines setting; expanded output keeps its fixed cap.
+    backgroundResultRenderer = createBackgroundResultRenderer({ previewLines });
     limits = resolvedLimits;
     // Scheduler subscriptions publish immediately. Reset its queue before
     // registering dashboard/presence observers so they cannot project stale
@@ -1228,7 +1337,7 @@ export default function (pi: ExtensionAPI) {
               }
               return {
                 content: [{ type: "text", text: formatBackgroundJobStatusText(job) }],
-                details: earlyToolDetails,
+                details: backgroundJobActionDetails("status", job),
               };
             }
 
@@ -1240,7 +1349,7 @@ export default function (pi: ExtensionAPI) {
                   ? `Background subagent jobs (${jobs.length}):\n${jobs.map((job) => formatBackgroundJobListEntry(job)).join("\n")}`
                   : "No background subagent jobs.",
               }],
-              details: earlyToolDetails,
+              details: backgroundJobStatusListDetails(jobs),
             };
           }
 
@@ -1253,19 +1362,22 @@ export default function (pi: ExtensionAPI) {
             if (cancellation.cancelled.length > 0) {
               return {
                 content: [{ type: "text", text: `Requested cancellation for background subagent job ${params.id}.` }],
-                details: earlyToolDetails,
+                details: backgroundJobActionDetails("cancellation-requested", cancellation.cancelled[0]!),
               };
             }
             const terminalJob = cancellation.terminal[0];
-            return {
-              content: [{
-                type: "text",
-                text: terminalJob
-                  ? `Background subagent job ${terminalJob.id} is already ${terminalJob.status}.`
-                  : `Background subagent job ${params.id} is not running.`,
-              }],
-              details: earlyToolDetails,
-            };
+            return terminalJob
+              ? {
+                content: [{
+                  type: "text",
+                  text: `Background subagent job ${terminalJob.id} is already ${terminalJob.status}.`,
+                }],
+                details: backgroundJobActionDetails("already-terminal", terminalJob),
+              }
+              : {
+                content: [{ type: "text", text: `Background subagent job ${params.id} is not running.` }],
+                details: earlyToolDetails,
+              };
           }
 
           return {
@@ -1275,7 +1387,7 @@ export default function (pi: ExtensionAPI) {
                 ? `Requested cancellation for ${cancellation.cancelled.length} background subagent job(s): ${cancellation.cancelled.map((job) => job.id).join(", ")}.`
                 : "No running background subagent jobs.",
             }],
-            details: earlyToolDetails,
+            details: backgroundJobStatusListDetails(cancellation.cancelled, "cancel-list"),
           };
         }
 
@@ -1740,7 +1852,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               text: `Started background subagent job ${job.id}. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
             }],
             details: {
-              ...makeDetails(intendedMode, detailsExtras)([]),
+              ...backgroundJobActionDetails("accepted", job),
+              // These top-level fields are part of the established start-result contract.
               jobId: job.id,
               status: job.status,
             },

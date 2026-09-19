@@ -19,6 +19,7 @@ import { settleWithUnrefTimeout } from "../../src/core/async-settle";
 import { buildChildProcessEnv } from "../../src/runtime/runner";
 import { ForkSourceOwnershipManager } from "../../src/runtime/fork-source-ownership";
 import { PI_SUBAGENT_DASHBOARD_EVENT, type PiSubagentDashboardPayload } from "../../src/integration/pi-cmux-contract";
+import { parseBackgroundJobActionDetails } from "../../src/core/background-job-details";
 
 const { ProcessLocalScheduler: RealProcessLocalScheduler } = await import("../../src/runtime/process-local-scheduler");
 const { createPiSubagentPresenceProducer: createRealPiSubagentPresenceProducer } = await import("../../src/integration/pi-presence-producer");
@@ -170,6 +171,7 @@ describe("production dashboard boundary", () => {
 
   test("registers the display-only background result renderer even when depth disables the tool", () => {
     const renderers = new Map<string, unknown>();
+    const registeredEvents: string[] = [];
     let registeredTools = 0;
     registerPiSubagent({
       registerMessageRenderer: (customType: string, renderer: unknown) => renderers.set(customType, renderer),
@@ -177,13 +179,14 @@ describe("production dashboard boundary", () => {
       getFlag: (name: string) => name === "subagent-max-depth" ? "0" : undefined,
       registerCommand: () => undefined,
       registerTool: () => { registeredTools += 1; },
-      on: () => undefined,
+      on: (event: string) => { registeredEvents.push(event); },
       events: { emit: () => undefined },
       getAllTools: () => [],
       getCommands: () => [],
     } as never);
     assert.equal(registeredTools, 0);
     assert.equal(renderers.size, 1);
+    assert.ok(!registeredEvents.includes("tool_result"), "depth-disabled extensions must not alter another extension's subagent result");
     const renderer = renderers.get("subagent_result") as (message: unknown, options: unknown, theme: unknown) => { children: Array<{ render: (width: number) => string[] }> };
     assert.equal(typeof renderer, "function");
     const component = renderer(
@@ -192,6 +195,30 @@ describe("production dashboard boundary", () => {
       { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text },
     );
     assert.match(component.children[0]!.render(100).join("\n"), /Alt\+E/, "the renderer uses the configured expansion binding rather than its fallback");
+  });
+
+  test("keeps structured error reasons parser-valid at a surrogate boundary", () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const handlers = new Map<string, (...args: any[]) => unknown>();
+    try {
+      process.env.PI_SUBAGENT_DEPTH = "0";
+      registerPiSubagent({
+        registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
+        registerCommand: () => undefined, registerTool: () => undefined,
+        on: (event: string, handler: (...args: any[]) => unknown) => handlers.set(event, handler),
+        events: { emit: () => undefined }, getAllTools: () => [], getCommands: () => [],
+      } as never);
+      const result = handlers.get("tool_result")!({
+        toolName: "subagent", isError: true, input: { action: "status" },
+        content: [{ type: "text", text: `${"x".repeat(4_095)}😀` }],
+      }) as { details: unknown };
+      assert.ok(result);
+      assert.ok(parseBackgroundJobActionDetails(result.details));
+      assert.doesNotMatch((result.details as { reason: string }).reason, /\p{Surrogate}/u);
+    } finally {
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
   });
 
   test("reports absent, invalid, and valid Herdr identities in doctor output without exposing identity values", async () => {

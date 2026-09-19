@@ -76,7 +76,7 @@ Pi에서 첫 작업을 위임합니다.
 { "agent": "writer", "task": "Draft release notes", "background": true }
 ```
 
-이 호출은 즉시 반환합니다. 결과가 도착하기 전에 결과를 만들거나 요약하지 말고, 반복 polling·sleep·로그 tail·대기 루프를 사용하지 마세요. 독립 작업을 계속하거나 턴을 끝내면 완료·실패·취소 결과가 steer 메시지로 자동 전달됩니다. 현재 프로세스의 작업은 `subagent({ action: "status" })`와 `subagent({ action: "cancel", id })`로 확인·취소할 수 있습니다. 보존 범위와 결과 wrapper를 포함한 정확한 계약은 [백그라운드 실행](docs/usage.md#백그라운드-실행-계약)을 참고하세요.
+이 호출은 즉시 **접수** 결과를 반환합니다. 이는 job이 registry에서 `running`으로 기록되었다는 뜻이지 child가 이미 실행 중이라는 보장은 아닙니다. 결과가 도착하기 전에 결과를 만들거나 요약하지 말고, 반복 polling·sleep·로그 tail·대기 루프를 사용하지 마세요. 독립 작업을 계속하거나 턴을 끝내면 실제 완료·실패·취소의 terminal 결과가 steer 메시지로 자동 전달됩니다. `cancel` 응답도 취소 요청을 접수해 `cancelling`으로 바꾼 acknowledgement일 뿐 terminal 결과가 아니므로 `status`로 실제 종료를 확인한 뒤에만 새 작업을 시작하세요. 현재 프로세스의 작업은 `subagent({ action: "status" })`와 `subagent({ action: "cancel", id })`로 확인·취소할 수 있습니다. TUI에서 표시 상한에 걸린 결과는 `/subagent-result <job-id 또는 고유 prefix>`로 현재 branch의 보존된 본문만 display-only로 열 수 있습니다. `pi-tool-display`의 전역 `extensions/pi-tool-display/config.json`의 `previewLines`(1–80)도 접힌 미리보기에 적용하며, 변경 뒤에는 `/reload` 또는 새 세션이 필요합니다. 보존 범위와 결과 wrapper를 포함한 정확한 계약은 [백그라운드 실행](docs/usage.md#백그라운드-실행-계약)을 참고하세요.
 
 ## 실행과 신뢰 경계
 

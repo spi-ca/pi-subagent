@@ -9,6 +9,8 @@ import { getResultSummaryText } from "../core/runner-events.js";
 import { getStageLabel } from "../core/chain-helpers.js";
 import { parseBackgroundJobActionDetails, type BackgroundJobDetailSummary } from "../core/background-job-details.js";
 import { configuredExpandHint } from "./expand-hint.js";
+import { InlineResultCard } from "./inline-result-card.js";
+import { INLINE_PRESENTATION_MAX_CARDS, type InlinePresentationRegistry } from "./inline-presentation.js";
 import {
 	type DelegationMode,
 	type DisplayItem,
@@ -404,14 +406,29 @@ function isSubagentDetails(value: unknown): value is SubagentDetails {
 		.every((key) => value[key] === undefined || isNonNegativeSafeInteger(value[key]));
 }
 
+export interface InlineResultRenderContext {
+	toolCallId?: unknown;
+}
+
 export function renderResult(
 	result: { content: Array<{ type: string; text?: string }>; details?: unknown },
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	context?: InlineResultRenderContext,
+	inlinePresentationRegistry?: InlinePresentationRegistry,
 ): Container | Text {
 	const backgroundDetails = parseBackgroundJobActionDetails(result.details);
 	if (backgroundDetails) return renderBackgroundJobAction(backgroundDetails, expanded, theme);
 	const details = isSubagentDetails(result.details) ? result.details : undefined;
+	const toolCallId = typeof context?.toolCallId === "string" ? context.toolCallId : undefined;
+	// Foreground failures and cancellation are thrown by execute(), so Pi may
+	// render a host error without the structured details. The registry is an
+	// UI-only terminal snapshot keyed by the existing call ID and preserves the
+	// card without changing that thrown-error contract.
+	if ((!details || details.results.length === 0) && toolCallId && inlinePresentationRegistry) {
+		const cards = renderInlineResultSnapshotCards(toolCallId, expanded, theme, inlinePresentationRegistry);
+		if (cards) return cards;
+	}
 	if (!details || details.results.length === 0) {
 		return new Text(rawResultFallback(result.content), 0, 0);
 	}
@@ -424,10 +441,47 @@ export function renderResult(
 		false,
 	);
 	const terminalMode = normalizedTerminalMode === "invalid" ? DEFAULT_TERMINAL_MODE : normalizedTerminalMode;
+	if (terminalMode === "inline" && toolCallId && inlinePresentationRegistry) {
+		const cards = renderInlineResultCards(details, toolCallId, expanded, theme, inlinePresentationRegistry);
+		if (cards) return cards;
+	}
 	if (details.mode === "single") {
 		return renderSingleResult(details.toolLabel || SUBAGENT_TOOL_LABEL, details.results[0], delegationMode, terminalMode, expanded, theme);
 	}
 	return renderParallelResult(details, details.toolLabel || SUBAGENT_TOOL_LABEL, delegationMode, terminalMode, expanded, theme);
+}
+
+function renderInlineResultCards(
+	details: SubagentDetails,
+	toolCallId: string,
+	expanded: boolean,
+	theme: { fg: ThemeFg; bold: (s: string) => string },
+	registry: InlinePresentationRegistry,
+): Container | undefined {
+	const container = new Container();
+	let count = 0;
+	for (let index = 0; index < Math.min(details.results.length, INLINE_PRESENTATION_MAX_CARDS); index += 1) {
+		const presentation = registry.get(toolCallId, details.results, index);
+		if (!presentation) continue;
+		container.addChild(new InlineResultCard(presentation, registry.state(toolCallId, presentation.identity, expanded), theme));
+		count += 1;
+	}
+	return count > 0 ? container : undefined;
+}
+
+function renderInlineResultSnapshotCards(
+	toolCallId: string,
+	expanded: boolean,
+	theme: { fg: ThemeFg; bold: (s: string) => string },
+	registry: InlinePresentationRegistry,
+): Container | undefined {
+	const cards = registry.all().filter((entry) => entry.toolCallId === toolCallId);
+	if (cards.length === 0) return undefined;
+	const container = new Container();
+	for (const { card } of cards) {
+		container.addChild(new InlineResultCard(card, registry.state(toolCallId, card.identity, expanded), theme));
+	}
+	return container;
 }
 
 // ---------------------------------------------------------------------------

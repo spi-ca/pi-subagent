@@ -55,6 +55,106 @@ export function canonicalAssistantMessage(message) {
   return stableStringify(message);
 }
 
+const INLINE_PRESENTATION_MAX_ACTIVITY = 16;
+const INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS = 4 * 1024;
+const INLINE_PRESENTATION_MAX_TOOL_NAME_CODE_UNITS = 128;
+const inlinePresentations = new WeakMap();
+
+function truncatePresentationText(text, maxCodeUnits = INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS) {
+  if (text.length <= maxCodeUnits) return text;
+  let end = maxCodeUnits;
+  const prior = text.charCodeAt(end - 1);
+  const next = text.charCodeAt(end);
+  if (prior >= 0xd800 && prior <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
+  return `${text.slice(0, end)}…`;
+}
+
+function boundedPresentationToolName(value) {
+  if (typeof value !== "string" || value.length === 0) return "tool";
+  return truncatePresentationText(value, INLINE_PRESENTATION_MAX_TOOL_NAME_CODE_UNITS) || "tool";
+}
+
+/**
+ * Process-local inline presentation only. The WeakMap deliberately leaves
+ * public tool results untouched, including Object/Reflect own-key inspection.
+ */
+export function ensureInlinePresentation(result) {
+  if (!result || (typeof result !== "object" && typeof result !== "function")) return undefined;
+  let presentation = inlinePresentations.get(result);
+  if (!presentation) {
+    presentation = { lastAssistantText: "", activities: [], revision: 0, nextActivity: 0 };
+    inlinePresentations.set(result, presentation);
+  }
+  return presentation;
+}
+
+export function getInlinePresentation(result) {
+  return result && (typeof result === "object" || typeof result === "function")
+    ? inlinePresentations.get(result)
+    : undefined;
+}
+
+function completedAssistantText(message) {
+  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
+  // message_end is also emitted for failures, aborts, and host-pending
+  // placeholders. Those are not a completed assistant response and must not
+  // replace the last valid preview.
+  if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "pending" || message.status === "pending") return "";
+  return truncatePresentationText(message.content
+    .filter((part) => part?.type === "text" && typeof part.text === "string" && part.text.length > 0)
+    .map((part) => part.text)
+    .join("\n"));
+}
+
+function updateInlinePresentation(presentation, event) {
+  if (!presentation || !event || typeof event !== "object") return false;
+  if (event.type === "message_end") {
+    const text = completedAssistantText(event.message);
+    if (!text || text === presentation.lastAssistantText) return false;
+    presentation.lastAssistantText = text;
+    presentation.revision += 1;
+    return true;
+  }
+  if (event.type === "agent_end") {
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    // An agent-end snapshot can finish with an error/abort placeholder after a
+    // valid turn. Walk backward until a non-empty completed response is found.
+    let text = "";
+    for (let index = messages.length - 1; index >= 0 && !text; index -= 1) {
+      text = completedAssistantText(messages[index]);
+    }
+    if (!text || text === presentation.lastAssistantText) return false;
+    presentation.lastAssistantText = text;
+    presentation.revision += 1;
+    return true;
+  }
+  if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return false;
+
+  // Tool call IDs are only a bounded process-local correlation key. Never
+  // copy an unbounded ID into a public result or retained presentation record.
+  const id = typeof event.toolCallId === "string"
+    ? truncatePresentationText(event.toolCallId, INLINE_PRESENTATION_MAX_TOOL_NAME_CODE_UNITS)
+    : `event-${presentation.nextActivity++}`;
+  const name = boundedPresentationToolName(event.toolName);
+  const status = event.type === "tool_execution_start" ? "running" : event.isError ? "failed" : "completed";
+  const index = presentation.activities.findIndex((activity) => activity.id === id);
+  if (index >= 0) {
+    const activity = presentation.activities[index];
+    if (activity.name === name && activity.status === status) return false;
+    activity.name = name;
+    activity.status = status;
+  } else {
+    presentation.activities.push({ id, name, status });
+    if (presentation.activities.length > INLINE_PRESENTATION_MAX_ACTIVITY) presentation.activities.shift();
+  }
+  presentation.revision += 1;
+  return true;
+}
+
+function updateInlinePresentationForEvent(options, event) {
+  return updateInlinePresentation(options.presentation, event);
+}
+
 function toolCallIdentity(message) {
   return typeof message?.toolCallId === "string"
     ? message.toolCallId
@@ -339,6 +439,11 @@ async function appendNewAssistantMessages(index, result, previousMessageLength) 
 export function processPiEvent(event, result, options = {}) {
   if (!event || typeof event !== "object") return false;
 
+  // This display-only side channel is never serialized or returned by this
+  // parser. It emits only completed assistant text and tool name/status.
+  // Its result is combined below, after all public parser mutation is done.
+  const presentationChanged = updateInlinePresentationForEvent(options, event);
+
   // Summary-generation usage has no public assistant message or callback.
   // Account it before handling the normal lifecycle event, but preserve the
   // historical return value so caller update ordering remains unchanged.
@@ -349,7 +454,7 @@ export function processPiEvent(event, result, options = {}) {
       if (event.message?.role === "assistant") {
         setCurrentTurnHandled(result, false);
       }
-      return false;
+      return presentationChanged;
 
     case "message_end": {
       const changed = addAssistantMessage(result, event.message);
@@ -363,7 +468,7 @@ export function processPiEvent(event, result, options = {}) {
         setProcessedAssistantCount(result, getProcessedAssistantCount(result) + 1);
         setCurrentTurnHandled(result, true);
       }
-      return changed;
+      return changed || presentationChanged;
     }
 
     case "turn_end": {
@@ -375,14 +480,14 @@ export function processPiEvent(event, result, options = {}) {
         setProcessedAssistantCount(result, getProcessedAssistantCount(result) + 1);
       }
       setCurrentTurnHandled(result, false);
-      return changed;
+      return changed || presentationChanged;
     }
 
     case "agent_end": {
       result.sawAgentEnd = true;
       const changed = addAssistantMessages(result, event.messages);
       collectPiToolResultUsage(result, event.messages, "agent_end", true);
-      return changed;
+      return changed || presentationChanged;
     }
 
     case "tool_execution_end":
@@ -396,10 +501,10 @@ export function processPiEvent(event, result, options = {}) {
           usage: event.result.usage,
         }, { source: "tool_execution_end" });
       }
-      return false;
+      return presentationChanged;
 
     default:
-      return false;
+      return presentationChanged;
   }
 }
 
@@ -420,7 +525,7 @@ export function processPiJsonLine(line, result) {
  * Async inline-runner variant. The optional index only proposes an overlap;
  * public result.messages always performs the final canonical equality check.
  */
-export async function processPiJsonLineWithAssistantSignatureIndex(line, result, index) {
+export async function processPiJsonLineWithAssistantSignatureIndex(line, result, index, options = {}) {
   if (!line.trim()) return false;
 
   let event;
@@ -432,6 +537,7 @@ export async function processPiJsonLineWithAssistantSignatureIndex(line, result,
 
   const previousMessageLength = result.messages.length;
   if (event?.type === "agent_end" && index) {
+    const presentationChanged = updateInlinePresentationForEvent(options, event);
     result.sawAgentEnd = true;
     const assistantMessages = Array.isArray(event.messages)
       ? event.messages.filter((message) => message?.role === "assistant")
@@ -446,10 +552,10 @@ export async function processPiJsonLineWithAssistantSignatureIndex(line, result,
     const changed = addAssistantMessages(result, event.messages, overlap);
     collectPiToolResultUsage(result, event.messages, "agent_end", true);
     await appendNewAssistantMessages(index, result, previousMessageLength);
-    return changed;
+    return changed || presentationChanged;
   }
 
-  const changed = processPiEvent(event, result);
+  const changed = processPiEvent(event, result, options);
   if (index) await appendNewAssistantMessages(index, result, previousMessageLength);
   return changed;
 }

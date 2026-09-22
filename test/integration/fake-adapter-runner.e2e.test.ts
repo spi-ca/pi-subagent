@@ -216,7 +216,7 @@ const rows = (separator, format) => {
   const value = current();
   const source = ["%1", "$1", "@1", String(value.sourcePid)];
   const target = value.target && !value.closed ? ["%2", "$1", "@2", String(value.target)] : null;
-  if (format.includes("pane_dead")) return [source, target].filter(Boolean).map((row) => [row[0], "0", row[0] === "%2" ? "fake-target" : "source-sentinel", row[3]].join("\|")).join("\\n") + "\\n";
+  if (format.includes("pane_dead")) return [source, target].filter(Boolean).map((row) => [row[0], "0", row[3]].join("\|")).join("\\n") + "\\n";
   if (format.includes("session_id") && format.startsWith("#{session_id}")) return [source, target].filter(Boolean).map((row) => [row[1], row[2], row[0], row[3]].join("|")).join("\\n") + "\\n";
   if (format.includes("session_id")) return [source, target].filter(Boolean).map((row) => row.join("|")).join("\\n") + "\\n";
   return [source, target].filter(Boolean).map((row) => [row[0], row[3]].join(separator)).join("\\n") + "\\n";
@@ -376,7 +376,9 @@ describe("fake-adapter interactive runAgent E2E", () => {
 
       await phase("external-close", async () => {
       const externallyClosing = runFake("hold for external close");
-      await waitFor(() => listActiveInteractiveRunIds()[0], "externally closed active run");
+      const externalRunId = await waitFor(() => listActiveInteractiveRunIds()[0], "externally closed active run");
+      const externalIntent = JSON.parse(await fs.promises.readFile(path.join(stateRoot, externalRunId, "launch-intent.json"), "utf8"));
+      assert.equal(externalIntent.version, 2, "the fake adapter deliberately exercises the no-control V2 path");
       const external = JSON.parse(await fs.promises.readFile(`${socketPath}.fake-state.json`, "utf8"));
       external.closed = true;
       external.externalClose = true;

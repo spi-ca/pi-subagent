@@ -171,11 +171,12 @@ async function setupBridge(runId: string, options: {
 	let leaseWrite = Promise.resolve();
 	let leaseStopped = false;
 	let leaseStopTask: Promise<void> | undefined;
-	const renewLease = () => {
+	const heartbeat = async () => {
 		if (leaseStopped) return;
 		leaseWrite = leaseWrite.then(writeLease).catch(() => undefined);
+		await leaseWrite;
 	};
-	const leaseTimer = options.maintainLiveLease === false ? undefined : setInterval(renewLease, 20);
+	const leaseTimer = options.maintainLiveLease === false ? undefined : setInterval(() => { void heartbeat(); }, 20);
 	const stopAndDrainLeaseRenewals = () => leaseStopTask ??= (async () => {
 		leaseStopped = true;
 		if (leaseTimer) clearInterval(leaseTimer);
@@ -243,7 +244,7 @@ async function setupBridge(runId: string, options: {
 	activeBridgeShutdowns.push(shutdownAndDrain);
 	return {
 		paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit,
-		stopAndDrainLeaseRenewals, shutdownAndDrain, drainEventTasks, waitForShutdown: () => shutdownReached.promise,
+		heartbeat, stopAndDrainLeaseRenewals, shutdownAndDrain, drainEventTasks, waitForShutdown: () => shutdownReached.promise,
 	};
 }
 
@@ -702,6 +703,9 @@ describe("child lifecycle bridge", () => {
 
 	test("completes settled turns", async () => {
 		const bridge = await setupBridge("run-complete");
+		// This fake parent must publish a confirmed fresh heartbeat immediately
+		// before the child's initial hard lease gate.
+		await bridge.heartbeat();
 		await bridge.emit("session_start", { reason: "startup" });
 		await bridge.emit("agent_start");
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });

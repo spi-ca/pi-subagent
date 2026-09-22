@@ -810,8 +810,11 @@ describe("two-tier gated Phase 0 live harness", () => {
 
   test("binds the stopped bootstrap watchdog, disarms it, and preserves the exact parent identity through exec", async () => {
     if (process.platform === "win32") return;
-    const root = await createPrivateEvidenceRoot(), executableRoot = await fs.mkdtemp(path.join(os.homedir(), ".managed-child-pi-live-")), executable = path.join(executableRoot, "pi");
-    await fs.chmod(executableRoot, 0o700); await fs.writeFile(executable, "#!/bin/sh\n/bin/sleep 0.2\nexit 1\n", { mode: 0o700 }); await fs.chmod(executable, 0o700);
+    const root = await createPrivateEvidenceRoot(), executableRoot = await fs.mkdtemp(path.join(os.homedir(), ".managed-child-pi-live-")), executable = path.join(executableRoot, "pi"), releasePath = path.join(executableRoot, "release");
+    // Hold the no-provider surrogate open until the exact post-disarm hook has
+    // observed the parent. A fixed sleep can expire while a hosted runner has
+    // descheduled this test between SIGCONT and the identity probe.
+    await fs.chmod(executableRoot, 0o700); await fs.writeFile(executable, `#!/bin/sh\nwhile [ ! -f ${JSON.stringify(releasePath)} ]; do /bin/sleep 0.01; done\nexit 1\n`, { mode: 0o700 }); await fs.chmod(executable, 0o700);
     const generation = captureManagedChildPiExecutableGeneration(executable);
     const pi: LivePiExecutable = { bin: generation.executable, version: "0.81.1", generation, tmux: generation, cmux: generation };
     const originalKill = process.kill, signals: Array<{ pid: number; signal: number | NodeJS.Signals | undefined }> = [];
@@ -821,7 +824,7 @@ describe("two-tier gated Phase 0 live harness", () => {
       await runParentCell(root, "/fixture/agent", "/fixture/extension", pi, 1, "short-response", { PATH: process.env.PATH }, {}, undefined, true, { expiresAt: Date.now() + 5_000 }, {
         bootstrapBindTimeoutMs: 1_000,
         afterBootstrapWatchdogBound: (_parent, binding) => { watchdog = binding.watchdog; sleepHelper = binding.sleepHelper; },
-        afterBootstrapResumed: (identity) => { resumed = identity; },
+        afterBootstrapResumed: async (identity) => { resumed = identity; await fs.writeFile(releasePath, "", { mode: 0o600 }); },
         skipStagedBundleRevalidation: true,
       });
     } catch (error) { thrown = error; }

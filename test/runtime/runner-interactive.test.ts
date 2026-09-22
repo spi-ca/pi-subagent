@@ -2766,6 +2766,21 @@ describe("interactive pane runner preparation", () => {
 		}
 	});
 
+	test("does not fall back to a CLI snapshot when a V3 tmux lease loses its accepted epoch", async () => {
+		let commands = 0;
+		const snapshot = await inspectActiveTmuxSnapshotForTest({
+			handle: { mode: "tmux-pane", native: {
+				paneId: "%2", panePid: 102, serverPid: 100, socketPath: "/private/socket",
+				generation: { socketPath: "/intentionally-unavailable/socket", socketDev: "1", socketIno: "1", serverStartedAt: 1 },
+			} },
+			run: async () => { commands += 1; return { exitCode: 0, stdout: "%2|0|102\\n", stderr: "", aborted: false }; },
+			backendKey: "must-not-use-cli", generation: getInteractiveShutdownGenerationForTest(),
+			tmuxAcceptedTransport: () => null,
+		});
+		assert.equal(snapshot, undefined);
+		assert.equal(commands, 0, "V3 loss remains unavailable for reconnect rather than issuing an unproven CLI read");
+	});
+
 	test("does not spend inspection failures on 16 mutation-invalidated snapshots and applies a stable completion", async () => {
 		const workspaceId = "123e4567-e89b-12d3-a456-426614174100";
 		const paneId = "123e4567-e89b-12d3-a456-426614174101";

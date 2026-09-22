@@ -84,8 +84,19 @@ mock.module("../../src/runtime/process-local-scheduler", () => ({
 }));
 
 mock.module("@earendil-works/pi-tui", () => ({
-  Box: class {},
-  Container: class {}, Markdown: class {}, Spacer: class {}, Text: class {},
+  Box: class {
+    children: unknown[] = [];
+    addChild(child: unknown): void { this.children.push(child); }
+    clear(): void { this.children = []; }
+    invalidate(): void {}
+  },
+  Container: class {
+    children: unknown[] = [];
+    addChild(child: unknown): void { this.children.push(child); }
+    clear(): void { this.children = []; }
+    invalidate(): void {}
+  },
+  Markdown: class {}, Spacer: class {}, Text: class {},
   visibleWidth: (text: string) => text.length,
   wrapTextWithAnsi: (text: string, width: number) => [text.slice(0, width)],
   truncateToWidth: (text: string, width: number) => text.slice(0, width),
@@ -143,12 +154,12 @@ mock.module("../../src/runtime/runner", () => ({
 }));
 const { default: registerPiSubagent } = await import("../../index");
 
-type Tool = { name?: string; execute?: (...args: any[]) => Promise<any> };
+type Tool = { name?: string; execute?: (...args: any[]) => Promise<any>; renderResult?: (...args: any[]) => unknown };
 type SessionContext = {
   cwd: string;
   hasUI: boolean;
   isIdle: () => boolean;
-  ui: { notify: () => void; confirm: () => Promise<false>; setStatus: (key: string, value: string | undefined) => void };
+  ui: { notify: () => void; confirm: () => Promise<false>; setStatus: (key: string, value: string | undefined) => void; setWidget?: (key: string, value: unknown) => void };
   sessionManager: { getSessionId: () => string; getSessionFile: () => undefined };
 };
 
@@ -296,6 +307,7 @@ describe("session-start background completion fence", () => {
     const secret = "send-message-secret";
     let runnerAttempts = 0;
     let deliveryAttempts = 0;
+    const widgetCalls: Array<{ key: string; value: unknown }> = [];
 
     try {
       configDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-background-delivery-"));
@@ -314,9 +326,14 @@ describe("session-start background completion fence", () => {
       let subagentTool: Tool | undefined;
       const context: SessionContext = {
         cwd: configDir,
-        hasUI: false,
+        hasUI: true,
         isIdle: () => true,
-        ui: { notify: () => undefined, confirm: async () => false, setStatus: () => undefined },
+        ui: {
+          notify: () => undefined,
+          confirm: async () => false,
+          setStatus: () => undefined,
+          setWidget: (key, value) => { widgetCalls.push({ key, value }); },
+        },
         sessionManager: { getSessionId: () => "delivery", getSessionFile: () => undefined },
       };
       registerPiSubagent({
@@ -341,6 +358,9 @@ describe("session-start background completion fence", () => {
       assert.ok(sessionShutdown);
       await sessionStart({}, context);
       assert.ok(subagentTool?.execute);
+      assert.equal(widgetCalls.length, 1, "a current UI session installs exactly one background presentation widget");
+      assert.equal(widgetCalls[0]?.key, "pi-subagent-background-inline");
+      assert.equal(typeof widgetCalls[0]?.value, "function");
 
       const started = await subagentTool.execute!("delivery-job", { agent: "worker", task: "deliver", background: true }, new AbortController().signal, undefined, context);
       const jobId = started.details?.jobId;
@@ -355,6 +375,9 @@ describe("session-start background completion fence", () => {
       assert.deepEqual(warnings, [`[pi-subagent] Failed to deliver background result for job ${jobId}.`]);
       assert.ok(warnings[0]!.length < 256, "delivery warning must remain bounded");
       assert.equal(warnings[0]!.includes(secret), false, "delivery warning must not expose the thrown secret");
+      await sessionShutdown!({}, context);
+      sessionShutdown = undefined;
+      assert.deepEqual(widgetCalls.at(-1), { key: "pi-subagent-background-inline", value: undefined }, "shutdown clears the widget and its session-local snapshots");
     } finally {
       console.warn = originalWarn;
       runAgentForTest = defaultRunAgentForTest;
@@ -369,6 +392,224 @@ describe("session-start background completion fence", () => {
       else process.env.PI_SUBAGENT_DEPTH = previousDepth;
       if (previousStack === undefined) delete process.env.PI_SUBAGENT_STACK;
       else process.env.PI_SUBAGENT_STACK = previousStack;
+      if (configDir) await fs.rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("projects settled background success, failure, and cancellation into the registered widget without foreground-style updates", async () => {
+    const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const previousStack = process.env.PI_SUBAGENT_STACK;
+    const previousTerminalMode = process.env.PI_SUBAGENT_TERMINAL_MODE;
+    let configDir: string | undefined;
+    let sessionShutdown: ((...args: any[]) => Promise<unknown>) | undefined;
+    let releaseCancelledRun!: () => void;
+    const cancelledRunStarted = new Promise<void>((resolve) => { releaseCancelledRun = resolve; });
+    let delivered = 0;
+    let resolveAllDelivered!: () => void;
+    const allDelivered = new Promise<void>((resolve) => { resolveAllDelivered = resolve; });
+    let requestRenders = 0;
+    let toolUpdates = 0;
+    let widgetFactory: ((tui: unknown, theme: unknown) => unknown) | undefined;
+    let widget: any;
+    try {
+      configDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-background-widget-"));
+      await fs.mkdir(path.join(configDir, "agents"), { recursive: true });
+      await fs.writeFile(path.join(configDir, "agents", "worker.md"), "---\nname: worker\ndescription: Worker\n---\nWork\n");
+      process.env.PI_CODING_AGENT_DIR = configDir;
+      process.env.PI_SUBAGENT_DEPTH = "0";
+      process.env.PI_SUBAGENT_STACK = "[]";
+      process.env.PI_SUBAGENT_TERMINAL_MODE = "inline";
+      runAgentForTest = async (options) => {
+        if (options.task === "failure") return { ...successfulResult(options, "failed completed text"), exitCode: 1, stopReason: "error", errorMessage: "failure" };
+        if (options.task === "cancel") {
+          releaseCancelledRun();
+          await new Promise<void>((resolve) => options.signal?.addEventListener("abort", () => resolve(), { once: true }));
+          return { ...successfulResult(options, "cancelled completed text"), exitCode: 1, stopReason: "error", errorMessage: "cancelled" };
+        }
+        return successfulResult(options, "successful completed text");
+      };
+      const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+      let subagentTool: Tool | undefined;
+      const context: SessionContext = {
+        cwd: configDir,
+        hasUI: true,
+        isIdle: () => true,
+        ui: {
+          notify: () => undefined,
+          confirm: async () => false,
+          setStatus: () => undefined,
+          setWidget: (_key, value) => { if (typeof value === "function") widgetFactory = value as any; else throw new Error("disposed widget host"); },
+        },
+        sessionManager: { getSessionId: () => "widget", getSessionFile: () => undefined },
+      };
+      registerPiSubagent({
+        registerMessageRenderer: () => undefined,
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: (tool: Tool) => { if (tool.name === "subagent") subagentTool = tool; },
+        on: (event: string, handler: (...args: any[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        sendMessage: () => { delivered += 1; if (delivered === 3) resolveAllDelivered(); },
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const sessionStart = handlers.get("session_start");
+      sessionShutdown = handlers.get("session_shutdown");
+      assert.ok(sessionStart);
+      assert.ok(sessionShutdown);
+      assert.ok(subagentTool?.execute);
+      await sessionStart({}, context);
+      assert.ok(widgetFactory);
+      widget = widgetFactory!({ requestRender: () => { requestRenders += 1; } }, {
+        fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text,
+      });
+
+      await subagentTool.execute!("success", { agent: "worker", task: "success", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
+      await subagentTool.execute!("failure", { agent: "worker", task: "failure", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
+      const cancelled = await subagentTool.execute!("cancel", { agent: "worker", task: "cancel", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
+      await withinDeadline(cancelledRunStarted, "cancelled background runner startup");
+      await subagentTool.execute!("cancel-action", { action: "cancel", id: cancelled.details?.jobId }, new AbortController().signal, undefined, context);
+      await withinDeadline(allDelivered, "all terminal background steers");
+      assert.equal(toolUpdates, 0, "background completion never invokes the already-returned tool update callback");
+      assert.ok(requestRenders >= 3, "raw terminal details refresh the widget for success, failure, and cancellation before job history compaction");
+      assert.deepEqual(widget.children.map((card: any) => card.presentation.status).sort(), ["cancelled", "completed", "failed"]);
+      await assert.doesNotReject(sessionShutdown!({}, context), "display cleanup failure must not alter session shutdown");
+      sessionShutdown = undefined;
+    } finally {
+      runAgentForTest = defaultRunAgentForTest;
+      if (sessionShutdown && configDir) await sessionShutdown({}, {
+        cwd: configDir, hasUI: false, isIdle: () => true,
+        ui: { notify: () => undefined, confirm: async () => false, setStatus: () => undefined },
+        sessionManager: { getSessionId: () => "cleanup", getSessionFile: () => undefined },
+      });
+      if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+      if (previousStack === undefined) delete process.env.PI_SUBAGENT_STACK;
+      else process.env.PI_SUBAGENT_STACK = previousStack;
+      if (previousTerminalMode === undefined) delete process.env.PI_SUBAGENT_TERMINAL_MODE;
+      else process.env.PI_SUBAGENT_TERMINAL_MODE = previousTerminalMode;
+      if (configDir) await fs.rm(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fences late foreground partial and final UI callbacks after replacement and shutdown", async () => {
+    const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    const previousStack = process.env.PI_SUBAGENT_STACK;
+    const previousTerminalMode = process.env.PI_SUBAGENT_TERMINAL_MODE;
+    let configDir: string | undefined;
+    let sessionShutdown: ((...args: any[]) => Promise<unknown>) | undefined;
+    try {
+      configDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-foreground-session-fence-"));
+      await fs.mkdir(path.join(configDir, "agents"), { recursive: true });
+      await fs.writeFile(path.join(configDir, "agents", "worker.md"), "---\nname: worker\ndescription: Worker\n---\nWork\n");
+      process.env.PI_CODING_AGENT_DIR = configDir;
+      process.env.PI_SUBAGENT_DEPTH = "0";
+      process.env.PI_SUBAGENT_STACK = "[]";
+      process.env.PI_SUBAGENT_TERMINAL_MODE = "inline";
+
+      let beginReplacement!: () => void;
+      let releaseReplacementPartial!: () => void;
+      let releaseReplacementFinal!: () => void;
+      let beginShutdown!: () => void;
+      let releaseShutdownPartial!: () => void;
+      let releaseShutdownFinal!: () => void;
+      const replacementStarted = new Promise<void>((resolve) => { beginReplacement = resolve; });
+      const replacementPartial = new Promise<void>((resolve) => { releaseReplacementPartial = resolve; });
+      const replacementFinal = new Promise<void>((resolve) => { releaseReplacementFinal = resolve; });
+      const shutdownStarted = new Promise<void>((resolve) => { beginShutdown = resolve; });
+      const shutdownPartial = new Promise<void>((resolve) => { releaseShutdownPartial = resolve; });
+      const shutdownFinal = new Promise<void>((resolve) => { releaseShutdownFinal = resolve; });
+      runAgentForTest = async (options) => {
+        const partial = () => options.onUpdate?.({
+          content: [{ type: "text", text: "late partial" }],
+          details: options.makeDetails([successfulResult(options, "late partial")]),
+        });
+        if (options.task === "replacement") {
+          beginReplacement();
+          await replacementPartial;
+          partial();
+          await replacementFinal;
+          return successfulResult(options, "late final");
+        }
+        beginShutdown();
+        await shutdownPartial;
+        partial();
+        await shutdownFinal;
+        return successfulResult(options, "late final");
+      };
+
+      const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
+      let subagentTool: Tool | undefined;
+      let updateCount = 0;
+      const session = (id: string): SessionContext => ({
+        cwd: configDir!, hasUI: false, isIdle: () => true,
+        ui: { notify: () => undefined, confirm: async () => false, setStatus: () => undefined },
+        sessionManager: { getSessionId: () => id, getSessionFile: () => undefined },
+      });
+      registerPiSubagent({
+        registerMessageRenderer: () => undefined,
+        registerFlag: () => undefined,
+        getFlag: () => undefined,
+        registerCommand: () => undefined,
+        registerTool: (tool: Tool) => { if (tool.name === "subagent") subagentTool = tool; },
+        on: (event: string, handler: (...args: any[]) => Promise<unknown>) => handlers.set(event, handler),
+        events: { emit: () => undefined },
+        sendMessage: () => undefined,
+        getAllTools: () => [],
+        getCommands: () => [],
+      } as never);
+      const sessionStart = handlers.get("session_start");
+      sessionShutdown = handlers.get("session_shutdown");
+      assert.ok(sessionStart);
+      assert.ok(sessionShutdown);
+      assert.ok(subagentTool?.execute);
+      await sessionStart({}, session("old"));
+
+      const replacement = subagentTool.execute!("foreground-replacement", { agent: "worker", task: "replacement" }, new AbortController().signal, () => { updateCount += 1; }, session("old"));
+      await withinDeadline(replacementStarted, "the replacement foreground runner to start");
+      await sessionStart({}, session("new"));
+      releaseReplacementPartial();
+      await Promise.resolve();
+      assert.equal(updateCount, 0, "a late partial cannot update the replacement session");
+      releaseReplacementFinal();
+      const replacementResult = await replacement;
+      assert.equal(replacementResult.isError, undefined, "session fencing preserves the foreground result contract");
+      const staleReplacementSnapshot = subagentTool.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-replacement" }) as any;
+      assert.equal(staleReplacementSnapshot.children, undefined, "a late final cannot repopulate the replacement registry");
+
+      const shutdown = subagentTool.execute!("foreground-shutdown", { agent: "worker", task: "shutdown" }, new AbortController().signal, () => { updateCount += 1; }, session("new"));
+      await withinDeadline(shutdownStarted, "the shutdown foreground runner to start");
+      await sessionShutdown({}, session("new"));
+      sessionShutdown = undefined;
+      releaseShutdownPartial();
+      await Promise.resolve();
+      assert.equal(updateCount, 0, "a late partial cannot update a shut down session");
+      releaseShutdownFinal();
+      const shutdownResult = await shutdown;
+      assert.equal(shutdownResult.isError, undefined, "shutdown fencing preserves the finalized foreground result");
+      assert.equal(updateCount, 0, "late final captures never revive the registered tool callback");
+      const staleShutdownSnapshot = subagentTool.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-shutdown" }) as any;
+      assert.equal(staleShutdownSnapshot.children, undefined, "a late final cannot repopulate the shut down registry");
+    } finally {
+      runAgentForTest = defaultRunAgentForTest;
+      if (sessionShutdown && configDir) await sessionShutdown({}, {
+        cwd: configDir, hasUI: false, isIdle: () => true,
+        ui: { notify: () => undefined, confirm: async () => false, setStatus: () => undefined },
+        sessionManager: { getSessionId: () => "cleanup", getSessionFile: () => undefined },
+      });
+      if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+      else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+      if (previousStack === undefined) delete process.env.PI_SUBAGENT_STACK;
+      else process.env.PI_SUBAGENT_STACK = previousStack;
+      if (previousTerminalMode === undefined) delete process.env.PI_SUBAGENT_TERMINAL_MODE;
+      else process.env.PI_SUBAGENT_TERMINAL_MODE = previousTerminalMode;
       if (configDir) await fs.rm(configDir, { recursive: true, force: true });
     }
   });

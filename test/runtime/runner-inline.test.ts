@@ -10,6 +10,7 @@ import { buildStoppedBootstrapArgv, monitorInlineProcess, resolvePiSpawnForTest,
 import { getProcessStartedAt } from "../../src/runtime/run-protocol";
 import { AssistantSignatureIndex } from "../../src/runtime/assistant-signature-index";
 import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "../../src/core/types";
+import { ensureInlinePresentation, getInlinePresentation, processPiEvent } from "../../src/core/runner-events";
 
 describe("inline runner path", () => {
   test("uses an absolute Pi entrypoint only for Node and Bun interpreter hosts", () => {
@@ -300,6 +301,50 @@ describe("inline runner path", () => {
     } finally {
       await fs.promises.rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test("records only completed assistant text and bounded tool name/status activity outside serialized results", async () => {
+    const events = [
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "/secret" } },
+      { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: { content: [{ type: "text", text: "secret output" }] }, isError: false },
+      { type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "partial must not display" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "completed answer" }] } },
+      { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "completed answer" }] }] },
+    ];
+    const proc = spawn(process.execPath, ["-e", `for (const event of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(event) + "\\n");`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const result = { agent: "scout", agentSource: "user" as const, task: "presentation", exitCode: -1, messages: [], stderr: "", usage: emptyUsage() };
+    let updates = 0;
+    await monitorInlineProcess(proc as any, result as any, undefined, () => { updates += 1; });
+    const presentation = getInlinePresentation(result as any);
+    assert.deepEqual(presentation?.activities, [{ id: "call-1", name: "read", status: "completed" }]);
+    assert.equal(presentation?.lastAssistantText, "completed answer");
+    assert.equal(updates, 3, "each tool/UI or result event produces one post-parser callback; duplicate agent_end is silent");
+    const serialized = JSON.stringify(result);
+    assert.doesNotMatch(serialized, /__inlinePresentation|secret output|partial must not display/);
+    assert.equal(Reflect.ownKeys(result as object).includes("__inlinePresentation"), false, "presentation is a WeakMap side channel, not a hidden public own property");
+  });
+
+  test("retains the last valid completed assistant text through failed, aborted, and pending snapshots", () => {
+    const result = { messages: [], usage: emptyUsage() } as any;
+    const presentation = ensureInlinePresentation(result)!;
+    const message = (text: string, stopReason?: string, status?: string) => ({
+      role: "assistant", content: [{ type: "text", text }], ...(stopReason ? { stopReason } : {}), ...(status ? { status } : {}),
+    });
+    processPiEvent({ type: "message_end", message: message("first complete", "stop") }, result, { presentation });
+    processPiEvent({ type: "message_end", message: message("failure must not replace", "error") }, result, { presentation });
+    processPiEvent({ type: "message_end", message: message("abort must not replace", "aborted") }, result, { presentation });
+    processPiEvent({ type: "message_end", message: message("pending must not replace", "pending") }, result, { presentation });
+    processPiEvent({ type: "message_end", message: message("status pending must not replace", "stop", "pending") }, result, { presentation });
+    assert.equal(presentation.lastAssistantText, "first complete");
+
+    processPiEvent({ type: "agent_end", messages: [
+      message("last valid completed", "stop"),
+      message("later failure", "error"),
+      message("later abort", "aborted"),
+    ] }, result, { presentation });
+    assert.equal(presentation.lastAssistantText, "last valid completed", "agent_end walks past terminal error placeholders to the last valid completed response");
   });
 
   test("accounts reused tool-call IDs once per inline execution across cumulative agent-end snapshots", async () => {

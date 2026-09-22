@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { emptyUsage, type SingleResult, type SubagentDetails } from "../../src/core/types";
 import { createBackgroundJobRecord } from "../../src/core/subagent-config";
 import { buildBackgroundJobDetailSummary, parseBackgroundJobActionDetails } from "../../src/core/background-job-details";
+import { Box } from "../../node_modules/@earendil-works/pi-tui/dist/components/box.js";
 import { Markdown } from "../../node_modules/@earendil-works/pi-tui/dist/components/markdown.js";
 import { Spacer } from "../../node_modules/@earendil-works/pi-tui/dist/components/spacer.js";
 import { Text } from "../../node_modules/@earendil-works/pi-tui/dist/components/text.js";
@@ -31,7 +32,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 		};
 	},
 }));
-mock.module("@earendil-works/pi-tui", () => ({ Container, Markdown, Spacer, Text }));
+mock.module("@earendil-works/pi-tui", () => ({ Box, Container, Markdown, Spacer, Text }));
 const { renderCall, renderResult } = await import("../../src/ui/render");
 
 const theme = {

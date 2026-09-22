@@ -50,6 +50,8 @@ import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSess
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
+import { InlinePresentationRegistry } from "./src/ui/inline-presentation.js";
+import { InlinePresentationWidget } from "./src/ui/inline-presentation-widget.js";
 import { createBackgroundResultRenderer } from "./src/ui/background-result.js";
 import {
   BACKGROUND_JOB_DETAILS_KIND,
@@ -193,6 +195,7 @@ interface DelegationDepthConfig {
 }
 
 const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
+const INLINE_PRESENTATION_WIDGET_KEY = "pi-subagent-background-inline";
 const backgroundJobs = new Map<string, BackgroundJobRecord>();
 const backgroundJobSettlements = new Map<string, Promise<void>>();
 
@@ -284,7 +287,7 @@ function startBackgroundJob(
   limits: SubagentLimits,
   sessionToken: number,
   sessionFence: BackgroundJobSessionFence,
-  onSettled?: (job: BackgroundJobRecord, usage: AccountingUsage | undefined) => void,
+  onSettled?: (job: BackgroundJobRecord, usage: AccountingUsage | undefined, rawResult: BackgroundJobToolResult | undefined) => void,
 ): void {
   if (!sessionFence.isCurrent(sessionToken)) {
     releaseBackgroundJobReservation(backgroundJobs, job);
@@ -305,7 +308,9 @@ function startBackgroundJob(
         maxCompletedJobs: limits.backgroundHistoryLimit,
         completedTtlMs: limits.backgroundHistoryTtlMs,
         onFinalized: (finalizedJob, finalizedUsage) => {
-          onSettled?.(finalizedJob, finalizedUsage);
+          // Keep the live result only for this synchronous display callback.
+          // Finalized job history is deliberately compacted and has no details.
+          onSettled?.(finalizedJob, finalizedUsage, result);
           notifyBackgroundJobResult(pi, finalizedJob);
         },
       });
@@ -321,7 +326,7 @@ function startBackgroundJob(
         maxCompletedJobs: limits.backgroundHistoryLimit,
         completedTtlMs: limits.backgroundHistoryTtlMs,
         onFinalized: (finalizedJob, finalizedUsage) => {
-          onSettled?.(finalizedJob, finalizedUsage);
+          onSettled?.(finalizedJob, finalizedUsage, undefined);
           notifyBackgroundJobResult(pi, finalizedJob);
         },
       });
@@ -589,6 +594,11 @@ export default function (pi: ExtensionAPI) {
   // The registered wrapper stays stable while session_start swaps in the current
   // global tool-display preview budget (including after /reload).
   let backgroundResultRenderer = createBackgroundResultRenderer();
+  // Presentation only: these registries never enter tool details or session data.
+  // Foreground cards and background widgets have isolated expansion state.
+  const foregroundInlinePresentationRegistry = new InlinePresentationRegistry();
+  const backgroundInlinePresentationRegistry = new InlinePresentationRegistry();
+  let clearInlinePresentationWidget: (() => void) | undefined;
   pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
     backgroundResultRenderer(message, options, theme),
   );
@@ -899,6 +909,37 @@ export default function (pi: ExtensionAPI) {
 
   let discoveredAgents: AgentConfig[] = [];
   let sessionShuttingDown = false;
+  let inlinePresentationWidgetGeneration = 0;
+  const resetInlinePresentationWidget = (): void => {
+    try { clearInlinePresentationWidget?.(); } catch { /* display cleanup is non-authoritative */ }
+    clearInlinePresentationWidget = undefined;
+    foregroundInlinePresentationRegistry.reset();
+    backgroundInlinePresentationRegistry.reset();
+  };
+  const installInlinePresentationWidget = (ctx: { hasUI: boolean; ui: unknown }): void => {
+    if (currentDepth !== 0 || !ctx.hasUI) return;
+    const ui = ctx.ui as { setWidget?: (key: string, content: unknown) => void };
+    if (typeof ui.setWidget !== "function") return;
+    const widgetGeneration = ++inlinePresentationWidgetGeneration;
+    try {
+      const widgets = new Set<InlinePresentationWidget>();
+      ui.setWidget(INLINE_PRESENTATION_WIDGET_KEY, (tui: any, theme: any) => {
+        const widget = new InlinePresentationWidget(tui, backgroundInlinePresentationRegistry, theme);
+        widgets.add(widget);
+        return widget;
+      });
+      clearInlinePresentationWidget = () => {
+        if (widgetGeneration !== inlinePresentationWidgetGeneration) return;
+        ++inlinePresentationWidgetGeneration;
+        for (const widget of widgets) widget.dispose();
+        widgets.clear();
+        try { ui.setWidget?.(INLINE_PRESENTATION_WIDGET_KEY, undefined); } catch { /* disposed UI is non-authoritative */ }
+      };
+    } catch {
+      // A widget is display-only. Keep execution and the existing steer result
+      // contract intact when a host UI declines this optional surface.
+    }
+  };
   // Advances at the synchronous boundary of every start/shutdown event.
   // Async startup continuations may install state only for their own token.
   let sessionStartupGeneration = 0;
@@ -1010,6 +1051,7 @@ export default function (pi: ExtensionAPI) {
     // The host rebuilds message components for replacement/reload. Do not let
     // an old card's local click state cross that session boundary.
     backgroundResultRenderer.reset();
+    resetInlinePresentationWidget();
     const toolDisplayPreviewLines = loadToolDisplayPreviewLines();
     // This preamble intentionally has no await. A replacement session must
     // fence old finalizers before a slow config read can yield to them.
@@ -1077,6 +1119,7 @@ export default function (pi: ExtensionAPI) {
     // tool-display previewLines setting; expanded output keeps its fixed cap.
     backgroundResultRenderer = createBackgroundResultRenderer({ previewLines });
     limits = resolvedLimits;
+    installInlinePresentationWidget(ctx);
     // Scheduler subscriptions publish immediately. Reset its queue before
     // registering dashboard/presence observers so they cannot project stale
     // work from the preceding session into the new one.
@@ -1188,6 +1231,7 @@ export default function (pi: ExtensionAPI) {
     ++sessionStartupGeneration;
     sessionShuttingDown = true;
     backgroundSessionFence.invalidate();
+    resetInlinePresentationWidget();
     reaperDiagnosticGeneration = reaperDiagnosticUx.invalidateSession();
     const priorSessionSettlements = Array.from(backgroundJobSettlements.values());
     cancelBackgroundJobs(backgroundJobs);
@@ -1812,11 +1856,19 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             startBackgroundJob(
               pi,
               job,
-              (jobSignal) => runInvocation(jobSignal, (partial) => updateUxFromPartial(job.id, uxGeneration, partial), true, job.id),
+              (jobSignal) => runInvocation(jobSignal, (partial) => {
+                if (!backgroundSessionFence.isCurrent(backgroundSessionToken)) return;
+                backgroundInlinePresentationRegistry.capture(job.id, partial.details);
+                updateUxFromPartial(job.id, uxGeneration, partial);
+              }, true, job.id),
               limits,
               backgroundSessionToken,
               backgroundSessionFence,
-              (finalizedJob, finalizedUsage) => {
+              (finalizedJob, finalizedUsage, rawResult) => {
+                if (!backgroundSessionFence.isCurrent(backgroundSessionToken)) return;
+                backgroundInlinePresentationRegistry.capture(finalizedJob.id, rawResult?.details);
+                if (finalizedJob.status === "cancelled") backgroundInlinePresentationRegistry.markTerminal(finalizedJob.id, "cancelled");
+                else if (finalizedJob.status === "failed") backgroundInlinePresentationRegistry.markTerminal(finalizedJob.id, "failed");
                 updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
                 // Public accounting remains finalized here. Presence is a
                 // content-free V2 observer projection and receives no usage.
@@ -1860,6 +1912,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           };
         }
 
+        // Foreground calls can outlive a host session replacement or shutdown.
+        // Keep their result contract intact, but never let stale display-only
+        // callbacks restore cards or tool updates into the new session.
+        const foregroundSessionGeneration = sessionStartupGeneration;
+        const isForegroundSessionCurrent = () =>
+          foregroundSessionGeneration === sessionStartupGeneration && !sessionShuttingDown;
         const foregroundController = new AbortController();
         const forwardAbort = () => foregroundController.abort();
         if (signal?.aborted) forwardAbort();
@@ -1873,14 +1931,24 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           cancel: () => foregroundController.abort(),
         });
         try {
-          const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => { updateUxFromPartial(uxRun.id, uxGeneration, partial); onUpdate?.(partial); }, false, uxRun.id));
-          updateUxFromPartial(uxRun.id, uxGeneration, result);
+          const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => {
+            if (!isForegroundSessionCurrent()) return;
+            foregroundInlinePresentationRegistry.capture(_toolCallId, partial.details);
+            updateUxFromPartial(uxRun.id, uxGeneration, partial);
+            onUpdate?.(partial);
+          }, false, uxRun.id));
+          if (isForegroundSessionCurrent()) {
+            foregroundInlinePresentationRegistry.capture(_toolCallId, result.details);
+            updateUxFromPartial(uxRun.id, uxGeneration, result);
+          }
           // Public accounting remains part of the result only; V2 presence
           // deliberately has no usage projection.
           if (foregroundController.signal.aborted) {
+            if (isForegroundSessionCurrent()) foregroundInlinePresentationRegistry.markTerminal(_toolCallId, "cancelled");
             failOperational("cancellation", "Foreground subagent invocation was canceled.");
           }
           if ("isError" in result && result.isError) {
+            if (isForegroundSessionCurrent()) foregroundInlinePresentationRegistry.markTerminal(_toolCallId, "failed");
             // Tool details are not attached to a thrown tool.execute error.
             // Keep the bounded public text, but never promise inaccessible data.
             const publicError = extractToolText(result).replaceAll("full structured result remains in tool details", "content is unavailable from this thrown error");
@@ -1904,8 +1972,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       },
 
       renderCall: (args, theme) => renderCall(args, theme),
-      renderResult: (result, { expanded }, theme) =>
-        renderResult(result, expanded, theme),
+      renderResult: (result, { expanded }, theme, context) =>
+        renderResult(result, expanded, theme, context, foregroundInlinePresentationRegistry),
     });
   }
 

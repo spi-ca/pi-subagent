@@ -240,7 +240,7 @@ import {
   type LaunchGateV3,
   type LaunchIntentV3,
 } from "./tmux-control-protocol.js";
-import { processPiJsonLineWithAssistantSignatureIndex } from "../core/runner-events.js";
+import { ensureInlinePresentation, processPiJsonLineWithAssistantSignatureIndex } from "../core/runner-events.js";
 import { emptyAccountingUsage } from "../core/accounting-usage.js";
 import { AssistantSignatureIndex } from "./assistant-signature-index.js";
 import { MINIMUM_PI_VERSION, isStableSemverAtLeast, parsePiVersionOutput } from "./version-policy.mjs";
@@ -5505,7 +5505,13 @@ export async function monitorInlineProcess(
       // Chaining keeps event/result/callback order identical to JSONL order.
       lineProcessing = lineProcessing.then(async () => {
         if (outputExceeded || settled) return;
-        if (await processPiJsonLineWithAssistantSignatureIndex(line, result, assistantSignatureIndex)) onUpdate();
+        // The parser returns one combined change signal only after public
+        // result mutation and signature-index publication are complete. This
+        // keeps tool-only presentation refreshes useful without duplicating or
+        // reordering established assistant-result callbacks.
+        if (await processPiJsonLineWithAssistantSignatureIndex(line, result, assistantSignatureIndex, {
+          presentation: ensureInlinePresentation(result),
+        })) onUpdate();
         if (!outputExceeded && !settled) maybeFinishFromAgentEnd();
       }).catch(() => {
         // The index and parser both fail closed to exact public-message

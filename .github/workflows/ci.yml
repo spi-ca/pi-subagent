@@ -48,23 +48,23 @@ jobs:
           - lane: current compatibility
             stage: core
             bun-version: 1.4.2
-            pi-version: 0.85.1
-            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+            pi-version: 0.87.0
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.87.0","@earendil-works/pi-ai":"0.87.0","@earendil-works/pi-client":"0.87.0","@earendil-works/pi-coding-agent":"0.87.0","@earendil-works/pi-protocol":"0.87.0","@earendil-works/pi-telemetry":"0.87.0","@earendil-works/pi-tui":"0.87.0"}'
           - lane: current compatibility
             stage: phase0
             bun-version: 1.4.2
-            pi-version: 0.85.1
-            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+            pi-version: 0.87.0
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.87.0","@earendil-works/pi-ai":"0.87.0","@earendil-works/pi-client":"0.87.0","@earendil-works/pi-coding-agent":"0.87.0","@earendil-works/pi-protocol":"0.87.0","@earendil-works/pi-telemetry":"0.87.0","@earendil-works/pi-tui":"0.87.0"}'
           - lane: current compatibility
             stage: reaper
             bun-version: 1.4.2
-            pi-version: 0.85.1
-            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+            pi-version: 0.87.0
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.87.0","@earendil-works/pi-ai":"0.87.0","@earendil-works/pi-client":"0.87.0","@earendil-works/pi-coding-agent":"0.87.0","@earendil-works/pi-protocol":"0.87.0","@earendil-works/pi-telemetry":"0.87.0","@earendil-works/pi-tui":"0.87.0"}'
           - lane: current compatibility
             stage: sessionTail
             bun-version: 1.4.2
-            pi-version: 0.85.1
-            pi-graph: '{"@earendil-works/pi-agent-core":"0.85.1","@earendil-works/pi-ai":"0.85.1","@earendil-works/pi-client":"0.85.1","@earendil-works/pi-coding-agent":"0.85.1","@earendil-works/pi-protocol":"0.85.1","@earendil-works/pi-telemetry":"0.85.1","@earendil-works/pi-tui":"0.85.1"}'
+            pi-version: 0.87.0
+            pi-graph: '{"@earendil-works/pi-agent-core":"0.87.0","@earendil-works/pi-ai":"0.87.0","@earendil-works/pi-client":"0.87.0","@earendil-works/pi-coding-agent":"0.87.0","@earendil-works/pi-protocol":"0.87.0","@earendil-works/pi-telemetry":"0.87.0","@earendil-works/pi-tui":"0.87.0"}'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

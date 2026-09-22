@@ -7190,7 +7190,17 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // allocation/close invalidated while this observer was awaiting it.
       if (observationGeneration !== topologyMutationGeneration) return "resume";
       if (backend.mode !== "tmux-pane") return "publish";
-      // Every tmux observer publication (including inspect exhaustion) must
+      if (!tmuxControlEnabled) {
+        // V2 has no pooled control epoch. Its terminal observation must still
+        // be revalidated against the exact durable handle before publication.
+        const recheckedPane = await backend.inspect(handle!).catch(() => undefined);
+        const recheckedCompletion = await readInteractiveCompletionAuthority(activePaths.completionPath, runId);
+        if (recheckedCompletion.outcome === "completion") return "completion";
+        if (recheckedCompletion.outcome === "invalid") return "invalid";
+        if (observationGeneration !== topologyMutationGeneration || !recheckedPane || (recheckedPane.exists && !recheckedPane.exited)) return "resume";
+        return "publish";
+      }
+      // Every V3 tmux observer publication (including inspect exhaustion) must
       // freshly prove this run against the current persistent connection.
       // A formerly accepted epoch is not terminal-publication authority.
       const live = await reconnectTmuxControl(true);
@@ -7400,7 +7410,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // client. Reconnection is retried with bounded backoff and starts from
       // the full durable gate/executable/socket/server/source/session/window/
       // target validation in reconnectTmuxControl.
-      if (backend.mode === "tmux-pane" && tmuxReconnectPending && !options.signal?.aborted) {
+      if (tmuxControlEnabled && tmuxReconnectPending && !options.signal?.aborted) {
         if (!canStartInteractiveRun(options.interactiveShutdownGeneration)) {
           // A fenced reconnect cannot return on a stale observation: elect and
           // replay a parent boundary before the shutdown path may release it.
@@ -7489,7 +7499,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
           // A parent abort must not send a mutation through a dead control
           // client. If recovery cannot prove the exact target, publish the
           // parent-aborted authority below without replaying that mutation.
-          if (backend.mode !== "tmux-pane" || !tmuxReconnectPending || await reconnectTmuxControl()) {
+          if (!tmuxControlEnabled || !tmuxReconnectPending || await reconnectTmuxControl()) {
             // Do not await this exact queued operation: its transport may hang
             // forever, while ABORT_WAIT continues from the first abort wake.
             const pending = interruptIfParentStillOwns();
@@ -7619,7 +7629,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // An unavailable or stale accepted epoch is retryable transport state,
       // not a topology failure. Reconnect with bounded backoff without spending
       // the inspect-exhausted budget.
-      if (backend.mode === "tmux-pane" && !tmuxParentLease?.acceptedTransport()) {
+      if (tmuxControlEnabled && !tmuxParentLease?.acceptedTransport()) {
         queryFailures = 0;
         tmuxInspectionDue = false;
         tmuxReconnectPending = true;
@@ -7632,19 +7642,21 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       // not a transport failure when an allocation/close advanced the topology
       // epoch while the request was in flight.
       const inspectionTopologyMutationGeneration = topologyMutationGeneration;
-      const pane = handle.mode === "herdr-pane"
+      const pane = handle.mode === "herdr-pane" || (handle.mode === "tmux-pane" && !tmuxControlEnabled)
+        // V2 must use its independently generation-bound exact-handle probe;
+        // only V3 observations are authorized through an accepted pool epoch.
         ? await backend.inspect(handle).catch(() => undefined)
         : await inspectActiveInteractiveSnapshot({
           handle,
           run: backendRun,
           backendKey: executableGenerationKey(backendGeneration),
           generation: options.interactiveShutdownGeneration,
-          tmuxAcceptedTransport: backend.mode === "tmux-pane"
+          tmuxAcceptedTransport: tmuxControlEnabled
             ? () => tmuxParentLease?.acceptedTransport() ?? null
             : undefined,
         });
       if (tmuxNotificationReceivedAt !== null) { recordPhase0LiveTelemetry("tmux", "notificationToReconcileLatencyMs", Math.max(0, Date.now() - tmuxNotificationReceivedAt), "notification"); tmuxNotificationReceivedAt = null; }
-      if (backend.mode === "tmux-pane" && tmuxParentLease) {
+      if (tmuxControlEnabled && tmuxParentLease) {
         const tmuxSequenceAfterInspect = tmuxParentLease.notificationSequence();
         observedTmuxNotificationSequence = tmuxSequenceAfterInspect;
         tmuxInspectionDue = tmuxSequenceAfterInspect !== tmuxSequenceBeforeInspect;
@@ -7656,7 +7668,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         continue;
       }
       if (pane === undefined) {
-        if (backend.mode === "tmux-pane") {
+        if (tmuxControlEnabled) {
           // The epoch can disappear between the pre-check and the shared read.
           // Treat that as reconnectable transport state, never as twenty rapid
           // topology failures.

@@ -11,7 +11,7 @@ import { getCmuxControlRequestManager } from "../../src/runtime/cmux-control-ada
 import { fakeCmuxControlServer } from "../helpers/fake-cmux-control-server";
 import { acceptanceAllocationCheckpointPath } from "../acceptance/acceptance-allocation-checkpoint";
 import { buildTmuxWindowLabel } from "../../src/runtime/tmux-window-label.mjs";
-import { cleanupAcceptanceCmuxTarget, terminateStoppedPostallocationBroker } from "../acceptance/live-harness";
+import { cleanupAcceptanceCmuxTarget, isIdentityStopped, terminateStoppedPostallocationBroker } from "../acceptance/live-harness";
 
 const tempDirs: string[] = [];
 afterEach(async () => { while (tempDirs.length) await fs.promises.rm(tempDirs.pop()!, { recursive: true, force: true }); });
@@ -645,6 +645,10 @@ describe("pane launch broker", () => {
 			assert.equal(await readBrokerJson(paths.decisionPath), null);
 			assert.equal(await readBrokerJson(paths.launchPath), null);
 			const broker = { pid: child.pid!, startedAt: getProcessStartedAt(child.pid!)!, expectedCommand: "pane-launch-broker.mjs", runId: "postallocation-checkpoint" };
+			// The checkpoint is published immediately before SIGSTOP; wait for the
+			// identity-bound stopped state before asking the kill helper to verify it.
+			for (let attempt = 0; attempt < 200 && !isIdentityStopped(broker); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(isIdentityStopped(broker), true);
 			const killed = await terminateStoppedPostallocationBroker(broker, paths);
 			assert.equal(killed.result, "exact-candidate-killed");
 			const target = (killed.allocation as { target: { workspaceId: string; surfaceId: string; paneId: string } }).target;

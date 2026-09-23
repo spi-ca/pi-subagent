@@ -326,6 +326,18 @@ describe("inline runner path", () => {
     assert.equal(Reflect.ownKeys(result as object).includes("__inlinePresentation"), false, "presentation is a WeakMap side channel, not a hidden public own property");
   });
 
+  test("marks code-unit-limited assistant previews as clipped for ASCII and multibyte output", () => {
+    for (const text of ["x".repeat(4_097), "🙂".repeat(2_049)]) {
+      const result = { messages: [], usage: emptyUsage() } as any;
+      const presentation = ensureInlinePresentation(result)!;
+      processPiEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } }, result, { presentation });
+      assert.equal(presentation.lastAssistantTextClipped, true);
+      assert.ok(presentation.lastAssistantText.endsWith("…"));
+      assert.ok(presentation.lastAssistantText.length <= 4_097, "the bounded preview includes at most the 4 KiB code-unit payload plus ellipsis");
+      assert.doesNotMatch(JSON.stringify(result), /lastAssistantTextClipped/, "clipping metadata remains in the WeakMap UI side channel");
+    }
+  });
+
   test("retains the last valid completed assistant text through failed, aborted, and pending snapshots", () => {
     const result = { messages: [], usage: emptyUsage() } as any;
     const presentation = ensureInlinePresentation(result)!;

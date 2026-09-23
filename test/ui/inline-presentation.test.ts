@@ -4,13 +4,15 @@ import { ensureInlinePresentation } from "../../src/core/runner-events";
 import { renderResult } from "../../src/ui/render";
 import { InlinePresentationRegistry } from "../../src/ui/inline-presentation";
 import { InlinePresentationWidget } from "../../src/ui/inline-presentation-widget";
-import { Box, Container } from "@earendil-works/pi-tui";
+import { Box, Container, visibleWidth } from "@earendil-works/pi-tui";
 
 const theme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
   bg: (_color: string, text: string) => text,
 };
+
+const nestedMouseTest = typeof (Container.prototype as any).handleMouse === "function" ? test : test.skip;
 
 function result(agent: string, text: string, activities: Array<{ id: string; name: string; status: "running" | "completed" | "failed" }>, terminal: Partial<{ exitCode: number; stopReason: string; errorMessage: string }> = {}) {
   const value = {
@@ -32,7 +34,7 @@ function details(results: ReturnType<typeof result>[]) {
 }
 
 function component(registry: InlinePresentationRegistry, value: ReturnType<typeof details>, expanded = false) {
-  registry.capture("tool-call", value);
+  registry.capture("tool-call", value, { retainAuthoritativeResults: true });
   return renderResult({ content: [], details: value }, expanded, theme, { toolCallId: "tool-call" }, registry) as any;
 }
 
@@ -48,12 +50,12 @@ describe("inline execution presentation", () => {
       result("reviewer", "review completed", [{ id: "b", name: "bash", status: "failed" }]),
     ]);
     const text = card(registry, value);
-    assert.match(text, /scout[\s\S]*scout completed[\s\S]*read · done/);
-    assert.match(text, /reviewer[\s\S]*review completed[\s\S]*bash · failed/);
+    assert.match(text, /▸ scout[\s\S]*scout completed/);
+    assert.match(text, /▸ reviewer[\s\S]*review completed/);
     assert.doesNotMatch(text, /task|arguments|tool output/i);
   });
 
-  test("collapses >2 response lines and >4 activities, then expands only from the header", () => {
+  test("keeps the collapsed card to one preview line, then expands only from the header", () => {
     const registry = new InlinePresentationRegistry();
     const value = details([result("worker", "one\ntwo\nthree\nfour", Array.from({ length: 6 }, (_, index) => ({
       id: `activity-${index}`, name: `tool-${index}`, status: "completed" as const,
@@ -61,9 +63,8 @@ describe("inline execution presentation", () => {
     const first = component(registry, value, false);
     const firstCard = first.children[0];
     const collapsed = first.render(160).join("\n");
-    assert.match(collapsed, /one\s+\ntwo/);
-    assert.doesNotMatch(collapsed, /three/);
-    assert.match(collapsed, /2 earlier tools/);
+    assert.match(collapsed, /one/);
+    assert.doesNotMatch(collapsed, /two|three|tool-0/);
     assert.equal(firstCard.handleMouse({ type: "click", button: "left", x: 2, y: 1 }), undefined, "body clicks stay available for transcript selection");
     assert.equal(firstCard.handleMouse({ type: "drag", button: "left", y: 0 }), undefined);
     assert.equal(firstCard.handleMouse({ type: "wheel", y: 0 }), undefined);
@@ -76,15 +77,69 @@ describe("inline execution presentation", () => {
     assert.match(expanded, /tool-0 · done/);
   });
 
-  test("uses Pi 0.87 transformed container dispatch for a header but not a card body", () => {
+  test("renders a terminal foreground result from full authoritative Markdown rather than its 4 KiB snapshot", () => {
+    const registry = new InlinePresentationRegistry();
+    const fullOutput = `**Full result**\n\n${"x".repeat(5_000)}\n\n**tail marker**`;
+    const value = details([result("worker", fullOutput, [])]);
+    value.results[0]!.messages = [{ role: "assistant", content: [{ type: "text", text: fullOutput }] }] as any;
+    const rendered = component(registry, value, false) as any;
+    assert.match(rendered.render(8_000).join("\n"), /Response preview \(clipped\)/, "the in-memory snapshot remains explicitly bounded");
+    rendered.children[0].handleMouse({ type: "click", button: "left", y: 0 });
+    const expanded = rendered.render(8_000).join("\n");
+    assert.match(expanded, /tail marker/);
+    assert.ok(expanded.length > 4_096, "expanded foreground output is not sourced from the capped snapshot");
+  });
+
+  test("retains authoritative terminal results only for foreground recovery and selects the last completed assistant response", () => {
+    const completed = `**completed response**\n${"x".repeat(5_000)}\n**completed tail**`;
+    const terminal = result("worker", completed, [], {
+      exitCode: 1, stopReason: "error", errorMessage: "terminal failure",
+    });
+    terminal.messages = [
+      { role: "assistant", content: [{ type: "text", text: completed }] },
+      { role: "assistant", content: [{ type: "text", text: "error placeholder" }], stopReason: "error" },
+      { role: "assistant", content: [{ type: "text", text: "aborted placeholder" }], stopReason: "aborted" },
+      { role: "assistant", content: [{ type: "text", text: "pending placeholder" }], stopReason: "pending" },
+      { role: "assistant", content: [{ type: "text", text: "status-pending placeholder" }], status: "pending" },
+    ] as any;
+    const value = details([terminal]);
+
+    const defaultRegistry = new InlinePresentationRegistry();
+    defaultRegistry.capture("default", value);
+    const defaultCard = defaultRegistry.get("default", value.results, 0)!;
+    assert.equal(defaultRegistry.authoritativeMessages("default", defaultCard.identity), undefined, "default capture retains no full terminal result");
+
+    const backgroundRegistry = new InlinePresentationRegistry();
+    backgroundRegistry.capture("background", value, { retainAuthoritativeResults: false });
+    const backgroundCard = backgroundRegistry.get("background", value.results, 0)!;
+    assert.equal(backgroundRegistry.authoritativeMessages("background", backgroundCard.identity), undefined, "background capture retains no full terminal result");
+
+    const foregroundRegistry = new InlinePresentationRegistry();
+    foregroundRegistry.capture("foreground", value, { retainAuthoritativeResults: true });
+    const foregroundCard = foregroundRegistry.get("foreground", value.results, 0)!;
+    assert.strictEqual(foregroundRegistry.authoritativeMessages("foreground", foregroundCard.identity), terminal.messages, "foreground recovery retains only the existing result reference");
+
+    const detailsComponent = renderResult({ content: [], details: value }, false, theme, { toolCallId: "foreground" }, foregroundRegistry) as any;
+    detailsComponent.children[0].handleMouse({ type: "click", button: "left", y: 0 });
+    const detailsText = detailsComponent.render(8_000).join("\n");
+    assert.match(detailsText, /completed tail/);
+    assert.doesNotMatch(detailsText, /error placeholder|aborted placeholder|pending placeholder|status-pending placeholder/);
+
+    const thrownRegistry = new InlinePresentationRegistry();
+    thrownRegistry.capture("thrown", value, { retainAuthoritativeResults: true });
+    const thrownSnapshot = renderResult({ content: [{ type: "text", text: "host error without details" }] }, false, theme, { toolCallId: "thrown" }, thrownRegistry) as any;
+    thrownSnapshot.children[0].handleMouse({ type: "click", button: "left", y: 0 });
+    const snapshotText = thrownSnapshot.render(8_000).join("\n");
+    assert.match(snapshotText, /completed tail/);
+    assert.doesNotMatch(snapshotText, /error placeholder|aborted placeholder|pending placeholder|status-pending placeholder/);
+  });
+
+  nestedMouseTest("uses Pi 0.87 transformed container dispatch for a header but not a card body", () => {
     const registry = new InlinePresentationRegistry();
     const value = details([result("worker", "answer", [])]);
     const rendered = component(registry, value, false);
     const firstCard = rendered.children[0];
     const parent = new Container() as any;
-    // Pi 0.84 intentionally has no mouse dispatch API; the isolated 0.87
-    // graph executes this exact nested-coordinate branch in verification.
-    if (typeof parent.handleMouse !== "function") return;
     parent.addChild(firstCard);
     const outer = new Box(2, 1, (text: string) => text) as any;
     outer.addChild(parent);
@@ -141,6 +196,90 @@ describe("inline execution presentation", () => {
     assert.match(rendered, /implementation final\s+\nline two\s+\nline three/, "the expanded duplicate agent stays bound to its chain stage");
   });
 
+  test("shows only running background cards within the bounded dock", () => {
+    const registry = new InlinePresentationRegistry();
+    const widget = new InlinePresentationWidget({ requestRender: () => {} } as any, registry, theme);
+    assert.deepEqual(widget.render(12), [], "an initially empty widget occupies no dock rows");
+    registry.capture("background-call", details([
+      result("completed", "completed", []),
+      result("running", "running\n".repeat(20), [], { exitCode: -1 }),
+      result("failed", "failed", [], { exitCode: 1, stopReason: "error" }),
+      result("cancelled", "cancelled", [], { exitCode: 130, stopReason: "aborted" }),
+    ]));
+    const compact = widget.render(12);
+    assert.ok(compact.length <= 12, "the dock budget applies after narrow-width rendering");
+    assert.ok(compact.every((line) => visibleWidth(line) <= 12), "the dock never exceeds its narrow terminal width");
+    const compactText = compact.join("\n");
+    assert.match(compactText, /running/, "a mixed invocation keeps its running card visible");
+    assert.doesNotMatch(compactText, /completed|failed|cancelled|Ctrl\+O|to expand/);
+    assert.ok(widget.render(12).length <= 12, "a local header expansion cannot consume the dock");
+    widget.dispose();
+  });
+
+  test("removes terminal background cards without clearing their registry snapshots", () => {
+    const registry = new InlinePresentationRegistry();
+    const widget = new InlinePresentationWidget({ requestRender: () => {} } as any, registry, theme);
+    registry.capture("success", details([result("success", "done", [])]));
+    registry.capture("failure", details([result("failure", "failed", [], { exitCode: 1, stopReason: "error" })]));
+    assert.deepEqual(widget.render(160), [], "captured successful and failed terminal results leave no dock space");
+
+    registry.capture("cancel", details([result("cancel", "working", [], { exitCode: -1 })]));
+    assert.match(widget.render(160).join("\n"), /cancel/);
+    registry.markTerminal("cancel", "cancelled");
+    assert.deepEqual(widget.render(160), [], "markTerminal cancellation removes the card without erasing its snapshot");
+
+    registry.capture("failure-after-partial", details([result("failure-after-partial", "working", [], { exitCode: -1 })]));
+    registry.markTerminal("failure-after-partial", "failed");
+    assert.deepEqual(widget.render(160), [], "markTerminal failure removes the card");
+
+    registry.capture("new-run", details([result("new-run", "working", [], { exitCode: -1 })]));
+    assert.match(widget.render(160).join("\n"), /new-run/, "a later running job reinstates the widget");
+    registry.reset();
+    assert.deepEqual(widget.render(160), [], "reset leaves no dock rows");
+    widget.dispose();
+  });
+
+  test("filters terminal history before the four-card widget cap", () => {
+    const registry = new InlinePresentationRegistry();
+    const widget = new InlinePresentationWidget({ requestRender: () => {} } as any, registry, theme);
+    for (let index = 0; index < 5; index += 1) {
+      registry.capture(`terminal-${index}`, details([result(`terminal-${index}`, "done", [])]));
+    }
+    registry.capture("current", details([result("current", "working", [], { exitCode: -1 })]));
+    assert.match(widget.render(160).join("\n"), /current/, "old terminal cards cannot starve a new running job");
+    widget.dispose();
+  });
+
+  nestedMouseTest("dispatches the visible second widget header after the first card expands", () => {
+    const registry = new InlinePresentationRegistry();
+    const widget = new InlinePresentationWidget({ requestRender: () => {} } as any, registry, theme);
+    registry.capture("background-call", details([
+      result("running-1", "one\ntwo\nthree", [], { exitCode: -1 }),
+      result("running-2", "two", [], { exitCode: -1 }),
+      result("running-3", "three", [], { exitCode: -1 }),
+      result("running-4", "four", [], { exitCode: -1 }),
+    ]));
+    const compact = widget.render(12);
+    const firstHeader = compact[0];
+    // Slots reserve three real rows per card at this width, so y=3 is the
+    // visible second header rather than a coordinate in the first body.
+    const secondHeaderRow = 3;
+    const dispatched = (widget as any).handleMouse({
+      type: "click", button: "left", x: 0, y: secondHeaderRow, screenX: 0, screenY: secondHeaderRow,
+      width: 12, height: compact.length, shift: false, alt: false, ctrl: false,
+    });
+    assert.equal(dispatched?.handled, true, "the rendered second-card header receives widget dispatch");
+    assert.equal((widget as any).handleMouse({
+      type: "click", button: "left", x: 0, y: 1, screenX: 0, screenY: 1,
+      width: 12, height: compact.length, shift: false, alt: false, ctrl: false,
+    }), undefined, "a visible narrow card body remains outside the header hit target");
+    const expanded = widget.render(12);
+    assert.match(expanded[secondHeaderRow]!, /▾/, "clicking the visible second header expands that card, not the hidden first body");
+    assert.equal(expanded[0], firstHeader, "the first header remains visible after a later card expands");
+    assert.ok(expanded.length <= 12);
+    widget.dispose();
+  });
+
   test("keeps foreground cards out of the background widget and isolates their expansion from background redraws", () => {
     const foreground = new InlinePresentationRegistry();
     const background = new InlinePresentationRegistry();
@@ -149,7 +288,7 @@ describe("inline execution presentation", () => {
     foregroundCard.handleMouse({ type: "click", button: "left", y: 0 });
     let renders = 0;
     const widget = new InlinePresentationWidget({ requestRender: () => { renders += 1; } } as any, background, theme);
-    const backgroundDetails = details([result("background", "background answer", [])]);
+    const backgroundDetails = details([result("background", "background answer", [], { exitCode: -1 })]);
     background.capture("background-call", backgroundDetails);
     assert.equal(widget.render(160).join("\n").includes("worker"), false, "the background widget never renders foreground tool calls");
     assert.match(component(foreground, foregroundDetails, false).render(160).join("\n"), /one\s+\ntwo\s+\nthree/, "background refresh does not reset foreground expansion");
@@ -190,12 +329,24 @@ describe("inline execution presentation", () => {
     const failed = details([result("worker", "completed before failure", [{ id: "x", name: "read", status: "completed" }], {
       exitCode: 1, stopReason: "error", errorMessage: "bounded failure",
     })]);
-    registry.capture("failed-call", failed);
-    const snapshot = renderResult({ content: [{ type: "text", text: "host error without details" }] }, false, theme, { toolCallId: "failed-call" }, registry).render(160).join("\n");
+    registry.capture("failed-call", failed, { retainAuthoritativeResults: true });
+    const snapshotComponent = renderResult({ content: [{ type: "text", text: "host error without details" }] }, false, theme, { toolCallId: "failed-call" }, registry) as any;
+    snapshotComponent.children[0].handleMouse({ type: "click", button: "left", y: 0 });
+    const snapshot = snapshotComponent.render(160).join("\n");
     assert.match(snapshot, /failed[\s\S]*completed before failure[\s\S]*bounded failure/);
     registry.markTerminal("failed-call", "cancelled");
-    const cancelled = renderResult({ content: [{ type: "text", text: "host cancellation without details" }] }, false, theme, { toolCallId: "failed-call" }, registry).render(160).join("\n");
+    const cancelled = renderResult({ content: [{ type: "text", text: "host cancellation without details" }] }, true, theme, { toolCallId: "failed-call" }, registry).render(160).join("\n");
     assert.match(cancelled, /cancelled[\s\S]*completed before failure/);
+
+    const fullFailure = `**full failure response**\n${"x".repeat(5_000)}\n**failure tail**`;
+    failed.results[0]!.messages = [{ role: "assistant", content: [{ type: "text", text: fullFailure }] }] as any;
+    registry.capture("failed-full", failed, { retainAuthoritativeResults: true });
+    const failedFull = renderResult({ content: [{ type: "text", text: "host error without details" }] }, false, theme, { toolCallId: "failed-full" }, registry) as any;
+    failedFull.children[0].handleMouse({ type: "click", button: "left", y: 0 });
+    assert.match(failedFull.render(8_000).join("\n"), /failure tail/, "a thrown failure uses its session-local terminal result reference without serializing a duplicate");
+    registry.reset();
+    const afterReload = renderResult({ content: [{ type: "text", text: "host error without details" }] }, true, theme, { toolCallId: "failed-full" }, registry).render(160).join("\n");
+    assert.doesNotMatch(afterReload, /failure tail|completed before failure/, "after session reset there is no fabricated recovery for missing thrown-error details");
 
     for (let index = 0; index < 70; index += 1) {
       const activities = Array.from({ length: 20 }, (_, activity) => ({
@@ -231,8 +382,26 @@ describe("inline execution presentation", () => {
     evictions.state("old", firstOld.identity, false).expanded = true;
     evictions.capture("fresh", details([result("fresh-1", "answer", []), result("fresh-2", "answer", [])]));
     assert.equal(evictions.all().length, 64, "the budget applies across multiple retained invocations");
-    assert.equal(evictions.get("old", old, 0), undefined, "the oldest retained card is evicted first");
-    assert.equal(evictions.state("old", firstOld.identity, false).expanded, false, "eviction removes the associated expansion state");
-    assert.deepEqual(evictions.all().filter(({ toolCallId }) => toolCallId === "fresh").map(({ card }) => card.agent), ["fresh-1", "fresh-2"]);
+    assert.notEqual(evictions.get("old", old, 0), undefined, "an equal-priority terminal arrival is discardable instead of evicting a retained card");
+    assert.equal(evictions.state("old", firstOld.identity, false).expanded, true, "discarding an incoming card retains existing expansion state");
+    assert.deepEqual(evictions.all().filter(({ toolCallId }) => toolCallId === "fresh").map(({ card }) => card.agent), ["fresh-1"], "the cap retains only the first equal-priority arrival after earlier retained terminals");
+
+    const active = new InlinePresentationRegistry();
+    active.capture("mixed", details([
+      ...Array.from({ length: 63 }, (_, index) => result(`terminal-${index}`, "answer", [])),
+      result("still-running", "answer", [], { exitCode: -1 }),
+    ]));
+    active.capture("fresh", details([result("fresh", "answer", []), result("fresh-2", "answer", [])]));
+    assert.ok(active.all().some(({ card }) => card.agent === "still-running"), "terminal snapshots make room before a running card is evicted");
+
+    const allRunning = new InlinePresentationRegistry();
+    const running = Array.from({ length: 64 }, (_, index) => result(`running-${index}`, "answer", [], { exitCode: -1 }));
+    allRunning.capture("running", details(running));
+    const expandedRunning = allRunning.get("running", running, 0)!;
+    allRunning.state("running", expandedRunning.identity, false).expanded = true;
+    allRunning.capture("terminal-arrival", details([result("completed-arrival", "answer", [])]));
+    assert.equal(allRunning.all().filter(({ toolCallId }) => toolCallId === "running").length, 64, "an incoming completed snapshot cannot evict any running card");
+    assert.equal(allRunning.get("terminal-arrival", [result("completed-arrival", "answer", [])], 0), undefined);
+    assert.equal(allRunning.state("running", expandedRunning.identity, false).expanded, true, "discarding the arrival leaves retained card state intact");
   });
 });

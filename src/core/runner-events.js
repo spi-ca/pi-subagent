@@ -60,13 +60,17 @@ const INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS = 4 * 1024;
 const INLINE_PRESENTATION_MAX_TOOL_NAME_CODE_UNITS = 128;
 const inlinePresentations = new WeakMap();
 
-function truncatePresentationText(text, maxCodeUnits = INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS) {
-  if (text.length <= maxCodeUnits) return text;
+function truncatePresentationTextWithStatus(text, maxCodeUnits = INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS) {
+  if (text.length <= maxCodeUnits) return { text, clipped: false };
   let end = maxCodeUnits;
   const prior = text.charCodeAt(end - 1);
   const next = text.charCodeAt(end);
   if (prior >= 0xd800 && prior <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
-  return `${text.slice(0, end)}…`;
+  return { text: `${text.slice(0, end)}…`, clipped: true };
+}
+
+function truncatePresentationText(text, maxCodeUnits = INLINE_PRESENTATION_MAX_ASSISTANT_CODE_UNITS) {
+  return truncatePresentationTextWithStatus(text, maxCodeUnits).text;
 }
 
 function boundedPresentationToolName(value) {
@@ -82,7 +86,7 @@ export function ensureInlinePresentation(result) {
   if (!result || (typeof result !== "object" && typeof result !== "function")) return undefined;
   let presentation = inlinePresentations.get(result);
   if (!presentation) {
-    presentation = { lastAssistantText: "", activities: [], revision: 0, nextActivity: 0 };
+    presentation = { lastAssistantText: "", lastAssistantTextClipped: false, activities: [], revision: 0, nextActivity: 0 };
     inlinePresentations.set(result, presentation);
   }
   return presentation;
@@ -94,24 +98,35 @@ export function getInlinePresentation(result) {
     : undefined;
 }
 
-function completedAssistantText(message) {
-  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
+/**
+ * Returns an untruncated completed assistant response, excluding the same
+ * terminal placeholders that must not replace an inline presentation preview.
+ */
+export function completedAssistantText(message) {
+  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
   // message_end is also emitted for failures, aborts, and host-pending
   // placeholders. Those are not a completed assistant response and must not
   // replace the last valid preview.
-  if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "pending" || message.status === "pending") return "";
-  return truncatePresentationText(message.content
+  if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "pending" || message.status === "pending") return undefined;
+  const text = message.content
     .filter((part) => part?.type === "text" && typeof part.text === "string" && part.text.length > 0)
     .map((part) => part.text)
-    .join("\n"));
+    .join("\n");
+  return text || undefined;
+}
+
+function completedAssistantPresentationText(message) {
+  const text = completedAssistantText(message);
+  return text ? truncatePresentationTextWithStatus(text) : undefined;
 }
 
 function updateInlinePresentation(presentation, event) {
   if (!presentation || !event || typeof event !== "object") return false;
   if (event.type === "message_end") {
-    const text = completedAssistantText(event.message);
-    if (!text || text === presentation.lastAssistantText) return false;
-    presentation.lastAssistantText = text;
+    const snapshot = completedAssistantPresentationText(event.message);
+    if (!snapshot || (snapshot.text === presentation.lastAssistantText && snapshot.clipped === presentation.lastAssistantTextClipped)) return false;
+    presentation.lastAssistantText = snapshot.text;
+    presentation.lastAssistantTextClipped = snapshot.clipped;
     presentation.revision += 1;
     return true;
   }
@@ -119,12 +134,13 @@ function updateInlinePresentation(presentation, event) {
     const messages = Array.isArray(event.messages) ? event.messages : [];
     // An agent-end snapshot can finish with an error/abort placeholder after a
     // valid turn. Walk backward until a non-empty completed response is found.
-    let text = "";
-    for (let index = messages.length - 1; index >= 0 && !text; index -= 1) {
-      text = completedAssistantText(messages[index]);
+    let snapshot;
+    for (let index = messages.length - 1; index >= 0 && !snapshot; index -= 1) {
+      snapshot = completedAssistantPresentationText(messages[index]);
     }
-    if (!text || text === presentation.lastAssistantText) return false;
-    presentation.lastAssistantText = text;
+    if (!snapshot || (snapshot.text === presentation.lastAssistantText && snapshot.clipped === presentation.lastAssistantTextClipped)) return false;
+    presentation.lastAssistantText = snapshot.text;
+    presentation.lastAssistantTextClipped = snapshot.clipped;
     presentation.revision += 1;
     return true;
   }

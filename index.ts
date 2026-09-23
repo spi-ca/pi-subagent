@@ -921,24 +921,46 @@ export default function (pi: ExtensionAPI) {
     const ui = ctx.ui as { setWidget?: (key: string, content: unknown) => void };
     if (typeof ui.setWidget !== "function") return;
     const widgetGeneration = ++inlinePresentationWidgetGeneration;
-    try {
-      const widgets = new Set<InlinePresentationWidget>();
-      ui.setWidget(INLINE_PRESENTATION_WIDGET_KEY, (tui: any, theme: any) => {
-        const widget = new InlinePresentationWidget(tui, backgroundInlinePresentationRegistry, theme);
-        widgets.add(widget);
-        return widget;
-      });
-      clearInlinePresentationWidget = () => {
-        if (widgetGeneration !== inlinePresentationWidgetGeneration) return;
-        ++inlinePresentationWidgetGeneration;
-        for (const widget of widgets) widget.dispose();
-        widgets.clear();
-        try { ui.setWidget?.(INLINE_PRESENTATION_WIDGET_KEY, undefined); } catch { /* disposed UI is non-authoritative */ }
-      };
-    } catch {
-      // A widget is display-only. Keep execution and the existing steer result
-      // contract intact when a host UI declines this optional surface.
-    }
+    const widgets = new Set<InlinePresentationWidget>();
+    let mounted = false;
+    const disposeWidgets = (): void => {
+      for (const widget of widgets) widget.dispose();
+      widgets.clear();
+    };
+    // Pi 0.87 places a spacer before every registered widget, even when its
+    // render() result is empty. Mount only while work is running so terminal
+    // snapshots leave no dock row; the registry remains the detail surface.
+    const syncWidget = (): void => {
+      if (widgetGeneration !== inlinePresentationWidgetGeneration) return;
+      const shouldMount = backgroundInlinePresentationRegistry.all().some(({ card }) => card.status === "running");
+      if (shouldMount === mounted) return;
+      try {
+        if (shouldMount) {
+          ui.setWidget!(INLINE_PRESENTATION_WIDGET_KEY, (tui: any, theme: any) => {
+            const widget = new InlinePresentationWidget(tui, backgroundInlinePresentationRegistry, theme);
+            widgets.add(widget);
+            return widget;
+          });
+        } else {
+          disposeWidgets();
+          mounted = false;
+          ui.setWidget!(INLINE_PRESENTATION_WIDGET_KEY, undefined);
+        }
+        if (shouldMount) mounted = true;
+      } catch {
+        // A widget is display-only. Keep execution and the existing steer result
+        // contract intact when a host UI declines this optional surface.
+      }
+    };
+    const unsubscribe = backgroundInlinePresentationRegistry.subscribe(syncWidget);
+    clearInlinePresentationWidget = () => {
+      if (widgetGeneration !== inlinePresentationWidgetGeneration) return;
+      ++inlinePresentationWidgetGeneration;
+      unsubscribe();
+      disposeWidgets();
+      mounted = false;
+      try { ui.setWidget?.(INLINE_PRESENTATION_WIDGET_KEY, undefined); } catch { /* disposed UI is non-authoritative */ }
+    };
   };
   // Advances at the synchronous boundary of every start/shutdown event.
   // Async startup continuations may install state only for their own token.
@@ -1858,7 +1880,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               job,
               (jobSignal) => runInvocation(jobSignal, (partial) => {
                 if (!backgroundSessionFence.isCurrent(backgroundSessionToken)) return;
-                backgroundInlinePresentationRegistry.capture(job.id, partial.details);
+                backgroundInlinePresentationRegistry.capture(job.id, partial.details, { retainAuthoritativeResults: false });
                 updateUxFromPartial(job.id, uxGeneration, partial);
               }, true, job.id),
               limits,
@@ -1866,7 +1888,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               backgroundSessionFence,
               (finalizedJob, finalizedUsage, rawResult) => {
                 if (!backgroundSessionFence.isCurrent(backgroundSessionToken)) return;
-                backgroundInlinePresentationRegistry.capture(finalizedJob.id, rawResult?.details);
+                backgroundInlinePresentationRegistry.capture(finalizedJob.id, rawResult?.details, { retainAuthoritativeResults: false });
                 if (finalizedJob.status === "cancelled") backgroundInlinePresentationRegistry.markTerminal(finalizedJob.id, "cancelled");
                 else if (finalizedJob.status === "failed") backgroundInlinePresentationRegistry.markTerminal(finalizedJob.id, "failed");
                 updateUxFromPartial(finalizedJob.id, uxGeneration, finalizedJob.result);
@@ -1933,12 +1955,12 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         try {
           const result = finalizeForegroundUsage(await runInvocation(foregroundController.signal, (partial) => {
             if (!isForegroundSessionCurrent()) return;
-            foregroundInlinePresentationRegistry.capture(_toolCallId, partial.details);
+            foregroundInlinePresentationRegistry.capture(_toolCallId, partial.details, { retainAuthoritativeResults: true });
             updateUxFromPartial(uxRun.id, uxGeneration, partial);
             onUpdate?.(partial);
           }, false, uxRun.id));
           if (isForegroundSessionCurrent()) {
-            foregroundInlinePresentationRegistry.capture(_toolCallId, result.details);
+            foregroundInlinePresentationRegistry.capture(_toolCallId, result.details, { retainAuthoritativeResults: true });
             updateUxFromPartial(uxRun.id, uxGeneration, result);
           }
           // Public accounting remains part of the result only; V2 presence

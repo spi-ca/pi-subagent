@@ -573,9 +573,9 @@ describe("pane launch broker", () => {
 	});
 
 	test("rejects an intent whose run id is not the run directory before claim", async () => {
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-")); tempDirs.push(root);
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
-		const backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "directory-run" });
+		// Intent validation rejects this run before invoking any backend; no native fixture is needed.
+		const backend = fs.realpathSync(process.execPath), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "directory-run" });
 		const args = await writeIntent(paths, "different-intent-run", backend);
 		assert.equal(await run(args, process.env), 0);
 		assert.equal(fs.existsSync(paths.brokerClaimPath), false);

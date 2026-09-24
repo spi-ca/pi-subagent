@@ -590,23 +590,35 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("does not let an unresolving lease read hold completion-fence ACK wait", async () => {
-		let reads = 0;
+		const leaseReadPhases: string[] = [];
 		const blockedLeaseRead = deferred<void>();
 		const bridge = await setupBridge("run-completion-fence-blocked-read", {
 			completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true,
 			readLease: async (filePath) => {
-				if (++reads === 1) return await readJsonFile(filePath);
+				if (leaseReadPhases.length === 0) {
+					leaseReadPhases.push("initial");
+					return await readJsonFile(filePath);
+				}
+				leaseReadPhases.push("periodic");
 				blockedLeaseRead.resolve();
 				return await new Promise<never>(() => undefined);
 			},
 		});
+		// The initial hard gate is a separate phase from the blocked periodic
+		// read. Refresh the fixture lease immediately before that gate so a
+		// slow CI worker cannot turn this ACK-deadline test into an orphan race.
+		await bridge.heartbeat();
 		await bridge.emit("session_start");
 		await withinDeadlockGuard(blockedLeaseRead.promise, "blocked periodic lease read start");
+		assert.deepEqual(leaseReadPhases, ["initial", "periodic"]);
 		await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		await withinDeadlockGuard(bridge.emit("agent_settled"), "settlement after blocked lease read");
 		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-blocked-read");
+		assert.equal(completion?.status, "failed");
 		assert.equal(completionError(completion), "bridge-error");
 		assert.equal(completion && "session" in completion, false);
+		assert.equal(fs.existsSync(bridge.paths.completionFencePath), true, "the child published its completion fence");
+		assert.equal(fs.existsSync(bridge.paths.completionFenceAckPath), false, "no ACK was published before the bounded fallback");
 	});
 
 	test("settles a never-resolving ACK artifact read through the boundary-less deadline fallback", async () => {

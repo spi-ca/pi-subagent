@@ -5,7 +5,7 @@
 import * as os from "node:os";
 import { getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { getResultSummaryText } from "../core/runner-events.js";
+import { completedAssistantText, getResultSummaryText } from "../core/runner-events.js";
 import { getStageLabel } from "../core/chain-helpers.js";
 import { parseBackgroundJobActionDetails, type BackgroundJobDetailSummary } from "../core/background-job-details.js";
 import { configuredExpandHint } from "./expand-hint.js";
@@ -451,6 +451,20 @@ export function renderResult(
 	return renderParallelResult(details, details.toolLabel || SUBAGENT_TOOL_LABEL, delegationMode, terminalMode, expanded, theme);
 }
 
+/**
+ * Inline-card details must ignore terminal error/abort/pending placeholders.
+ * Generic getFinalOutput intentionally keeps its existing model-delivery
+ * semantics, so this UI-only recovery path uses the runner's shared predicate.
+ */
+function getAuthoritativeCompletedAssistantText(messages: unknown): string | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const text = completedAssistantText(messages[index]);
+		if (text) return text;
+	}
+	return undefined;
+}
+
 function renderInlineResultCards(
 	details: SubagentDetails,
 	toolCallId: string,
@@ -463,7 +477,15 @@ function renderInlineResultCards(
 	for (let index = 0; index < Math.min(details.results.length, INLINE_PRESENTATION_MAX_CARDS); index += 1) {
 		const presentation = registry.get(toolCallId, details.results, index);
 		if (!presentation) continue;
-		container.addChild(new InlineResultCard(presentation, registry.state(toolCallId, presentation.identity, expanded), theme));
+		const authoritativeAssistantText = presentation.status === "running"
+			? undefined
+			: getAuthoritativeCompletedAssistantText(details.results[index]!.messages);
+		container.addChild(new InlineResultCard(
+			presentation,
+			registry.state(toolCallId, presentation.identity, expanded),
+			theme,
+			{ authoritativeAssistantText: authoritativeAssistantText || undefined },
+		));
 		count += 1;
 	}
 	return count > 0 ? container : undefined;
@@ -479,7 +501,16 @@ function renderInlineResultSnapshotCards(
 	if (cards.length === 0) return undefined;
 	const container = new Container();
 	for (const { card } of cards) {
-		container.addChild(new InlineResultCard(card, registry.state(toolCallId, card.identity, expanded), theme));
+		const messages = registry.authoritativeMessages(toolCallId, card.identity);
+		const authoritativeAssistantText = card.status === "running" || !messages
+			? undefined
+			: getAuthoritativeCompletedAssistantText(messages);
+		container.addChild(new InlineResultCard(
+			card,
+			registry.state(toolCallId, card.identity, expanded),
+			theme,
+			{ authoritativeAssistantText: authoritativeAssistantText || undefined },
+		));
 	}
 	return container;
 }

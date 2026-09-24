@@ -8,6 +8,7 @@ import { Markdown } from "../../node_modules/@earendil-works/pi-tui/dist/compone
 import { Spacer } from "../../node_modules/@earendil-works/pi-tui/dist/components/spacer.js";
 import { Text } from "../../node_modules/@earendil-works/pi-tui/dist/components/text.js";
 import { Container } from "../../node_modules/@earendil-works/pi-tui/dist/tui.js";
+import { truncateToWidth } from "../../node_modules/@earendil-works/pi-tui/dist/utils.js";
 
 // The local TypeScript paths intentionally point at declaration files. Load
 // the actual TUI components from their runtime modules, then supply them while
@@ -32,7 +33,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 		};
 	},
 }));
-mock.module("@earendil-works/pi-tui", () => ({ Box, Container, Markdown, Spacer, Text }));
+mock.module("@earendil-works/pi-tui", () => ({ Box, Container, Markdown, Spacer, Text, truncateToWidth }));
 const { renderCall, renderResult } = await import("../../src/ui/render");
 
 const theme = {

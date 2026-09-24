@@ -17,6 +17,7 @@ export interface InlineCardPresentation {
   ordinal: number;
   stageLabel?: string;
   lastAssistantText: string;
+  lastAssistantTextClipped: boolean;
   activities: InlineActivityPresentation[];
   status: "running" | "completed" | "cancelled" | "failed";
   error?: string;
@@ -33,9 +34,15 @@ type InlineResultLike = {
   exitCode?: unknown;
   stopReason?: unknown;
   errorMessage?: unknown;
+  messages?: unknown;
 };
 
 type InlineDetailsLike = { terminalMode?: unknown; results?: unknown };
+
+export interface InlinePresentationCaptureOptions {
+  /** Retains existing foreground terminal result references only for thrown-error recovery. */
+  retainAuthoritativeResults?: boolean;
+}
 
 function sanitizeTerminalText(text: string): string {
   return text
@@ -48,15 +55,19 @@ function sanitizeTerminalText(text: string): string {
 }
 
 function truncateUtf8(text: string, maxBytes: number): string {
+  return truncateUtf8WithStatus(text, maxBytes).text;
+}
+
+function truncateUtf8WithStatus(text: string, maxBytes: number): { text: string; clipped: boolean } {
   let bytes = 0;
   let result = "";
   for (const character of text) {
     const size = Buffer.byteLength(character, "utf8");
-    if (bytes + size > maxBytes) return `${result}…`;
+    if (bytes + size > maxBytes) return { text: `${result}…`, clipped: true };
     result += character;
     bytes += size;
   }
-  return result;
+  return { text: result, clipped: false };
 }
 
 function safeLabel(value: unknown, fallback: string): string {
@@ -93,16 +104,21 @@ function terminalStatus(candidate: InlineResultLike): InlineCardPresentation["st
  */
 export class InlinePresentationRegistry {
   private cards = new Map<string, Map<string, InlineCardPresentation>>();
+  // Terminal result references are UI-only and bounded by the same card cap.
+  // They avoid a second full-output copy while a thrown host error has no
+  // details to render. Session reset releases every reference.
+  private terminalResults = new Map<string, Map<string, InlineResultLike>>();
   private cardCount = 0;
   private states = new Map<string, InlineCardState>();
   private listeners = new Set<() => void>();
 
-  capture(toolCallId: string, details: unknown): boolean {
+  capture(toolCallId: string, details: unknown, options: InlinePresentationCaptureOptions = {}): boolean {
     if (!toolCallId || details === null || typeof details !== "object") return false;
     const typedDetails = details as InlineDetailsLike;
     if (typedDetails.terminalMode !== "inline" || !Array.isArray(typedDetails.results)) return false;
 
     const cards = new Map<string, InlineCardPresentation>();
+    const terminalResults = new Map<string, InlineResultLike>();
     // Presentation observers must not allocate or inspect unbounded result
     // arrays. Result order is stable, so retaining the first slots gives a
     // deterministic clipped preview while the tool details remain complete.
@@ -114,6 +130,7 @@ export class InlinePresentationRegistry {
       const result = candidate as InlineResultLike;
       const presentation = getInlinePresentation(candidate) as {
         lastAssistantText?: unknown;
+        lastAssistantTextClipped?: unknown;
         activities?: Array<{ name?: unknown; status?: unknown }>;
       } | undefined;
       const activities = Array.isArray(presentation?.activities)
@@ -128,21 +145,24 @@ export class InlinePresentationRegistry {
       const error = terminalStatus(result) === "failed" || terminalStatus(result) === "cancelled"
         ? safeLabel(result.errorMessage, terminalStatus(result) === "cancelled" ? "cancelled" : "failed")
         : undefined;
+      const assistantSnapshot = typeof presentation?.lastAssistantText === "string"
+        ? truncateUtf8WithStatus(sanitizeTerminalText(presentation.lastAssistantText), MAX_ASSISTANT_BYTES)
+        : { text: "", clipped: false };
+      const status = terminalStatus(result);
       cards.set(identity.identity, {
         ...identity,
-        lastAssistantText: typeof presentation?.lastAssistantText === "string"
-          ? truncateUtf8(sanitizeTerminalText(presentation.lastAssistantText), MAX_ASSISTANT_BYTES)
-          : "",
+        lastAssistantText: assistantSnapshot.text,
+        // The upstream observer clips by code units before this UTF-8 cap.
+        // Its explicit metadata is required for exact-limit ASCII previews.
+        lastAssistantTextClipped: assistantSnapshot.clipped || presentation?.lastAssistantTextClipped === true,
         activities,
-        status: terminalStatus(result),
+        status,
         ...(error ? { error } : {}),
       });
+      if (options.retainAuthoritativeResults === true && status !== "running") terminalResults.set(identity.identity, result);
     }
     if (cards.size === 0) return false;
-    this.removeInvocation(toolCallId, cards);
-    while (this.cardCount + cards.size > MAX_CARDS) this.evictOldestCard();
-    this.cards.set(toolCallId, cards);
-    this.cardCount += cards.size;
+    this.replaceInvocation(toolCallId, cards, terminalResults);
     this.emit();
     return true;
   }
@@ -159,6 +179,12 @@ export class InlinePresentationRegistry {
 
   all(): Array<{ toolCallId: string; card: InlineCardPresentation }> {
     return [...this.cards.entries()].flatMap(([toolCallId, cards]) => [...cards.values()].map((card) => ({ toolCallId, card })));
+  }
+
+  /** Returns the existing terminal message array without copying it. */
+  authoritativeMessages(toolCallId: string, identity: string): unknown[] | undefined {
+    const messages = this.terminalResults.get(toolCallId)?.get(identity)?.messages;
+    return Array.isArray(messages) ? messages : undefined;
   }
 
   state(toolCallId: string, identity: string, globalExpanded: boolean): InlineCardState {
@@ -190,35 +216,53 @@ export class InlinePresentationRegistry {
 
   reset(): void {
     this.cards.clear();
+    this.terminalResults.clear();
     this.cardCount = 0;
     this.states.clear();
     this.emit();
   }
 
-  private removeInvocation(toolCallId: string, retainedCards?: ReadonlyMap<string, InlineCardPresentation>): void {
-    const cards = this.cards.get(toolCallId);
-    if (!cards) return;
-    this.cards.delete(toolCallId);
-    this.cardCount -= cards.size;
-    for (const identity of cards.keys()) {
-      if (!retainedCards?.has(identity)) this.states.delete(`${toolCallId}\u0000${identity}`);
+  private replaceInvocation(
+    toolCallId: string,
+    incomingCards: ReadonlyMap<string, InlineCardPresentation>,
+    incomingTerminalResults: ReadonlyMap<string, InlineResultLike>,
+  ): void {
+    // Choose from the combined retained and incoming candidates. A completed
+    // arrival must never evict one of 64 running cards merely because it was
+    // captured later. Ordering within a priority is stable and deterministic.
+    const candidates: Array<{ toolCallId: string; identity: string; card: InlineCardPresentation; terminalResult?: InlineResultLike; order: number }> = [];
+    let order = 0;
+    for (const [existingToolCallId, cards] of this.cards) {
+      if (existingToolCallId === toolCallId) continue;
+      for (const [identity, card] of cards) {
+        candidates.push({ toolCallId: existingToolCallId, identity, card, terminalResult: this.terminalResults.get(existingToolCallId)?.get(identity), order: order++ });
+      }
     }
-  }
-
-  private evictOldestCard(): void {
-    const oldestToolCallId = this.cards.keys().next().value;
-    if (oldestToolCallId === undefined) return;
-    const cards = this.cards.get(oldestToolCallId);
-    if (!cards) return;
-    const oldestIdentity = cards.keys().next().value;
-    if (oldestIdentity === undefined) {
-      this.cards.delete(oldestToolCallId);
-      return;
+    for (const [identity, card] of incomingCards) {
+      candidates.push({ toolCallId, identity, card, terminalResult: incomingTerminalResults.get(identity), order: order++ });
     }
-    cards.delete(oldestIdentity);
-    this.cardCount -= 1;
-    this.states.delete(`${oldestToolCallId}\u0000${oldestIdentity}`);
-    if (cards.size === 0) this.cards.delete(oldestToolCallId);
+    const priority = (card: InlineCardPresentation): number => card.status === "running" ? 0 : card.status === "failed" || card.status === "cancelled" ? 1 : 2;
+    const retained = candidates
+      .sort((left, right) => priority(left.card) - priority(right.card) || left.order - right.order)
+      .slice(0, MAX_CARDS);
+    const retainedKeys = new Set(retained.map((candidate) => `${candidate.toolCallId}\u0000${candidate.identity}`));
+    for (const key of this.states.keys()) {
+      if (!retainedKeys.has(key)) this.states.delete(key);
+    }
+    this.cards.clear();
+    this.terminalResults.clear();
+    this.cardCount = 0;
+    for (const candidate of retained) {
+      let cards = this.cards.get(candidate.toolCallId);
+      if (!cards) this.cards.set(candidate.toolCallId, cards = new Map());
+      cards.set(candidate.identity, candidate.card);
+      if (candidate.terminalResult) {
+        let terminalResults = this.terminalResults.get(candidate.toolCallId);
+        if (!terminalResults) this.terminalResults.set(candidate.toolCallId, terminalResults = new Map());
+        terminalResults.set(candidate.identity, candidate.terminalResult);
+      }
+      this.cardCount += 1;
+    }
   }
 
   private emit(): void {

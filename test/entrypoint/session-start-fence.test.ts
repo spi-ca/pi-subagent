@@ -358,9 +358,7 @@ describe("session-start background completion fence", () => {
       assert.ok(sessionShutdown);
       await sessionStart({}, context);
       assert.ok(subagentTool?.execute);
-      assert.equal(widgetCalls.length, 1, "a current UI session installs exactly one background presentation widget");
-      assert.equal(widgetCalls[0]?.key, "pi-subagent-background-inline");
-      assert.equal(typeof widgetCalls[0]?.value, "function");
+      assert.deepEqual(widgetCalls, [], "an empty session leaves the widget unmounted and the dock clear");
 
       const started = await subagentTool.execute!("delivery-job", { agent: "worker", task: "deliver", background: true }, new AbortController().signal, undefined, context);
       const jobId = started.details?.jobId;
@@ -396,7 +394,7 @@ describe("session-start background completion fence", () => {
     }
   });
 
-  test("projects settled background success, failure, and cancellation into the registered widget without foreground-style updates", async () => {
+  test("removes settled background success, failure, and cancellation from the registered widget without foreground-style updates", async () => {
     const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
     const previousDepth = process.env.PI_SUBAGENT_DEPTH;
     const previousStack = process.env.PI_SUBAGENT_STACK;
@@ -411,6 +409,9 @@ describe("session-start background completion fence", () => {
     let requestRenders = 0;
     let toolUpdates = 0;
     let widgetFactory: ((tui: unknown, theme: unknown) => unknown) | undefined;
+    const widgetCalls: unknown[] = [];
+    let resolveWidgetMounted!: () => void;
+    const widgetMounted = new Promise<void>((resolve) => { resolveWidgetMounted = resolve; });
     let widget: any;
     try {
       configDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-subagent-background-widget-"));
@@ -421,6 +422,10 @@ describe("session-start background completion fence", () => {
       process.env.PI_SUBAGENT_STACK = "[]";
       process.env.PI_SUBAGENT_TERMINAL_MODE = "inline";
       runAgentForTest = async (options) => {
+        options.onUpdate?.({
+          content: [],
+          details: options.makeDetails([{ ...successfulResult(options, `${options.task} running`), exitCode: -1 }]),
+        });
         if (options.task === "failure") return { ...successfulResult(options, "failed completed text"), exitCode: 1, stopReason: "error", errorMessage: "failure" };
         if (options.task === "cancel") {
           releaseCancelledRun();
@@ -439,7 +444,13 @@ describe("session-start background completion fence", () => {
           notify: () => undefined,
           confirm: async () => false,
           setStatus: () => undefined,
-          setWidget: (_key, value) => { if (typeof value === "function") widgetFactory = value as any; else throw new Error("disposed widget host"); },
+          setWidget: (_key, value) => {
+            widgetCalls.push(value);
+            if (typeof value === "function") {
+              widgetFactory = value as any;
+              resolveWidgetMounted();
+            }
+          },
         },
         sessionManager: { getSessionId: () => "widget", getSessionFile: () => undefined },
       };
@@ -461,12 +472,15 @@ describe("session-start background completion fence", () => {
       assert.ok(sessionShutdown);
       assert.ok(subagentTool?.execute);
       await sessionStart({}, context);
-      assert.ok(widgetFactory);
-      widget = widgetFactory!({ requestRender: () => { requestRenders += 1; } }, {
-        fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text,
-      });
+      assert.equal(widgetFactory, undefined, "an empty session does not reserve a widget spacer");
 
       await subagentTool.execute!("success", { agent: "worker", task: "success", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
+      await withinDeadline(widgetMounted, "a running background update mounts the widget");
+      assert.ok(widgetFactory);
+      const mountedWidgetFactory = widgetFactory as unknown as (tui: unknown, theme: unknown) => unknown;
+      widget = mountedWidgetFactory({ requestRender: () => { requestRenders += 1; } }, {
+        fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text,
+      });
       await subagentTool.execute!("failure", { agent: "worker", task: "failure", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
       const cancelled = await subagentTool.execute!("cancel", { agent: "worker", task: "cancel", background: true }, new AbortController().signal, () => { toolUpdates += 1; }, context);
       await withinDeadline(cancelledRunStarted, "cancelled background runner startup");
@@ -474,7 +488,9 @@ describe("session-start background completion fence", () => {
       await withinDeadline(allDelivered, "all terminal background steers");
       assert.equal(toolUpdates, 0, "background completion never invokes the already-returned tool update callback");
       assert.ok(requestRenders >= 3, "raw terminal details refresh the widget for success, failure, and cancellation before job history compaction");
-      assert.deepEqual(widget.children.map((card: any) => card.presentation.status).sort(), ["cancelled", "completed", "failed"]);
+      assert.deepEqual(widget.render(160), [], "settled jobs leave the persistent widget with no dock rows");
+      assert.deepEqual(widget.children, [], "terminal cards remain in their result histories, not the running widget");
+      assert.equal(widgetCalls.at(-1), undefined, "terminal state removes the registered widget so Pi does not retain its dock slot");
       await assert.doesNotReject(sessionShutdown!({}, context), "display cleanup failure must not alter session shutdown");
       sessionShutdown = undefined;
     } finally {

@@ -317,9 +317,11 @@ function summarySemanticKey(kind, entry) {
   // Deliberately exclude entry ID, parent/timestamp, and extension details so
   // compaction_end.result can pair with its later/earlier persisted entry.
   // Entry IDs still take precedence and are never compared to each other.
-  const identity = kind === "compaction"
-    ? { summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId, tokensBefore: entry.tokensBefore, usage: entry.usage }
-    : { fromId: entry.fromId, summary: entry.summary, usage: entry.usage };
+  const identity = kind === "usage"
+    ? { kind: entry.kind, provider: entry.provider, model: entry.model, usage: entry.usage }
+    : kind === "compaction"
+      ? { summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId, tokensBefore: entry.tokensBefore, usage: entry.usage }
+      : { fromId: entry.fromId, summary: entry.summary, usage: entry.usage };
   return `${kind}:semantic:${stableStringify(identity)}`;
 }
 
@@ -350,6 +352,8 @@ function addSummaryUsage(result, kind, entry) {
 
 function collectLifecycleSummaryUsage(result, event) {
   switch (event?.type) {
+    case "session_usage":
+      return addSummaryUsage(result, "usage", event.usageEntry);
     case "compaction_end":
       return addSummaryUsage(result, "compaction", event.result);
     case "session_compact":

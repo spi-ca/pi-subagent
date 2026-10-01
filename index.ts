@@ -22,6 +22,7 @@
 import * as crypto from "node:crypto";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   buildChainTaskFromStages,
   collectRequestedAgentNamesFromChain,
@@ -43,6 +44,7 @@ import { type AgentConfig, findNearestProjectAgentsDir, type AgentDiscoveryResul
 import { AgentDiscoveryCache } from "./src/core/agent-discovery-cache.js";
 import { settleWithUnrefTimeout } from "./src/core/async-settle.js";
 import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
+import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/structured-result.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
@@ -1322,6 +1324,7 @@ export default function (pi: ExtensionAPI) {
       label: SUBAGENT_TOOL_LABEL,
       description: formatSubagentToolDescription(),
       parameters: SubagentParams,
+      outputSchema: SubagentOutputSchema,
 
       // Reject raw model arguments before the host applies Value.Convert. The
       // host's converter intentionally coerces values, while invocation shape
@@ -1333,6 +1336,9 @@ export default function (pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        const emitUpdate = onUpdate;
+        onUpdate = emitUpdate ? (partial) => emitUpdate(withSubagentStructuredContent(partial)) : undefined;
+        const executeInvocation = async (): Promise<AgentToolResult<unknown>> => {
         try {
         // Capture once at tool invocation time so queued/background work cannot
         // observe a later parent-session thinking change.
@@ -1991,6 +1997,8 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
           // never bypass the model-visible byte/line limits.
           throw new Error(formatBoundedForegroundThrownError(error));
         }
+        };
+        return withSubagentStructuredContent(await executeInvocation());
       },
 
       renderCall: (args, theme) => renderCall(args, theme),

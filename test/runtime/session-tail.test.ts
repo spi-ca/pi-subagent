@@ -869,3 +869,24 @@ describe("session JSONL tail", () => {
 		await assert.rejects(() => fs.promises.stat(drained.state.indexPath!));
 	});
 });
+
+test("0.99.2 tail accounts usage once while leaving system and canonical edits out of raw output", async () => {
+	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-tail-0992-")); tempDirs.push(root);
+	const filePath = path.join(root, "session.jsonl");
+	const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const entries = [
+		assistantEntry("final", "raw output"),
+		{ type: "message", id: "system", parentId: "final", message: { role: "system", content: "private prompt", timestamp: 0 } },
+		{ type: "context_edit", id: "edit", parentId: "system", targetId: "final", replacement: { content: "canonical replacement" } },
+		{ type: "usage", id: "usage", parentId: "edit", kind: "future", provider: "p", model: "m", usage },
+	];
+	await fs.promises.writeFile(filePath, entries.map((entry) => JSON.stringify(entry) + "\n").join(""));
+	const result = makeResult(), state = createSessionTailState(), observed: unknown[] = [];
+	await drainSessionJsonl({ filePath, state, result, final: true, onEntry: (entry) => observed.push(entry) });
+	assert.deepEqual(observed, entries); assert.equal(getFinalOutput(result.messages), "raw output");
+	const tokens = (result as any).accountingUsage.input;
+	state.offset = 0;
+	await drainSessionJsonl({ filePath, state, result, final: true });
+	assert.equal((result as any).accountingUsage.input, tokens); assert.ok(tokens >= 2);
+	assert.deepEqual(JSON.parse((await fs.promises.readFile(filePath, "utf8")).trim().split("\n")[2]), entries[2]);
+});

@@ -693,7 +693,7 @@ describe("child lifecycle bridge", () => {
 	test("negotiates Pi 0.81 success metadata tails for rolling parents", async () => {
 		const legacy = await setupBridge("run-legacy-success-tail");
 		const modern = await setupBridge("run-modern-success-tail", { metadataTailSuccessBoundaryCapability: true });
-		const usage = { input: 4, output: 1, totalTokens: 5 };
+		const usage = { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 		// The fixture's assistant IDs derive from each run ID, so link each
 		// metadata tail to its exact final assistant.
 		await fs.promises.writeFile(legacy.paths.childSessionPath, `${JSON.stringify({ type: "message", id: "entry-run-legacy-success-tail", timestamp: new Date().toISOString(), message: assistant("stop") })}\n${JSON.stringify({ type: "compaction", id: "compact-legacy", parentId: "entry-run-legacy-success-tail", timestamp: "2026-07-21T00:00:00.000Z", summary: "compact", tokensBefore: 9, retainedTail: [], usage })}\n`, { mode: 0o600 });

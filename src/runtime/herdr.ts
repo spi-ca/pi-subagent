@@ -11,7 +11,7 @@ import {
 
 export { HERDR_MAX_PUBLIC_ID_BYTES, isHerdrPublicId, parseHerdrEnvironment } from "../core/herdr-environment.js";
 
-/** v0.8.0 speaks protocol 19; preview builds speak 20; v0.9.0 speaks 22. */
+/** v0.8.0 speaks protocol 19; preview builds speak 20; v0.9.0–0.9.3 speak 22. */
 export const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20, 22] as const);
 export type HerdrProtocolVersion = 19 | 20 | 22;
 export function isSupportedHerdrProtocol(value: unknown): value is HerdrProtocolVersion {
@@ -391,7 +391,21 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 	}
 	let stopped = false; let healthy: boolean | null = null; let current: net.Socket | null = null; let reconciliation: Promise<void> | null = null; let reconciliationPending = false;
 	const controller = new AbortController();
+	let lossHintTimer: ReturnType<typeof setTimeout> | undefined;
 	const wake = () => { if (!stopped) options.onWake?.(); };
+	// Herdr 0.9.3 reports subscriber lag without pane identity. Coalesce a
+	// burst into one bounded fresh read/wake, never consume its payload as state.
+	const requestLossReconcile = () => {
+		if (stopped || lossHintTimer) return;
+		lossHintTimer = setTimeout(() => {
+			lossHintTimer = undefined;
+			if (stopped) return;
+			options.onEvent?.("events_lost", null);
+			if (options.wakeOnEvent !== false) wake();
+			if (options.reconcileOnEvent !== false) requestReconcile();
+		}, HERDR_RECONNECT_MIN_MS);
+		lossHintTimer.unref?.();
+	};
 	// Health is a transport fact, not lifecycle authority. Notify exactly once
 	// per transition so callers can add/remove their degraded-only observer.
 	const setHealthy = (next: boolean) => {
@@ -445,6 +459,7 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 					socket.on("data", (chunk: Buffer) => {
 						buffer = Buffer.concat([buffer, chunk]); if (buffer.length > HERDR_MAX_LINE_BYTES) return finish(new Error("Herdr subscription exceeded the strict wire limit."));
 						for (;;) { const newline = buffer.indexOf(0x0a); if (newline < 0) return; const line = buffer.subarray(0, newline); buffer = buffer.subarray(newline + 1); let message: unknown; try { message = JSON.parse(line.toString("utf8")); } catch { return finish(new Error("Herdr subscription returned malformed JSON.")); } if (!isRecord(message)) return finish(new Error("Herdr subscription returned a non-object frame.")); if (!acknowledged) { if (message.id !== id || !isRecord(message.result) || message.result.type !== "subscription_started") return finish(new Error("Herdr subscription acknowledgement is invalid.")); acknowledged = true; setHealthy(true); clearTimeout(ackTimer); delay = minDelay; if (options.reconcileOnEvent !== false) requestReconcile(); continue; }
+							if (message.event === "events_lost") { requestLossReconcile(); continue; }
 							const data = isRecord(message.data) ? message.data : null;
 							if (typeof message.event === "string") options.onEvent?.(message.event, data);
 							// Event payloads only establish relevance. Every binding and presence
@@ -471,7 +486,9 @@ export function subscribeHerdrPane(options: { handle: HerdrPaneHandle; onReconci
 	})();
 	return { stop: () => {
 		if (stopped) return;
-		stopped = true; healthy = false; reconciliationPending = false; controller.abort(); current?.destroy();
+		stopped = true; healthy = false; reconciliationPending = false;
+		clearTimeout(lossHintTimer); lossHintTimer = undefined;
+		controller.abort(); current?.destroy();
 	}, closed, isHealthy: () => healthy === true && !stopped };
 }
 

@@ -34,7 +34,7 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 | `thinking` | 아니요 | 현재 부모 세션 thinking, 부모 CLI thinking 오버라이드, Pi 기본값 순 | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` 중 모델/provider가 지원하는 수준 |
 | `tools` | 아니요 | 부모 CLI 도구 오버라이드, Pi 기본 도구 순 | Pi `--tools`에 전달하는 전체 allowlist. 쉼표 목록 또는 YAML 배열 |
 
-호출별 `model`이 파일의 `model`보다 우선합니다. 단일 호출은 최상위 `model`, 병렬은 각 task item, 체인은 순차 단계 또는 병렬 단계의 각 task item에 지정합니다. `thinking`을 생략하면 Pi `0.84.4`에서는 호출 시점 부모 세션의 `ctx.thinkingLevel`을 상속하고, 이전 호환 host에서는 부모 CLI 오버라이드와 Pi 기본값으로 fallback합니다.
+호출별 `model`이 파일의 `model`보다 우선합니다. 단일 호출은 최상위 `model`, 병렬은 각 task item, 체인은 순차 단계 또는 병렬 단계의 각 task item에 지정합니다. `thinking`을 생략하면 Pi `0.99.2`에서는 호출 시점 부모 세션의 `ctx.thinkingLevel`을 상속하고, 이전 호환 host에서는 부모 CLI 오버라이드와 Pi 기본값으로 fallback합니다.
 
 ## 도구와 권한
 
@@ -50,6 +50,8 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 | --- | --- | --- |
 | `spawn` | 에이전트 프롬프트와 `Task: ...` | 독립적이고 재현 가능한 작업 |
 | `fork` | 현재 부모 세션 스냅샷, 에이전트 프롬프트, `Task: ...` | 이전 대화·파일 읽기·결정에 의존하는 후속 작업 |
+
+Pi `0.99.2` fork는 현재 branch의 raw entry를 보존한다. 초기/변경 system message의 prompt section과 tool loadout, `context_edit`의 omission/replacement, accounting-only `usage`, retain-none compaction의 자기 ID와 complete system checkpoint를 유지하며 projected 메시지로 평탄화하지 않는다. 알 수 없는 entry, 잘못된 shape/link/target은 snapshot을 거부한다. child 결과 observer는 raw assistant 출력·usage만 수집하므로 context edit을 새로운 출력으로 해석하거나 system prompt를 결과에 넣지 않는다.
 
 `spawn`이 기본값입니다. 블로킹 결과 래퍼, `background: true`, 상태 조회와 취소는 [사용법](./usage.md)을 참고하세요. 백그라운드 결과는 비신뢰 데이터로 처리하고, 자동 전달을 기다리는 동안 polling·sleep·대기 루프를 만들지 마세요.
 

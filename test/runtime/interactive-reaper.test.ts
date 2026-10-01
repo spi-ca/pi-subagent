@@ -968,8 +968,10 @@ describe("stale interactive run reaper", () => {
 		const outcome = await reapStaleInteractiveRuns({ rootDir: root, now: 100, staleAfterMs: 10, scheduleCleanup: (runDir) => scheduled.push(path.basename(runDir)), cmuxRun: async (args) => ({
 			exitCode: args[0] === "close-surface" ? 1 : 0, stdout: args.includes("tree") ? JSON.stringify(cmuxAbsentTree()) : "", stderr: "", aborted: false,
 		}) });
-		assert.deepEqual(outcome.reaped, ["v2-intention-only", "v2-target-gone"]);
-		assert.deepEqual(scheduled, ["v2-intention-only", "v2-target-gone"]);
+		// These independent runs have no ordering contract; filesystem traversal
+		// order differs across hosts. Still require exactly both retained IDs.
+		assert.deepEqual([...outcome.reaped].sort(), ["v2-intention-only", "v2-target-gone"]);
+		assert.deepEqual([...scheduled].sort(), ["v2-intention-only", "v2-target-gone"]);
 	});
 
 	test("does not let a fresh V2 lease outlive its immutable dead parent identity", async () => {

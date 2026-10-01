@@ -25,6 +25,11 @@ import {
 } from "../../src/runtime/completion-v3";
 
 const tempDirs: string[] = [];
+const validAssistantMessage = {
+	role: "assistant", content: [{ type: "text", text: "raw output" }], timestamp: 0,
+	api: "test", provider: "p", model: "m", stopReason: "stop",
+	usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+};
 
 afterEach(async () => {
 	while (tempDirs.length > 0) await fs.promises.rm(tempDirs.pop()!, { recursive: true, force: true });
@@ -165,7 +170,7 @@ describe("CompletionRecordV3 session boundary", () => {
 
 	test("uses an assistant-only legacy success boundary when Pi 0.81 metadata follows", async () => {
 		const assistant = { type: "message", id: "final", message: { role: "assistant", content: [{ type: "text", text: "done" }] } };
-		const compaction = { type: "compaction", id: "compact", parentId: "final", timestamp: "2026-07-21T00:00:00.000Z", summary: "compact", tokensBefore: 9, retainedTail: [], usage: { totalTokens: 5 } };
+		const compaction = { type: "compaction", id: "compact", parentId: "final", timestamp: "2026-07-21T00:00:00.000Z", summary: "compact", tokensBefore: 9, retainedTail: [], usage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 		const filePath = await sessionFile([assistant, compaction]);
 		const boundary = await computeLegacySessionCompletionBoundary(filePath);
 		assert.ok(boundary);
@@ -410,4 +415,88 @@ describe("CompletionRecordV3 session boundary", () => {
 		await fs.promises.symlink(target, link);
 		await assert.rejects(() => computeSessionCompletionBoundary(link));
 	});
+});
+
+test("0.99.2 success tail binds system deltas, context edits, usage and retain-none compaction", async () => {
+	const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const system = { role: "system", content: "", sections: { skills: null }, toolsAdded: [{ name: "tool", description: "tool", parameters: { type: "object" } }], timestamp: 0 };
+	const tail = [
+		{ type: "message", id: "system", parentId: "final", timestamp: new Date(0).toISOString(), message: system },
+		{ type: "context_edit", id: "edit", parentId: "system", timestamp: new Date(0).toISOString(), targetId: "final", replacement: { content: "canonical replacement" } },
+		{ type: "usage", id: "usage", parentId: "edit", timestamp: new Date(0).toISOString(), kind: "future", provider: "p", model: "m", usage },
+		{ type: "compaction", id: "compact", parentId: "usage", timestamp: new Date(0).toISOString(), firstKeptEntryId: "compact", summary: "summary", tokensBefore: 9, systemMessage: system },
+	];
+	const final = { type: "message", id: "final", message: validAssistantMessage };
+	const filePath = await sessionFile([final, ...tail]);
+	const boundary = await computeSessionCompletionBoundary(filePath); assert.ok(boundary); assert.equal(boundary.finalEntryId, "compact");
+	const lease = await readVerifiedSessionCompletionSuffix(filePath, boundary, 0); assert.ok(lease);
+	try { assert.deepEqual(lease.bytes, await fs.promises.readFile(filePath), "canonical edits and prompt checkpoint are digest-bound, not discarded"); } finally { lease.release(); }
+	const legacy = await computeLegacySessionCompletionBoundary(filePath); assert.ok(legacy); assert.equal(legacy.finalEntryId, "final");
+	for (const badTail of [
+		[{ ...tail[0], message: { ...system, toolsAdded: [{}] } }],
+		[tail[0], { ...tail[1], targetId: "system", replacement: null }],
+		[tail[0], { ...tail[1], targetId: "missing" }],
+		[tail[0], { ...tail[1], replacement: { content: 42 } }],
+		[tail[0], tail[1], { ...tail[2], usage: { ...usage, input: -1 } }],
+		[{ ...tail[0], parentId: "foreign" }],
+	]) assert.equal(await computeSessionCompletionBoundary(await sessionFile([final, ...badTail])), null);
+});
+
+test("context edits can target linked custom-message tails but not forward entries or missing compaction boundaries", async () => {
+	const timestamp = new Date(0).toISOString();
+	const assistant = { type: "message", id: "final", message: { role: "assistant" } };
+	const custom = { type: "custom_message", id: "custom", parentId: "final", timestamp, customType: "notice", content: "original", display: false };
+	const edit = { type: "context_edit", id: "edit", parentId: "custom", timestamp, targetId: "custom", replacement: { content: "replacement" } };
+	assert.ok(await computeSessionCompletionBoundary(await sessionFile([assistant, custom, edit])));
+	assert.equal(await computeSessionCompletionBoundary(await sessionFile([assistant, custom, { ...edit, targetId: "later" }])), null);
+	assert.equal(await computeSessionCompletionBoundary(await sessionFile([assistant, { type: "compaction", id: "compact", parentId: "final", timestamp, summary: "s", tokensBefore: 1, firstKeptEntryId: "missing" }])), null);
+});
+
+test("context edits require structurally valid known targets without strictifying unrelated history", async () => {
+	const timestamp = new Date(0).toISOString();
+	const assistant = { type: "message", id: "final", message: validAssistantMessage };
+	const edit = { type: "context_edit", id: "edit", parentId: "final", timestamp, targetId: "target", replacement: null };
+	const custom = { type: "custom_message", id: "target", parentId: null, timestamp, customType: "notice", content: "original", display: false };
+	const { content: _content, ...missingContent } = custom;
+	for (const target of [
+		{ type: "not-a-session-entry", id: "target", message: { role: "user", content: "fake", timestamp: 0 } },
+		{ type: "custom", id: "target", customType: "state", message: { role: "user", content: "fake", timestamp: 0 } },
+		{ type: "message", id: "target", message: { role: "system", content: "prompt", timestamp: 0 } },
+		{ type: "message", id: "target", message: { role: "user", content: 42, timestamp: 0 } },
+		{ type: "message", id: "target", message: { role: "assistant" } },
+		missingContent,
+		{ ...custom, content: 42 },
+		{ ...custom, content: [{ type: "text", text: 42 }] },
+	]) {
+		assert.ok(await computeSessionCompletionBoundary(await sessionFile([target, assistant])), "unrelated historical entries retain existing boundary behavior");
+		const filePath = await sessionFile([target, assistant, edit]);
+		const boundary = await computeSessionFailureBoundary(filePath); assert.ok(boundary);
+		assert.equal(await computeSessionCompletionBoundary(filePath), null);
+		assert.equal(await computeLegacySessionCompletionBoundary(filePath), null);
+		assert.equal(await verifySessionCompletionBoundary(filePath, boundary), false);
+		assert.equal(await readVerifiedSessionCompletionSuffix(filePath, boundary, 0), null);
+	}
+	for (const target of [
+		{ type: "message", id: "target", message: { role: "user", content: "user", timestamp: 0 } },
+		{ type: "message", id: "target", message: { role: "toolResult", toolCallId: "call", toolName: "tool", content: [], isError: false, timestamp: 0 } },
+		{ type: "message", id: "target", message: { role: "custom", customType: "notice", content: "custom", display: true, timestamp: 0 } },
+		custom,
+		{ ...custom, content: [{ type: "text", text: "text" }, { type: "image", data: "AA==", mimeType: "image/png" }] },
+	]) assert.ok(await computeSessionCompletionBoundary(await sessionFile([target, assistant, edit])));
+});
+
+test("custom-message completion tails require string or text/image block content", async () => {
+	const timestamp = new Date(0).toISOString();
+	const assistant = { type: "message", id: "final", message: { role: "assistant" } };
+	const custom = { type: "custom_message", id: "custom", parentId: "final", timestamp, customType: "notice", display: false };
+	for (const content of [undefined, 42, null, [{ type: "text" }], [{ type: "image", data: "AA==" }], [{ type: "thinking", thinking: "not custom content" }]]) {
+		const filePath = await sessionFile([assistant, { ...custom, content }]);
+		const boundary = await computeSessionFailureBoundary(filePath); assert.ok(boundary);
+		assert.equal(await computeSessionCompletionBoundary(filePath), null);
+		assert.equal(await computeLegacySessionCompletionBoundary(filePath), null);
+		assert.equal(await verifySessionCompletionBoundary(filePath, boundary), false);
+	}
+	for (const content of ["", [], [{ type: "text", text: "text" }, { type: "image", data: "AA==", mimeType: "image/png" }]]) {
+		assert.ok(await computeSessionCompletionBoundary(await sessionFile([assistant, { ...custom, content }])));
+	}
 });

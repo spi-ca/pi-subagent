@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { SessionBoundaryV3 } from "./run-protocol.js";
+import { isPersistedSystemMessage, isPersistedContextEdit, isPersistedUsage, isPersistedCompactionEntry, isPersistedMessage, isCustomMessageContent } from "../core/fork-session.js";
 
 export const MAX_COMPLETION_SESSION_BYTES = 64 * 1024 * 1024;
 /** Per-entry limits bound parser retention independently of the full 64 MiB prefix cap. */
@@ -141,12 +142,12 @@ function matchesExpectedIdentity(stat: BigIntStats, expected: SessionFileIdentit
 	return !expected || (stat.dev === expected.dev && stat.ino === expected.ino);
 }
 
-type SessionEntry = { id?: string; kind: "assistant" } | { id?: string; kind: "metadata"; parentId: string } | { id?: string; kind: "other" };
+type SessionEntry = { id?: string; kind: "assistant"; editableRole?: string } | { id?: string; kind: "metadata"; parentId: string; editableRole?: string; keptEntryId?: string; targetId?: string; edit?: Record<string, unknown> } | { id?: string; kind: "other"; editableRole?: string };
 type ValidationMode = "generic" | "completion" | "legacy-completion";
 type PrefixRead = { digest: string; finalEntryId: string | null; byteOffset: number; bytes: Buffer };
 type TimedOutRead = { settled: Promise<void> };
 
-/** Pi 0.81 can append these linked, non-message records after agent settlement. */
+/** Pi may append linked metadata and prompt deltas after agent settlement. */
 function validCompletionMetadata(entry: Record<string, unknown>, id: string | undefined): entry is Record<string, unknown> & { parentId: string } {
 	if (!id || !validSessionEntryId(entry.parentId) || typeof entry.timestamp !== "string" || !entry.timestamp) return false;
 	switch (entry.type) {
@@ -155,15 +156,18 @@ function validCompletionMetadata(entry: Record<string, unknown>, id: string | un
 		case "model_change":
 			return typeof entry.provider === "string" && entry.provider.length > 0
 				&& typeof entry.modelId === "string" && entry.modelId.length > 0;
-		case "compaction":
-			return typeof entry.summary === "string" && typeof entry.tokensBefore === "number" && Number.isFinite(entry.tokensBefore)
-				&& (typeof entry.firstKeptEntryId === "string" || Array.isArray(entry.retainedTail));
+		case "message": return isPersistedSystemMessage(entry.message);
+		case "context_edit": return isPersistedContextEdit(entry);
+		case "usage": return typeof entry.kind === "string" && typeof entry.provider === "string" && typeof entry.model === "string"
+			&& isPersistedUsage(entry.usage) && (entry.note === undefined || typeof entry.note === "string");
+		case "compaction": return isPersistedCompactionEntry(entry);
 		case "branch_summary":
 			return typeof entry.fromId === "string" && entry.fromId.length > 0 && typeof entry.summary === "string";
 		case "custom":
 			return typeof entry.customType === "string" && entry.customType.length > 0;
 		case "custom_message":
-			return typeof entry.customType === "string" && entry.customType.length > 0 && typeof entry.display === "boolean";
+			return typeof entry.customType === "string" && entry.customType.length > 0
+				&& typeof entry.display === "boolean" && isCustomMessageContent(entry.content);
 		case "label":
 			return typeof entry.targetId === "string" && entry.targetId.length > 0
 				&& (entry.label === undefined || typeof entry.label === "string");
@@ -174,6 +178,15 @@ function validCompletionMetadata(entry: Record<string, unknown>, id: string | un
 	}
 }
 
+/** Only known, structurally valid context-producing entries may be edit targets. */
+function editableSessionRole(entry: Record<string, unknown>): string | undefined {
+	if (entry.type === "custom_message" && typeof entry.customType === "string" && entry.customType.length > 0
+		&& typeof entry.display === "boolean" && isCustomMessageContent(entry.content)) return "custom";
+	if (entry.type !== "message" || !isPersistedMessage(entry.message)) return undefined;
+	const role = (entry.message as { role: string }).role;
+	return ["user", "assistant", "toolResult", "custom"].includes(role) ? role : undefined;
+}
+
 /** Parse one JSONL entry. Generic boundaries require every ID; completion accepts a linked Pi metadata tail. */
 function sessionEntry(line: Buffer): SessionEntry | null {
 	try {
@@ -181,10 +194,14 @@ function sessionEntry(line: Buffer): SessionEntry | null {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 		const entry = value as Record<string, unknown>;
 		const id = validSessionEntryId(entry.id) ? entry.id : undefined;
+		const editableRole = editableSessionRole(entry);
 		if (entry.type === "message" && entry.message && typeof entry.message === "object" && !Array.isArray(entry.message)
-			&& (entry.message as { role?: unknown }).role === "assistant") return id ? { id, kind: "assistant" } : null;
-		if (validCompletionMetadata(entry, id)) return { id, kind: "metadata", parentId: entry.parentId };
-		return id ? { id, kind: "other" } : { kind: "other" };
+			&& (entry.message as { role?: unknown }).role === "assistant") return id ? { id, kind: "assistant", editableRole } : null;
+		if (validCompletionMetadata(entry, id)) return { id, kind: "metadata", parentId: entry.parentId,
+			editableRole,
+			...(entry.type === "compaction" && typeof entry.firstKeptEntryId === "string" ? { keptEntryId: entry.firstKeptEntryId } : {}),
+			...(entry.type === "context_edit" ? { targetId: entry.targetId as string, edit: entry } : {}) };
+		return id ? { id, kind: "other", editableRole } : { kind: "other" };
 	} catch { return null; }
 }
 
@@ -214,7 +231,7 @@ function validateLegacyCompletionPrefix(prefix: Buffer): { byteOffset: number; f
 }
 
 function validatePrefix(prefix: Buffer, mode: Exclude<ValidationMode, "legacy-completion">): string | null {
-	const entryIds = new Set<string>();
+	const entryIds = new Map<string, string | undefined>();
 	let entryCount = 0;
 	let entryIdBytes = 0;
 	let genericFinalEntryId: string | null = null;
@@ -232,7 +249,13 @@ function validatePrefix(prefix: Buffer, mode: Exclude<ValidationMode, "legacy-co
 		if (!entry?.id || entryIds.has(entry.id)) return null;
 		const idBytes = Buffer.byteLength(entry.id, "utf8");
 		if (idBytes > MAX_COMPLETION_SESSION_ENTRY_ID_BYTES - entryIdBytes) return null;
-		entryIds.add(entry.id);
+		if (mode === "completion" && entry.kind === "metadata" && entry.targetId) {
+			const role = entryIds.get(entry.targetId);
+			if (!role || !["user", "assistant", "toolResult", "custom"].includes(role) || !isPersistedContextEdit(entry.edit!, role)) return null;
+		}
+		if (mode === "completion" && entry.kind === "metadata" && entry.keptEntryId
+			&& entry.keptEntryId !== entry.id && !entryIds.has(entry.keptEntryId)) return null;
+		entryIds.set(entry.id, entry.editableRole);
 		entryIdBytes += idBytes;
 		entryCount += 1;
 		if (mode === "generic") genericFinalEntryId = entry.id;

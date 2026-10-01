@@ -15,6 +15,8 @@ import {
   truncateAgentDescription,
 } from "../../src/core/subagent-config";
 import { buildForkBranchSourceJsonl } from "../../src/core/fork-session";
+import { SubagentOutputSchema } from "../../src/core/structured-result";
+import { Value } from "typebox/value";
 import { settleWithUnrefTimeout } from "../../src/core/async-settle";
 import { buildChildProcessEnv } from "../../src/runtime/runner";
 import { ForkSourceOwnershipManager } from "../../src/runtime/fork-source-ownership";
@@ -729,6 +731,25 @@ describe("subagent tool schema", () => {
     assert.equal(prompt.includes("\nagent"), false);
     assert.match(prompt, /stack \["evil\\nagent"\]/);
   });
+});
+
+test("registered subagent exposes outputSchema and actual structured empty status/cancel data", async () => {
+  let tool: any;
+  registerPiSubagent({
+    registerTool: (value: any) => { if (value.name === "subagent") tool = value; },
+    registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
+    registerCommand: () => undefined, on: () => undefined, events: { emit: () => undefined },
+    getAllTools: () => [], getCommands: () => [],
+  } as never);
+  assert.deepEqual(tool.outputSchema, SubagentOutputSchema);
+  for (const action of ["status", "cancel"]) {
+    const result = await tool.execute("machine-contract", { action }, undefined, undefined, { cwd: process.cwd() });
+    assert.equal(Value.Check(tool.outputSchema, result.structuredContent), true);
+    assert.equal(result.structuredContent.operation, action);
+    assert.deepEqual(result.structuredContent.jobs, []);
+    assert.ok(result.content[0].text.length > 0, "human output remains available");
+    assert.equal(result.isError, undefined);
+  }
 });
 
 describe("fork branch snapshot validation", () => {

@@ -8,6 +8,12 @@ inline 실행의 TUI 카드는 접힌 상태에서 에이전트별 짧은 응답
 
 호출 크기·동시성·백그라운드 보존/출력/종료 대기는 도구 JSON 필드가 아닙니다. Pi CLI, 환경 변수 또는 `pi-subagent.json`의 열한 가지 한계 키로 설정합니다. 파일 경로·신뢰 조건·우선순위·기본값은 [설정의 `pi-subagent.json` 파일 설정](./configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
 
+## 구조화된 결과
+
+Pi `0.99.2`의 `outputSchema`/`structuredContent`를 지원한다. single/parallel/chain은 producer의 실제 결과에서 `results`(agent, exitCode, 최종 output 등)를, background 접수/status/cancel은 실제 registry details에서 `jobs`(jobId, status, 시간, 보존된 output/error 등)를 만든다. 사람용 `content`를 파싱하지 않는다. envelope는 `kind: "subagent.result"`, `version: 1`, `operation`과 omission/clipping 정보를 포함한다. codemode 호출은 이 데이터를 받으며 출력은 계속 비신뢰 데이터다.
+
+각 배열은 최대 32행, 문자열은 최대 2048 UTF-16 code unit, JSON-escaped 전체 machine data는 최대 64 KiB다. 잘린 문자열/행은 `clipped`, `omittedResults`, `omittedJobs`로 표시한다. 원본 human text, TUI details, usage와 thrown 실패/취소 의미는 그대로 유지하며, 예외를 성공 data로 바꾸지 않는다. machine projection은 전체 transcript 또는 원본 출력 복구를 약속하지 않는다.
+
 ## 입력 검증
 
 호출 인수는 실행 전에 원본 값 그대로 엄격하게 검증합니다.

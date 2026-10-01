@@ -2944,3 +2944,37 @@ describe("interactive pane runner preparation", () => {
 		assert.equal(replaced[SUBAGENT_RUN_ID_ENV], "child-run");
 	});
 });
+
+test("events_lost fans fresh reconciliation out to every shared selector with one physical stream", async () => {
+	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-loss-"));
+	const socketPath = path.join(root, "herdr.sock");
+	let stream: net.Socket | undefined, subscriptions = 0;
+	const sockets = new Set<net.Socket>();
+	const counts = [0, 0], wakes = [0, 0];
+	const server = net.createServer((socket) => {
+		sockets.add(socket); socket.once("close", () => sockets.delete(socket)); socket.on("error", () => undefined);
+		socket.once("data", (chunk) => {
+			const request = JSON.parse(chunk.toString("utf8"));
+			if (request.method === "events.subscribe") { stream = socket; subscriptions++; socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`); return; }
+			const id = request.params.pane_id;
+			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: { workspace_id: "w", tab_id: "t", pane_id: id, terminal_id: `terminal-${id}` } } })}\n`);
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+	const stat = fs.lstatSync(socketPath, { bigint: true });
+	const subscriptionsOwned = ["a", "b"].map((paneId, index) => subscribeSharedHerdrPaneForTest({
+		handle: { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: "w", tabId: "t", paneId, terminalId: `terminal-${paneId}`, protocol: 22 },
+		onReconcile: (pane) => { assert.equal(pane?.terminalId, `terminal-${paneId}`); counts[index]++; }, onWake: () => { wakes[index]++; },
+	}));
+	try {
+		for (let i = 0; i < 100 && counts.some((n) => n < 1); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(subscriptions, 1); assert.ok(counts.every((n) => n >= 1));
+		const before = [...counts], beforeWake = [...wakes];
+		stream!.write(Array.from({ length: 100 }, () => '{"event":"events_lost","data":{"pane_id":"a","terminal_id":"foreign","agent_status":"done"}}\n').join(""));
+		for (let i = 0; i < 100 && counts.some((n, index) => n === before[index]); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.deepEqual(counts, before.map((n) => n + 1)); assert.deepEqual(wakes, beforeWake.map((n) => n + 1)); assert.equal(subscriptions, 1);
+	} finally {
+		for (const sub of subscriptionsOwned) sub.stop(); await Promise.all(subscriptionsOwned.map((sub) => sub.closed));
+		for (const socket of sockets) socket.destroy(); await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+	}
+});

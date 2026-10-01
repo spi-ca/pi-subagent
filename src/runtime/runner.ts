@@ -608,6 +608,9 @@ function sharedHerdrTransportKey(handle: HerdrPaneHandle): string {
   return `${handle.socketPath}\u0000${handle.socketDev}\u0000${handle.socketIno}\u0000${handle.protocol}`;
 }
 function sharedHerdrEventMatches(handle: HerdrPaneHandle, event: string, data: Record<string, unknown> | null): boolean {
+  // Coalesced subscriber loss invalidates every selector, not just the seed.
+  // No payload field can bind, complete, remove, or authorize a target.
+  if (event === "events_lost") return true;
   if (!data) return false;
   const pane = data.pane && typeof data.pane === "object" && !Array.isArray(data.pane) ? data.pane as Record<string, unknown> : null;
   const terminalMatches = pane?.terminal_id === handle.terminalId;

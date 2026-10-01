@@ -813,3 +813,26 @@ describe("Herdr socket client", () => {
 		await fixture.close();
 	});
 });
+
+test("0.9.3 events_lost coalesces a burst into fresh single-stream reconciliation without payload authority", async () => {
+	let stream: net.Socket | undefined, reads = 0, reconciles = 0, wakes = 0;
+	const fixture = await serverFor((request, socket) => {
+		if (request.method === "events.subscribe") { stream = socket; socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`); }
+		else { reads += 1; socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane: sourcePane } })}\n`); }
+	});
+	const handle = { ...socketGeneration(fixture.socketPath), socketPath: fixture.socketPath, workspaceId: sourcePane.workspace_id, tabId: sourcePane.tab_id, paneId: sourcePane.pane_id, terminalId: sourcePane.terminal_id, protocol: 22 as const };
+	const subscription = subscribeHerdrPane({ handle, onReconcile: () => { reconciles += 1; }, onWake: () => { wakes += 1; } });
+	try {
+		for (let i = 0; i < 100 && reconciles < 1; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(reconciles, 1);
+		const beforeReads = reads, beforeWakes = wakes;
+		stream!.write(Array.from({ length: 100 }, () => JSON.stringify({ event: "events_lost", data: { pane_id: "foreign", terminal_id: "forged", agent_status: "done", count: 999 } }) + "\n").join(""));
+		for (let i = 0; i < 100 && reconciles < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(reconciles, 2); assert.equal(reads, beforeReads + 1); assert.equal(wakes, beforeWakes + 1);
+		assert.equal(handle.terminalId, sourcePane.terminal_id); assert.equal(subscription.isHealthy(), true);
+		stream!.write('{"event":"events_lost"}\n');
+		subscription.stop(); await subscription.closed;
+		await new Promise((resolve) => setTimeout(resolve, 130));
+		assert.equal(reconciles, 2, "stop cancels the pending loss hint");
+	} finally { subscription.stop(); await subscription.closed; await fixture.close(); }
+});

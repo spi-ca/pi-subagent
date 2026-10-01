@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { SingleResult } from "../core/types.js";
 import type { SessionFileIdentity } from "./completion-v3.js";
 import { processPiEvent } from "../core/runner-events.js";
+import { isPersistedUsage } from "../core/fork-session.js";
 
 /** The tail never retains an unbounded unterminated JSONL line. */
 export const SESSION_TAIL_MAX_REMAINDER_BYTES = 64 * 1024;
@@ -412,7 +413,7 @@ function classifySessionEntry(entry: unknown, line: Buffer, start: number, end: 
 	if (!entry || typeof entry !== "object") return undefined;
 	const record = entry as Record<string, unknown>;
 	const id = typeof record.id === "string" && /^[^\u0000-\u001f\u007f]{1,512}$/.test(record.id) ? record.id : undefined;
-	if (record.type === "compaction" || record.type === "branch_summary") {
+	if (record.type === "usage" && isPersistedUsage(record.usage) || record.type === "compaction" || record.type === "branch_summary") {
 		return { start, end, byteLength: line.length, digest: digest(line), id, record };
 	}
 	if (record.type !== "message" || !record.message || typeof record.message !== "object") return undefined;
@@ -423,6 +424,12 @@ function classifySessionEntry(entry: unknown, line: Buffer, start: number, end: 
 
 function applyStagedSessionEntry(entry: StagedSessionEntry, duplicate: boolean, result: SingleResult, state: SessionTailState): boolean {
 	if (duplicate) return false;
+	if (entry.record.type === "usage") {
+		// Usage is accounting-only. Prompt deltas and context edits remain raw
+		// canonical history, never synthetic assistant output in this observer.
+		processPiEvent({ type: "session_usage", usageEntry: entry.record }, result);
+		return false;
+	}
 	if (entry.record.type === "compaction" || entry.record.type === "branch_summary") {
 		processPiEvent(
 			entry.record.type === "compaction"

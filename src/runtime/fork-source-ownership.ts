@@ -372,7 +372,8 @@ export class ForkSourceOwnershipManager {
 		const stateRoot = path.dirname(rootDir);
 		if (path.basename(rootDir) !== FORK_SOURCE_ROOT_NAME || !token(path.basename(invocationDir))) throw new Error("Fork invocation is outside the reserved root");
 		const canonicalRoot = await assertPrivateDirectory(rootDir);
-		const canonicalStateRoot = await assertPrivateDirectory(stateRoot);
+		await assertSafeStateRoot(stateRoot);
+		const canonicalStateRoot = await fs.promises.realpath(stateRoot);
 		if (path.dirname(canonicalRoot) !== canonicalStateRoot || path.dirname(canonicalInvocation) !== canonicalRoot) throw new Error("Fork invocation escaped private containment");
 		const invocationId = path.basename(canonicalInvocation);
 		const paths: ForkSourceOwnershipPaths = {
@@ -711,7 +712,7 @@ export async function reconcileForkSourceOwnershipRoot(options: {
 	let rootDir: string;
 	try {
 		await assertSafeStateRoot(requestedStateRoot);
-		const canonicalStateRoot = await assertPrivateDirectory(requestedStateRoot);
+		const canonicalStateRoot = await fs.promises.realpath(requestedStateRoot);
 		const canonicalRoot = await assertPrivateDirectory(requestedRootDir);
 		if (path.dirname(canonicalRoot) !== canonicalStateRoot) throw new Error("Fork root escaped state root");
 		await assertMarker(path.join(canonicalRoot, "root-marker.json"), parseRootMarker);

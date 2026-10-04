@@ -300,9 +300,12 @@ const commandEnv = Object.fromEntries([
 ]);
 async function validateRunAuthority() {
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-  const privateDir = async (directory) => {
+  const privateDir = async (directory, isStateRoot = false) => {
     const stat = await fs.lstat(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid) || (process.platform !== "win32" && (stat.mode & 0o777) !== 0o700)) throw new Error("unsafe run authority directory");
+    const mode = stat.mode & 0o777;
+    // Only the shared state root permits group read/search; runs stay private.
+    const safeMode = mode === 0o700 || (isStateRoot && mode === 0o750);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid) || (process.platform !== "win32" && !safeMode)) throw new Error("unsafe run authority directory");
   };
   const marker = async (file, expected) => {
     const stat = await fs.lstat(file);
@@ -313,7 +316,7 @@ async function validateRunAuthority() {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== keys.length || !keys.every((key) => Object.hasOwn(value, key) && value[key] === expected[key])) throw new Error("invalid ownership marker");
   };
   if (!path.isAbsolute(rootDir) || path.resolve(runDir) !== path.join(path.resolve(rootDir), path.basename(runDir))) throw new Error("unsafe run authority path");
-  await privateDir(rootDir); await privateDir(runDir);
+  await privateDir(rootDir, true); await privateDir(runDir);
   await marker(path.join(rootDir, "state-root-marker.json"), { version: 1, kind: "pi-subagent-state-root" });
   await marker(path.join(runDir, "run-directory-marker.json"), { version: 1, kind: "pi-subagent-run-directory", runId: path.basename(runDir) });
   const [canonicalRoot, canonicalRun] = await Promise.all([fs.realpath(rootDir), fs.realpath(runDir)]);

@@ -249,6 +249,70 @@ async function writeCommittedGate(paths: Awaited<ReturnType<typeof prepareRunArt
 }
 
 describe("pane launch broker", () => {
+	test("accepts a newly initialized 0750 state root for broker startup and gate verification", async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-root750-")); tempDirs.push(root);
+		const stateRoot = path.join(root, "ancestor", "state");
+		assert.equal(fs.existsSync(stateRoot), false, "initialize a genuinely absent state root");
+		const backend = await nativeMock(root);
+		const startupPaths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "new-root-startup" });
+		assert.equal((await fs.promises.stat(stateRoot)).mode & 0o777, 0o750);
+		assert.equal((await fs.promises.stat(path.dirname(stateRoot))).mode & 0o777, 0o700);
+		assert.equal((await fs.promises.stat(startupPaths.runDir)).mode & 0o777, 0o700);
+		assert.equal((await fs.promises.stat(path.join(stateRoot, "state-root-marker.json"))).mode & 0o777, 0o600);
+		assert.equal((await fs.promises.stat(path.join(startupPaths.runDir, "run-directory-marker.json"))).mode & 0o777, 0o600);
+		assert.equal(await run(await writeIntent(startupPaths, "new-root-startup", backend), process.env), 0);
+		assert.equal((await readBrokerJson(startupPaths.brokerStatusPath) as { phase?: string })?.phase, "committed");
+		assert.ok(await readBrokerJson(startupPaths.allocationPath));
+
+		const gatePaths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "new-root-gate" });
+		const args = await writeCommittedGate(gatePaths, "new-root-gate", backend);
+		const launched = path.join(root, "launched");
+		await writePrivateExecutableFile(gatePaths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(launched)}\n`);
+		assert.equal(await run([...args, "--verify-gate", "--wrapper", gatePaths.wrapperPath], {
+			...process.env, CMUX_WORKSPACE_ID: workspaceId, CMUX_SURFACE_ID: surfaceId,
+		}, gatePaths.runDir), 0);
+		assert.equal(fs.existsSync(launched), true);
+		assert.equal((await fs.promises.stat(stateRoot)).mode & 0o777, 0o750, "broker preserves root mode");
+	});
+
+	test("startup and gate verification reject unsafe root/run permissions, markers, and symlinks", async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-authority-")); tempDirs.push(root);
+		const backend = await nativeMock(root);
+		for (const corruption of ["root-0770", "root-0755", "run-0750", "state-marker-content", "run-marker-content", "state-marker-mode", "run-marker-mode", "root-symlink", "run-symlink"] as const) {
+			const stateRoot = path.join(root, `state-${corruption}`), runId = `unsafe-${corruption}`;
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			assert.equal((await fs.promises.stat(stateRoot)).mode & 0o777, 0o750);
+			const args = await writeCommittedGate(paths, runId, backend);
+			const launched = path.join(root, `${corruption}-launched`), log = path.join(root, `${corruption}-commands.log`);
+			await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(launched)}\n`);
+			const stateMarker = path.join(stateRoot, "state-root-marker.json"), runMarker = path.join(paths.runDir, "run-directory-marker.json");
+			switch (corruption) {
+				case "root-0770": await fs.promises.chmod(stateRoot, 0o770); break;
+				case "root-0755": await fs.promises.chmod(stateRoot, 0o755); break;
+				case "run-0750": await fs.promises.chmod(paths.runDir, 0o750); break;
+				case "state-marker-content": await fs.promises.writeFile(stateMarker, "{}\n"); break;
+				case "run-marker-content": await fs.promises.writeFile(runMarker, "{}\n"); break;
+				case "state-marker-mode": await fs.promises.chmod(stateMarker, 0o640); break;
+				case "run-marker-mode": await fs.promises.chmod(runMarker, 0o640); break;
+				case "root-symlink":
+					await fs.promises.rename(stateRoot, `${stateRoot}-actual`);
+					await fs.promises.symlink(`${stateRoot}-actual`, stateRoot); break;
+				case "run-symlink":
+					await fs.promises.rename(paths.runDir, `${paths.runDir}-actual`);
+					await fs.promises.symlink(`${paths.runDir}-actual`, paths.runDir); break;
+			}
+			const env = { ...process.env, CMUX_SOCKET_PATH: log, CMUX_WORKSPACE_ID: workspaceId, CMUX_SURFACE_ID: surfaceId };
+			assert.equal(await run(args, env), 2, corruption);
+			assert.equal(fs.existsSync(paths.brokerStatusPath), false, corruption);
+			assert.equal(fs.existsSync(paths.brokerClaimPath), false, corruption);
+			assert.equal(await run([...args, "--verify-gate", "--wrapper", paths.wrapperPath], env), 0, corruption);
+			assert.equal(fs.existsSync(launched), false, corruption);
+			assert.equal(fs.existsSync(log), false, "invalid authority never reaches the backend");
+		}
+	});
+
 	test("records production Herdr success, split uncertainty, and post-commit send uncertainty separately", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const runtime = fs.realpathSync(process.execPath);

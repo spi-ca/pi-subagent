@@ -6,6 +6,10 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
 	RUN_PROTOCOL_VERSION,
+	RUN_STATE_DIR_ENV,
+	ensureRunStateRoot,
+	getRunStateRoot,
+	writePrivateFile,
 	V3_FAILURE_BOUNDARY_CAPABILITY,
 	hasV3FailureBoundaryCapability,
 	V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY,
@@ -93,6 +97,120 @@ describe("run protocol", () => {
 		assert.equal(await isPrivateOwnedDirectory(paths.shellHomePath), true);
 		assert.deepEqual(await fs.promises.readdir(paths.shellHomePath), []);
 		await assert.rejects(() => prepareRunArtifactPaths({ rootDir: root, runId: "../escape" }), /Invalid subagent run id/);
+	});
+
+	for (const rootMode of [0o700, 0o750]) {
+		for (const marked of [false, true]) {
+			test(`accepts an existing ${rootMode.toString(8)} ${marked ? "marked" : "empty"} root without chmod or ownership changes`, async () => {
+				if (process.platform === "win32") return;
+				const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(root);
+				await fs.promises.chmod(root, rootMode);
+				const markerPath = path.join(root, STATE_ROOT_MARKER_NAME);
+				const marker = `${JSON.stringify({ version: 1, kind: "pi-subagent-state-root" })}\n`;
+				if (marked) await fs.promises.writeFile(markerPath, marker, { mode: 0o600 });
+				const before = await fs.promises.stat(root);
+				const originalChmod = fs.promises.chmod;
+				Object.defineProperty(fs.promises, "chmod", {
+					configurable: true, writable: true,
+					value: (async (...args: unknown[]) => {
+						assert.notEqual(args[0], root, "an existing root must never be chmodded");
+						return Reflect.apply(originalChmod, fs.promises, args);
+					}) as typeof fs.promises.chmod,
+				});
+				try {
+					assert.equal(getRunStateRoot({ [RUN_STATE_DIR_ENV]: root }), root);
+					assert.equal(selectDefaultRunStateRoot(root), root);
+					assert.equal(await ensureRunStateRoot(root), await fs.promises.realpath(root));
+					const paths = await prepareRunArtifactPaths({ rootDir: root, runId: "existing-root" });
+					await assertSafeRunArtifactPaths(paths);
+					await assertSafeStateRoot(root);
+					assert.equal(selectDefaultRunStateRoot(root), root);
+					assert.equal((await fs.promises.stat(paths.runDir)).mode & 0o777, 0o700);
+					assert.equal((await fs.promises.stat(paths.shellHomePath)).mode & 0o777, 0o700);
+					assert.equal((await fs.promises.stat(markerPath)).mode & 0o777, 0o600);
+					assert.equal(await fs.promises.readFile(markerPath, "utf8"), marker);
+					const after = await fs.promises.stat(root);
+					assert.equal(after.mode, before.mode);
+					assert.equal(after.uid, before.uid);
+					assert.equal(after.gid, before.gid);
+					assert.equal(after.ino, before.ino);
+				} finally {
+					Object.defineProperty(fs.promises, "chmod", { configurable: true, writable: true, value: originalChmod });
+				}
+			});
+		}
+	}
+
+	test("creates a new 0750 root while keeping run directories and artifacts private", async () => {
+		if (process.platform === "win32") return;
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(container);
+		const parent = path.join(container, "new-parent");
+		const root = path.join(parent, "new-root");
+		await ensureRunStateRoot(root);
+		assert.equal((await fs.promises.stat(parent)).mode & 0o777, 0o700, "new ancestors remain private");
+		const paths = await prepareRunArtifactPaths({ rootDir: root, runId: "new-root" });
+		await writePrivateFile(paths.taskPath, "private task");
+		await atomicWriteJson(paths.statePath, { private: true });
+		await publishImmutableJson(paths.launchIntentPath, { private: true });
+		assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o750);
+		assert.equal(await isPrivateOwnedDirectory(root), false, "the generic non-root policy must remain 0700-only");
+		for (const directory of [paths.runDir, paths.shellHomePath]) {
+			assert.equal((await fs.promises.stat(directory)).mode & 0o777, 0o700);
+			assert.equal(await isPrivateOwnedDirectory(directory), true);
+		}
+		for (const file of [paths.rootMarkerPath, paths.runMarkerPath, paths.taskPath, paths.statePath, paths.launchIntentPath]) {
+			assert.equal((await fs.promises.stat(file)).mode & 0o777, 0o600);
+		}
+		assert.deepEqual(await readBoundedPrivateJson(paths.statePath), { private: true });
+		assert.deepEqual(await readBrokerJson(paths.launchIntentPath), { private: true });
+		await removeRunArtifacts(paths);
+		assert.equal(fs.existsSync(paths.runDir), false);
+		await assertSafeStateRoot(root);
+	});
+
+	test("rejects 0750 non-root directories even beneath an accepted 0750 root", async () => {
+		if (process.platform === "win32") return;
+		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(container);
+		const paths = await prepareRunArtifactPaths({ rootDir: path.join(container, "state"), runId: "private-run" });
+		await atomicWriteJson(paths.statePath, { private: true });
+		await fs.promises.chmod(paths.runDir, 0o750);
+		assert.equal(await isPrivateOwnedDirectory(paths.runDir), false);
+		await assert.rejects(() => assertSafeRunArtifactPaths(paths), /run directory is not private/);
+		await assert.rejects(() => atomicWriteJson(paths.statePath, {}), /run directory is not private/);
+		assert.equal(await readBoundedPrivateJson(paths.statePath), null);
+		await fs.promises.chmod(paths.runDir, 0o700);
+		await fs.promises.chmod(paths.shellHomePath, 0o750);
+		assert.equal(await isPrivateOwnedDirectory(paths.shellHomePath), false);
+	});
+
+	for (const rootMode of [0o770, 0o755]) {
+		test(`rejects an existing ${rootMode.toString(8)} root without modifying it`, async () => {
+			if (process.platform === "win32") return;
+			const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(root);
+			await fs.promises.chmod(root, rootMode);
+			assert.equal(selectDefaultRunStateRoot(root), root);
+			await assert.rejects(() => ensureRunStateRoot(root));
+			await assert.rejects(() => prepareRunArtifactPaths({ rootDir: root, runId: "unsafe-root" }));
+			assert.equal((await fs.promises.stat(root)).mode & 0o777, rootMode);
+			assert.deepEqual(await fs.promises.readdir(root), []);
+		});
+	}
+
+	test("rejects a foreign-owned 0750 root through sync and async root validation", async () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function") return;
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(root);
+		await fs.promises.chmod(root, 0o750);
+		await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
+		const originalGetuid = process.getuid;
+		const foreignUid = originalGetuid() + 1;
+		process.getuid = () => foreignUid;
+		try {
+			assert.equal(selectDefaultRunStateRoot(root), root, "a foreign root cannot authorize migration");
+			await assert.rejects(() => ensureRunStateRoot(root), /not an owned 0700\/0750 directory/);
+			await assert.rejects(() => assertSafeStateRoot(root), /not an owned 0700\/0750 directory/);
+			assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o750);
+			assert.deepEqual(await fs.promises.readdir(root), ["legacy.json"]);
+		} finally { process.getuid = originalGetuid; }
 	});
 
 	test("publishes an optional initial parent lease before returning the run directory", async () => {
@@ -183,17 +301,82 @@ describe("run protocol", () => {
 		assert.equal(await fs.promises.readFile(path.join(fallback, "retained.json"), "utf8"), "fallback");
 	});
 
-	test("keeps selecting the first initialized migration fallback", async () => {
-		const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-"));
-		tempDirs.push(container);
-		const root = path.join(container, "default-root");
-		const fallback = `${root}-owned-v1`;
-		await fs.promises.mkdir(root, { mode: 0o700 });
-		await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
-		await prepareRunArtifactPaths({ rootDir: fallback, runId: "fallback-run" });
+	for (const rootMode of [0o700, 0o750]) {
+		test(`preserves ${rootMode.toString(8)} marker-less legacy roots and advances past a populated fallback`, async () => {
+			if (process.platform === "win32") return;
+			const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(container);
+			const root = path.join(container, "default-root");
+			const fallback = `${root}-owned-v1`;
+			for (const directory of [root, fallback]) {
+				await fs.promises.mkdir(directory, { mode: rootMode });
+				await fs.promises.chmod(directory, rootMode);
+				await fs.promises.writeFile(path.join(directory, "legacy.json"), "private legacy", { mode: 0o600 });
+				await assert.rejects(() => ensureRunStateRoot(directory), /ownership marker is missing from nonempty root/);
+				assert.equal((await fs.promises.stat(directory)).mode & 0o777, rootMode);
+				assert.equal(await fs.promises.readFile(path.join(directory, "legacy.json"), "utf8"), "private legacy");
+				assert.equal(fs.existsSync(path.join(directory, STATE_ROOT_MARKER_NAME)), false);
+			}
+			assert.equal(selectDefaultRunStateRoot(root), `${fallback}-2`);
+			await ensureRunStateRoot(`${fallback}-2`);
+			assert.equal(selectDefaultRunStateRoot(root), `${fallback}-2`, "reuse initialized authority instead of splitting state");
+		});
 
-		assert.equal(selectDefaultRunStateRoot(root), fallback);
-	});
+		test(`keeps selecting the first initialized ${rootMode.toString(8)} migration fallback`, async () => {
+			if (process.platform === "win32") return;
+			const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(container);
+			const root = path.join(container, "default-root");
+			const fallback = `${root}-owned-v1`;
+			await fs.promises.mkdir(root, { mode: rootMode });
+			await fs.promises.chmod(root, rootMode);
+			await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
+			assert.equal(selectDefaultRunStateRoot(root), fallback);
+			await fs.promises.mkdir(fallback, { mode: rootMode });
+			await fs.promises.chmod(fallback, rootMode);
+			await prepareRunArtifactPaths({ rootDir: fallback, runId: "fallback-run" });
+			assert.equal(selectDefaultRunStateRoot(root), fallback);
+			await assertSafeStateRoot(fallback);
+			assert.equal((await fs.promises.stat(fallback)).mode & 0o777, rootMode);
+			assert.equal((await fs.promises.stat(path.join(fallback, STATE_ROOT_MARKER_NAME))).mode & 0o777, 0o600);
+		});
+	}
+
+	for (const invalidMarker of ["malformed", "public", "group-writable", "symlink"] as const) {
+		test(`rejects a 0750 fallback with a ${invalidMarker} marker without replacing or bypassing it`, async () => {
+			if (process.platform === "win32") return;
+			const container = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-protocol-")); tempDirs.push(container);
+			const root = path.join(container, "default-root");
+			const fallback = `${root}-owned-v1`;
+			for (const directory of [root, fallback]) {
+				await fs.promises.mkdir(directory, { mode: 0o750 });
+				await fs.promises.chmod(directory, 0o750);
+			}
+			await fs.promises.writeFile(path.join(root, "legacy.json"), "legacy", { mode: 0o600 });
+			const markerPath = path.join(fallback, STATE_ROOT_MARKER_NAME);
+			const validMarker = `${JSON.stringify({ version: 1, kind: "pi-subagent-state-root" })}\n`;
+			if (invalidMarker === "symlink") {
+				const target = path.join(container, "marker-target.json");
+				await fs.promises.writeFile(target, validMarker, { mode: 0o600 });
+				await fs.promises.symlink(target, markerPath);
+			} else {
+				await fs.promises.writeFile(markerPath, invalidMarker === "malformed" ? "{}\n" : validMarker, { mode: 0o600 });
+				if (invalidMarker !== "malformed") await fs.promises.chmod(markerPath, invalidMarker === "public" ? 0o644 : 0o660);
+			}
+			const before = await fs.promises.lstat(markerPath);
+			const textBefore = await fs.promises.readFile(markerPath, "utf8");
+			assert.equal(selectDefaultRunStateRoot(fallback), fallback);
+			assert.equal(selectDefaultRunStateRoot(root), fallback, "an invalid marker must fail validation, not select new authority");
+			await assert.rejects(() => ensureRunStateRoot(fallback), /ownership marker/);
+			await assert.rejects(() => prepareRunArtifactPaths({ rootDir: fallback, runId: "unsafe-marker" }), /ownership marker/);
+			await assert.rejects(() => assertSafeStateRoot(fallback), /ownership marker/);
+			const after = await fs.promises.lstat(markerPath);
+			assert.equal(after.ino, before.ino);
+			assert.equal(after.mode, before.mode);
+			assert.equal(await fs.promises.readFile(markerPath, "utf8"), textBefore);
+			assert.equal((await fs.promises.stat(fallback)).mode & 0o777, 0o750);
+			assert.deepEqual(await fs.promises.readdir(fallback), [STATE_ROOT_MARKER_NAME]);
+			assert.equal(fs.existsSync(`${fallback}-2`), false);
+		});
+	}
 
 	test("rejects unsafe existing ancestors without creating or chmodding a root", async () => {
 		if (process.platform === "win32") return;
@@ -207,9 +390,19 @@ describe("run protocol", () => {
 		await assert.rejects(() => prepareRunArtifactPaths({ rootDir: absentRoot, runId: "run" }), /group\/other writable/);
 		assert.equal(fs.existsSync(absentRoot), false);
 		assert.equal((await fs.promises.stat(renameable)).mode & 0o777, before);
+		await fs.promises.mkdir(absentRoot, { mode: 0o750 });
+		await fs.promises.chmod(absentRoot, 0o750);
+		await assert.rejects(() => ensureRunStateRoot(absentRoot), /group\/other writable/);
+		assert.equal((await fs.promises.stat(absentRoot)).mode & 0o777, 0o750);
+		assert.deepEqual(await fs.promises.readdir(absentRoot), []);
 		const actual = path.join(container, "actual"); const linked = path.join(container, "linked");
-		await fs.promises.mkdir(actual, { mode: 0o700 }); await fs.promises.symlink(actual, linked);
+		await ensureRunStateRoot(actual); await fs.promises.symlink(actual, linked);
+		assert.equal((await fs.promises.stat(actual)).mode & 0o777, 0o750);
+		assert.equal(selectDefaultRunStateRoot(linked), linked);
+		await assert.rejects(() => ensureRunStateRoot(linked), /must not be a symlink/);
+		await assert.rejects(() => assertSafeStateRoot(linked), /must not be a symlink/);
 		await assert.rejects(() => prepareRunArtifactPaths({ rootDir: linked, runId: "run" }), /must not be a symlink/);
+		assert.equal(fs.existsSync(path.join(actual, "run")), false);
 	});
 
 	test("atomically writes private JSON and validates run-bound records", async () => {

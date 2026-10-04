@@ -18,8 +18,13 @@ import {
 const dirs: string[] = [];
 afterEach(async () => { while (dirs.length) await fs.promises.rm(dirs.pop()!, { recursive: true, force: true }); });
 
-async function fixture() {
-	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-fork-source-")); dirs.push(root);
+async function fixture(initializeAbsentRoot = false) {
+	const base = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-fork-source-")); dirs.push(base);
+	let root = base;
+	if (initializeAbsentRoot) {
+		root = path.join(base, "ancestor", "state");
+		assert.equal(fs.existsSync(root), false, "initialize a genuinely absent state root");
+	}
 	let tick = 100;
 	const manager = await ForkSourceOwnershipManager.create('{"role":"user"}\n', { rootDir: root, ownerPid: 10, ownerStartedAt: 20, now: () => ++tick });
 	const session = path.join(root, "session.jsonl");
@@ -29,6 +34,67 @@ async function fixture() {
 }
 
 describe("fork source ownership", () => {
+	test("reopens and reconciles a newly initialized 0750 state root with private fork directories", async () => {
+		if (process.platform === "win32") return;
+		const { root, manager } = await fixture(true);
+		assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o750);
+		assert.equal((await fs.promises.stat(path.dirname(root))).mode & 0o777, 0o700);
+		assert.equal((await fs.promises.stat(path.join(root, "state-root-marker.json"))).mode & 0o777, 0o600);
+		const child = await manager.registerChild({ childId: "no-launch", surface: "inline" });
+		for (const directory of [manager.paths.rootDir, manager.paths.invocationDir, manager.paths.childrenDir, child.childDir]) {
+			assert.equal((await fs.promises.stat(directory)).mode & 0o777, 0o700);
+		}
+		const reopened = await ForkSourceOwnershipManager.open(manager.paths.invocationDir);
+		assert.equal(reopened.paths.stateRoot, await fs.promises.realpath(root));
+		assert.equal(reopened.paths.invocationDir, manager.paths.invocationDir);
+		const outcome = await reconcileForkSourceOwnershipRoot({ stateRoot: root, ownerStatus: () => "dead", now: () => 10_000 });
+		assert.deepEqual(outcome.invalid, []);
+		assert.deepEqual(outcome.scanned, [manager.invocationId]);
+		assert.deepEqual(outcome.resolved, [`${manager.invocationId}/${child.childId}`]);
+		assert.deepEqual(outcome.removed, [manager.invocationId]);
+		assert.equal(fs.existsSync(manager.paths.invocationDir), false);
+		assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o750, "recovery preserves root mode");
+	});
+
+	test("open and startup recovery reject unsafe roots, non-root 0750 directories, and invalid markers", async () => {
+		if (process.platform === "win32") return;
+		for (const corruption of ["root-0770", "root-0755", "fork-root-0750", "invocation-0750", "children-0750", "state-marker-content", "state-marker-mode", "fork-marker-content"] as const) {
+			const { root, manager } = await fixture(true);
+			const stateMarker = path.join(root, "state-root-marker.json");
+			switch (corruption) {
+				case "root-0770": await fs.promises.chmod(root, 0o770); break;
+				case "root-0755": await fs.promises.chmod(root, 0o755); break;
+				case "fork-root-0750": await fs.promises.chmod(manager.paths.rootDir, 0o750); break;
+				case "invocation-0750": await fs.promises.chmod(manager.paths.invocationDir, 0o750); break;
+				case "children-0750": await fs.promises.chmod(manager.paths.childrenDir, 0o750); break;
+				case "state-marker-content": await fs.promises.writeFile(stateMarker, "{}\n"); break;
+				case "state-marker-mode": await fs.promises.chmod(stateMarker, 0o640); break;
+				case "fork-marker-content": await fs.promises.writeFile(manager.paths.rootMarkerPath, "{}\n"); break;
+			}
+			await assert.rejects(() => ForkSourceOwnershipManager.open(manager.paths.invocationDir), corruption);
+			const outcome = await reconcileForkSourceOwnershipRoot({ stateRoot: root, ownerStatus: () => "dead" });
+			const invalidEntry = corruption === "invocation-0750" || corruption === "children-0750" ? manager.invocationId : FORK_SOURCE_ROOT_NAME;
+			assert.deepEqual(outcome.invalid, [invalidEntry], corruption);
+			assert.deepEqual(outcome.removed, [], corruption);
+			assert.equal(fs.existsSync(manager.paths.sourcePath), true, corruption);
+			assert.equal(fs.existsSync(manager.paths.sealPath), false, "invalid authority is not mutated");
+		}
+	});
+
+	test("startup recovery retains a non-private child under a valid 0750 state root", async () => {
+		if (process.platform === "win32") return;
+		const { root, manager } = await fixture(true);
+		const child = await manager.registerChild({ childId: "unsafe-child", surface: "inline" });
+		await manager.quiesce();
+		await fs.promises.chmod(child.childDir, 0o750);
+		const outcome = await reconcileForkSourceOwnershipRoot({ stateRoot: root, ownerStatus: () => "dead" });
+		assert.deepEqual(outcome.invalid, []);
+		assert.deepEqual(outcome.retained, [`${manager.invocationId}/source`, `${manager.invocationId}/${child.childId}`]);
+		assert.deepEqual(outcome.removed, []);
+		assert.equal(fs.existsSync(manager.paths.sourcePath), true);
+		assert.equal(fs.existsSync(path.join(child.childDir, "terminal.json")), false);
+	});
+
 	test("creates private marked source records and exact parsers reject extra keys", async () => {
 		const { manager } = await fixture();
 		for (const item of [manager.paths.rootDir, manager.paths.invocationDir, manager.paths.childrenDir]) assert.equal((await fs.promises.stat(item)).mode & 0o777, 0o700);

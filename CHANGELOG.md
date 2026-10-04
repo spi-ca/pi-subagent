@@ -1,5 +1,9 @@
 # 변경 기록
 
+## v20261004-2
+
+- 현재 UID 소유 상태 root에 `0700`/`0750`을 허용하고 새 root를 `0750`으로 생성한다. 기존 root는 자동 chmod하지 않으며 run·권한 디렉터리 `0700`, 파일·marker `0600`과 소유자·symlink·ancestor 검증은 유지한다.
+
 ## v20261004-1
 
 - Shared `@pi/presence`를 immutable `v2-20261004-1`로 동기화했습니다. 기존 release와 peeled commit·V2 protocol·ABI는 같습니다.

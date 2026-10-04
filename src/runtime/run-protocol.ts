@@ -286,12 +286,17 @@ export function createRunId(): string {
 	return crypto.randomUUID();
 }
 
-function isPrivateOwnedDirectorySync(directory: string): boolean {
+/** Only the shared root permits group visibility; run/artifact directories stay 0700. */
+function isOwnedStateRootDirectory(stat: fs.Stats): boolean {
+	if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+	if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
+	const mode = stat.mode & 0o777;
+	return process.platform === "win32" || mode === 0o700 || mode === 0o750;
+}
+
+function isOwnedStateRootDirectorySync(directory: string): boolean {
 	try {
-		const stat = fs.lstatSync(directory);
-		if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
-		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
-		return process.platform === "win32" || (stat.mode & 0o777) === 0o700;
+		return isOwnedStateRootDirectory(fs.lstatSync(directory));
 	} catch {
 		return false;
 	}
@@ -299,7 +304,7 @@ function isPrivateOwnedDirectorySync(directory: string): boolean {
 
 function hasValidStateRootMarkerSync(root: string): boolean {
 	try {
-		if (!isPrivateOwnedDirectorySync(root)) return false;
+		if (!isOwnedStateRootDirectorySync(root)) return false;
 		const markerPath = path.join(root, STATE_ROOT_MARKER_NAME);
 		const stat = fs.lstatSync(markerPath);
 		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024) return false;
@@ -319,7 +324,7 @@ function hasValidStateRootMarkerSync(root: string): boolean {
 
 function hasPrivateMarkerlessLegacyState(defaultRoot: string): boolean {
 	try {
-		if (!isPrivateOwnedDirectorySync(defaultRoot)) return false;
+		if (!isOwnedStateRootDirectorySync(defaultRoot)) return false;
 		if (fs.existsSync(path.join(defaultRoot, STATE_ROOT_MARKER_NAME))) return false;
 		const entries = fs.readdirSync(defaultRoot);
 		if (entries.some((name) => name.startsWith(`.${STATE_ROOT_MARKER_NAME}.`) && name.endsWith(".tmp"))) return false;
@@ -392,7 +397,7 @@ async function assertPrivateStateRootDirectory(directory: string): Promise<void>
 	if (configured.isSymbolicLink()) throw new Error(`Subagent state root must not be a symlink: ${directory}`);
 	await assertSafeAncestorChain(directory, false);
 	await assertSafeAncestorChain(directory, true);
-	if (!await isPrivateOwnedDirectory(directory)) throw new Error(`Subagent state path is not a private directory: ${directory}`);
+	if (!isOwnedStateRootDirectory(await fs.promises.lstat(directory))) throw new Error(`Subagent state path is not an owned 0700/0750 directory: ${directory}`);
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -490,7 +495,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 			await fs.promises.lstat(markerPath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			// Marker-less roots are legacy/untrusted. Only an empty, already-private
+			// Marker-less roots are legacy/untrusted. Only an empty, already-safe
 			// directory can be initialized; a populated root is retained untouched.
 			if ((await fs.promises.readdir(directory)).length !== 0) {
 				throw new Error(`Subagent state root ownership marker is missing from nonempty root: ${directory}`);
@@ -501,20 +506,21 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 		return;
 	}
 	await assertSafeExistingAncestorChains(directory);
+	// Keep any newly created ancestors private; only the state root becomes 0750 below.
 	await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
 	const stat = await fs.promises.lstat(directory);
 	if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Subagent state root must be a directory: ${directory}`);
 	if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error(`Subagent state directory is owned by a different user: ${directory}`);
 	// The path was absent when validated and is revalidated immediately after
-	// creation before its private mode is enforced.
+	// creation before its root-only group-visible mode is enforced.
 	await assertSafeAncestorChain(directory, false);
 	await assertSafeAncestorChain(directory, true);
-	await fs.promises.chmod(directory, 0o700);
+	await fs.promises.chmod(directory, 0o750);
 	await publishOwnershipMarker(directory, STATE_ROOT_MARKER_NAME, { version: 1, kind: "pi-subagent-state-root" });
 	await assertSafeStateRoot(directory);
 }
 
-/** Initialize or validate the shared private state root without creating a run. */
+/** Initialize or validate the shared owned state root without creating a run. */
 export async function ensureRunStateRoot(rootDir = getRunStateRoot()): Promise<string> {
 	const resolved = path.resolve(rootDir);
 	await ensurePrivateDirectory(resolved);

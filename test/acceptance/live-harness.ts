@@ -1547,6 +1547,7 @@ const api = new Proxy({
   on: (event: unknown, handler: unknown) => { if (typeof handler !== "function") throw new Error("non-function event handler"); registeredEvents.push(event); },
   registerTool: (tool: { name?: unknown }) => { registeredTools.push(tool?.name); },
   registerCommand: (name: unknown, command: { handler?: unknown }) => { if (typeof command?.handler !== "function") throw new Error("command has no handler"); registeredCommands.push(name); },
+  registerToolRenderer: () => undefined,
   registerMessageRenderer: (customType: unknown, renderer: unknown) => { if (typeof renderer !== "function") throw new Error("message renderer is not a function"); registeredMessageRenderers.push(customType); },
 }, { get(target, key, receiver) { if (typeof key !== "string" || !(key in target)) throw new Error("unexpected ExtensionAPI access: " + String(key)); return Reflect.get(target, key, receiver); } });
 extension(api as never);

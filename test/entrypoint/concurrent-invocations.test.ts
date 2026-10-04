@@ -153,7 +153,7 @@ describe("subagent foreground invocation concurrency", () => {
         sessionManager: { getSessionId: () => "concurrent-invocations", getSessionFile: () => undefined },
       };
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "2" : undefined,
         registerCommand: () => undefined,

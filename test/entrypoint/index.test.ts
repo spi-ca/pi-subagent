@@ -176,6 +176,7 @@ describe("production dashboard boundary", () => {
     const registeredEvents: string[] = [];
     let registeredTools = 0;
     registerPiSubagent({
+      registerToolRenderer: () => undefined,
       registerMessageRenderer: (customType: string, renderer: unknown) => renderers.set(customType, renderer),
       registerFlag: () => undefined,
       getFlag: (name: string) => name === "subagent-max-depth" ? "0" : undefined,
@@ -205,7 +206,7 @@ describe("production dashboard boundary", () => {
     try {
       process.env.PI_SUBAGENT_DEPTH = "0";
       registerPiSubagent({
-        registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
         registerCommand: () => undefined, registerTool: () => undefined,
         on: (event: string, handler: (...args: any[]) => unknown) => handlers.set(event, handler),
         events: { emit: () => undefined }, getAllTools: () => [], getCommands: () => [],
@@ -231,7 +232,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
@@ -286,7 +287,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: (name: string, command: { handler: (rawArgs: string, ctx: unknown) => Promise<void> }) => commands.set(name, command),
@@ -338,7 +339,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,
@@ -409,7 +410,7 @@ describe("production dashboard boundary", () => {
     try {
       delete process.env.PI_SUBAGENT_DEPTH;
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -452,7 +453,7 @@ describe("production dashboard boundary", () => {
       else process.env.PI_SUBAGENT_DEPTH = depth;
       const handlers = new Map<string, unknown>();
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -573,7 +574,7 @@ describe("subagent tool schema", () => {
       execute?: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; isError?: boolean }>;
     } | undefined;
     const pi = {
-      registerMessageRenderer: () => undefined,
+      registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
       getFlag: () => undefined,
       registerCommand: () => undefined,
@@ -737,7 +738,7 @@ test("registered subagent exposes outputSchema and actual structured empty statu
   let tool: any;
   registerPiSubagent({
     registerTool: (value: any) => { if (value.name === "subagent") tool = value; },
-    registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
+    registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined, registerFlag: () => undefined, getFlag: () => undefined,
     registerCommand: () => undefined, on: () => undefined, events: { emit: () => undefined },
     getAllTools: () => [], getCommands: () => [],
   } as never);
@@ -874,7 +875,7 @@ describe("fork setup session fences", () => {
       await fs.mkdir(path.join(process.env.PI_CODING_AGENT_DIR, "agents"), { recursive: true });
       await fs.writeFile(path.join(process.env.PI_CODING_AGENT_DIR, "agents", "worker.md"), "---\nname: worker\ndescription: worker\n---\nWorker prompt\n");
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -940,7 +941,7 @@ describe("project-agent root confirmation", () => {
     const confirmations: Array<{ title: string; body: string }> = [];
     let subagentTool: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
     const pi = {
-      registerMessageRenderer: () => undefined,
+      registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
       getFlag: () => undefined,
       registerCommand: () => undefined,
@@ -1051,7 +1052,7 @@ describe("pi-subagent child project trust", () => {
 
       const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
       const pi = {
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,

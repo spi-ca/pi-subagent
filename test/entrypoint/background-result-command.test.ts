@@ -18,7 +18,7 @@ describe("/subagent-result command", () => {
   test("registers a TUI-only retained-result viewer using only the current branch", async () => {
     const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
     registerPiSubagent({
-      registerMessageRenderer: () => undefined,
+      registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
       registerFlag: () => undefined,
       getFlag: () => undefined,
       registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => commands.set(name, command),

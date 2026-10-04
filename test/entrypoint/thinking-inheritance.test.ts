@@ -102,7 +102,7 @@ describe("subagent thinking inheritance", () => {
       delete process.env.PI_SUBAGENT_DEPTH;
       delete process.env.PI_SUBAGENT_STACK;
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,

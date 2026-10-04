@@ -191,7 +191,7 @@ describe("session-start background completion fence", () => {
       const messages: unknown[] = [];
       const observerEvents: Array<{ channel: string; payload: unknown }> = [];
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: (name: string) => name === "subagent-max-active" ? "1" : undefined,
         registerCommand: () => undefined,
@@ -337,7 +337,7 @@ describe("session-start background completion fence", () => {
         sessionManager: { getSessionId: () => "delivery", getSessionFile: () => undefined },
       };
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -455,7 +455,7 @@ describe("session-start background completion fence", () => {
         sessionManager: { getSessionId: () => "widget", getSessionFile: () => undefined },
       };
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,
@@ -561,6 +561,7 @@ describe("session-start background completion fence", () => {
 
       const handlers = new Map<string, (...args: any[]) => Promise<unknown>>();
       let subagentTool: Tool | undefined;
+      let toolRenderers: Pick<Tool, "renderResult"> | undefined;
       let updateCount = 0;
       const session = (id: string): SessionContext => ({
         cwd: configDir!, hasUI: false, isIdle: () => true,
@@ -568,6 +569,9 @@ describe("session-start background completion fence", () => {
         sessionManager: { getSessionId: () => id, getSessionFile: () => undefined },
       });
       registerPiSubagent({
+        registerToolRenderer: (resolve: (name: string, next: () => undefined) => Pick<Tool, "renderResult"> | undefined) => {
+          toolRenderers = resolve("subagent", () => undefined);
+        },
         registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
@@ -595,7 +599,7 @@ describe("session-start background completion fence", () => {
       releaseReplacementFinal();
       const replacementResult = await replacement;
       assert.equal(replacementResult.isError, undefined, "session fencing preserves the foreground result contract");
-      const staleReplacementSnapshot = subagentTool.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-replacement" }) as any;
+      const staleReplacementSnapshot = toolRenderers!.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-replacement" }) as any;
       assert.equal(staleReplacementSnapshot.children, undefined, "a late final cannot repopulate the replacement registry");
 
       const shutdown = subagentTool.execute!("foreground-shutdown", { agent: "worker", task: "shutdown" }, new AbortController().signal, () => { updateCount += 1; }, session("new"));
@@ -609,7 +613,7 @@ describe("session-start background completion fence", () => {
       const shutdownResult = await shutdown;
       assert.equal(shutdownResult.isError, undefined, "shutdown fencing preserves the finalized foreground result");
       assert.equal(updateCount, 0, "late final captures never revive the registered tool callback");
-      const staleShutdownSnapshot = subagentTool.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-shutdown" }) as any;
+      const staleShutdownSnapshot = toolRenderers!.renderResult!({ content: [{ type: "text", text: "host error" }] }, { expanded: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, { toolCallId: "foreground-shutdown" }) as any;
       assert.equal(staleShutdownSnapshot.children, undefined, "a late final cannot repopulate the shut down registry");
     } finally {
       runAgentForTest = defaultRunAgentForTest;
@@ -675,7 +679,7 @@ describe("session-start background completion fence", () => {
         sessionManager: { getSessionId: () => "cancel", getSessionFile: () => undefined },
       };
       registerPiSubagent({
-        registerMessageRenderer: () => undefined,
+        registerToolRenderer: () => undefined, registerMessageRenderer: () => undefined,
         registerFlag: () => undefined,
         getFlag: () => undefined,
         registerCommand: () => undefined,

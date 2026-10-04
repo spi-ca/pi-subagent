@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from "bun:test";
+import { afterEach, describe, jest, test } from "bun:test";
 import assert from "node:assert/strict";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs";
@@ -46,6 +46,7 @@ import {
 	parseRunState,
 	prepareRunArtifactPaths,
 	readJsonFile,
+	readBrokerArtifact,
 	publishImmutableJson,
 } from "../../src/runtime/run-protocol";
 
@@ -508,14 +509,49 @@ describe("child lifecycle bridge", () => {
 	});
 
 	test("waits for an exact completion-fence ACK before capturing completion", async () => {
-		const bridge = await setupBridge("run-completion-fence", { completionFence: true });
-		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		const settled = bridge.emit("agent_settled");
-		await waitForCondition(() => fs.existsSync(bridge.paths.completionFencePath), "completion fence publication");
-		assert.equal(await readJsonFile(bridge.paths.completionPath), null, "boundary waits for ACK");
-		await publishImmutableJson(bridge.paths.completionFenceAckPath, { version: 1, kind: "completion-fence-ack", runId: "run-completion-fence", nonce: "d".repeat(64), acknowledgedAt: Date.now() });
-		await settled;
-		assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence")?.status, "completed");
+		const missingAckRead = deferred<void>();
+		let bridge: Awaited<ReturnType<typeof setupBridge>> | undefined;
+		let settled: Promise<void> | undefined;
+		const handshakeTimeout = deferred<never>();
+		// Schedule before switching clocks so the deadlock guard stays real.
+		const watchdog = setTimeout(() => handshakeTimeout.reject(new Error("Timed out waiting for completion-fence handshake")), 2_000);
+		void handshakeTimeout.promise.catch(() => undefined);
+		// Only this positive handshake owns a fake clock: CI scheduling and real
+		// filesystem I/O must not consume its unchanged 100ms ACK budget.
+		jest.useFakeTimers();
+		try {
+			bridge = await setupBridge("run-completion-fence", {
+				completionFence: true,
+				readCompletionFenceAck: async (filePath) => {
+					const artifact = await readBrokerArtifact(filePath);
+					if (artifact.outcome === "missing") missingAckRead.resolve();
+					return artifact;
+				},
+			});
+			await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+			settled = bridge.emit("agent_settled");
+			await Promise.race([missingAckRead.promise, handshakeTimeout.promise]);
+			assert.equal(fs.existsSync(bridge.paths.completionFencePath), true);
+			assert.equal(await readJsonFile(bridge.paths.completionPath), null, "boundary waits for ACK");
+			await publishImmutableJson(bridge.paths.completionFenceAckPath, { version: 1, kind: "completion-fence-ack", runId: "run-completion-fence", nonce: "d".repeat(64), acknowledgedAt: Date.now() });
+			jest.advanceTimersByTime(20); // one ACK polling cadence, still before the deadline
+			await Promise.race([settled, handshakeTimeout.promise]);
+			assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence")?.status, "completed");
+		} finally {
+			try {
+				jest.advanceTimersByTime(100); // release a pending deadline if an assertion failed
+			} finally {
+				// Restore before awaiting cleanup: late I/O may schedule another
+				// poll, which must not be stranded on a clock nobody advances.
+				jest.useRealTimers();
+				clearTimeout(watchdog);
+			}
+			try {
+				await withinDeadlockGuard(Promise.resolve(settled), "completion-fence cleanup settlement");
+			} finally {
+				await withinDeadlockGuard(Promise.resolve(bridge?.shutdownAndDrain()), "completion-fence shutdown drain");
+			}
+		}
 	});
 
 	test("settles an exact cancellation fence as aborted without waiting for a completion ACK", async () => {

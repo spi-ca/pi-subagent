@@ -21,7 +21,7 @@
 
 import * as crypto from "node:crypto";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   buildChainTaskFromStages,
@@ -600,6 +600,14 @@ export default function (pi: ExtensionAPI) {
   // Foreground cards and background widgets have isolated expansion state.
   const foregroundInlinePresentationRegistry = new InlinePresentationRegistry();
   const backgroundInlinePresentationRegistry = new InlinePresentationRegistry();
+  // Historical calls remain displayable even when this runtime cannot delegate.
+  // Renderer registration never grants execution authority or restores UI state.
+  const subagentRenderers: ToolRenderers = {
+    renderCall: (args, theme) => renderCall(args as Parameters<typeof renderCall>[0], theme),
+    renderResult: (result, { expanded }, theme, context) =>
+      renderResult(result, expanded, theme, context, foregroundInlinePresentationRegistry),
+  };
+  pi.registerToolRenderer((toolName, next) => toolName === "subagent" ? subagentRenderers : next());
   let clearInlinePresentationWidget: (() => void) | undefined;
   pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
     backgroundResultRenderer(message, options, theme),
@@ -2000,10 +2008,6 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         };
         return withSubagentStructuredContent(await executeInvocation());
       },
-
-      renderCall: (args, theme) => renderCall(args, theme),
-      renderResult: (result, { expanded }, theme, context) =>
-        renderResult(result, expanded, theme, context, foregroundInlinePresentationRegistry),
     });
   }
 

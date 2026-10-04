@@ -2,6 +2,7 @@
 
 ## v20261004-2
 
+- 기존 broker 테스트 하네스의 늦은 `close` 구독 race를 spawn 직후 completion 캐시와 protocol 22 event-checkpoint 회귀 테스트로 안정화했다. 실패 시 직접 소유한 process를 bounded 종료·reap한 뒤 fake server를 닫는다. 과거 CI 실패의 원인으로 확정한 것은 아니며 production 동작·보안 검증·기한은 변경하지 않는다.
 - 현재 UID 소유 상태 root에 `0700`/`0750`을 허용하고 새 root를 `0750`으로 생성한다. 기존 root는 자동 chmod하지 않으며 run·권한 디렉터리 `0700`, 파일·marker `0600`과 소유자·symlink·ancestor 검증은 유지한다.
 
 ## v20261004-1

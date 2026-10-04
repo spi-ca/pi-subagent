@@ -151,6 +151,32 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<number> {
 	return new Promise((resolve, reject) => { child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
 }
 
+// Only for directly spawned gate/checkpoint fixtures: latch before any artifact await.
+function latchOwnedGateProcess(child: ReturnType<typeof spawn>) {
+	const exited = waitForExit(child);
+	// Handle an early spawn error now, but keep the original rejection for assertions.
+	void exited.catch(() => {});
+	let closeObserved = false;
+	const closed = new Promise<void>((resolve) => child.once("close", () => { closeObserved = true; resolve(); }));
+	async function reapWithinDeadline(): Promise<boolean> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([closed.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 500); })]);
+		} finally { clearTimeout(timer); }
+	}
+	return {
+		exited,
+		async cleanup() {
+			if (closeObserved) return;
+			// Use the owned ChildProcess handle, never a PID read from an artifact.
+			if (child.pid && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+			if (await reapWithinDeadline()) return;
+			if (child.pid && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			assert.equal(await reapWithinDeadline(), true, "owned gate process must be reaped before fixture teardown");
+		},
+	};
+}
+
 function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = process.execPath): Promise<number> {
 	const fixtureEnv = { ...env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) };
 	return new Promise((resolve, reject) => { const child = spawn(command, args, { cwd, env: fixtureEnv, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
@@ -318,6 +344,7 @@ describe("pane launch broker", () => {
 		const runtime = fs.realpathSync(process.execPath);
 		for (const mode of ["success", "split-unknown", "send-unknown"] as const) {
 			const server = await fakeHerdrBrokerServer(root, mode);
+			let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 			try {
 				const stateRoot = path.join(root, `state-${mode}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-${mode}` });
@@ -329,9 +356,10 @@ describe("pane launch broker", () => {
 					continue;
 				}
 				const broker = spawn(runtime, args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+				completion = latchOwnedGateProcess(broker);
 				await waitForBrokerArtifact(paths.launchPath);
 				await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId: `herdr-${mode}`, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-				assert.equal(await waitForExit(broker), 0);
+				assert.equal(await completion.exited, 0);
 				assert.equal((await readBrokerJson(paths.allocationPath) as { target?: { terminalId?: string } })?.target?.terminalId, herdrChild.terminal_id);
 				if (mode === "success") {
 					assert.equal(await readBrokerJson(paths.launchDeliveryUnknownPath), null);
@@ -340,7 +368,7 @@ describe("pane launch broker", () => {
 					assert.equal((await readBrokerJson(paths.launchDeliveryUnknownPath) as { allocationPath?: string })?.allocationPath, paths.allocationPath);
 					assert.equal((await readBrokerJson(paths.residualRiskPath)), null, "known allocation delivery uncertainty is not split residual risk");
 				}
-			} finally { await server.close(); }
+			} finally { await completion?.cleanup(); await server.close(); }
 		}
 	});
 
@@ -385,6 +413,7 @@ describe("pane launch broker", () => {
 		for (const layout of ["auto", "split"] as const) {
 			const serverRoot = path.join(root, layout); await fs.promises.mkdir(serverRoot, { mode: 0o700 });
 			const server = await fakeHerdrBrokerServer(serverRoot, "success");
+			let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 			try {
 				const stateRoot = path.join(root, `state-task-cwd-${layout}`);
 				await fs.promises.mkdir(stateRoot, { mode: 0o700 });
@@ -395,15 +424,16 @@ describe("pane launch broker", () => {
 					assert.equal(await run(args, process.env, paths.runDir), 0);
 				} else {
 					const broker = spawn(fs.realpathSync(process.execPath), args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+					completion = latchOwnedGateProcess(broker);
 					await waitForBrokerArtifact(paths.launchPath);
 					await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-					assert.equal(await waitForExit(broker), 0);
+					assert.equal(await completion.exited, 0);
 				}
 				const request = server.requests.find((candidate) => candidate.method === (layout === "auto" ? "layout.apply" : "pane.split"));
 				const cwd = layout === "auto" ? (request?.params.root as { cwd?: string } | undefined)?.cwd : request?.params.cwd;
 				assert.equal(cwd, path.parse(paths.runDir).root, layout);
 				assert.notEqual(cwd, taskCwd, layout);
-			} finally { await server.close(); }
+			} finally { await completion?.cleanup(); await server.close(); }
 		}
 	});
 
@@ -497,17 +527,59 @@ describe("pane launch broker", () => {
 			const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 			const runtime = fs.realpathSync(process.execPath);
 			const server = await fakeHerdrBrokerServer(root, "success", protocol);
+			let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 			try {
 				const stateRoot = path.join(root, `state-protocol-${protocol}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-protocol-${protocol}` });
 				const broker = spawn(runtime, await writeHerdrIntent(paths, `herdr-protocol-${protocol}`, server.socketPath, protocol), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+				completion = latchOwnedGateProcess(broker);
 				await waitForBrokerArtifact(paths.launchPath);
 				await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId: `herdr-protocol-${protocol}`, terminalMode: "herdr-pane", protocol, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-				assert.equal(await waitForExit(broker), 0);
+				assert.equal(await completion.exited, 0);
 				assert.equal((await readBrokerJson(paths.allocationPath) as { target?: { protocol?: number } })?.target?.protocol, protocol);
-			} finally { await server.close(); }
+			} finally { await completion?.cleanup(); await server.close(); }
 		});
 	}
+
+	test("caches Herdr protocol 22 broker exit before a delayed final await", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
+		const server = await fakeHerdrBrokerServer(root, "success", 22);
+		let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
+		try {
+			const stateRoot = path.join(root, "state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
+			const runId = "herdr-protocol-22-cached-exit", paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const broker = spawn(fs.realpathSync(process.execPath), await writeHerdrIntent(paths, runId, server.socketPath, 22), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+			completion = latchOwnedGateProcess(broker);
+			let closeObserved = false;
+			const closeCheckpoint = new Promise<void>((resolve) => broker.once("close", () => { closeObserved = true; resolve(); }));
+			await waitForBrokerArtifact(paths.launchPath);
+			const gate = { version: 2, runId, terminalMode: "herdr-pane", protocol: 22, launchPath: paths.launchPath, publishedAt: 1 };
+			await writePrivateFile(paths.launchGatePath, `${JSON.stringify(gate)}\n`);
+			// Event checkpoint, not a sleep: close must precede the final cached-exit await.
+			await closeCheckpoint;
+			assert.equal(closeObserved, true);
+			assert.equal(broker.exitCode, 0);
+			assert.equal(await completion.exited, 0);
+			const allocation = await readBrokerJson(paths.allocationPath) as { allocatedAt: number };
+			const socketStat = fs.lstatSync(server.socketPath, { bigint: true });
+			assert.deepEqual(allocation, {
+				version: 2, runId, terminalMode: "herdr-pane",
+				target: { socketPath: server.socketPath, workspaceId: herdrChild.workspace_id, tabId: herdrChild.tab_id, paneId: herdrChild.pane_id, terminalId: herdrChild.terminal_id, protocol: 22, generation: { socketDev: socketStat.dev.toString(), socketIno: socketStat.ino.toString() } },
+				allocatedAt: allocation.allocatedAt,
+			});
+			const decision = await readBrokerJson(paths.decisionPath) as { decidedAt: number };
+			assert.deepEqual(decision, { version: 2, runId, kind: "commit", decidedAt: decision.decidedAt, allocationPath: paths.allocationPath, launchPath: paths.launchPath });
+			const launch = await readBrokerJson(paths.launchPath) as { committedAt: number };
+			assert.deepEqual(launch, { version: 2, runId, terminalMode: "herdr-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: launch.committedAt, ownership: "parent-owned" });
+			assert.deepEqual(await readBrokerJson(paths.launchGatePath), gate);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { phase?: string })?.phase, "committed");
+			assert.equal(await readBrokerJson(paths.launchDeliveryUnknownPath), null);
+			assert.equal(await readBrokerJson(paths.residualRiskPath), null);
+			assert.deepEqual(server.calls, ["ping", "pane.get", "ping", "pane.get", "pane.split", "ping", "pane.get", "pane.send_text"]);
+			assert.equal(server.requests.find((request) => request.method === "pane.split")?.params.target_pane_id, herdrSource.pane_id);
+			assert.deepEqual(server.requests.find((request) => request.method === "pane.send_text")?.params, { pane_id: herdrChild.pane_id, text: `exec '${paths.wrapperPath.replace(/'/g, `'"'"'`)}'\n` });
+		} finally { await completion?.cleanup(); await server.close(); }
+	});
 
 	test("rejects a broker intent when the live Herdr protocol no longer matches", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
@@ -528,6 +600,7 @@ describe("pane launch broker", () => {
 			for (const failure of ["malformed", "oversized", "wrong-id", "wrong-type"] as const) {
 				const mode: HerdrBrokerMode = `${operation}-${failure}`;
 				const server = await fakeHerdrBrokerServer(root, mode);
+				let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 				try {
 					const stateRoot = path.join(root, `state-${mode}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 					const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-${mode}` });
@@ -538,14 +611,15 @@ describe("pane launch broker", () => {
 						assert.equal(await readBrokerJson(paths.allocationPath), null);
 					} else {
 						const broker = spawn(runtime, args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+						completion = latchOwnedGateProcess(broker);
 						await waitForBrokerArtifact(paths.launchPath);
 						await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId: `herdr-${mode}`, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-						assert.equal(await waitForExit(broker), 0);
+						assert.equal(await completion.exited, 0);
 						assert.ok(await readBrokerJson(paths.launchDeliveryUnknownPath));
 						assert.equal(await readBrokerJson(paths.residualRiskPath), null);
 					}
 					assert.equal(server.calls.includes("pane.close"), false, `${mode} must not roll back a possibly launched target`);
-				} finally { await server.close(); }
+				} finally { await completion?.cleanup(); await server.close(); }
 			}
 		}
 	});
@@ -553,16 +627,18 @@ describe("pane launch broker", () => {
 	test("does not treat a duplicate unrelated Herdr list as target absence during rollback", async () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-broker-")); tempDirs.push(root); await fs.promises.chmod(root, 0o700);
 		const server = await fakeHerdrBrokerServer(root, "send-known-duplicate-unrelated");
+		let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 		try {
 			const stateRoot = path.join(root, "state"); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 			const runId = "herdr-duplicate-unrelated", paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
 			const broker = spawn(fs.realpathSync(process.execPath), await writeHerdrIntent(paths, runId, server.socketPath), { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+			completion = latchOwnedGateProcess(broker);
 			await waitForBrokerArtifact(paths.launchPath);
 			await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-			assert.equal(await waitForExit(broker), 0);
+			assert.equal(await completion.exited, 0);
 			assert.ok(await readBrokerJson(paths.residualRiskPath), "ambiguous global list retains recovery risk");
 			assert.equal(server.calls.includes("pane.close"), false, "unrelated duplicate rows cannot prove target absence or authorize rollback");
-		} finally { await server.close(); }
+		} finally { await completion?.cleanup(); await server.close(); }
 	});
 
 	test("binds broker source and allocation authority to terminal identity across pane moves", async () => {
@@ -570,6 +646,7 @@ describe("pane launch broker", () => {
 		const runtime = fs.realpathSync(process.execPath);
 		for (const mode of ["split-terminal-reuse", "split-pane-reuse", "source-moved"] as const) {
 			const server = await fakeHerdrBrokerServer(root, mode);
+			let completion: ReturnType<typeof latchOwnedGateProcess> | undefined;
 			try {
 				const stateRoot = path.join(root, `state-${mode}`); await fs.promises.mkdir(stateRoot, { mode: 0o700 });
 				const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: `herdr-${mode}` });
@@ -581,12 +658,13 @@ describe("pane launch broker", () => {
 					continue;
 				}
 				const broker = spawn(runtime, args, { cwd: paths.runDir, env: process.env, stdio: "ignore" });
+				completion = latchOwnedGateProcess(broker);
 				await waitForBrokerArtifact(paths.launchPath);
 				await writePrivateFile(paths.launchGatePath, `${JSON.stringify({ version: 2, runId: `herdr-${mode}`, terminalMode: "herdr-pane", protocol: 20, launchPath: paths.launchPath, publishedAt: 1 })}\n`);
-				assert.equal(await waitForExit(broker), 0);
+				assert.equal(await completion.exited, 0);
 				assert.equal(server.requests.find((request) => request.method === "pane.split")?.params.target_pane_id, "herdr-source-moved");
 				assert.equal((await readBrokerJson(paths.allocationPath) as { target?: { terminalId?: string } })?.target?.terminalId, herdrChild.terminal_id);
-			} finally { await server.close(); }
+			} finally { await completion?.cleanup(); await server.close(); }
 		}
 	});
 
@@ -668,8 +746,9 @@ describe("pane launch broker", () => {
 		const backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "preallocation-checkpoint" });
 		const nonce = "a".repeat(43);
 		const child = spawn(process.execPath, [...await writeIntent(paths, "preallocation-checkpoint", backend), "--acceptance-preallocation-checkpoint"], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore" });
-		await writePrivateFile(path.join(paths.runDir, "acceptance-handoff.json"), `${JSON.stringify({ version: 1, runId: "preallocation-checkpoint", brokerNonce: nonce, broker: { pid: child.pid, startedAt: 1, expectedCommand: "pane-launch-broker.mjs", runId: "preallocation-checkpoint" } })}\n`);
+		const completion = latchOwnedGateProcess(child);
 		try {
+			await writePrivateFile(path.join(paths.runDir, "acceptance-handoff.json"), `${JSON.stringify({ version: 1, runId: "preallocation-checkpoint", brokerNonce: nonce, broker: { pid: child.pid, startedAt: 1, expectedCommand: "pane-launch-broker.mjs", runId: "preallocation-checkpoint" } })}\n`);
 			for (let attempt = 0; attempt < 100; attempt += 1) {
 				if ((await readBrokerJson(paths.brokerStatusPath) as { phase?: string } | null)?.phase === "ready") break;
 				await new Promise((resolve) => setTimeout(resolve, 20));
@@ -679,11 +758,12 @@ describe("pane launch broker", () => {
 			assert.equal(await readBrokerJson(paths.decisionPath), null);
 			assert.match(spawnSync("/bin/ps", ["-o", "state=", "-p", String(child.pid)], { encoding: "utf8" }).stdout, /T/);
 			child.kill("SIGCONT");
-			assert.equal(await new Promise<number>((resolve) => child.once("close", (code) => resolve(code ?? 1))), 0);
+			assert.equal(await completion.exited, 0);
 			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { phase?: string } | null)?.phase, "committed");
 		} finally {
-			// SIGKILL is reserved for the dedicated acceptance fixture parent.
-			if (child.exitCode === null) { child.kill("SIGCONT"); child.kill("SIGTERM"); }
+			// Resume only this owned checkpoint fixture so bounded cleanup can reap it.
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGCONT");
+			await completion.cleanup();
 		}
 	});
 
@@ -1154,10 +1234,13 @@ describe("pane launch broker", () => {
 		const args = await writeTmuxIntent(paths, "tmux-gate-direct", backend), marker = path.join(root, "launched");
 		await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
 		const child = spawn(process.execPath, [...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) }, stdio: "ignore" });
-		assert.ok(child.pid);
-		await publishCommittedTmuxGate(paths, "tmux-gate-direct", child.pid!);
-		assert.equal(await waitForExit(child), 0);
-		assert.equal(fs.existsSync(marker), true);
+		const completion = latchOwnedGateProcess(child);
+		try {
+			assert.ok(child.pid);
+			await publishCommittedTmuxGate(paths, "tmux-gate-direct", child.pid!);
+			assert.equal(await completion.exited, 0);
+			assert.equal(fs.existsSync(marker), true);
+		} finally { await completion.cleanup(); }
 	});
 
 	test("tmux verifier accepts exactly one non-exec wrapper layer", async () => {
@@ -1167,12 +1250,15 @@ describe("pane launch broker", () => {
 		const args = await writeTmuxIntent(paths, "tmux-gate-child", backend), marker = path.join(root, "launched");
 		await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
 		const launcher = path.join(root, "non-exec-launcher.mjs");
-		await fs.promises.writeFile(launcher, `import { spawn } from "node:child_process";\nconst [runtime, ...args] = process.argv.slice(2);\nconst child = spawn(runtime, args, { stdio: "inherit", env: { ...process.env, PI_SUBAGENT_TEST_TMUX_PANE_PID: String(process.pid) } });\nchild.once("exit", (code) => process.exit(code ?? 1));\n`);
+		await fs.promises.writeFile(launcher, `import { spawn } from "node:child_process";\nconst [runtime, ...args] = process.argv.slice(2);\nconst child = spawn(runtime, args, { stdio: "inherit", env: { ...process.env, PI_SUBAGENT_TEST_TMUX_PANE_PID: String(process.pid) } });\nprocess.on("SIGTERM", () => child.kill("SIGKILL"));\nchild.once("error", () => process.exit(1));\nchild.once("close", (code) => process.exit(code ?? 1));\n`);
 		const child = spawn(process.execPath, [launcher, process.execPath, ...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) }, stdio: "ignore" });
-		assert.ok(child.pid);
-		await publishCommittedTmuxGate(paths, "tmux-gate-child", child.pid!);
-		assert.equal(await waitForExit(child), 0);
-		assert.equal(fs.existsSync(marker), true);
+		const completion = latchOwnedGateProcess(child);
+		try {
+			assert.ok(child.pid);
+			await publishCommittedTmuxGate(paths, "tmux-gate-child", child.pid!);
+			assert.equal(await completion.exited, 0);
+			assert.equal(fs.existsSync(marker), true);
+		} finally { await completion.cleanup(); }
 	});
 
 	test("tmux verifier rejects unrelated process authority and source aliases", async () => {
@@ -1184,10 +1270,13 @@ describe("pane launch broker", () => {
 			const args = await writeTmuxIntent(paths, runId, backend), marker = path.join(root, `${runId}-launched`);
 			await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
 			const child = spawn(process.execPath, [...args, "--verify-gate", "--wrapper", paths.wrapperPath], { cwd: paths.runDir, stdio: "ignore" });
-			assert.ok(child.pid);
-			await publishCommittedTmuxGate(paths, runId, panePid ?? child.pid! + 1, paneId);
-			assert.equal(await waitForExit(child), 0);
-			assert.equal(fs.existsSync(marker), false, runId);
+			const completion = latchOwnedGateProcess(child);
+			try {
+				assert.ok(child.pid);
+				await publishCommittedTmuxGate(paths, runId, panePid ?? child.pid! + 1, paneId);
+				assert.equal(await completion.exited, 0);
+				assert.equal(fs.existsSync(marker), false, runId);
+			} finally { await completion.cleanup(); }
 		}
 	});
 

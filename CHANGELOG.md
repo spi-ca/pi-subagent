@@ -6,6 +6,7 @@
 
 - Pi 개발 의존성과 CI graph를 exact `1.0.2`로 동기화했다.
 - `registerToolRenderer()`로 subagent 호출·결과 표시를 실행 등록에서 분리했다. 위임 깊이 제한에서도 저장된 호출을 표시하며 실행 권한·출력 계약은 변경하지 않는다.
+- 정상 completion-fence ACK 테스트의 시계를 제어해 CI 부하에 따른 타이밍 실패를 제거했다. 실제 ACK 검증·100ms 보안 기한·음성 테스트·runtime은 변경하지 않는다.
 
 ## v20261001-1
 

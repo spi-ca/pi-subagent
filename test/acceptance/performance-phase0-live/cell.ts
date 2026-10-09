@@ -1022,7 +1022,8 @@ export type Phase0ParentCellTestHooks = {
   /** Test-harness-only post-signal observer; exceptions and mutation cannot affect cleanup. */
   observeBootstrapCleanupSignalIntent?: Phase0BootstrapSignalIntentObserver;
   afterBootstrapResumed?: (identity: ProcessIdentity) => void | Promise<void>;
-  afterPrimaryFailureCaptured?: () => void | Promise<void>;
+  /** Test-only observer of the original failure before the outward summary is sanitized. */
+  afterPrimaryFailureCaptured?: (error: unknown) => void | Promise<void>;
   /** Test-only: production always requires the staged executable/theme bundle fence. */
   skipStagedBundleRevalidation?: boolean;
 };
@@ -1059,7 +1060,7 @@ export async function runParentCell(root: string, agentDir: string, extension: s
     primaryFailureCaptured = true;
     // Capture precedence before any backend or identity cleanup can cross the deadline.
     primaryFailureCategory = phase0FailureCategory(error, { timedOut, stdoutOverflow: outputOverflow, stderrOverflow: diagnosticsOverflow, deadlineExpired: expiredAtCapture });
-    await testHooks.afterPrimaryFailureCaptured?.();
+    await testHooks.afterPrimaryFailureCaptured?.(error);
   };
   let failureSummary: Phase0FailureSummary | null = null;
   let summaryRetentionProven = false;

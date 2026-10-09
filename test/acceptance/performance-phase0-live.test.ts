@@ -454,9 +454,13 @@ describe("two-tier gated Phase 0 live harness", () => {
   test("classifies setup deadline exhaustion and output-overflow signal precedence without a provider", async () => {
     const root = await createPrivateEvidenceRoot();
     try {
-      let thrown: unknown;
-      try { await runParentCell(root, "/fixture/agent", "/fixture/extension", fixturePi, 1, "short-response", {}, {}, undefined, true, { expiresAt: Date.now() - 1 }); }
-      catch (error) { thrown = error; }
+      let thrown: unknown, primaryFailure: unknown;
+      try {
+        await runParentCell(root, "/fixture/agent", "/fixture/extension", fixturePi, 1, "short-response", {}, {}, undefined, true, { expiresAt: Date.now() - 1 }, {
+          afterPrimaryFailureCaptured: (error) => { primaryFailure = error; },
+        });
+      } catch (error) { thrown = error; }
+      assert.ok(primaryFailure instanceof Error); assert.equal(primaryFailure.message, "Phase 0 harness deadline exhausted.");
       assert.ok(thrown instanceof Phase0CellFailure); assert.equal(thrown.summary.category, "deadline-exhausted"); assert.equal(thrown.summary.latestMilestone, "none");
       const signal = phase0ChildTerminalFailure({ exitCode: null, signalCode: "SIGKILL" });
       assert.ok(signal); assert.equal(phase0FailureCategory(signal, { timedOut: false, stdoutOverflow: true, stderrOverflow: false }), "stdout-overflow");
@@ -819,12 +823,20 @@ describe("two-tier gated Phase 0 live harness", () => {
     const pi: LivePiExecutable = { bin: generation.executable, version: "0.81.1", generation, tmux: generation, cmux: generation };
     const originalKill = process.kill, signals: Array<{ pid: number; signal: number | NodeJS.Signals | undefined }> = [];
     let resumed: { pid: number; startedAt: number } | null = null, watchdog: { pid: number; startedAt: number } | null = null, sleepHelper: { pid: number; startedAt: number } | null = null, thrown: unknown;
+    let primaryFailure: unknown;
+    const identityObservations: Array<{ pid: number; status: string }> = [];
     process.kill = ((pid: number, signal?: number | NodeJS.Signals) => { signals.push({ pid, signal }); return originalKill(pid, signal); }) as typeof process.kill;
     try {
       await runParentCell(root, "/fixture/agent", "/fixture/extension", pi, 1, "short-response", { PATH: process.env.PATH }, {}, undefined, true, { expiresAt: Date.now() + 5_000 }, {
         bootstrapBindTimeoutMs: 1_000,
         afterBootstrapWatchdogBound: (_parent, binding) => { watchdog = binding.watchdog; sleepHelper = binding.sleepHelper; },
         afterBootstrapResumed: async (identity) => { resumed = identity; await fs.writeFile(releasePath, "", { mode: 0o600 }); },
+        classifyBootstrapIdentity: (identity) => {
+          const status = classifyParentProcessIdentity(identity.pid, identity.startedAt);
+          if (identityObservations.length < 128) identityObservations.push({ pid: identity.pid, status });
+          return status;
+        },
+        afterPrimaryFailureCaptured: (error) => { primaryFailure = error; },
         skipStagedBundleRevalidation: true,
       });
     } catch (error) { thrown = error; }
@@ -832,7 +844,11 @@ describe("two-tier gated Phase 0 live harness", () => {
     try {
       const resumedIdentity = resumed as { pid: number; startedAt: number } | null;
       const watchdogIdentity = watchdog as { pid: number; startedAt: number } | null, sleepHelperIdentity = sleepHelper as { pid: number; startedAt: number } | null;
-      assert.ok(resumedIdentity); assert.ok(watchdogIdentity); assert.ok(sleepHelperIdentity); assert.ok(resumedIdentity!.pid > 0 && resumedIdentity!.startedAt > 0);
+      const originalFailure = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
+      const outwardFailure = thrown instanceof Error ? thrown.message : String(thrown);
+      const diagnostic = `bootstrap did not resume: ${originalFailure}; observations=${JSON.stringify(identityObservations)}; failure=${outwardFailure}`;
+      assert.ok(resumedIdentity, diagnostic);
+      assert.ok(watchdogIdentity); assert.ok(sleepHelperIdentity); assert.ok(resumedIdentity!.pid > 0 && resumedIdentity!.startedAt > 0);
       assert.notEqual(watchdogIdentity!.pid, resumedIdentity!.pid); assert.notEqual(sleepHelperIdentity!.pid, watchdogIdentity!.pid);
       assert.notEqual(getProcessStartedAt(watchdogIdentity!.pid), watchdogIdentity!.startedAt); assert.notEqual(getProcessStartedAt(sleepHelperIdentity!.pid), sleepHelperIdentity!.startedAt);
       assert.ok(signals.some(({ pid, signal }) => pid === resumedIdentity!.pid && signal === "SIGCONT"));

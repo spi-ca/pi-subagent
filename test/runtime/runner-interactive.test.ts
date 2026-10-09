@@ -302,37 +302,84 @@ describe("interactive pane runner preparation", () => {
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-herdr-reconnect-classification-"));
 		const socketPath = path.join(root, "herdr.sock");
 		const pane = { workspace_id: "workspace", tab_id: "tab", pane_id: "pane", terminal_id: "terminal" };
-		let subscriptions = 0, paneGets = 0;
-		const server = net.createServer((socket) => socket.once("data", (chunk) => {
-			const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
-			if (request.method === "events.subscribe") {
-				subscriptions += 1;
-				socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
-				if (subscriptions === 1) setTimeout(() => socket.end(), 5);
-				return;
-			}
-			if (request.method === "pane.get") {
-				paneGets += 1;
-				setTimeout(() => socket.end(`${JSON.stringify({ id: request.id, result: { type: "pane_info", pane } })}\n`), paneGets === 1 ? 180 : 0);
-				return;
-			}
-			socket.end(`${JSON.stringify({ id: request.id, result: { type: "pong", protocol: 20 } })}\n`);
-		}));
-		await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
-		const stat = fs.lstatSync(socketPath, { bigint: true });
-		const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
-		const targets: string[] = [];
-		const subscription = subscribeSharedHerdrPaneForTest({
-			handle,
-			onReconcile: () => undefined,
-			onReconcileTarget: (terminal) => targets.push(terminal.state),
+		type PendingPaneGet = { socket: net.Socket; id: string };
+		let receivedInitialPaneGet!: (request: PendingPaneGet) => void, receivedFreshPaneGet!: (request: PendingPaneGet) => void;
+		const initialPaneGet = new Promise<PendingPaneGet>((resolve) => { receivedInitialPaneGet = resolve; });
+		const freshPaneGet = new Promise<PendingPaneGet>((resolve) => { receivedFreshPaneGet = resolve; });
+		let reconnected!: () => void, reconciled!: () => void;
+		const reconnect = new Promise<void>((resolve) => { reconnected = resolve; });
+		const reconciliation = new Promise<void>((resolve) => { reconciled = resolve; });
+		let subscriptions = 0, paneGets = 0, healthyTransitions = 0;
+		let initialSubscriptionSocket: net.Socket | undefined;
+		const sockets = new Set<net.Socket>();
+		const server = net.createServer((socket) => {
+			sockets.add(socket); socket.once("close", () => sockets.delete(socket));
+			socket.once("data", (chunk) => {
+				const request = JSON.parse(chunk.toString("utf8")) as { id: string; method: string };
+				if (request.method === "events.subscribe") {
+					subscriptions += 1;
+					if (subscriptions === 1) initialSubscriptionSocket = socket;
+					socket.write(`${JSON.stringify({ id: request.id, result: { type: "subscription_started" } })}\n`);
+					return;
+				}
+				if (request.method === "pane.get") {
+					paneGets += 1;
+					if (paneGets === 1) receivedInitialPaneGet({ socket, id: request.id });
+					else receivedFreshPaneGet({ socket, id: request.id });
+					return;
+				}
+				socket.end(`${JSON.stringify({ id: request.id, result: { type: "pong", protocol: 20 } })}\n`);
+			});
 		});
-		for (let attempt = 0; attempt < 100 && (subscriptions < 2 || targets.length < 1); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-		assert.ok(subscriptions >= 2, "the transport reconnects before the initial classification returns");
-		assert.ok(paneGets >= 2, "the reconnect schedules a fresh classification");
-		assert.deepEqual(targets, ["present"], "the pre-reconnect classification cannot restore target presentation");
-		subscription.stop(); await subscription.closed;
-		await new Promise<void>((resolve) => server.close(() => resolve())); await fs.promises.rm(root, { recursive: true, force: true });
+		let subscription: ReturnType<typeof subscribeSharedHerdrPaneForTest> | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await new Promise<void>((resolve) => server.listen(socketPath, resolve)); fs.chmodSync(socketPath, 0o600);
+			const stat = fs.lstatSync(socketPath, { bigint: true });
+			const handle = { socketPath, socketDev: stat.dev.toString(), socketIno: stat.ino.toString(), workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, protocol: 20 as const };
+			const targets: Array<{ state: string; tab?: string }> = [];
+			const deadline = new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error(`timed out waiting for Herdr reconnect classification: subscriptions=${subscriptions}, paneGets=${paneGets}, healthyTransitions=${healthyTransitions}, targets=${JSON.stringify(targets)}`)), 1_000);
+			});
+			subscription = subscribeSharedHerdrPaneForTest({
+				handle,
+				onHealthChange: (healthy) => { if (healthy && ++healthyTransitions === 2) reconnected(); },
+				onReconcile: () => { reconciled(); },
+				onReconcileTarget: (terminal) => targets.push(terminal.state === "present" ? { state: terminal.state, tab: terminal.handle.tabId } : { state: terminal.state }),
+			});
+			// Receipt proves the initial classification is in flight; withhold its
+			// response across an explicitly triggered and acknowledged reconnect.
+			const initial = await Promise.race([initialPaneGet, deadline]);
+			assert.equal(subscriptions, 1);
+			assert.equal(subscription.isHealthy(), true);
+			assert.ok(initialSubscriptionSocket);
+			initialSubscriptionSocket.destroy();
+			await Promise.race([reconnect, deadline]);
+			assert.equal(subscriptions, 2, "the transport reconnects before the initial classification returns");
+			assert.equal(subscription.isHealthy(), true, "the replacement acknowledgement has been consumed");
+			assert.equal(paneGets, 1, "the fresh classification waits for the in-flight read to drain");
+			assert.deepEqual(targets, []);
+			initial.socket.end(`${JSON.stringify({ id: initial.id, result: { type: "pane_info", pane: { ...pane, tab_id: "stale-tab" } } })}\n`);
+			const fresh = await Promise.race([freshPaneGet, deadline]);
+			assert.equal(paneGets, 2, "the reconnect schedules a fresh classification");
+			// A second request proves the old classification drained. The fresh
+			// response is still withheld, so no old result may restore presentation.
+			assert.deepEqual(targets, [], "the pre-reconnect classification cannot restore target presentation");
+			assert.equal(handle.tabId, pane.tab_id, "the stale classification never mutates the live binding");
+			fresh.socket.end(`${JSON.stringify({ id: fresh.id, result: { type: "pane_info", pane } })}\n`);
+			await Promise.race([reconciliation, deadline]);
+			assert.deepEqual(targets, [{ state: "present", tab: pane.tab_id }], "only the completed fresh classification restores presentation");
+			assert.equal(handle.tabId, pane.tab_id, "diagnostic classification never mutates the live binding");
+		} finally {
+			clearTimeout(timer);
+			subscription?.stop();
+			for (const socket of sockets) socket.destroy();
+			try { await subscription?.closed; }
+			finally {
+				try { await new Promise<void>((resolve) => server.close(() => resolve())); }
+				finally { await fs.promises.rm(root, { recursive: true, force: true }); }
+			}
+		}
 	});
 
 	test("clears stale Herdr target presentation on health transitions until fresh classification", async () => {

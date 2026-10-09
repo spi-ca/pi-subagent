@@ -80,6 +80,12 @@ describe("inherited CLI args", () => {
     assert.deepEqual(parsed.alwaysProxy, []);
   });
 
+  test("preserves an explicit parent MCP disable flag for every child", () => {
+    const parsed = parseInheritedCliArgs(["node", "pi", "--no-mcp", "--tools", "read,codemode"]);
+    assert.deepEqual(parsed.alwaysProxy, ["--no-mcp"]);
+    assert.equal(parsed.fallbackTools, "read,codemode");
+  });
+
   test("does not forward unknown flags while preserving explicit allowlisted non-secret flags", () => {
     const parsed = parseInheritedCliArgs([
       "node",

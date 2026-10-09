@@ -249,6 +249,7 @@ export function parseInheritedCliArgs(argv) {
         "--no-themes",
         "--no-context-files",
         "-nc",
+        "--no-mcp",
         "--no-builtin-tools",
         "-nbt",
         "--verbose",

@@ -90,6 +90,69 @@ test("chain call rendering uses canonical trimmed and generated labels", () => {
 	assert.doesNotMatch(text, / plan /);
 });
 
+describe("Pi 1.1 tool render context", () => {
+	test("uses only finite non-negative host execution duration, including zero and restored errors", () => {
+		const raw = { content: [{ type: "text", text: "restored error" }] };
+		for (const [durationMs, expected] of [[0, "0ms"], [999, "999ms"], [1250, "1.25s"]] as const) {
+			const text = renderResult(raw, false, theme, { durationMs }).render(80).join("\n");
+			assert.match(text, new RegExp(`Execute: ${expected}`));
+		}
+		for (const durationMs of [undefined, -1, NaN, Infinity, "250"]) {
+			assert.doesNotMatch(renderResult(raw, false, theme, { durationMs }).render(80).join("\n"), /Execute:/);
+		}
+		for (const expanded of [false, true]) {
+			assert.doesNotMatch(renderResult(raw, expanded, theme, { durationMs: 1250, isPartial: true }).render(80).join("\n"), /Execute:/);
+			assert.match(renderResult(raw, expanded, theme, { durationMs: 1250, isPartial: false }).render(80).join("\n"), /Execute: 1\.25s/);
+		}
+	});
+
+	test("leaves calls and every result path unpadded for Pi's default shell", () => {
+		const single: SubagentDetails = { ...details("parallel", [result({ agent: "worker", exitCode: 0 })]), mode: "single" };
+		const cases = [
+			{ content: [{ type: "text", text: "fallback" }] },
+			{ content: [], details: single },
+			{ content: [], details: details("parallel", [result({ agent: "worker", exitCode: -1 })]) },
+			{ content: [], details: details("chain", [result({ agent: "worker", exitCode: 1 })]) },
+			{ content: [], details: { kind: "subagent.background-job", version: 1, event: "error", operation: "status", reason: "missing" } },
+		];
+		for (const expanded of [false, true]) for (const value of cases) {
+			const plain = renderResult(value, expanded, theme, { durationMs: 1250 }).render(80);
+			for (const outputPad of [0, 1]) {
+				const rendered = renderResult(value, expanded, theme, { outputPad, durationMs: 1250 });
+				assert.ok(!(rendered instanceof Box), "no inner padding Box");
+				assert.deepEqual(rendered.render(80), plain);
+				assert.doesNotMatch(rendered.render(80)[0]!, /^ /);
+				const partial = renderResult(value, expanded, theme, { outputPad, durationMs: 1250, isPartial: true });
+				assert.doesNotMatch(partial.render(80).join("\n"), /Execute:/, "every partial path suppresses the duration footer");
+			}
+			for (const width of [1, 2, 16, 40]) {
+				for (const line of renderResult(value, expanded, theme, { outputPad: 1 }).render(width)) {
+					assert.ok(line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").length <= width);
+				}
+			}
+		}
+		const args = { agent: "scout", task: "Inspect" };
+		const plain = renderCall(args, theme).render(80);
+		for (const outputPad of [0, 1]) {
+			const rendered = renderCall(args, theme, { outputPad });
+			assert.ok(rendered instanceof Text);
+			assert.deepEqual(rendered.render(80), plain);
+			assert.doesNotMatch(rendered.render(80)[0]!, /^ /);
+		}
+	});
+
+	test("labels background job wall-clock elapsed separately from the short status execute duration", () => {
+		const job = { jobId: "12345678-1234-4123-8123-123456789abc", status: "completed", startedAt: 1000, completedAt: 6000, omittedBytes: 0 };
+		const value = { content: [], details: { kind: "subagent.background-job", version: 1, event: "status", job } };
+		const text = renderResult(value, false, theme, { durationMs: 12 }).render(160).join("\n");
+		assert.match(text, /Job elapsed: 5\.00s/);
+		assert.match(text, /Execute: 12ms/);
+		const legacy = renderResult(value, false, theme).render(160).join("\n");
+		assert.match(legacy, /Job elapsed: 5\.00s/);
+		assert.doesNotMatch(legacy, /Execute:/, "job timestamps must not fabricate a host execution duration");
+	});
+});
+
 describe("background action rendering", () => {
 	test("uses only closed structured details for start, status, cancel, and error actions", () => {
 		const jobId = "12345678-1234-4123-8123-123456789abc";

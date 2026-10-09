@@ -873,6 +873,47 @@ describe("child lifecycle bridge", () => {
 		assert.equal(bridge.lifecycle.shutdown, true);
 	});
 
+	test("Pi 1.1 settled cancellation wins over earlier successful, tool-use, error, or absent assistant messages", async () => {
+		for (const stopReason of ["stop", "toolUse", "error", undefined]) {
+			const runId = `run-settled-aborted-${stopReason ?? "absent"}`;
+			const bridge = await setupBridge(runId, { completionFence: true, leaseStaleMs: 10_000, isProcessIdentityAlive: () => true });
+			await bridge.emit("session_start"); await bridge.emit("agent_start");
+			await bridge.emit("agent_end", { messages: stopReason ? [assistant(stopReason)] : [] });
+			await bridge.emit("agent_settled", { aborted: true });
+			assert.equal(await readJsonFile(bridge.paths.completionPath), null);
+			assert.equal(fs.existsSync(bridge.paths.completionFencePath), false, "cancellation cannot mint a completion proof/ACK request");
+			assert.equal(bridge.lifecycle.shutdown, false, "cancelled interactive turn remains resumable");
+			assert.equal(parseRunState(await readJsonFile(bridge.paths.statePath), runId)?.lastEvent, "agent_settled:aborted");
+			await bridge.shutdownAndDrain();
+		}
+	});
+
+	test("explicit non-aborted settlement ignores an old aborted assistant and uses existing failure proof", async () => {
+		const runId = "run-settled-false";
+		const bridge = await setupBridge(runId, { leaseStaleMs: 10_000 });
+		await bridge.emit("session_start"); await bridge.emit("agent_start");
+		await bridge.emit("agent_end", { messages: [assistant("aborted", "")] });
+		await bridge.emit("agent_settled", { aborted: false });
+		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
+		assert.equal(completion?.status, "failed");
+		assert.equal(completionError(completion), "child-error");
+		assert.equal(bridge.lifecycle.shutdown, true);
+	});
+
+	test("a cancelled turn can resume and publish a verified successful completion", async () => {
+		const runId = "run-settled-resume";
+		const bridge = await setupBridge(runId, { leaseStaleMs: 10_000 });
+		await bridge.emit("session_start"); await bridge.emit("agent_start");
+		await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		await bridge.emit("agent_settled", { aborted: true });
+		await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		await bridge.emit("agent_settled", { aborted: false });
+		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId);
+		assert.equal(completion?.status, "completed");
+		assert.equal(completion && "session" in completion ? completion.session.finalEntryId : undefined, `entry-${runId}`);
+		assert.equal(bridge.lifecycle.shutdown, true);
+	});
+
 	test("does not complete an aborted turn", async () => {
 		const fakeMonotonicNow = () => 0;
 		const bridge = await setupBridge("run-aborted-turn", {

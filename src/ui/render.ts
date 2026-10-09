@@ -290,7 +290,8 @@ function isSingleResult(value: unknown): value is SingleResult {
 // renderCall — shown while the tool is being invoked
 // ---------------------------------------------------------------------------
 
-export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }): Text {
+/** Pi's native default shell owns output padding for calls and results. */
+export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }, _context?: InlineResultRenderContext): Text {
 	const delegationMode = normalizeDelegationMode(args.mode);
 	const terminalMode = getDefaultTerminalModeFromEnv();
 	const modeBadge = theme.fg("muted", ` [${delegationMode}, ${terminalMode}]`);
@@ -351,6 +352,7 @@ function renderBackgroundJobSummary(
 ): string {
 	const color = job.status === "completed" ? "success" : job.status === "failed" ? "error" : job.status === "cancelled" || job.status === "cancelling" ? "warning" : "accent";
 	let text = theme.fg(color, theme.bold(`${job.status} · job ${compactBackgroundJobId(job.jobId, expanded)}`));
+	text += theme.fg("dim", ` · Job elapsed: ${formatDuration(Math.max(0, (job.completedAt ?? Date.now()) - job.startedAt))}`);
 	if (job.errorReason) text += `\n${theme.fg("error", job.errorReason)}`;
 	if (job.output !== undefined) text += `\n${theme.fg("dim", job.output)}`;
 	if (job.outputClipped) text += `\n${theme.fg("muted", `... (output clipped • /subagent-result ${job.jobId})`)}`;
@@ -408,9 +410,36 @@ function isSubagentDetails(value: unknown): value is SubagentDetails {
 
 export interface InlineResultRenderContext {
 	toolCallId?: unknown;
+	/** Host-measured execute() duration; never inferred from a background job. */
+	durationMs?: unknown;
+	isPartial?: boolean;
+	/** Applied by Pi's default shell, not by these renderer components. */
+	outputPad?: unknown;
+}
+
+function formatDuration(ms: number): string {
+	return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(2)}s`;
 }
 
 export function renderResult(
+	result: { content: Array<{ type: string; text?: string }>; details?: unknown },
+	expanded: boolean,
+	theme: { fg: ThemeFg; bold: (s: string) => string },
+	context?: InlineResultRenderContext,
+	inlinePresentationRegistry?: InlinePresentationRegistry,
+): Container | Text {
+	let component = renderResultBody(result, expanded, theme, context, inlinePresentationRegistry);
+	const duration = context?.durationMs;
+	if (!context?.isPartial && typeof duration === "number" && Number.isFinite(duration) && duration >= 0) {
+		const container = new Container();
+		container.addChild(component);
+		container.addChild(new Text(theme.fg("dim", `Execute: ${formatDuration(duration)}`), 0, 0));
+		component = container;
+	}
+	return component;
+}
+
+function renderResultBody(
 	result: { content: Array<{ type: string; text?: string }>; details?: unknown },
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },

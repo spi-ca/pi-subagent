@@ -1,7 +1,9 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import { ensureInlinePresentation } from "../../src/core/runner-events";
-import { renderResult } from "../../src/ui/render";
+import { renderCall, renderResult } from "../../src/ui/render";
+import { ToolExecutionComponent } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
+import { initTheme } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { InlinePresentationRegistry } from "../../src/ui/inline-presentation";
 import { InlinePresentationWidget } from "../../src/ui/inline-presentation-widget";
 import { Box, Container, visibleWidth } from "@earendil-works/pi-tui";
@@ -75,6 +77,68 @@ describe("inline execution presentation", () => {
     const expanded = first.render(160).join("\n");
     assert.match(expanded, /one\s+\ntwo\s+\nthree\s+\nfour/);
     assert.match(expanded, /tool-0 · done/);
+  });
+
+  nestedMouseTest("unpadded results and host duration preserve nested card expansion and error snapshots", () => {
+    const registry = new InlinePresentationRegistry();
+    const value = details([result("worker", "one\ntwo", [], { exitCode: 1, stopReason: "error", errorMessage: "failed" })]);
+    registry.capture("tool-call", value, { retainAuthoritativeResults: true });
+    for (const snapshot of [false, true]) {
+      const rendered = renderResult(snapshot ? { content: [{ type: "text", text: "host error" }] } : { content: [], details: value }, false, theme,
+        { toolCallId: "tool-call", outputPad: 1, durationMs: 42 }, registry) as any;
+      const before = rendered.render(80).join("\n");
+      assert.match(before, /^▸ worker/m);
+      assert.match(before, /^Execute: 42ms/m);
+      assert.ok(!(rendered instanceof Box), "the native host shell supplies the only padding");
+      const handled = rendered.handleMouse({ type: "click", button: "left", x: 3, y: 0, screenX: 13, screenY: 10, width: 80, height: 8 });
+      assert.equal(handled?.handled, true);
+      assert.match(rendered.render(80).join("\n"), /^▾ worker/m);
+      assert.match(rendered.render(80).join("\n"), /two/);
+      handled.target.component.handleMouse({ type: "click", button: "left", y: 0 });
+    }
+  });
+
+  nestedMouseTest("Pi 1.1 default ToolExecutionComponent owns padding and dispatches nested card headers", () => {
+    // This file has no module mocks; keep the actual host graph separate from render.test.ts.
+    initTheme("dark", false);
+    for (const outputPad of [0, 1]) for (const snapshot of [false, true]) {
+      const registry = new InlinePresentationRegistry();
+      const value = details([result("worker", "one\ntwo", [], { exitCode: 1, stopReason: "error", errorMessage: "failed" })]);
+      registry.capture("tool-call", value, { retainAuthoritativeResults: true });
+      const host = new ToolExecutionComponent("subagent", "tool-call", { agent: "worker", task: "Inspect" }, { outputPad }, {
+        // No renderShell override: use Pi's native default shell.
+        renderCall: (args, hostTheme, context) => renderCall(args as Parameters<typeof renderCall>[0], hostTheme, context),
+        renderResult: (value, { expanded }, hostTheme, context) => renderResult(value, expanded, hostTheme, context, registry),
+      }, { requestRender: () => {} } as never, process.cwd());
+      const hostResult = { ...(snapshot ? { content: [{ type: "text", text: "host error" }] } : { content: [], details: value }), isError: true, durationMs: 42 };
+      const lines = () => host.render(80).map((line) => line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").trimEnd());
+      host.updateResult(hostResult, true);
+      assert.doesNotMatch(lines().join("\n"), /Execute:/, "partial host results never have a duration footer");
+      host.updateResult(hostResult);
+      for (const pad of [outputPad, 1 - outputPad]) {
+        host.setOutputPad(pad);
+        const before = lines();
+        assert.equal(before.find((line) => line.includes("Subagent worker"))?.indexOf("Subagent"), pad);
+        const headerRow = before.findIndex((line) => line.includes("▸ worker"));
+        assert.ok(headerRow >= 0, "host renders the card, not its generic fallback");
+        assert.equal(before[headerRow]!.indexOf("▸"), pad, "only the host's horizontal padding is present");
+        assert.equal(before.find((line) => line.includes("Execute: 42ms"))?.indexOf("Execute:"), pad);
+        const handled = host.handleMouse({ type: "click", button: "left", x: pad + 2, y: headerRow,
+          screenX: 100 + pad + 2, screenY: 50 + headerRow, width: 80, height: before.length, shift: false, alt: false, ctrl: false });
+        assert.equal(handled?.handled, true);
+        assert.equal(handled?.target?.originX, 100 + pad, "nested target accounts for native shell padding only");
+        const after = lines();
+        assert.match(after[headerRow]!, /▾ worker/);
+        assert.match(after.join("\n"), /two/);
+        assert.equal(after.some((line) => line.includes("─── Task ───")), false, "nested header did not toggle global tool expansion");
+        // The host's MouseRegion intentionally handles body clicks; drags remain unconsumed for selection.
+        assert.equal(host.handleMouse({ type: "drag", button: "left", x: pad + 2, y: headerRow + 1,
+          screenX: 100 + pad + 2, screenY: 51 + headerRow, width: 80, height: after.length, shift: false, alt: false, ctrl: false }), undefined);
+        host.handleMouse({ type: "click", button: "left", x: pad + 2, y: headerRow,
+          screenX: 100 + pad + 2, screenY: 50 + headerRow, width: 80, height: after.length, shift: false, alt: false, ctrl: false });
+        assert.match(lines()[headerRow]!, /▸ worker/);
+      }
+    }
   });
 
   test("renders a terminal foreground result from full authoritative Markdown rather than its 4 KiB snapshot", () => {

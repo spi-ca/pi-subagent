@@ -18,6 +18,7 @@ import {
 	buildPrivateChildEnvironmentScript,
 	buildInteractivePiArgs,
 	buildPiArgs,
+	buildChildMcpArgs,
 	resolveChildThinkingLevel,
 	buildInteractiveExtensionArgs,
 	assertManagedChildToolCompatibility,
@@ -1261,6 +1262,37 @@ describe("interactive pane runner preparation", () => {
 		const forkArgs = buildPiArgs({ name: "worker", description: "", systemPrompt: "", source: "user", filePath: "/tmp/worker.md", tools: ["subagent"] }, null, "/tmp/task", "fork", "/tmp/session", undefined, "managed");
 		assert.equal(forkArgs.filter((value) => value === "--extension").length, 2);
 		assert.ok(forkArgs.some((value) => value.endsWith("child-bridge.ts")));
+	});
+
+	test("restricts built-in MCP for explicit child allowlists without changing general inheritance", () => {
+		const general = { name: "worker", description: "", systemPrompt: "", source: "user" as const, filePath: "/tmp/worker.md", tools: undefined };
+		const restricted = { ...general, tools: ["read", "codemode"] };
+		for (const version of ["1.0.4", "1.1.0"]) {
+			assert.deepEqual(buildChildMcpArgs(restricted, undefined, "inherit", version), ["--no-mcp"]);
+			assert.deepEqual(buildChildMcpArgs(general, "read,grep", "inherit", version), ["--no-mcp"]);
+			assert.deepEqual(buildChildMcpArgs(general, undefined, "managed", version), ["--no-mcp"]);
+			assert.deepEqual(buildChildMcpArgs({ tools: [] }, undefined, "inherit", version), ["--no-mcp"]);
+			for (const tools of [undefined, "+codemode,-write"]) assert.deepEqual(buildChildMcpArgs(general, tools, "inherit", version), []);
+			assert.deepEqual(buildChildMcpArgs({ tools: ["read", "codemode", "mcp__docs__*"] }, undefined, "inherit", version), []);
+			assert.deepEqual(buildChildMcpArgs({ tools: ["read"] }, "mcp__docs__*", "inherit", version), ["--no-mcp"], "agent selection takes precedence over inherited MCP selection");
+			for (const mode of ["spawn", "fork"] as const) {
+				const args = buildPiArgs(restricted, null, "/tmp/task", mode, mode === "fork" ? "/tmp/session" : null, undefined, "inherit", undefined, version);
+				assert.equal(args.filter((arg) => arg === "--no-mcp").length, 1);
+				assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2), ["--tools", "read,codemode"]);
+			}
+			assert.ok(buildInteractivePiArgs(restricted, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"));
+			assert.equal(buildInteractivePiArgs(general, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"), false);
+			assert.throws(() => buildPiArgs(restricted, null, "/tmp/task", "spawn", null, undefined, "managed", undefined, version), /cannot preserve/);
+			const managed = buildInteractivePiArgs({ ...general, tools: ["read", "subagent"] }, null, "/tmp/task", "/tmp/session", undefined, "managed", undefined, version);
+			assert.ok(managed.includes("--no-mcp") && managed.includes("--no-extensions"));
+			assert.equal(managed.filter((arg) => arg === "--extension").length, 2, "bridge and nested delegation remain present");
+		}
+		for (const version of ["0.80.10", "1.0.2", "1.0.3", "unknown"]) {
+			assert.deepEqual(buildChildMcpArgs(restricted, undefined, "inherit", version), []);
+			const args = buildInteractivePiArgs({ ...general, tools: ["read"] }, null, "/tmp/task", "/tmp/session", undefined, "managed", undefined, version);
+			assert.equal(args.includes("--no-mcp"), false);
+			assert.ok(args.includes("--no-extensions"), "legacy managed profile is unchanged");
+		}
 	});
 
 	test("adds the self extension when inheritance omits it", () => {

@@ -16,6 +16,7 @@ import {
 } from "./phase0-live-proof.js";
 export { PHASE0_LIVE_GATE_ENV, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_BARRIER_PATHS_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV, PHASE0_LIVE_PROOF_CAPABILITY_ENV, PHASE0_LIVE_PROOF_ID_ENV, PHASE0_LIVE_PROOF_MASTER_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKENS_ENV, PHASE0_LIVE_PROOF_SOCKET_ENV } from "./phase0-live-proof.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import * as PiHost from "@earendil-works/pi-coding-agent";
 import {
   getAmbiguousInheritedCliApiKeyMessage,
   getProviderFromModelSpecifier,
@@ -4567,6 +4568,23 @@ export function assertManagedChildToolCompatibility(
   if (overridden.length > 0) throw new Error(`managed child policy cannot preserve extension overrides for built-in tools: ${overridden.join(", ")}`);
 }
 
+/** --tools alone keeps indirect MCP capabilities on newer Pi hosts. */
+export function buildChildMcpArgs(
+  agent: Pick<AgentConfig, "tools">,
+  fallbackTools: string | undefined,
+  childPolicy: ManagedChildPolicy,
+  hostVersion: string = PiHost.VERSION,
+): string[] {
+  // Children respawn the current host, not an unrelated PATH executable.
+  // Older Pi has no built-in MCP flag; managed --no-extensions still applies.
+  if (!isStableSemverAtLeast(hostVersion, "1.0.4")) return [];
+  const tools = agent.tools ?? fallbackTools?.split(",").map((value) => value.trim()).filter(Boolean);
+  // +/- selections modify defaults, rather than specifying a full allowlist.
+  const allowlist = tools !== undefined && (tools.length === 0 || tools.some((name) => !/^[+-]/.test(name)));
+  const explicitMcp = tools?.some((name) => name.startsWith("mcp__")) ?? false;
+  return childPolicy === "managed" || (allowlist && !explicitMcp) ? ["--no-mcp"] : [];
+}
+
 export function buildManagedExtensionArgs(includeBridge: boolean, selfExtensionPath = resolveCurrentPackageExtensionEntrypoint(), childBridgePath = CHILD_BRIDGE_PATH): string[] {
   return ["--no-extensions", "--extension", canonicalizeExtensionPath(selfExtensionPath), ...(includeBridge ? ["--extension", canonicalizeExtensionPath(childBridgePath)] : [])];
 }
@@ -4650,9 +4668,11 @@ export function buildPiArgs(
   childPolicy: ManagedChildPolicy = resolveManagedChildPolicy(),
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
+  hostVersion: string = PiHost.VERSION,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
   const args: string[] = [
+    ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
     "--mode",
     "json",
     ...(childPolicy === "managed" ? buildManagedExtensionArgs(delegationMode === "fork" || phase0LiveProofEnabled()) : delegationMode === "fork" ? buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs) : inheritedCliArgs.extensionArgs),
@@ -4696,9 +4716,11 @@ export function buildInteractivePiArgs(
   childPolicy: ManagedChildPolicy = resolveManagedChildPolicy(),
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
+  hostVersion: string = PiHost.VERSION,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
   const args: string[] = [
+    ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
     ...(childPolicy === "managed" ? buildManagedExtensionArgs(true) : buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs)),
     ...getInheritedCliArgsForAgent(agent, inheritedCliArgs.alwaysProxy, inheritedCliArgs.fallbackModel, modelOverride),
     "--session",

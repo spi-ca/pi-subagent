@@ -603,7 +603,7 @@ export default function (pi: ExtensionAPI) {
   // Historical calls remain displayable even when this runtime cannot delegate.
   // Renderer registration never grants execution authority or restores UI state.
   const subagentRenderers: ToolRenderers = {
-    renderCall: (args, theme) => renderCall(args as Parameters<typeof renderCall>[0], theme),
+    renderCall: (args, theme, context) => renderCall(args as Parameters<typeof renderCall>[0], theme, context),
     renderResult: (result, { expanded }, theme, context) =>
       renderResult(result, expanded, theme, context, foregroundInlinePresentationRegistry),
   };

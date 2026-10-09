@@ -132,7 +132,7 @@ Bun의 native Unix `server.close()`는 close 직전에 path를 다른 file로 �
 
 ### Generic presence producer 집중 검증
 
-root-only producer는 shared [`@pi/presence` protocol (v2-20261004-1)](https://github.com/spi-ca/pi-presence/tree/v2-20261004-1)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다. 새 session은 dashboard/presence observer를 등록하기 전에 process-local scheduler를 reset하므로, 즉시 전달되는 scheduler 구독이 이전 session의 queued/running 상태를 새 presence로 투영하지 않는다.
+root-only producer는 shared [`@pi/presence` protocol (v2-20261009-1)](https://github.com/spi-ca/pi-presence/tree/v2-20261009-1)의 `subagent` projection만 생산한다. shared protocol grammar는 dependency 문서를 따르며, 이 repository의 aggregate, terminal dedupe, privacy와 consumer-transport isolation은 focused test로 확인한다. 새 session은 dashboard/presence observer를 등록하기 전에 process-local scheduler를 reset하므로, 즉시 전달되는 scheduler 구독이 이전 session의 queued/running 상태를 새 presence로 투영하지 않는다.
 
 ```bash
 bun test --isolate test/integration/pi-presence-producer.test.ts test/entrypoint/index.test.ts
@@ -157,9 +157,24 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 이 focused 범위는 실제 cmux/tmux acceptance를 실행하지 않습니다. 따라서 이 변경에 대해 live cmux/tmux acceptance 통과를 주장하지 않습니다. 실제 multiplexer를 의도적으로 승인해 검증할 때만 위의 `PI_SUBAGENT_LIVE_TMUX` 또는 `PI_SUBAGENT_LIVE_CMUX` 명령을 사용합니다.
 
+## Pi 1.1 집중 회귀 검증
+
+설치된 Pi `1.1.0`의 `extensions.md`, `json.md`, `mcp.md`, `cli.md`, `settings.md`, `tui.md` 계약을 기준으로 settled cancellation, 도구 execution duration/padding, MCP child 선택을 검증합니다. 아래 파일은 기존 dependencies로도 서로 독립된 Bun process에서 실행할 수 있지만, exact `1.1.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
+
+```bash
+bun test --max-concurrency 1 test/runtime/child-bridge.test.ts
+bun test --max-concurrency 1 test/runtime/runner-cli.test.ts
+bun test --max-concurrency 1 test/runtime/runner-interactive.test.ts -t 'MCP|managed child profile|thinking resolution|inherited extensions'
+bun test --max-concurrency 1 test/ui/render.test.ts
+bun test --max-concurrency 1 test/ui/inline-presentation.test.ts
+bun test --max-concurrency 1 test/entrypoint/index.test.ts
+```
+
+이 범위는 실제 provider/MCP 연결 또는 live terminal acceptance를 실행하거나 증명하지 않습니다. 취소 event만으로 completion proof를 만들지 않는 동작과 기존 fence/lease/ownership 검증을 함께 유지합니다.
+
 ## 개발 의존성
 
-클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.0.2`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
+클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.1.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
 
 Pi 관련 peer dependency는 host 설치를 막지 않도록 `"*"`로 유지합니다. interactive pane 실행에 필요한 Pi `>=0.80.10`은 peer range가 아니라 runtime version policy로 검사합니다.
 
@@ -241,9 +256,9 @@ push와 pull request의 일반 CI는 provider 인증 정보, provider 요청, li
 
 | lane | Bun | Pi development graph | install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.0.2 lockfile 해석 | `bun install --frozen-lockfile` |
-| current compatibility | 1.4.2 | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.0.2로 맞춘 임시 graph | `bun install --no-save` |
+| locked baseline | 1.3.14 (`packageManager`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.1.0 lockfile 해석 | `bun install --frozen-lockfile` |
+| current compatibility | 1.4.2 | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.1.0로 맞춘 임시 graph | `bun install --no-save` |
 
-각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.0.2`, compatibility mapping은 `1.0.2`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 패키지만 포함하며 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.0.2`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane 모두 선택된 Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
+각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.1.0`, compatibility mapping은 `1.1.0`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 Pi 패키지와 `@earendil-works/chord`를 포함하며 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.1.0`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane 모두 선택된 Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
 
 retained Phase 0/7 fixture의 strict current-source verifier는 의도적으로 일반 CI에 포함하지 않는다. unit CI는 synthetic evidence로 source-binding 비교 로직만 다룬다. `benchmark:phase0:live:verify`와 `benchmark:phase7:verify`는 opt-in strict evidence gate로 남으며, source 변경 뒤 historical fixture hash를 자동 갱신하지 않는다. 따라서 retained fixture는 현재 worktree의 새 성능 측정 증거가 아니다.

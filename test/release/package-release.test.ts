@@ -9,16 +9,16 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const PI_CORE_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "1.0.2",
-  "@earendil-works/pi-ai": "1.0.2",
-  "@earendil-works/pi-coding-agent": "1.0.2",
-  "@earendil-works/pi-tui": "1.0.2",
+  "@earendil-works/pi-agent-core": "1.1.0",
+  "@earendil-works/pi-ai": "1.1.0",
+  "@earendil-works/pi-coding-agent": "1.1.0",
+  "@earendil-works/pi-tui": "1.1.0",
 } as const;
 const PI_GRAPH_PACKAGE_NAME = /^@earendil-works\/(?:pi-[a-z0-9][a-z0-9._-]*|chord)$/;
 const EXACT_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const CLEAN_CHECKOUT_DEV_DEPENDENCIES = { typebox: "1.1.38" } as const;
-const PRESENCE_RELEASE_TAG = "v2-20261004-1";
-const PRESENCE_TAG_OBJECT = "054ae6a14296b24ebe811bba0eea6b4cd81ea332";
+const PRESENCE_RELEASE_TAG = "v2-20261009-1";
+const PRESENCE_TAG_OBJECT = "577778ed14db65b8a24ca38e131a383888a4e242";
 const PRESENCE_RELEASE_COMMIT = "78256300e166b40e7a627c321fa0eb9a9e4e2b89";
 const PRESENCE_DEPENDENCY = `github:spi-ca/pi-presence#${PRESENCE_RELEASE_TAG}`;
 const PRESENCE_LOCK_RESOLUTION = PRESENCE_TAG_OBJECT.slice(0, 7);
@@ -117,22 +117,22 @@ describe("release packaging and live acceptance workflow", () => {
     assert.throws(() => selectedPiCoreDependencies("not-json"), /PI_GRAPH_EXPECTED must be a JSON package\/version map/);
     assert.throws(() => selectedPiCoreDependencies("{}"), /must provide an exact version for @earendil-works\/pi-agent-core/);
     assert.throws(
-      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.0.2","@earendil-works/pi-ai":"1.0.2","@earendil-works/pi-coding-agent":"1.0.2","@earendil-works/pi-tui":"latest"}'),
+      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.1.0","@earendil-works/pi-ai":"1.1.0","@earendil-works/pi-coding-agent":"1.1.0","@earendil-works/pi-tui":"latest"}'),
       /invalid Pi graph entry/,
     );
   });
 
-  test("CI selects the eight-package 1.0.2 runtime graph including chord, never obsolete client/protocol", () => {
+  test("CI selects the eight-package 1.1.0 runtime graph including chord, never obsolete client/protocol", () => {
     const names = [...["agent-core", "ai", "codemode", "coding-agent", "mcp", "telemetry", "tui"].map((name) => `@earendil-works/pi-${name}`), "@earendil-works/chord"].sort();
     const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
     const graphs = [...workflow.matchAll(/pi-graph: '([^']+)'/g)].map((match) => JSON.parse(match[1]!));
     assert.equal(graphs.length, 8);
     for (const graph of graphs) {
       assert.deepEqual(Object.keys(graph).sort(), names);
-      assert.ok(Object.values(graph).every((version) => version === "1.0.2"));
+      assert.ok(Object.values(graph).every((version) => version === "1.1.0"));
     }
     const lockfile = fs.readFileSync(path.join(ROOT, "bun.lock"), "utf8");
-    for (const name of names) assert.ok(lockfile.includes(`"${name}@1.0.2"`), `${name} must be resolved in the published graph`);
+    for (const name of names) assert.ok(lockfile.includes(`"${name}@1.1.0"`), `${name} must be resolved in the published graph`);
     for (const suffix of ["client", "protocol"]) {
       assert.equal(workflow.includes(`@earendil-works/pi-${suffix}`), false);
       assert.equal(lockfile.includes(`@earendil-works/pi-${suffix}`), false);
@@ -155,7 +155,7 @@ describe("release packaging and live acceptance workflow", () => {
   });
 
   test("selected graph accepts chord but rejects a mismatched installed chord version", () => {
-    const expected = { ...PI_CORE_DEPENDENCIES, "@earendil-works/chord": "1.0.2" };
+    const expected = { ...PI_CORE_DEPENDENCIES, "@earendil-works/chord": "1.1.0" };
     assert.deepEqual(selectedPiCoreDependencies(JSON.stringify(expected)), PI_CORE_DEPENDENCIES);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-release-chord-"));
     try {
@@ -166,7 +166,7 @@ describe("release packaging and live acceptance workflow", () => {
       }
       verifyPiGraph(root, expected, Object.keys(expected));
       fs.writeFileSync(path.join(root, "@earendil-works/chord/package.json"), JSON.stringify({ name: "@earendil-works/chord", version: "1.0.1" }));
-      assert.throws(() => verifyPiGraph(root, expected, Object.keys(expected)), /chord: expected only 1\.0\.2, installed 1\.0\.1/);
+      assert.throws(() => verifyPiGraph(root, expected, Object.keys(expected)), /chord: expected only 1\.1\.0, installed 1\.0\.1/);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 

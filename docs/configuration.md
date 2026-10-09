@@ -158,11 +158,13 @@ pi --subagent-max-depth 3 --no-subagent-prevent-cycles
 
 `PI_SUBAGENT_CMUX_CHILD_POLICY=inherit|managed`는 child extension profile을 선택하는 session-level 환경 정책입니다. 기본 `inherit`는 기존 inherited extension 집합을 보존합니다. opt-in `managed`는 Pi의 `--no-extensions` 뒤 이 패키지의 nested delegation extension만 명시적으로 로드하고, interactive child에는 lifecycle bridge도 추가합니다. 내장·models.json provider 설정과 auth 전달, agent의 built-in tool allowlist, child-private session과 nested delegation은 그대로 유지되며 parent 전용 dashboard나 `cmux_open_terminal` 같은 inherited extension tool은 registry에 들어오지 않습니다. inherited extension이 등록한 custom provider는 의도적으로 제외되므로 그 provider만 제공하는 model이 필요한 agent는 `inherit`를 사용해야 하며, 그렇지 않으면 child Pi가 model-unavailable로 fail-closed합니다.
 
+Pi `>=1.0.4`에서는 managed child에 `--no-mcp`도 명시합니다. `inherit`에서도 agent 또는 부모 CLI의 **명시 allowlist**에 `mcp__...`가 없으면 built-in MCP를 끕니다. Pi `1.1.0`의 `--tools`만으로는 간접 MCP 접근을 제거하지 않기 때문입니다. `tools`와 부모 CLI 도구 선택을 모두 생략한 general agent, 또는 `+codemode,-write`처럼 기본 선택만 조정하는 부모 CLI는 기존 MCP 상속을 유지합니다. `inherit`의 명시 `mcp__...` 목록은 Pi 자체 MCP 필터를 사용하고, 부모가 직접 지정한 `--no-mcp`도 child에 전달합니다. 구형 host에는 지원하지 않는 자동 flag를 추가하지 않으며 managed의 `--no-extensions` 경계는 유지합니다. `--no-mcp`는 built-in MCP만 끄므로 replacement MCP extension을 차단하는 보안 경계는 아닙니다. project MCP 설정은 기존 `--no-approve` 정책에 따라 로드하지 않습니다.
+
 managed profile이 agent 또는 inherited `--tools`의 extension-owned tool이나 활성 Pi built-in override를 보존할 수 없으면 조용히 좁히지 않고 launch 전에 오류로 끝냅니다. 이름이 같은 inherited `subagent` 도구는 nested delegation authority를 이 패키지 하나로 고정하기 위해 의도적으로 이 패키지의 구현으로 대체합니다. CLI API-key용 private agent-dir overlay도 managed에서는 agents/skills/prompts/themes와 data 설정만 bounded snapshot으로 복제하고 extension/package cache는 상속하지 않습니다. 설정하지 않거나 빈 값이면 `inherit`이고, 값 앞뒤 공백은 제거한 뒤 `inherit` 또는 `managed`만 허용하며 nested child에 그대로 전달됩니다. 이 정책은 terminal/backend가 아니라 child extension registry를 제어하므로 inline, cmux, tmux child에 동일하게 적용됩니다.
 
 부모 CLI의 `--api-key` 값은 child argv에 그대로 전달하지 않습니다. 명시한 parent `--provider`, fully-qualified parent model, 또는 허용된 agent model에서 provider를 결정해 provider별 API-key 환경 변수로 매핑하고 private agent-dir overlay를 통해 전달합니다. parent provider와 parent/child model provider가 충돌하거나 provider가 없거나 지원 매핑이 없으면 key 전달을 생략하고 경고하며, 기존 provider별 환경 변수나 다른 auth는 그대로 사용할 수 있습니다. user agent model은 provider hint로 사용할 수 있지만 project agent model은 현재 exact project root가 신뢰된 경우에만 사용합니다. 확실한 상속이 필요하면 지원되는 `--provider` 또는 `provider/model` 형식의 `--model`을 명시하고 서로 일치시키세요.
 
-Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20261004-1)](https://github.com/spi-ca/pi-presence/tree/v2-20261004-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
+Generic presence는 별도 설정 항목이 아닙니다. root parent만 shared [`@pi/presence` protocol (v2-20261009-1)](https://github.com/spi-ca/pi-presence/tree/v2-20261009-1) producer를 만들고 nested child는 만들지 않습니다. `PI_CMUX_PRESENCE_*` 전달이나 child별 presence policy는 지원하지 않습니다. 이 observer 출력은 `pi-subagent.json`, CLI flag 또는 `subagent` tool field로 제어하지 않으며 실행·취소·lease·reaper·cleanup authority를 바꾸지 않습니다. [`pi-subagent presence projection`](./pi-cmux-presence-integration.md)을 참고하세요.
 
 ## 컨텍스트 모드
 
@@ -228,7 +230,7 @@ _2x PNG · [SVG](./diagram/interactive-layout-coordination.svg) · [Mermaid sour
 
 - stdout/stderr를 renderer나 FIFO로 pipe하지 않습니다.
 - 부모 결과는 child session JSONL과 lifecycle sidecar에서 읽습니다.
-- interactive child는 `parent-owned` 고정 lifecycle로 첫 정상 `agent_settled` 뒤 종료됩니다.
+- interactive child는 `parent-owned` 고정 lifecycle로 첫 정상 `agent_settled` 뒤 종료됩니다. Pi `1.1.0`의 `event.aborted=true`이면 앞선 assistant가 정상 응답했거나 tool-use 뒤 취소됐더라도 idle로 남아 재개할 수 있습니다. 필드가 없는 구형 event는 마지막 assistant의 `stopReason=aborted`로 fallback합니다. 이 event만으로 completion/ACK proof, ownership 이전 또는 permit 해제를 만들지 않으며 기존 lease·취소 fence·reaper 경계를 유지합니다.
 - 부모 취소·session shutdown에서는 먼저 Escape를 보내고, grace period 뒤 surface를 닫습니다.
 - 부모가 비정상 종료되면 2초 주기의 lease와 12초 stale threshold로 child가 orphan 상태를 감지합니다.
 - stale run은 다음 root session 시작 시 leaf-first reaper가 다시 정리합니다.

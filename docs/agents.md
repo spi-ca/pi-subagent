@@ -38,7 +38,7 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 
 ## 도구와 권한
 
-`tools`는 Pi가 child에 전달하는 **전체** 도구 allowlist입니다. 이는 sandbox가 아니며, hostile child를 격리하는 OS 보안 경계도 아닙니다. 편집 가능한 역할에는 필요한 도구만, `scout`·`reviewer` 같은 읽기 전용 역할에는 `read,find,ls,grep`를 우선 지정하세요. 변경 또는 명령 실행이 필요할 때만 `bash`, `edit`, `write`를 추가합니다.
+`tools`는 Pi `--tools`로 child에 전달하는 도구 선택입니다. Pi `1.1.0`에서 일반 이름만 지정한 `--tools`는 MCP 도구를 제거하지 않으므로, 이 패키지는 명시 allowlist에 `mcp__...`가 없으면 호환 host(`>=1.0.4`)에서 `--no-mcp`도 전달합니다. `codemode`만 추가해 MCP 전체가 우연히 열리는 것을 막습니다. MCP를 의도적으로 선택하려면 `inherit` profile에서 `read,codemode,mcp__docs__*`처럼 MCP 패턴을 명시하세요. 도구 선택은 sandbox가 아니며, hostile child를 격리하는 OS 보안 경계도 아닙니다. 편집 가능한 역할에는 필요한 도구만, `scout`·`reviewer` 같은 읽기 전용 역할에는 `read,find,ls,grep`를 우선 지정하세요. 변경 또는 명령 실행이 필요할 때만 `bash`, `edit`, `write`를 추가합니다.
 
 명시적 목록으로 nested delegation을 허용하려면 `subagent`도 넣어야 합니다. `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`에서는 `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`만 허용하며, 그 밖의 명시 목록은 launch 전에 fail-closed합니다. managed profile의 extension·신뢰 경계는 [설정](./configuration.md#managed-child-profile)을 참고하세요.
 

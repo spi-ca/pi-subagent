@@ -6,6 +6,8 @@
 
 inline 실행의 TUI 카드는 접힌 상태에서 에이전트별 짧은 응답 미리보기 또는 현재 활동만 표시하며, 관찰 단계에서 잘린 미리보기는 명시적으로 `clipped`로 표시합니다. 완료·실패·취소된 foreground 결과는 카드 **헤더**를 왼쪽 클릭해 펼치면 기존 result details 또는 같은 프로세스의 UI-only terminal result 참조에서 **사용 가능한** 전체 최종 응답을 Markdown으로 렌더링합니다. 따라서 throw된 실패·취소도 세션이 유지되는 동안 마지막 완료 응답을 표시할 수 있지만, reload·세션 교체 뒤에는 그 참조와 details가 없으므로 없는 출력을 복구하거나 만들어 내지 않습니다. 백그라운드 inline 작업은 editor 위 widget에서 실행 중인 작업만 제한된 요약으로 갱신하며, 최대 네 카드의 헤더를 먼저 보존한 뒤 제한된 본문만 표시합니다. 완료·실패·취소되면 widget에서 즉시 사라지고, 상세 내용은 기존 최종 결과를 확인합니다. widget은 host 전역 펼침 상태에 연결되지 않으므로 그 단축키 hint를 표시하지 않습니다. 세션 교체·reload·종료 시 widget과 표시 상태를 제거합니다. 전체 화면에서는 카드 **헤더**를 왼쪽 클릭해 개별적으로 펼치거나 접고, 일반 foreground 도구 결과에는 기존 `app.tools.expand`의 현재 설정도 공통으로 적용합니다. 이는 토큰 스트리밍·도구 인수/출력·thinking 표시를 추가하지 않으며, 표시 metadata와 terminal result 참조는 세션 수명 동안만 유지되어 모델 컨텍스트·도구 schema·직렬화 결과를 늘이지 않습니다.
 
+Pi `1.1.0`의 도구 render context에 유한한 0 이상의 `durationMs`가 있고 partial 결과가 아니면 결과에 `Execute: ...`를 표시합니다. `isPartial: true`이면 duration 값이 함께 있어도 이 footer를 표시하지 않습니다. 이는 host가 측정한 해당 `execute()` 호출 시간이며, background 접수/status/cancel 호출의 짧은 실행 시간을 job 전체 수행 시간으로 해석하지 않습니다. background status의 `Job elapsed: ...`는 별도로 job의 시작·완료 시각(실행 중이면 표시 시각)에서 계산한 경과 시간입니다. 구형 host나 시간이 없는 복원 결과에서는 `Execute`를 추정하지 않습니다. 도구 호출·결과의 `outputPad=0|1`은 Pi native default shell이 소유하고 적용합니다. subagent renderer는 내부 padding이나 별도 Box를 추가하지 않으며, 기존 shell의 배경·여백과 중첩 카드 헤더의 mouse dispatch를 유지합니다. background 자동 메시지의 기존 custom padding 동작은 별도로 유지합니다.
+
 호출 크기·동시성·백그라운드 보존/출력/종료 대기는 도구 JSON 필드가 아닙니다. Pi CLI, 환경 변수 또는 `pi-subagent.json`의 열한 가지 한계 키로 설정합니다. 파일 경로·신뢰 조건·우선순위·기본값은 [설정의 `pi-subagent.json` 파일 설정](./configuration.md#pi-subagentjson-파일-설정)을 참고하세요.
 
 ## 구조화된 결과

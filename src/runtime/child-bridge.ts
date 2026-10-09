@@ -117,7 +117,7 @@ type MessageEndRegistrar = (
 
 type AgentSettledRegistrar = (
 	event: "agent_settled",
-	handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+	handler: (event: { aborted?: boolean }, ctx: ExtensionContext) => void | Promise<void>,
 ) => void;
 
 function parsePositiveInt(raw: string | undefined, fallback: number, minimum: number): number {
@@ -982,10 +982,15 @@ export function registerChildBridge(
 		lifecycleClient?.send("agent-ended");
 		await writeState("idle", "agent_end").catch(reportBridgeError);
 	});
-	(pi.on as unknown as AgentSettledRegistrar)("agent_settled", async (_event, ctx) => {
+	(pi.on as unknown as AgentSettledRegistrar)("agent_settled", async (event, ctx) => {
 		if (!agentStarted || terminal) return;
 		lifecycleClient?.send("agent-settled");
-		if (lastAssistant.stopReason === "aborted") {
+		// Pi 1.1 reports cancellation even after a successful assistant/tool
+		// message. Older settled events omit the field: retain that fallback.
+		// Keep the pane idle, not terminal; ownership/lease/fence authority still
+		// decides durable cancellation and permit release.
+		const aborted = typeof event?.aborted === "boolean" ? event.aborted : lastAssistant.stopReason === "aborted";
+		if (aborted) {
 			setRuntimeTitle(ctx, "waiting");
 			herdrMetadataReporter?.report("waiting");
 			await writeState("idle", "agent_settled:aborted").catch(reportBridgeError);

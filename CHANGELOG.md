@@ -1,5 +1,12 @@
 # 변경 기록
 
+## v20261009-1
+
+- Pi 개발 의존성과 현재 CI graph를 exact `1.1.0`으로 동기화했다. shared `@pi/presence`는 immutable `v2-20261009-1`로 고정하며, peeled commit·V2 protocol·ABI는 기존 `v2-20261004-1`과 같다.
+- Interactive child는 `agent_settled.aborted`를 반영해 앞선 assistant 응답이 완료됐더라도 취소 시 idle로 남아 재개할 수 있다. 구형 event는 마지막 assistant stop reason으로 fallback하며 completion/ACK proof·ownership·permit 해제 경계는 유지한다.
+- Pi가 제공하는 유한한 0 이상의 `durationMs`를 최종 도구 결과의 `Execute`로 표시하고 partial 결과에서는 생략한다. background의 `Job elapsed`와 구분하며, 도구 카드의 `outputPad`는 Pi native shell에 맡겨 중복 padding을 추가하지 않는다.
+- Pi `>=1.0.4`의 managed child와 MCP 도구가 없는 명시 allowlist에 `--no-mcp`를 적용한다. 기본 도구 선택의 MCP 상속과 명시 `mcp__...` 필터는 유지하며 replacement MCP extension까지 차단하는 보안 경계로 주장하지 않는다.
+
 ## v20261004-2
 
 - 기존 broker 테스트 하네스의 늦은 `close` 구독 race를 spawn 직후 completion 캐시와 protocol 22 event-checkpoint 회귀 테스트로 안정화했다. 실패 시 직접 소유한 process를 bounded 종료·reap한 뒤 fake server를 닫는다. 과거 CI 실패의 원인으로 확정한 것은 아니며 production 동작·보안 검증·기한은 변경하지 않는다.

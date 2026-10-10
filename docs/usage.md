@@ -18,6 +18,35 @@ Pi `1.0.2`의 `outputSchema`/`structuredContent`를 지원한다. single/paralle
 
 각 배열은 최대 32행, 문자열은 최대 2048 UTF-16 code unit, JSON-escaped 전체 machine data는 최대 64 KiB다. 잘린 문자열/행은 `clipped`, `omittedResults`, `omittedJobs`로 표시한다. 원본 human text, TUI details, usage와 thrown 실패/취소 의미는 그대로 유지하며, 예외를 성공 data로 바꾸지 않는다. machine projection은 전체 transcript 또는 원본 출력 복구를 약속하지 않는다.
 
+### Codemode에서 사용
+
+codemode가 활성인 부모에서는 독립적인 호출과 필요한 결과 필터링을 스크립트로 묶을 수 있습니다. child의 managed codemode는 별도 [명시적 도구 선택](./agents.md#도구와-권한)이 필요합니다. `tools.subagent()`는 human `content`가 아니라 위 구조화된 envelope를 받습니다.
+
+```js
+const batches = await Promise.allSettled([
+  tools.subagent({ agent: "scout", task: "Inspect API routes" }),
+  tools.subagent({ agent: "reviewer", task: "Review error handling" }),
+]);
+for (const batch of batches) {
+  if (batch.status === "rejected") { text({ error: String(batch.reason) }); continue; }
+  const data = batch.value;
+  text({ results: data.results.map(r => ({ agent: r.agent, exitCode: r.exitCode, output: r.output })),
+    clipped: data.clipped, omittedResults: data.omittedResults });
+}
+```
+
+`results[].exitCode`와 `jobs[].status`를 확인하세요. 스크립트가 성공했다고 child 작업도 성공한 것은 아니며, `clipped`/`omittedResults`/`omittedJobs`는 출력 누락 표시이지 완료 증거가 아닙니다. 실패·취소 예외는 여전히 reject하므로 성공 envelope로 가정하지 않습니다. 모든 child 출력은 비신뢰 데이터입니다.
+
+백그라운드는 **start 호출 자체를 await**해야 합니다. await하지 않고 스크립트를 끝내면 native codemode가 진행 중인 호출을 취소할 수 있습니다. 접수 뒤에는 자동 steer 전달을 기다리고 polling·sleep·대기 루프를 만들지 마세요.
+
+```js
+const accepted = await tools.subagent({ agent: "scout", task: "Inspect local modules", background: true });
+text({ jobs: accepted.jobs, clipped: accepted.clipped, omittedJobs: accepted.omittedJobs });
+// 접수는 완료가 아니다. 이후 자동 전달에 의존하고 독립적인 작업만 계속한다.
+```
+
+native classifier/image 모델, session store와 temp output은 tool allowlist 밖이며, codemode/managed profile은 OS sandbox나 no-network 보장이 아닙니다. [Managed child profile](./configuration.md#managed-child-profile)의 경계를 따르세요.
+
 ## 입력 검증
 
 호출 인수는 실행 전에 원본 값 그대로 엄격하게 검증합니다.

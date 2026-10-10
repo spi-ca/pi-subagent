@@ -5,7 +5,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const captured: Array<{ agentName: string; parentThinkingLevel?: string }> = [];
+const captured: Array<{ agentName: string; parentThinkingLevel?: string; managedOverriddenBuiltinTools?: string[] }> = [];
+let toolOwners: Array<{ name: string; sourceInfo?: { source?: string; path?: string } }> = [];
 
 mock.module("@earendil-works/pi-tui", () => ({
   Box: class {},
@@ -53,7 +54,7 @@ const successfulResult = (options: { agentName: string; task: string }) => ({
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 });
 const interceptor = async (options: Parameters<typeof actualRunner.runAgent>[0]) => {
-  captured.push({ agentName: options.agentName, parentThinkingLevel: options.parentThinkingLevel });
+  captured.push({ agentName: options.agentName, parentThinkingLevel: options.parentThinkingLevel, managedOverriddenBuiltinTools: options.managedOverriddenBuiltinTools });
   if (options.task === "blocker") await blockerReleased;
   return successfulResult(options);
 };
@@ -110,7 +111,7 @@ describe("subagent thinking inheritance", () => {
         on: (event: string, handler: (...args: any[]) => Promise<unknown>) => handlers.set(event, handler),
         events: { emit: () => undefined },
         sendMessage: () => undefined,
-        getAllTools: () => [],
+        getAllTools: () => toolOwners,
         getCommands: () => [],
       } as never);
       const sessionStart = handlers.get("session_start");
@@ -124,6 +125,20 @@ describe("subagent thinking inheritance", () => {
       captured.length = 0;
       await invoke({ agent: "worker", task: "single" });
       assert.deepEqual(captured.map((entry) => entry.parentThinkingLevel), ["medium"]);
+
+      for (const sourceInfo of [
+        { source: "builtin", path: "builtin:codemode" },
+        { source: "extension", path: "builtin:codemode" },
+        { source: "builtin", path: "/replacement.ts" },
+        { source: "builtin" }, undefined,
+      ]) {
+        toolOwners = [{ name: "codemode", sourceInfo }];
+        captured.length = 0;
+        await invoke({ agent: "worker", task: "owner-capture" });
+        const expected = sourceInfo?.source === "builtin" && sourceInfo?.path === "builtin:codemode" ? [] : ["codemode"];
+        assert.deepEqual(captured[0]?.managedOverriddenBuiltinTools, expected, "entrypoint must capture codemode provenance before scheduling");
+      }
+      toolOwners = [];
 
       context.thinkingLevel = "low";
       captured.length = 0;

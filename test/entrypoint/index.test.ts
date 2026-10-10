@@ -743,6 +743,11 @@ test("registered subagent exposes outputSchema and actual structured empty statu
     getAllTools: () => [], getCommands: () => [],
   } as never);
   assert.deepEqual(tool.outputSchema, SubagentOutputSchema);
+  assert.equal(tool.exposure, undefined, "default direct exposure is unchanged");
+  assert.equal(tool.description, formatSubagentToolDescription(), "compact description stays unchanged");
+  assert.match(tool.promptGuidelines.join("\n"), /results\[\]\.exitCode.*jobs\[\]\.status/);
+  assert.match(tool.promptGuidelines.join("\n"), /clipped\/omitted.*not proof of completion/);
+  assert.match(tool.promptGuidelines.join("\n"), /await.*background start.*automatic result delivery.*do not poll/);
   for (const action of ["status", "cancel"]) {
     const result = await tool.execute("machine-contract", { action }, undefined, undefined, { cwd: process.cwd() });
     assert.equal(Value.Check(tool.outputSchema, result.structuredContent), true);

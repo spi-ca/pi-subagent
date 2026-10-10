@@ -1329,7 +1329,11 @@ describe("interactive pane runner preparation", () => {
 			}
 			assert.ok(buildInteractivePiArgs(restricted, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"));
 			assert.equal(buildInteractivePiArgs(general, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"), false);
-			assert.throws(() => buildPiArgs(restricted, null, "/tmp/task", "spawn", null, undefined, "managed", undefined, version), /cannot preserve/);
+			if (version === "1.0.4") {
+				assert.throws(() => buildPiArgs(restricted, null, "/tmp/task", "spawn", null, undefined, "managed", undefined, version), /codemode requires/);
+			} else {
+				assert.ok(buildPiArgs(restricted, null, "/tmp/task", "spawn", null, undefined, "managed", undefined, version).includes("builtin:codemode"));
+			}
 			const managed = buildInteractivePiArgs({ ...general, tools: ["read", "subagent"] }, null, "/tmp/task", "/tmp/session", undefined, "managed", undefined, version);
 			assert.ok(managed.includes("--no-mcp") && managed.includes("--no-extensions"));
 			assert.equal(managed.filter((arg) => arg === "--extension").length, 2, "bridge and nested delegation remain present");

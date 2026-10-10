@@ -4550,17 +4550,39 @@ export function resolveManagedChildPolicy(env: NodeJS.ProcessEnv = process.env):
   throw new Error(`${SUBAGENT_MANAGED_CHILD_POLICY_ENV} must be exactly inherit or managed.`);
 }
 
-const MANAGED_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent"]);
+const MANAGED_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "codemode"]);
 const MANAGED_DEFAULT_ACTIVE_TOOLS = ["read", "bash", "edit", "write", "subagent"] as const;
+
+function resolveChildToolSelection(agent: Pick<AgentConfig, "tools">, fallbackTools?: string): string[] | undefined {
+  return agent.tools ?? fallbackTools?.split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+/** Capture owner provenance before scheduling; never substitute native codemode
+ * for an inherited replacement, including one without owner metadata. */
+export function collectManagedOverriddenBuiltinTools(tools: readonly {
+  name: string;
+  sourceInfo?: { source?: string; path?: string };
+}[]): string[] {
+  return tools.filter((tool) => {
+    if (tool.name === "codemode") {
+      return tool.sourceInfo?.source !== "builtin" || tool.sourceInfo?.path !== "builtin:codemode";
+    }
+    return MANAGED_BUILTIN_TOOLS.has(tool.name) && tool.name !== "subagent" && tool.sourceInfo?.source !== "builtin";
+  }).map((tool) => tool.name);
+}
 export function assertManagedChildToolCompatibility(
   agent: Pick<AgentConfig, "tools">,
   fallbackTools?: string,
   overriddenBuiltinTools: readonly string[] = [],
   fallbackNoTools = false,
+  hostVersion: string = PiHost.VERSION,
 ): void {
-  const configured = agent.tools ?? (fallbackTools === undefined ? undefined : fallbackTools.split(",").map((value) => value.trim()).filter(Boolean));
+  const configured = resolveChildToolSelection(agent, fallbackTools);
   const unsupported = configured?.filter((name) => !MANAGED_BUILTIN_TOOLS.has(name)) ?? [];
   if (unsupported.length > 0) throw new Error(`managed child policy cannot preserve extension-owned tools: ${unsupported.join(", ")}`);
+  if (configured?.includes("codemode") && !isStableSemverAtLeast(hostVersion, "1.1.0")) {
+    throw new Error("managed child codemode requires a verified stable Pi >=1.1.0 host.");
+  }
   // With no explicit allowlist Pi still activates its default built-ins. Managed
   // mode must not silently replace an inherited override of one of those tools.
   const effective = configured ?? (fallbackNoTools ? [] : [...MANAGED_DEFAULT_ACTIVE_TOOLS]);
@@ -4585,8 +4607,8 @@ export function buildChildMcpArgs(
   return childPolicy === "managed" || (allowlist && !explicitMcp) ? ["--no-mcp"] : [];
 }
 
-export function buildManagedExtensionArgs(includeBridge: boolean, selfExtensionPath = resolveCurrentPackageExtensionEntrypoint(), childBridgePath = CHILD_BRIDGE_PATH): string[] {
-  return ["--no-extensions", "--extension", canonicalizeExtensionPath(selfExtensionPath), ...(includeBridge ? ["--extension", canonicalizeExtensionPath(childBridgePath)] : [])];
+export function buildManagedExtensionArgs(includeBridge: boolean, selfExtensionPath = resolveCurrentPackageExtensionEntrypoint(), childBridgePath = CHILD_BRIDGE_PATH, includeCodemode = false): string[] {
+  return ["--no-extensions", "--extension", canonicalizeExtensionPath(selfExtensionPath), ...(includeBridge ? ["--extension", canonicalizeExtensionPath(childBridgePath)] : []), ...(includeCodemode ? ["--extension", "builtin:codemode"] : [])];
 }
 
 /** Preserve inherited extensions while ensuring child bootstrap extensions are unique. */
@@ -4670,12 +4692,13 @@ export function buildPiArgs(
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
 ): string[] {
-  if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
+  if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
+  const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
   const args: string[] = [
     ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
     "--mode",
     "json",
-    ...(childPolicy === "managed" ? buildManagedExtensionArgs(delegationMode === "fork" || phase0LiveProofEnabled()) : delegationMode === "fork" ? buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs) : inheritedCliArgs.extensionArgs),
+    ...(childPolicy === "managed" ? buildManagedExtensionArgs(delegationMode === "fork" || phase0LiveProofEnabled(), undefined, undefined, includeCodemode) : delegationMode === "fork" ? buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs) : inheritedCliArgs.extensionArgs),
     ...getInheritedCliArgsForAgent(agent, inheritedCliArgs.alwaysProxy, inheritedCliArgs.fallbackModel, modelOverride),
     "-p",
   ];
@@ -4718,10 +4741,11 @@ export function buildInteractivePiArgs(
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
 ): string[] {
-  if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools);
+  if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
+  const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
   const args: string[] = [
     ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
-    ...(childPolicy === "managed" ? buildManagedExtensionArgs(true) : buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs)),
+    ...(childPolicy === "managed" ? buildManagedExtensionArgs(true, undefined, undefined, includeCodemode) : buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs)),
     ...getInheritedCliArgsForAgent(agent, inheritedCliArgs.alwaysProxy, inheritedCliArgs.fallbackModel, modelOverride),
     "--session",
     childSessionPath,

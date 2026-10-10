@@ -168,9 +168,14 @@ bun test --max-concurrency 1 test/runtime/runner-interactive.test.ts -t 'MCP|man
 bun test --max-concurrency 1 test/ui/render.test.ts
 bun test --max-concurrency 1 test/ui/inline-presentation.test.ts
 bun test --max-concurrency 1 test/entrypoint/index.test.ts
+bun test --max-concurrency 1 test/entrypoint/thinking-inheritance.test.ts
+bun test --max-concurrency 1 test/runtime/runner-codemode.test.ts
+bun test --max-concurrency 1 test/integration/managed-codemode-host.test.ts
 ```
 
 이 범위는 실제 provider/MCP 연결 또는 live terminal acceptance를 실행하거나 증명하지 않습니다. 취소 event만으로 completion proof를 만들지 않는 동작과 기존 fence/lease/ownership 검증을 함께 유지합니다.
+
+`runner-codemode.test.ts`는 managed inline/fork/interactive builder, fallback 우선순위, exact selection, version guard와 codemode override 오류를 검사합니다. `managed-codemode-host.test.ts`는 exact installed Pi `1.1.0`의 resource loader에서 `--no-extensions` + `builtin:codemode`를 로드하고 native session/QuickJS/nested-tool pipeline으로 읽기 도구 batch를 실행하는 provider-free 통합 테스트입니다. project 내부의 격리 temporary agent/workspace, in-memory 설정·session과 static model catalog를 사용하며 auth/config credential 조회·network/provider 호출을 차단합니다. `read`/`grep`/`find`/`ls`만 callable인지 검사하고 실제 batch는 `read` 두 호출과 `ls`로 실행합니다. native `grep`/`find`의 rg/fd 자동 다운로드 가능성을 피하려고 이 테스트에서는 그 도구를 실행하지 않습니다. bash/edit/write/recursive codemode/nested delegation, discovered extension과 MCP가 열리지 않는지 검증합니다. synthetic assistant entry는 provider 없이 native nested-call의 issuing-message 조건만 충족합니다. 기본 CI inventory가 자동 발견하며 timeout은 제한돼 있습니다. native `models=true`는 유지하지만 classifier/image 호출·session-store persistence·temp output 기능 또는 OS/no-network sandbox를 검증한 것으로 해석하지 않습니다.
 
 ## 개발 의존성
 

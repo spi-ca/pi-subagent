@@ -35,17 +35,6 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, description:
 	throw new Error(`timed out waiting for ${description}`);
 }
 
-async function waitForFile(file: string): Promise<void> {
-	if (await fs.promises.stat(file).then(() => true).catch(() => false)) return;
-	await new Promise<void>((resolve, reject) => {
-		const watcher = fs.watch(path.dirname(file), (_event, filename) => {
-			if (filename?.toString() === path.basename(file)) { watcher.close(); resolve(); }
-		});
-		watcher.once("error", reject);
-		void fs.promises.stat(file).then(() => { watcher.close(); resolve(); }).catch(() => undefined);
-	});
-}
-
 async function pythonSupervisorWithSecondCleanupSignal(): Promise<string> {
 	const source = await fs.promises.readFile(path.join(process.cwd(), ".github/scripts/ci-stage.ts"), "utf8");
 	const match = /const PYTHON_SUPERVISOR = String\.raw`([\s\S]*?)`;\n\nfunction parseSupervisorRecord/.exec(source);
@@ -455,33 +444,88 @@ describe("CI stage partition and external timeout boundary", () => {
 
 	test("preserves direct Popen status when it exits after poll and before selective adopted reaping", { timeout: 8_000 }, async () => {
 		if (process.platform !== "linux") return;
-		const directory = await temporaryDirectory(), state = path.join(directory, "state.json");
+		const directory = await temporaryDirectory(), state = path.join(directory, "state.json"), detachedReady = path.join(directory, "detached-ready.json");
+		// Each process acknowledges its own installed handler, publishing complete
+		// JSON by rename rather than exposing a partially written readiness file.
+		const publishReady = `
+			const publishReady = (file) => {
+				const stat = fs.readFileSync("/proc/self/stat", "utf8");
+				const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\\s+/);
+				fs.writeFileSync(file + ".tmp", JSON.stringify({ pid: process.pid, start: fields[19], parent: process.ppid }));
+				fs.renameSync(file + ".tmp", file);
+			};
+		`;
+		const detached = `
+			const fs = require("node:fs");
+			${publishReady}
+			process.once("SIGUSR1", () => process.exit(0));
+			setInterval(() => {}, 1000);
+			publishReady(process.argv[1]);
+		`;
 		const intermediary = `
-			const fs = require("node:fs"), { spawn } = require("node:child_process");
-			const detached = spawn(process.execPath, ["-e", ${JSON.stringify('process.once("SIGUSR1", () => process.exit(0)); setInterval(() => {}, 1000);')}], { detached: true, stdio: "ignore" });
-			fs.writeFileSync(process.argv[1], String(detached.pid));
+			const { spawn } = require("node:child_process");
+			spawn(process.execPath, ["-e", ${JSON.stringify(detached)}, process.argv[1]], { detached: true, stdio: "ignore" });
 			process.exit(0);
 		`;
 		const workload = `
 			const fs = require("node:fs"), { spawn } = require("node:child_process");
+			${publishReady}
 			const intermediary = spawn(process.execPath, ["-e", ${JSON.stringify(intermediary)}, process.argv[1]], { stdio: "ignore" });
 			intermediary.once("exit", () => {
-				fs.writeFileSync(process.argv[2], JSON.stringify({ direct: process.pid, detached: Number(fs.readFileSync(process.argv[1], "utf8")) }));
 				process.once("SIGUSR1", () => process.exit(42));
 				setInterval(() => {}, 1000);
+				publishReady(process.argv[2]);
 			});
 		`;
+		type ReadyProcess = { pid: number; start: string; parent: number };
+		// Existing live-process identity parsers reject zombies; this fixture must
+		// retain PID/start identity while proving both children are unreaped zombies.
+		const readProcess = (pid: number) => {
+			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"), close = stat.lastIndexOf(")");
+			assert.equal(Number(stat.slice(0, stat.indexOf("(")).trim()), pid);
+			assert.ok(close > stat.indexOf("("));
+			const fields = stat.slice(close + 1).trim().split(/\s+/);
+			assert.match(fields[19]!, /^[1-9][0-9]*$/);
+			return { start: fields[19]!, parent: Number(fields[1]), state: fields[0] };
+		};
+		const sameProcess = (ready: ReadyProcess) => {
+			assert.ok(Number.isSafeInteger(ready.pid) && ready.pid > 0);
+			const current = readProcess(ready.pid);
+			assert.equal(current.start, ready.start, "the ready PID has not been reused");
+			return current;
+		};
+		let hookError: unknown;
 		const result = await runOwnedStage({
-			stage: "direct-status-after-poll", command: [process.execPath, "-e", workload, path.join(directory, "detached-pid"), state], timeoutMs: 5_000, diagnosticsDirectory: directory, strictLinux: true,
+			stage: "direct-status-after-poll", command: [process.execPath, "-e", workload, detachedReady, state], timeoutMs: 5_000, diagnosticsDirectory: directory, strictLinux: true,
 			testSupervisorHooks: {
 				afterDirectPollBeforeReap: async () => {
-					await waitForFile(state);
-					const pids = JSON.parse(await fs.promises.readFile(state, "utf8")) as { direct: number; detached: number };
-					process.kill(pids.detached, "SIGUSR1");
-					process.kill(pids.direct, "SIGUSR1");
+					try {
+						await waitFor(() => fs.existsSync(state) && fs.existsSync(detachedReady), "both installed SIGUSR1 handlers");
+						const direct = JSON.parse(fs.readFileSync(state, "utf8")) as ReadyProcess;
+						const detached = JSON.parse(fs.readFileSync(detachedReady, "utf8")) as ReadyProcess;
+						const supervisor = direct.parent;
+						assert.equal(sameProcess(direct).parent, supervisor);
+						await waitFor(() => sameProcess(detached).parent === supervisor, "detached adoption by the direct child's supervisor");
+						for (const ready of [detached, direct]) {
+							const current = sameProcess(ready);
+							assert.equal(current.parent, supervisor);
+							assert.notEqual(current.state, "Z", "the ready process is still alive before signaling");
+							process.kill(ready.pid, "SIGUSR1");
+						}
+						await waitFor(() => [direct, detached].every((ready) => {
+							const current = sameProcess(ready);
+							assert.equal(current.parent, supervisor);
+							return current.state === "Z";
+						}), "both children exiting before selective reaping");
+					} catch (error) {
+						// Return normally so the private FD receives C and the supervisor
+						// can clean up; report fixture errors only after the owned stage settles.
+						hookError = error;
+					}
 				},
 			},
 		});
+		if (hookError) throw hookError;
 		assert.equal(result.status, "failure");
 		assert.equal(result.exitCode, 42, "selective waitpid never consumes the direct Popen return status");
 	});

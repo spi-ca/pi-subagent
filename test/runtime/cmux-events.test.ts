@@ -16,6 +16,11 @@ const handshake = (request: any, fake: FakeCmuxServer) => {
 	if (request.method === "system.identify") { fake.send(request.socket, { id: request.id, ok: true, result: { app_bundle_path: "/Applications/cmux.app" } }); return true; }
 	return false;
 };
+async function bounded(barrier: Promise<void>): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try { await Promise.race([barrier, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("event callback timed out")), 2_000); })]); }
+	finally { clearTimeout(timer); }
+}
 const event = (seq: number) => ({ type: "event", protocol: "cmux-events", version: 1, boot_id: bootId, seq, id: `${bootId}-${seq}`, name: "surface.changed", category: "surface", source: "cmux", occurred_at: "2026-07-20T00:00:00Z", workspace_id: null, surface_id: "0F61DF95-D7D5-44D4-B251-B2B44DF0CF8B", pane_id: null, window_id: null, payload: {} });
 
 describe("cmux events", () => {
@@ -40,10 +45,14 @@ describe("cmux events", () => {
 			else if (!handshake(request, fake) && request.method === "events.stream") { fake.send(request.socket, ack()); fake.send(request.socket, event(1)); fake.send(request.socket, event(2)); }
 		});
 		const events: number[] = []; const hints: string[] = [];
-		const client = new CmuxEventsClient({ env: { CMUX_SOCKET_PATH: socket }, password: "memory-only", onEvent: (received) => events.push(received.seq), onReconcile: (hint) => hints.push(hint) });
-		await client.start(); await new Promise((resolve) => setTimeout(resolve, 10));
-		assert.deepEqual(server!.requests.map((request) => request.method), ["auth.login", "system.capabilities", "system.identify", "events.stream"]);
-		assert.deepEqual(server!.requests[3]!.params, { names: [], categories: [], include_heartbeats: false }); assert.deepEqual(events, [1, 2]); assert.deepEqual(hints, []); assert.deepEqual(client.cursor, { boot_id: bootId, seq: 2 }); client.close();
+		let delivered!: () => void;
+		const replayed = new Promise<void>((resolve) => { delivered = resolve; });
+		const client = new CmuxEventsClient({ env: { CMUX_SOCKET_PATH: socket }, password: "memory-only", onEvent: (received) => { events.push(received.seq); if (received.seq === 2) delivered(); }, onReconcile: (hint) => hints.push(hint) });
+		try {
+			await client.start(); await bounded(replayed);
+			assert.deepEqual(server!.requests.map((request) => request.method), ["auth.login", "system.capabilities", "system.identify", "events.stream"]);
+			assert.deepEqual(server!.requests[3]!.params, { names: [], categories: [], include_heartbeats: false }); assert.deepEqual(events, [1, 2]); assert.deepEqual(hints, []); assert.deepEqual(client.cursor, { boot_id: bootId, seq: 2 });
+		} finally { client.close(); }
 	});
 	test("rejects an event connection from a different socket generation", async () => {
 		const socket = await setup(() => {});
@@ -52,15 +61,43 @@ describe("cmux events", () => {
 		await assert.rejects(client.start(), /generation differs/); client.close();
 	});
 
-	test("reconciles ack gaps, boot changes, reordering, and slow consumers without delivering unsafe events", async () => {
+	test("reconciles acknowledgement gaps before delivering replay", async () => {
+		let reconciled!: () => void;
+		const barrier = new Promise<void>((resolve) => { reconciled = resolve; });
 		const socket = await setup((request, fake) => {
-			if (!handshake(request, fake) && request.method === "events.stream") { fake.send(request.socket, ack(3, true)); fake.send(request.socket, event(5)); fake.send(request.socket, { type: "error", code: "slow_consumer", message: "slow", latest_seq: 8 }); }
+			if (!handshake(request, fake) && request.method === "events.stream") { fake.send(request.socket, ack(3, true)); fake.send(request.socket, event(5)); }
 		});
 		const events: number[] = []; const hints: string[] = [];
-		const client = new CmuxEventsClient({ env: { CMUX_SOCKET_PATH: socket }, cursor: { boot_id: bootId, seq: 3 }, onEvent: (received) => events.push(received.seq), onReconcile: (hint) => hints.push(hint) });
-		await client.start(); await new Promise((resolve) => setTimeout(resolve, 10));
-		assert.deepEqual(events, []); assert.deepEqual(hints, ["gap"]); assert.equal(client.healthy, false); client.close();
+		const client = new CmuxEventsClient({ env: { CMUX_SOCKET_PATH: socket }, cursor: { boot_id: bootId, seq: 3 }, onEvent: (received) => events.push(received.seq), onReconcile: (hint) => { hints.push(hint); reconciled(); } });
+		try { await client.start(); await bounded(barrier);
+			assert.deepEqual(events, []); assert.deepEqual(hints, ["gap"]); assert.equal(client.healthy, false);
+		} finally { client.close(); }
 	});
+
+	for (const [label, frame, expected] of [
+		["boot change", { ...event(2), boot_id: subscription, id: `${subscription}-2` }, "gap"],
+		["reordering", event(1), "reorder"],
+		["slow consumer", { type: "error", ok: false, error: { code: "slow_consumer", message: "slow", latest_seq: 8 } }, "slow_consumer"],
+	] as const) {
+		test(`reconciles ${label} on its own healthy stream`, async () => {
+			let delivered!: () => void; let reconciled!: () => void;
+			const healthy = new Promise<void>((resolve) => { delivered = resolve; });
+			const failed = new Promise<void>((resolve) => { reconciled = resolve; });
+			const socket = await setup((request, fake) => {
+				if (!handshake(request, fake) && request.method === "events.stream") { fake.send(request.socket, ack()); fake.send(request.socket, event(1)); }
+			});
+			const events: number[] = []; const hints: string[] = [];
+			const client = new CmuxEventsClient({ env: { CMUX_SOCKET_PATH: socket }, onEvent: (received) => { events.push(received.seq); delivered(); }, onReconcile: (hint) => { hints.push(hint); reconciled(); } });
+			try {
+				await client.start(); await bounded(healthy);
+				assert.equal(client.healthy, true); assert.deepEqual(hints, []);
+				server!.send(server!.requests.find((request) => request.method === "events.stream")!.socket, frame);
+				await bounded(failed);
+				assert.deepEqual(events, [1]); assert.deepEqual(hints, [expected]); assert.equal(client.healthy, false);
+				assert.deepEqual(client.cursor, { boot_id: bootId, seq: 1 });
+			} finally { client.close(); }
+		});
+	}
 	test("uses the acknowledged heartbeat interval for one bounded unref timeout", async () => {
 		const socket = await setup((request, fake) => {
 			if (!handshake(request, fake) && request.method === "events.stream") fake.send(request.socket, ack());

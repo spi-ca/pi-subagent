@@ -64,6 +64,7 @@ export interface InteractivePaneLaunchOptions {
 export interface InteractivePaneBackend {
 	readonly mode: InteractivePaneMode;
 	availabilityError(env?: NodeJS.ProcessEnv): string | null;
+	/** @deprecated Direct-call compatibility only. runAgent allocation is broker-owned. */
 	launch(options: InteractivePaneLaunchOptions): Promise<InteractivePaneHandle>;
 	/** Lifecycle authority only; it never reads diagnostic pane titles. */
 	inspect(handle: InteractivePaneHandle): Promise<InteractivePaneSnapshot | undefined>;

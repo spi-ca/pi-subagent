@@ -4,7 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createCmuxControlCommandRunner, getCmuxControlRequestManager, matchingSupportedCmuxVersions, resetCmuxControlRequestManagersForTest } from "../../src/runtime/cmux-control-adapter.mjs";
+import { createCmuxControlCommandRunner, getCmuxControlRequestManager, matchingSupportedCmuxVersions, readCmuxAppBundleVersion, resetCmuxControlRequestManagersForTest } from "../../src/runtime/cmux-control-adapter.mjs";
 import { fakeCmuxControlServer, type FakeCmuxServer } from "../helpers/fake-cmux-control-server";
 
 const roots: string[] = []; const servers: FakeCmuxServer[] = [];
@@ -13,6 +13,28 @@ const workspace = "2ff1ce1c-5160-461b-9412-a5630ea19054", pane = "acdc865f-c84c-
 const capabilities = { version: 2, protocol: "cmux-socket", access_mode: "automation", methods: ["system.tree", "surface.split", "surface.create", "surface.respawn", "surface.send_key", "surface.close", "surface.focus", "tab.action"] };
 
 describe("cmux control-v2 command adapter", () => {
+  test("publishes the canonical declarations through the .d.mts re-export", async () => {
+    const wrapper = await fs.readFile(path.join(process.cwd(), "src/runtime/cmux-control-adapter.d.mts"), "utf8");
+    assert.equal(wrapper.trim(), 'export * from "./cmux-control-adapter.d.ts";');
+    const canonical = await fs.readFile(path.join(process.cwd(), "src/runtime/cmux-control-adapter.d.ts"), "utf8");
+    assert.match(canonical, /export function matchingSupportedCmuxVersions\(/);
+  });
+
+  test("returns null, never false, for rejected bundle authority", async () => {
+    assert.equal(await readCmuxAppBundleVersion({ app_bundle_path: "relative" }), null);
+    if (process.platform !== "darwin") return;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cmux-adapter-bundle-")); roots.push(root);
+    const bundle = path.join(root, "cmux.app"), alias = path.join(root, "alias.app");
+    await fs.mkdir(path.join(bundle, "Contents"), { recursive: true, mode: 0o700 });
+    const plist = path.join(bundle, "Contents", "Info.plist");
+    await fs.writeFile(plist, "<plist><key>CFBundleShortVersionString</key><string>0.64.20</string></plist>", { mode: 0o600 });
+    await fs.symlink(bundle, alias);
+    assert.equal(await readCmuxAppBundleVersion({ app_bundle_path: alias }), null);
+    await fs.chmod(bundle, 0o777);
+    assert.equal(await readCmuxAppBundleVersion({ app_bundle_path: bundle }), null);
+    await fs.chmod(bundle, 0o700); await fs.chmod(plist, 0o666);
+    assert.equal(await readCmuxAppBundleVersion({ app_bundle_path: bundle }), null);
+  });
   test("requires the running identify version to match the supported app bundle", () => {
     assert.equal(matchingSupportedCmuxVersions("0.64.20", "0.64.20"), "0.64.20");
     assert.equal(matchingSupportedCmuxVersions("0.65.0", "0.65.0"), "0.65.0");

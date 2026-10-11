@@ -8,6 +8,10 @@ import { ACTIVE_RUN_MATRIX, FIXTURE_PATH, METRIC_UNITS, WORKLOADS, createLocalCh
 const CREDENTIAL_CANARY = "credential-canary-must-never-be-persisted";
 
 describe("performance Phase 0 local benchmark", () => {
+  // One real all-cell capture per OS-isolated file. Each caller owns its clone;
+  // recordLocalBenchmark still measures and joins every child before returning.
+  let measured: ReturnType<typeof recordLocalBenchmark> | undefined;
+  const capture = async () => structuredClone(await (measured ??= recordLocalBenchmark()));
   test("keeps the preflight schema declaration separate from measured baseline validation", async () => {
     const template = createPhase0SchemaTemplate();
     assert.deepEqual(template.activeRunMatrix, ACTIVE_RUN_MATRIX);
@@ -18,7 +22,7 @@ describe("performance Phase 0 local benchmark", () => {
   });
 
   test("rejects extensions, missing measured metrics, wrong canonical units, and unmeasured transport metrics", async () => {
-    const evidence = await recordLocalBenchmark();
+    const evidence = await capture();
     assert.equal(validatePerformanceEvidence(evidence), true);
     const extra = structuredClone(evidence) as Record<string, unknown>;
     extra.unexpected = true;
@@ -38,7 +42,7 @@ describe("performance Phase 0 local benchmark", () => {
   });
 
   test("records a fixed local barrier with exact peak concurrency and complete cleanup", async () => {
-    const evidence = await recordLocalBenchmark();
+    const evidence = await capture();
     for (const entry of evidence.matrix) {
       const sample = entry.samples[0]!;
       assert.equal(sample.metrics.childSpawnCount.value, entry.activeRuns);
@@ -54,7 +58,7 @@ describe("performance Phase 0 local benchmark", () => {
     const root = await createPrivateEvidenceRoot();
     try {
       assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o700);
-      const evidence = await recordLocalBenchmark();
+      const evidence = await capture();
       const file = await writePrivateEvidence(root, evidence);
       assert.equal((await fs.promises.stat(file)).mode & 0o777, 0o600);
       assert.equal((await fs.promises.readFile(file, "utf8")).includes(CREDENTIAL_CANARY), false);
@@ -164,7 +168,7 @@ describe("performance Phase 0 local benchmark", () => {
   });
 
   test("binds fresh synthetic evidence to the current worktree and rejects identity mismatches", async () => {
-    const fresh = await recordLocalBenchmark();
+    const fresh = await capture();
     assert.equal(verifyCurrentPerformanceEvidence(fresh), true);
     const mismatch = structuredClone(fresh);
     mismatch.environment.worktreeDigest = "0".repeat(64);

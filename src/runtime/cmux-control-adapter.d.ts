@@ -1,5 +1,6 @@
 import type { CmuxCapabilities, CmuxConnectionIdentity, CmuxControlSocketClient } from "./cmux-control-socket.mjs";
 export const CMUX_MINIMUM_APP_VERSION: "0.64.20";
+export function matchingSupportedCmuxVersions(reportedVersion: unknown, bundleVersion: unknown, minimum?: string): string | null;
 export function readCmuxAppBundleVersion(identify: Record<string, unknown>, minimum?: string): Promise<string | null>;
 export function validateCmuxAppBundleVersion(identify: Record<string, unknown>, minimum?: string): Promise<boolean>;
 export interface CmuxExpectedControl { transport: "cmux-control-v2"; socketPath: string; socketDev: string; socketIno: string; accessMode: string; apiVersion: 2; appVersion: string; identifyDigest: string; bootIdentity?: string; }

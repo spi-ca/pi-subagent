@@ -1,16 +1,16 @@
 /** Process-local, invocation-fair permit scheduler for child launches. */
 
-import { MAX_SUBAGENT_ACTIVE } from "../core/subagent-limits.js";
+import { MAX_SUBAGENT_ACTIVE, parseLimitValue, resolveSubagentLimits, SUBAGENT_LIMIT_DEFINITIONS } from "../core/subagent-limits.js";
 
-export const DEFAULT_MAX_ACTIVE = 16;
-export const SUBAGENT_MAX_ACTIVE_ENV = "PI_SUBAGENT_MAX_ACTIVE";
+export const DEFAULT_MAX_ACTIVE = SUBAGENT_LIMIT_DEFINITIONS.maxActive.defaultValue;
+export const SUBAGENT_MAX_ACTIVE_ENV = SUBAGENT_LIMIT_DEFINITIONS.maxActive.env;
 
 export function parsePositiveSafeInteger(raw: unknown): number | null {
   if (typeof raw !== "string") return null;
   const value = raw.trim();
   if (!/^[1-9]\d*$/.test(value)) return null;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed <= MAX_SUBAGENT_ACTIVE ? parsed : null;
+  // Retain this exported compatibility reader's no-leading-zero contract.
+  return parseLimitValue(value, true, MAX_SUBAGENT_ACTIVE);
 }
 
 /** CLI > environment > default. Invalid configured values are ignored with a warning. */
@@ -19,21 +19,22 @@ export function resolveMaxActive(options: {
   runtimeFlag?: unknown;
   warn?: (message: string) => void;
 } = {}): number {
-  const env = options.env ?? process.env;
   const warn = options.warn ?? console.warn;
-  const runtimeValue = options.runtimeFlag;
-  const runtimeParsed = parsePositiveSafeInteger(runtimeValue);
-  if (runtimeValue !== undefined && runtimeValue !== null && runtimeParsed === null) {
-    warn(`[pi-subagent] Ignoring invalid --subagent-max-active value "${String(runtimeValue)}". Expected a positive safe integer at most ${MAX_SUBAGENT_ACTIVE}.`);
+  const runtimeParsed = parsePositiveSafeInteger(options.runtimeFlag);
+  if (options.runtimeFlag !== undefined && options.runtimeFlag !== null && runtimeParsed === null) {
+    warn(`[pi-subagent] Ignoring invalid --subagent-max-active value "${String(options.runtimeFlag)}". Expected a positive safe integer at most ${MAX_SUBAGENT_ACTIVE}.`);
   }
-  if (runtimeParsed !== null) return runtimeParsed;
-
-  const envValue = env[SUBAGENT_MAX_ACTIVE_ENV];
-  const envParsed = parsePositiveSafeInteger(envValue);
-  if (envValue !== undefined && envParsed === null) {
+  const envValue = (options.env ?? process.env)[SUBAGENT_MAX_ACTIVE_ENV];
+  const envParsed = runtimeParsed === null ? parsePositiveSafeInteger(envValue) : null;
+  if (runtimeParsed === null && envValue !== undefined && envParsed === null) {
     warn(`[pi-subagent] Ignoring invalid ${SUBAGENT_MAX_ACTIVE_ENV}="${envValue}". Expected a positive safe integer at most ${MAX_SUBAGENT_ACTIVE}.`);
   }
-  return envParsed ?? DEFAULT_MAX_ACTIVE;
+  // Retain legacy lexical/warning compatibility, but share canonical defaults
+  // and precedence without resolving unrelated environment flags.
+  return resolveSubagentLimits({
+    env: envParsed === null ? {} : { [SUBAGENT_MAX_ACTIVE_ENV]: String(envParsed) },
+    getFlag: (name) => name === SUBAGENT_LIMIT_DEFINITIONS.maxActive.flag && runtimeParsed !== null ? String(runtimeParsed) : undefined,
+  }).maxActive;
 }
 
 export interface SchedulerHandle { readonly generation: number; readonly id: number; }

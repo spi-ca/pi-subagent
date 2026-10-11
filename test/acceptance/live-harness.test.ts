@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getProcessStartedAt, prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
 import { acceptanceAllocationCheckpointPath } from "./acceptance-allocation-checkpoint";
-import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, createBoundedPackageProbeEvents, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_FLAGS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
+import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, createBoundedPackageProbeEvents, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_COMMANDS, PACKAGE_REGISTRATION_EXPECTED_EVENTS, PACKAGE_REGISTRATION_EXPECTED_FLAGS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
 
 async function waitForStartedAt(pid: number): Promise<number> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -69,6 +69,39 @@ describe("live acceptance harness safety guards", () => {
     assert.throws(() => assertExactPackageRegistrationNames([...PACKAGE_REGISTRATION_EXPECTED_FLAGS, "other"], PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /unexpected flag registration: other/);
     assert.throws(() => assertExactPackageRegistrationNames([...PACKAGE_REGISTRATION_EXPECTED_FLAGS, "subagent-pane-layout"], PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /duplicate flag registration: subagent-pane-layout/);
     assert.throws(() => assertExactPackageRegistrationNames(PACKAGE_REGISTRATION_EXPECTED_FLAGS.slice(0, -1), PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag"), /missing flag registration: subagent-pane-layout/);
+  });
+
+  test("real entrypoint matches the exact package lifecycle inventory without providers", async () => {
+    const { default: register } = await import("../../index");
+    const flags: string[] = []; const lifecycle: string[] = [];
+    const tools: string[] = []; const commands: string[] = []; const renderers: string[] = [];
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    try {
+      delete process.env.PI_SUBAGENT_DEPTH; // tarball probe registers the root extension, not this worker's nested context.
+      register(new Proxy({
+        getFlag: () => undefined,
+        events: createBoundedPackageProbeEvents(),
+        registerFlag: (name: string) => { flags.push(name); },
+        on: (name: string, handler: unknown) => { assert.equal(typeof handler, "function"); lifecycle.push(name); },
+        registerTool: (tool: { name: string }) => { tools.push(tool.name); },
+        registerCommand: (name: string) => { commands.push(name); },
+        registerMessageRenderer: (name: string) => { renderers.push(name); },
+        registerToolRenderer: () => undefined,
+      }, { get(target, key, receiver) {
+        if (typeof key !== "string" || !(key in target)) throw new Error(`unexpected ExtensionAPI access: ${String(key)}`);
+        return Reflect.get(target, key, receiver);
+      } }) as never);
+    } finally {
+      if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH; else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+    }
+    assertExactPackageRegistrationNames(flags, PACKAGE_REGISTRATION_EXPECTED_FLAGS, "flag");
+    assertExactPackageRegistrationNames(lifecycle, PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event");
+    assertExactPackageRegistrationNames(tools, ["subagent"], "tool");
+    assertExactPackageRegistrationNames(commands, PACKAGE_REGISTRATION_EXPECTED_COMMANDS, "command");
+    assertExactPackageRegistrationNames(renderers, ["subagent_result"], "message renderer");
+    assert.throws(() => assertExactPackageRegistrationNames([...lifecycle, "tool_result"], PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /duplicate event/);
+    assert.throws(() => assertExactPackageRegistrationNames([...lifecycle, "unknown"], PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /unexpected event/);
+    assert.throws(() => assertExactPackageRegistrationNames(lifecycle.filter((name) => name !== "agent_settled"), PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /missing event/);
   });
 
   test("keeps bounded dashboard events separate from lifecycle registrations", () => {

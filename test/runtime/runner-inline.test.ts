@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildStoppedBootstrapArgv, monitorInlineProcess, resolvePiSpawnForTest, resumeStoppedBootstrapForTest, runAgent, signalUnixProcessTree, STOPPED_BOOTSTRAP_WATCHDOG_SECONDS, type StoppedProcessResumeProbe } from "../../src/runtime/runner";
+import { buildStoppedBootstrapArgv, monitorInlineProcess, resolvePiSpawnForTest, resumeStoppedBootstrapForTest, resumeStoppedProcessForTest, runAgent, signalUnixProcessTree, STOPPED_BOOTSTRAP_WATCHDOG_SECONDS, type StoppedProcessResumeProbe } from "../../src/runtime/runner";
 import { getProcessStartedAt } from "../../src/runtime/run-protocol";
 import { AssistantSignatureIndex } from "../../src/runtime/assistant-signature-index";
 import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "../../src/core/types";
@@ -62,6 +62,7 @@ describe("inline runner path", () => {
       sleep: async () => undefined,
     };
 
+    assert.equal(resumeStoppedProcessForTest, resumeStoppedBootstrapForTest, "published deprecated alias remains a narrow compatibility export");
     const result = await resumeStoppedBootstrapForTest({ processId: 42, expectedStartedAt: 101, probe });
     assert.equal(result, "resumed");
     assert.deepEqual(signals, [[42, "SIGCONT"]]);

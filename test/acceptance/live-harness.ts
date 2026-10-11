@@ -51,9 +51,9 @@ export const PACKAGE_REGISTRATION_EXPECTED_FLAGS = [
   "subagent-prevent-cycles",
   "subagent-pane-layout",
 ] as const;
-const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "session_shutdown", "before_agent_start"] as const;
+export const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "tool_result", "agent_start", "agent_settled", "session_shutdown", "before_agent_start"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_TOOLS = ["subagent"] as const;
-const PACKAGE_REGISTRATION_EXPECTED_COMMANDS = ["subagents"] as const;
+export const PACKAGE_REGISTRATION_EXPECTED_COMMANDS = ["subagent-result", "subagents"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS = ["subagent_result"] as const;
 export const PACKAGE_PROBE_EVENT_CHANNELS = ["pi-subagent:dashboard:v1", "pi-subagent:aggregate-completed:v1"] as const;
 

@@ -73,11 +73,20 @@ async function nativeCmuxLayoutMock(root: string, log: string, options: { split?
 	return binary;
 }
 
+// Native fake transport has no live socket; only transport is injected. These
+// records must pass the same current control-v2 authority grammar as production.
+function fixtureCmuxControl(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>) {
+	return { transport: "cmux-control-v2", socketPath: path.join(paths.runDir, "fixture-control.sock"), socketDev: "1", socketIno: "2", accessMode: "automation", apiVersion: 2, appVersion: "0.64.20", identifyDigest: "c".repeat(64) };
+}
+function fixtureCmuxAllocationAuthority(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, allocatedWorkspace = workspaceId) {
+	return { layout: "split", placement: "cmux-split", container: { kind: "cmux-pane", workspaceId: allocatedWorkspace, paneId }, control: fixtureCmuxControl(paths) };
+}
+
 async function writeIntent(paths: Awaited<ReturnType<typeof prepareRunArtifactPaths>>, runId: string, backend: string): Promise<string[]> {
 	const nonce = "a".repeat(43), broker = path.resolve("src/runtime/pane-launch-broker.mjs");
 	await writePrivateFile(paths.launchIntentPath, `${JSON.stringify({
 		version: 2, runId, parentSessionId: "p", parentPid: process.pid, parentStartedAt: 1, terminalMode: "cmux-pane",
-		source: { workspaceId, sourceSurfaceId: "123e4567-e89b-12d3-a456-426614174001" }, childSessionFile: paths.childSessionPath,
+		source: { workspaceId, sourceSurfaceId }, layout: "split", placement: "cmux-split", container: { kind: "cmux-source", workspaceId, sourceSurfaceId }, control: fixtureCmuxControl(paths), childSessionFile: paths.childSessionPath,
 		createdAt: 1, brokerNonce: nonce, runtimePath: fs.realpathSync(process.execPath), runtimeInterpreterPath: fs.realpathSync(process.execPath), backendPath: fs.realpathSync(backend), brokerEntrypoint: fs.realpathSync(broker),
 	})}\n`);
 	return [broker, "--run-dir", paths.runDir, "--nonce", nonce, "--runtime", fs.realpathSync(process.execPath), "--runtime-interpreter", fs.realpathSync(process.execPath), "--backend", fs.realpathSync(backend)];
@@ -178,7 +187,7 @@ function latchOwnedGateProcess(child: ReturnType<typeof spawn>) {
 }
 
 function run(args: string[], env: NodeJS.ProcessEnv, cwd?: string, command = process.execPath): Promise<number> {
-	const fixtureEnv = { ...env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) };
+	const fixtureEnv = { ...env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_CMUX_EXEC_TRANSPORT: "1", PI_SUBAGENT_TEST_TMUX_GENERATION: "1", PI_SUBAGENT_TEST_TMUX_SERVER_PID: String(process.pid) };
 	return new Promise((resolve, reject) => { const child = spawn(command, args, { cwd, env: fixtureEnv, stdio: "ignore" }); child.once("error", reject); child.once("close", (code) => resolve(code ?? 1)); });
 }
 
@@ -266,7 +275,7 @@ async function writeCommittedGate(paths: Awaited<ReturnType<typeof prepareRunArt
 	const allocationRunId = options.allocationRunId ?? runId;
 	const allocation = options.allocationMode === "tmux-pane"
 		? { version: 2, runId: allocationRunId, terminalMode: "tmux-pane", target: { socketPath: "/tmp/tmux.sock", serverPid: 123, paneId: "%2", panePid: 789 }, allocatedAt: 1 }
-		: { version: 2, runId: allocationRunId, terminalMode: "cmux-pane", target: { workspaceId, surfaceId, paneId }, allocatedAt: 1 };
+		: { version: 2, runId: allocationRunId, terminalMode: "cmux-pane", ...fixtureCmuxAllocationAuthority(paths), target: { workspaceId, surfaceId, paneId }, allocatedAt: 1 };
 	await writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`);
 	await writePrivateFile(paths.decisionPath, `${JSON.stringify({ version: 2, runId, kind: "commit", decidedAt: 1, allocationPath: paths.allocationPath, launchPath: paths.launchPath })}\n`);
 	await writePrivateFile(paths.launchPath, `${JSON.stringify({ version: 2, runId, terminalMode: "cmux-pane", allocationPath: paths.allocationPath, childSessionFile: paths.childSessionPath, committedAt: 1, ownership: "parent-owned" })}\n`);
@@ -705,6 +714,46 @@ describe("pane launch broker", () => {
 		} finally { await fake.close(); }
 	});
 
+	test("fake transport still rejects legacy or malformed current cmux authority before commands", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-authority-")); tempDirs.push(root);
+		const backend = await nativeMock(root), log = path.join(root, "commands.log");
+		const stateRoot = path.join(root, "state");
+		for (const [runId, mutate] of [
+			["legacy-no-control", (value: any) => { delete value.control; }],
+			["legacy-no-layout", (value: any) => { delete value.layout; delete value.placement; delete value.container; }],
+			["control-old-version", (value: any) => { value.control.appVersion = "0.64.19"; }],
+			["control-extra-field", (value: any) => { value.control.unexpected = true; }],
+			["control-invalid-inode", (value: any) => { value.control.socketIno = "-1"; }],
+			["control-numeric-device", (value: any) => { value.control.socketDev = 1; }],
+			["control-numeric-inode", (value: any) => { value.control.socketIno = 2; }],
+			["control-array-digest", (value: any) => { value.control.identifyDigest = ["c".repeat(64)]; }],
+		] as const) {
+			const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId });
+			const args = await writeIntent(paths, runId, backend);
+			const record = await readBrokerJson(paths.launchIntentPath);
+			mutate(record);
+			await fs.promises.unlink(paths.launchIntentPath); await writePrivateFile(paths.launchIntentPath, `${JSON.stringify(record)}\n`);
+			assert.equal(await run(args, { ...process.env, CMUX_SOCKET_PATH: log }, paths.runDir), 0);
+			assert.equal(fs.existsSync(paths.brokerClaimPath), false);
+			assert.equal(await readBrokerJson(paths.allocationPath), null);
+			assert.equal((await readBrokerJson(paths.brokerStatusPath) as { errorCode?: string })?.errorCode, "intent-invalid");
+		}
+		assert.equal(fs.existsSync(log), false, "transport injection never skips production authority validation");
+	});
+
+	test("fake-transport gate refuses mismatched control authority before executing a wrapper", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-gate-control-")); tempDirs.push(root);
+		const backend = await nativeMock(root), marker = path.join(root, "launched");
+		const paths = await prepareRunArtifactPaths({ rootDir: path.join(root, "state"), runId: "mismatched-control" });
+		const args = await writeCommittedGate(paths, "mismatched-control", backend);
+		const allocation = await readBrokerJson(paths.allocationPath) as { control: { socketIno: string } };
+		allocation.control.socketIno = "3";
+		await fs.promises.unlink(paths.allocationPath); await writePrivateFile(paths.allocationPath, `${JSON.stringify(allocation)}\n`);
+		await writePrivateExecutableFile(paths.wrapperPath, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`);
+		assert.equal(await run([...args, "--verify-gate", "--wrapper", paths.wrapperPath], { ...process.env, CMUX_WORKSPACE_ID: workspaceId, CMUX_SURFACE_ID: surfaceId }, paths.runDir), 0);
+		assert.equal(fs.existsSync(marker), false);
+	});
+
 	test("rejects an unsafe run directory before reading or mutating authority", async () => {
 		if (process.platform === "win32") return;
 		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-broker-")); tempDirs.push(root);
@@ -745,7 +794,7 @@ describe("pane launch broker", () => {
 		const stateRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-state-")); tempDirs.push(stateRoot);
 		const backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "preallocation-checkpoint" });
 		const nonce = "a".repeat(43);
-		const child = spawn(process.execPath, [...await writeIntent(paths, "preallocation-checkpoint", backend), "--acceptance-preallocation-checkpoint"], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore" });
+		const child = spawn(process.execPath, [...await writeIntent(paths, "preallocation-checkpoint", backend), "--acceptance-preallocation-checkpoint"], { cwd: paths.runDir, env: { ...process.env, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_CMUX_EXEC_TRANSPORT: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore" });
 		const completion = latchOwnedGateProcess(child);
 		try {
 			await writePrivateFile(path.join(paths.runDir, "acceptance-handoff.json"), `${JSON.stringify({ version: 1, runId: "preallocation-checkpoint", brokerNonce: nonce, broker: { pid: child.pid, startedAt: 1, expectedCommand: "pane-launch-broker.mjs", runId: "preallocation-checkpoint" } })}\n`);
@@ -774,7 +823,7 @@ describe("pane launch broker", () => {
 		const log = path.join(root, "commands.log"), backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "postallocation-checkpoint" });
 		const checkpointPath = acceptanceAllocationCheckpointPath(paths);
 		const child = spawn(process.execPath, [...await writeIntent(paths, "postallocation-checkpoint", backend), "--acceptance-postallocation-checkpoint"], {
-			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
+			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_CMUX_EXEC_TRANSPORT: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
 		});
 		try {
 			let checkpoint: Record<string, unknown> | null = null;
@@ -784,7 +833,7 @@ describe("pane launch broker", () => {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
 			assert.ok(checkpoint);
-			assert.deepEqual(checkpoint!.allocation, { version: 2, runId: "postallocation-checkpoint", terminalMode: "cmux-pane", target: { workspaceId, surfaceId, paneId }, allocatedAt: (checkpoint!.allocation as { allocatedAt: unknown }).allocatedAt });
+			assert.deepEqual(checkpoint!.allocation, { version: 2, runId: "postallocation-checkpoint", terminalMode: "cmux-pane", ...fixtureCmuxAllocationAuthority(paths), target: { workspaceId, surfaceId, paneId }, allocatedAt: (checkpoint!.allocation as { allocatedAt: unknown }).allocatedAt });
 			assert.equal(await readBrokerJson(paths.allocationPath), null);
 			assert.equal(await readBrokerJson(paths.decisionPath), null);
 			assert.equal(await readBrokerJson(paths.launchPath), null);
@@ -820,7 +869,7 @@ describe("pane launch broker", () => {
 		const log = path.join(root, "commands.log"), backend = await nativeMock(root), paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "postallocation-residual" });
 		const checkpointPath = acceptanceAllocationCheckpointPath(paths);
 		const child = spawn(process.execPath, [...await writeIntent(paths, "postallocation-residual", backend), "--acceptance-postallocation-checkpoint"], {
-			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
+			cwd: paths.runDir, env: { ...process.env, CMUX_SOCKET_PATH: log, PI_SUBAGENT_TEST_HARNESS: "1", PI_SUBAGENT_TEST_CMUX_EXEC_TRANSPORT: "1", PI_SUBAGENT_ACCEPTANCE_HARNESS: "1" }, stdio: "ignore",
 		});
 		try {
 			let checkpoint: Record<string, unknown> | null = null;
@@ -1208,7 +1257,7 @@ describe("pane launch broker", () => {
 		const backend = await nativeMock(root), log = path.join(root, "commands.log");
 		const paths = await prepareRunArtifactPaths({ rootDir: stateRoot, runId: "wrong-workspace-winner" });
 		const args = await writeIntent(paths, "wrong-workspace-winner", backend);
-		await writePrivateFile(paths.allocationPath, `${JSON.stringify({ version: 2, runId: "wrong-workspace-winner", terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174099", surfaceId, paneId }, allocatedAt: 1 })}\n`);
+		await writePrivateFile(paths.allocationPath, `${JSON.stringify({ version: 2, runId: "wrong-workspace-winner", terminalMode: "cmux-pane", ...fixtureCmuxAllocationAuthority(paths, "123e4567-e89b-12d3-a456-426614174099"), target: { workspaceId: "123e4567-e89b-12d3-a456-426614174099", surfaceId, paneId }, allocatedAt: 1 })}\n`);
 		assert.equal(await run(args, { ...process.env, CMUX_SOCKET_PATH: log }, paths.runDir), 0);
 		assert.ok(await readBrokerJson(paths.residualRiskPath));
 		assert.match(await fs.promises.readFile(log, "utf8"), new RegExp(`close-surface --workspace ${workspaceId} --surface ${surfaceId}`));

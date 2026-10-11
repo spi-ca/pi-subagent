@@ -671,7 +671,12 @@ describe("subagent tool schema", () => {
   test("centralizes essential behavior in the tool description", () => {
     const description = formatSubagentToolDescription();
     assert.match(description, /exactly one.*agent\+task.*tasks.*chain.*action/is);
-    assert.match(description, /model overrides.*agent default.*call.*task.*stage/is);
+    assert.match(description, /model overrides agent default/i);
+    assert.match(description, /model\/cwd: top-level for singles, per task\/sequential stage; parallel stages use tasks/);
+    assert.match(description, /top-level cwd ignored for tasks\/chain/i);
+    assert.match(description, /status without id lists background jobs/);
+    assert.match(description, /cancel without id cancels all running background jobs/);
+    assert.match(description, /cancel ACK is not terminal/i);
     assert.match(description, /chain labels.*unique/i);
     assert.match(description, /defaults to on_success/i);
     assert.match(description, /recovery.*continueOnError.*failed stage/is);

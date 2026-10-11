@@ -1311,23 +1311,23 @@ describe("interactive pane runner preparation", () => {
 		assert.ok(forkArgs.some((value) => value.endsWith("child-bridge.ts")));
 	});
 
-	test("retains native MCP for local child allowlists while managed and empty selection remain disabled", () => {
+	test("restricts built-in MCP for explicit child allowlists without changing general inheritance", () => {
 		const general = { name: "worker", description: "", systemPrompt: "", source: "user" as const, filePath: "/tmp/worker.md", tools: undefined };
 		const restricted = { ...general, tools: ["read", "codemode"] };
 		for (const version of ["1.0.4", "1.1.0"]) {
-			assert.deepEqual(buildChildMcpArgs(restricted, undefined, "inherit", version), []);
-			assert.deepEqual(buildChildMcpArgs(general, "read,grep", "inherit", version), []);
+			assert.deepEqual(buildChildMcpArgs(restricted, undefined, "inherit", version), ["--no-mcp"]);
+			assert.deepEqual(buildChildMcpArgs(general, "read,grep", "inherit", version), ["--no-mcp"]);
 			assert.deepEqual(buildChildMcpArgs(general, undefined, "managed", version), ["--no-mcp"]);
 			assert.deepEqual(buildChildMcpArgs({ tools: [] }, undefined, "inherit", version), ["--no-mcp"]);
 			for (const tools of [undefined, "+codemode,-write"]) assert.deepEqual(buildChildMcpArgs(general, tools, "inherit", version), []);
 			assert.deepEqual(buildChildMcpArgs({ tools: ["read", "codemode", "mcp__docs__*"] }, undefined, "inherit", version), []);
-			assert.deepEqual(buildChildMcpArgs({ tools: ["read"] }, "mcp__docs__*", "inherit", version), [], "MCP selection survives local agent selection");
+			assert.deepEqual(buildChildMcpArgs({ tools: ["read"] }, "mcp__docs__*", "inherit", version), ["--no-mcp"], "agent selection takes precedence over inherited MCP selection");
 			for (const mode of ["spawn", "fork"] as const) {
 				const args = buildPiArgs(restricted, null, "/tmp/task", mode, mode === "fork" ? "/tmp/session" : null, undefined, "inherit", undefined, version);
-				assert.equal(args.filter((arg) => arg === "--no-mcp").length, 0);
+				assert.equal(args.filter((arg) => arg === "--no-mcp").length, 1);
 				assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2), ["--tools", "read,codemode"]);
 			}
-			assert.equal(buildInteractivePiArgs(restricted, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"), false);
+			assert.ok(buildInteractivePiArgs(restricted, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"));
 			assert.equal(buildInteractivePiArgs(general, null, "/tmp/task", "/tmp/session", undefined, "inherit", undefined, version).includes("--no-mcp"), false);
 			if (version === "1.0.4") {
 				assert.throws(() => buildPiArgs(restricted, null, "/tmp/task", "spawn", null, undefined, "managed", undefined, version), /codemode requires/);

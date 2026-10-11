@@ -605,24 +605,44 @@ describe("child lifecycle bridge", () => {
 
 	test("bounds an uncertain parent identity probe by the completion-fence ACK deadline", async () => {
 		const probeBudgets: number[] = [];
-		const bridge = await setupBridge("run-completion-fence-bounded-identity", {
-			completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true,
-			classifyParentProcessIdentity: (_pid, _startedAt, probeOptions) => {
-				const timeoutMs = probeOptions?.timeoutMs;
-				assert.ok(timeoutMs && timeoutMs > 0 && timeoutMs <= 100, "the exact-parent probe receives only the remaining ACK budget");
-				probeBudgets.push(timeoutMs);
-				const delayUntil = Date.now() + Math.min(timeoutMs, 15);
-				while (Date.now() < delayUntil) { /* simulate a bounded Darwin probe that times out uncertain */ }
-				return "unknown";
-			},
-		});
-		await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
-		await withinDeadlockGuard(bridge.emit("agent_settled"), "bounded parent-identity settlement");
-		assert.ok(probeBudgets.length > 0);
-		const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-bounded-identity");
-		assert.equal(completion?.status, "failed");
-		assert.equal(completionError(completion), "bridge-error");
-		assert.equal(completion && "session" in completion, false);
+		let bridge: Awaited<ReturnType<typeof setupBridge>> | undefined;
+		let settled: Promise<void> | undefined;
+		const handshakeTimeout = deferred<never>();
+		// Keep the deadlock guard real, but do not let asynchronous fence I/O
+		// consume the unchanged 100ms budget before the first identity probe.
+		const watchdog = setTimeout(() => handshakeTimeout.reject(new Error("Timed out waiting for bounded parent-identity settlement")), 2_000);
+		void handshakeTimeout.promise.catch(() => undefined);
+		jest.useFakeTimers({ now: Date.now() });
+		try {
+			bridge = await setupBridge("run-completion-fence-bounded-identity", {
+				completionFence: true, leaseStaleMs: 100, isProcessIdentityAlive: () => true, maintainLiveLease: false,
+				classifyParentProcessIdentity: (_pid, _startedAt, probeOptions) => {
+					const timeoutMs = probeOptions?.timeoutMs;
+					assert.ok(timeoutMs && timeoutMs > 0 && timeoutMs <= 100, "the exact-parent probe receives only the remaining ACK budget");
+					probeBudgets.push(timeoutMs);
+					// Simulate a bounded uncertain probe without blocking the event loop.
+					jest.advanceTimersByTime(Math.min(timeoutMs, 60));
+					return "unknown";
+				},
+			});
+			await bridge.emit("session_start"); await bridge.emit("agent_start"); await bridge.emit("agent_end", { messages: [assistant("stop")] });
+			settled = bridge.emit("agent_settled");
+			await Promise.race([settled, handshakeTimeout.promise]);
+			assert.ok(probeBudgets.length > 0);
+			assert.deepEqual(probeBudgets, [100, 40], "uncertain probes share one absolute ACK deadline");
+			const completion = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "run-completion-fence-bounded-identity");
+			assert.equal(completion?.status, "failed");
+			assert.equal(completionError(completion), "bridge-error");
+			assert.equal(completion && "session" in completion, false);
+		} finally {
+			jest.useRealTimers();
+			clearTimeout(watchdog);
+			try {
+				await withinDeadlockGuard(Promise.resolve(settled), "bounded parent-identity cleanup settlement");
+			} finally {
+				await withinDeadlockGuard(Promise.resolve(bridge?.shutdownAndDrain()), "bounded parent-identity shutdown drain");
+			}
+		}
 	});
 
 	test("does not let an unresolving lease read hold completion-fence ACK wait", async () => {

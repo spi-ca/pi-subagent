@@ -3616,14 +3616,6 @@ async function removeSelectedSensitiveArtifacts(
   return allAbsent;
 }
 
-async function readFileIfExists(filePath: string): Promise<string> {
-  try {
-    return await fs.promises.readFile(filePath, "utf-8");
-  } catch {
-    return "";
-  }
-}
-
 /** Resolve an existing regular file. Symlinks and script files are valid. */
 export function resolveRegularFile(candidate: string, executable: boolean): string | null {
   try {
@@ -4068,26 +4060,6 @@ async function cleanupTempDirs(...dirs: Array<string | null | undefined>): Promi
 // ---------------------------------------------------------------------------
 
 const inheritedCliArgs = parseInheritedCliArgs(process.argv);
-
-function findNearestProjectAgentsDirForRunner(cwd: string): string | null {
-  let dir = cwd;
-  while (true) {
-    const candidate = path.join(dir, ".pi", "agents");
-    try {
-      if (fs.statSync(candidate).isDirectory()) return candidate;
-    } catch {
-      // ignore
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
-
-function getProjectRootForCwd(cwd: string): string | null {
-  const projectAgentsDir = findNearestProjectAgentsDirForRunner(cwd);
-  return projectAgentsDir ? canonicalizePathForTrust(path.dirname(path.dirname(projectAgentsDir))) : null;
-}
 
 /** Project-agent approval authorizes only the supplied agent prompt, never a
  * child's general Pi project configuration, extensions, packages, or themes. */

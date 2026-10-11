@@ -31,6 +31,11 @@ describe("process-local scheduler", () => {
     assert.equal(resolveMaxActive({ env: {}, warn: () => {} }), DEFAULT_MAX_ACTIVE);
     assert.equal(resolveMaxActive({ runtimeFlag: "0", env: { PI_SUBAGENT_MAX_ACTIVE: "2" }, warn: () => {} }), 2);
     assert.equal(parsePositiveSafeInteger("9007199254740992"), null);
+    assert.equal(parsePositiveSafeInteger("01"), null, "legacy lexical compatibility remains stricter than config parsing");
+    const warnings: string[] = [];
+    assert.equal(resolveMaxActive({ runtimeFlag: "01", env: { PI_SUBAGENT_MAX_ACTIVE: "2", PI_SUBAGENT_MAX_CONCURRENCY: "invalid" }, warn: (message) => warnings.push(message) }), 2);
+    assert.equal(warnings.length, 1, "unrelated limits are not read by the compatibility wrapper");
+    assert.match(warnings[0]!, /value "01"/);
   });
 
   test("records fixed-size queue and local-slot timing metrics across completion and rejection", async () => {

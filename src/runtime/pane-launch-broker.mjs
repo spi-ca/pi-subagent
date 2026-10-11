@@ -261,15 +261,15 @@ const brokerInterpreter = regularFile(expectedRuntimeInterpreter, true);
 const backendPath = regularFile(expectedBackend, true);
 let backendMode = null;
 let protocolVersion = 2;
-const legacyCmuxHarness = process.env.PI_SUBAGENT_TEST_HARNESS === "1";
+// Transport-only seam: fake native commands do not relax authority readers.
+const fakeCmuxExecTransport = process.env.PI_SUBAGENT_TEST_HARNESS === "1" && process.env.PI_SUBAGENT_TEST_CMUX_EXEC_TRANSPORT === "1";
 // A detached broker has a separate process-owned UDS client. No cmux binary
 // is spawned for allocation, rollback, inspection, or gate checks.
 let cmuxCommand = null;
 let cmuxManager = null;
 let tmuxCommand = null;
 let tmuxManager = null;
-const cmuxBrokerOptions = { broker: true,
-  ...(process.env.PI_SUBAGENT_TEST_HARNESS === "1" ? { appVersionValidator: (identify) => isStableSemverAtLeast(identify?.app_version, MINIMUM_CMUX_VERSION) || identify?.app_bundle_path === "/Applications/cmux.app" } : {}) };
+const cmuxBrokerOptions = { broker: true };
 const brokerEntrypoint = regularFile(path.resolve(process.argv[1] || ""), false);
 if (!brokerRuntime || !brokerInterpreter || !backendPath || !brokerEntrypoint || !regularFile(process.execPath, true)) process.exit(2);
 const rootDir = path.dirname(runDir);
@@ -445,10 +445,11 @@ function intent(value) {
     && Object.keys(candidate).every((key) => ["transport", "socketPath", "socketDev", "socketIno", "accessMode", "apiVersion", "appVersion", "identifyDigest", "bootIdentity"].includes(key))
     && ["transport", "socketPath", "socketDev", "socketIno", "accessMode", "apiVersion", "appVersion", "identifyDigest"].every((key) => Object.hasOwn(candidate, key))
     && candidate.transport === "cmux-control-v2" && typeof candidate.socketPath === "string" && path.isAbsolute(candidate.socketPath)
-    && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketDev) && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketIno)
-    && typeof candidate.accessMode === "string" && candidate.accessMode.length > 0 && candidate.apiVersion === 2 && typeof candidate.appVersion === "string" && isStableSemverAtLeast(candidate.appVersion, MINIMUM_CMUX_VERSION) && /^[a-f0-9]{64}$/.test(candidate.identifyDigest)
+    && typeof candidate.socketDev === "string" && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketDev)
+    && typeof candidate.socketIno === "string" && /^(?:0|[1-9][0-9]*)$/.test(candidate.socketIno)
+    && typeof candidate.accessMode === "string" && candidate.accessMode.length > 0 && candidate.apiVersion === 2 && typeof candidate.appVersion === "string" && isStableSemverAtLeast(candidate.appVersion, MINIMUM_CMUX_VERSION) && typeof candidate.identifyDigest === "string" && /^[a-f0-9]{64}$/.test(candidate.identifyDigest)
     && (candidate.bootIdentity === undefined || typeof candidate.bootIdentity === "string");
-  const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
+  const requiresControl = value.terminalMode === "cmux-pane";
   const transportKeys = tmuxControlV3 ? ["transport", "transportGatePath", "transportGateDigest"] : [];
   const tmuxNewWindow = value.terminalMode === "tmux-pane" && value.placement === "tmux-new-window";
   const herdrAutoTab = value.terminalMode === "herdr-pane" && value.placement === "herdr-new-tab";
@@ -463,7 +464,7 @@ function intent(value) {
     || tmuxNewWindow && !isValidTmuxWindowLabel(value.windowLabel, value.runId)
     || herdrAutoTab && !validHerdrTabLabel(value.tabLabel)
     || value.terminalMode === "herdr-pane" && hasLayout && typeof value.workingDirectory !== "string"
-    || value.terminalMode === "cmux-pane" && ((!hasLayout && !legacyCmuxHarness) || requiresControl && !control(value.control))
+    || value.terminalMode === "cmux-pane" && (!hasLayout || requiresControl && !control(value.control))
     || tmuxControlV3 && (value.transport !== "tmux-control-v1" || !artifactPathEquals(value.transportGatePath, "transport-gate.json") || typeof value.transportGateDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.transportGateDigest))) return null;
   const sourceValid = value.terminalMode === "cmux-pane"
     ? exact(value.source, ["workspaceId", "sourceSurfaceId"]) && isUuidString(value.source.workspaceId) && isUuidString(value.source.sourceSurfaceId)
@@ -521,11 +522,11 @@ function allocation(value, runId) {
   if (!value || value.version !== protocolVersion || value.runId !== runId || !Number.isFinite(value.allocatedAt) || value.allocatedAt <= 0 || !value.target || typeof value.target !== "object") return null;
   const hasLayout = ["layout", "placement", "container"].some((key) => Object.hasOwn(value, key));
   const baseKeys = ["version", "runId", "terminalMode", "target", "allocatedAt"];
-  const requiresControl = value.terminalMode === "cmux-pane" && !legacyCmuxHarness;
+  const requiresControl = value.terminalMode === "cmux-pane";
   const transportKeys = value.version === 3 ? ["transport", "intentDigest"] : [];
   if (!exact(value, hasLayout ? [...baseKeys, "layout", "placement", "container", ...(requiresControl ? ["control"] : []), ...transportKeys] : [...baseKeys, ...transportKeys])) return null;
   if (value.version === 3 && (value.terminalMode !== "tmux-pane" || value.transport !== "tmux-control-v1" || typeof value.intentDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.intentDigest))) return null;
-  if (requiresControl && (!value.control || value.control.transport !== "cmux-control-v2" || !isStableSemverAtLeast(value.control.appVersion, MINIMUM_CMUX_VERSION))) return null;
+  if (requiresControl && (!hasLayout || !value.control || value.control.transport !== "cmux-control-v2" || !isStableSemverAtLeast(value.control.appVersion, MINIMUM_CMUX_VERSION))) return null;
   if (value.terminalMode === "herdr-pane") {
     if (!herdrTarget(value.target)) return null;
     return !hasLayout ? value : herdrTabContainer(value.container)
@@ -610,7 +611,7 @@ function allocationMatchesIntentSource(intentRecord, allocationRecord) {
         && allocationRecord.target.tabId !== intentRecord.source.tabId;
   }
   if (intentRecord.terminalMode === "cmux-pane") {
-    if (!legacyCmuxHarness && (!intentRecord.control || !allocationRecord.control || JSON.stringify(intentRecord.control) !== JSON.stringify(allocationRecord.control))) return false;
+    if (!intentRecord.control || !allocationRecord.control || JSON.stringify(intentRecord.control) !== JSON.stringify(allocationRecord.control)) return false;
     const sourceMatches = cmuxIdsEqual(allocationRecord.target.workspaceId, intentRecord.source.workspaceId)
       && !cmuxIdsEqual(allocationRecord.target.surfaceId, intentRecord.source.sourceSurfaceId);
     if (!sourceMatches) return false;
@@ -1121,7 +1122,7 @@ async function main() {
     tmuxCommand = async (args, options) => { const result = await controlRun(args, options); return { ...result, code: result.exitCode }; };
   }
   if (i.terminalMode === "cmux-pane") {
-    if (legacyCmuxHarness) cmuxCommand = async (args) => await command(backendPath, args);
+    if (fakeCmuxExecTransport) cmuxCommand = async (args) => await command(backendPath, args);
     else { cmuxManager = getCmuxControlRequestManager({ ...cmuxBrokerOptions, expectedControl: i.control }); cmuxCommand = createCmuxControlCommandRunner({ manager: cmuxManager }); }
   }
   if (regularFile(i.backendPath, true) !== backendPath) { await status(i.runId, "failed", "intent-invalid"); return; }
@@ -1346,7 +1347,7 @@ async function verifyGate() {
     tmuxCommand = async (args, options) => { const result = await controlRun(args, options); return { ...result, code: result.exitCode }; };
   }
   if (i.terminalMode === "cmux-pane") {
-    if (legacyCmuxHarness) cmuxCommand = async (args) => await command(backendPath, args);
+    if (fakeCmuxExecTransport) cmuxCommand = async (args) => await command(backendPath, args);
     else { cmuxManager = getCmuxControlRequestManager({ ...cmuxBrokerOptions, expectedControl: i.control }); cmuxCommand = createCmuxControlCommandRunner({ manager: cmuxManager }); }
   }
   if (regularFile(i.backendPath, true) !== backendPath) return;

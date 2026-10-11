@@ -31,7 +31,7 @@ function cell(mode: "inline" | "tmux" | "cmux", activeRuns: 1 | 16, workload: "i
   return { mode, activeRuns, workload, timing: { monotonicElapsedMs: 2, settlementLatencyMs: 1, eventLoopDelayMeanMs: 0, eventLoopDelayMaxMs: 0, eventLoopDelayP99Ms: 0 }, parent: { cpuDeltaMs: 1, peakRssKiB: 1 }, descendants: { peakCount: activeRuns, peakIdentities: Array.from({ length: activeRuns }, (_, i) => ({ pid: i + 1, startedAt: i + 1 })), verifiedProviderIdentities: Array.from({ length: activeRuns }, (_, i) => ({ pid: i + 1, startedAt: i + 1 })), resources: { cumulativeCpuMs: 1, peakAggregateCpuMs: 1, peakAggregateRssKiB: 1, peakIndividualRssKiB: 1 } }, backend: { topologyProbeCount: mode === "inline" ? 0 : activeRuns, transportCounters: mode === "inline" ? inline() : measured(mode) }, verifiedProviderChildren: activeRuns, settlement: workload === "idle-wait" ? "observed-then-cancelled" : workload === "cancel" ? "cancelled" : workload === "external-close" ? "externally-closed" : "settled", requestedProvider: "openai-codex", requestedModel: CHILD_MODEL, observedProvider: "openai-codex", observedModel: "gpt-5.4-mini", cleanup: { result: "clean", residualDescendantCount: 0, residualBackendTargetCount: 0 }, sourceAndSentinelPreserved: true };
 }
 function evidence(tier: typeof ROUTINE_TIER_ID | typeof CMUX_CONCURRENCY_TIER_ID, source: { sourceRevision: "unknown" | string; sourceDirty: boolean; worktreeDigest: string } = { sourceRevision: "unknown", sourceDirty: true, worktreeDigest: "a".repeat(64) }): LiveEvidence {
-  const plan = livePlan(tier); return { schemaVersion: 4, tier, planId: plan.planId, planDigest: plan.planDigest, phase: "M0-live", evidenceKind: "gated-provider-transport-benchmark", capturedAt: new Date().toISOString(), environment: { os: "darwin", arch: "arm64", bunVersion: "1", piVersion: "1", ...source }, requested: { provider: "openai-codex", model: CHILD_MODEL, childRuns: plan.childRuns }, matrix: expectedLiveCells(tier).map((entry) => cell(entry.mode, entry.activeRuns, entry.workload)), cleanup: { result: "clean", evidenceRoot: "private-0700", evidenceFile: "private-0600", residualDescendantCount: 0, residualBackendTargetCount: 0 } };
+  const plan = livePlan(tier); return { schemaVersion: 4, tier, planId: plan.planId, planDigest: plan.planDigest, phase: "M0-live", evidenceKind: "gated-provider-transport-benchmark", capturedAt: new Date().toISOString(), environment: { os: "darwin", arch: "arm64", bunVersion: "1", piVersion: fixturePi.version, ...source }, requested: { provider: "openai-codex", model: CHILD_MODEL, childRuns: plan.childRuns }, matrix: expectedLiveCells(tier).map((entry) => cell(entry.mode, entry.activeRuns, entry.workload)), cleanup: { result: "clean", evidenceRoot: "private-0700", evidenceFile: "private-0600", residualDescendantCount: 0, residualBackendTargetCount: 0 } };
 }
 async function writeReleaseProfile(root: string, dark: string | Buffer = '{"name":"dark"}\n', light: string | Buffer = '{"name":"light"}\n'): Promise<void> {
   for (const spec of STAGED_NATIVE_PI_ASSET_MANIFEST) {
@@ -144,6 +144,15 @@ describe("two-tier gated Phase 0 live harness", () => {
     assert.equal(validateLiveEvidence(routine), true); assert.equal(validateLiveEvidence(concurrency), true);
     for (const sourceRevision of ["a".repeat(40), "b".repeat(64)]) {
       assert.equal(validateLiveEvidence(evidence(ROUTINE_TIER_ID, { sourceRevision, sourceDirty: false, worktreeDigest: "c".repeat(64) })), true);
+    }
+    for (const piVersion of ["1", "0.81.0", "0.81.1-beta", "secret", ""]) {
+      assert.equal(validateLiveEvidence({ ...routine, environment: { ...routine.environment, piVersion } }), false);
+      const plan = livePlan(ROUTINE_TIER_ID);
+      assert.equal(validateLiveCheckpoint({ version: 4, tier: ROUTINE_TIER_ID, planId: plan.planId, planDigest: plan.planDigest, piVersion, sourceRevision: "unknown", sourceDirty: true, worktreeDigest: "b".repeat(64), childRuns: plan.childRuns, cells: [] }), false);
+    }
+    for (const piVersion of ["0.81.1", "1.1.0"]) assert.equal(validateLiveEvidence({ ...routine, environment: { ...routine.environment, piVersion } }), true);
+    for (const capturedAt of ["", "not-a-date", "2026-02-30T00:00:00.000Z", "2026-07-20T00:00:00Z", "2026-07-20T00:00:00.000+00:00"]) {
+      assert.equal(validateLiveEvidence({ ...routine, capturedAt }), false);
     }
     const wrongVersion = structuredClone(routine) as any; wrongVersion.schemaVersion = 3; assert.equal(validateLiveEvidence(wrongVersion), false);
     const reordered = structuredClone(routine); [reordered.matrix[0], reordered.matrix[1]] = [reordered.matrix[1]!, reordered.matrix[0]!]; assert.equal(validateLiveEvidence(reordered), false);

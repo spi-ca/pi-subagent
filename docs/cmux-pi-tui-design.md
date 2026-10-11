@@ -134,12 +134,15 @@ interactive child pi
 interface InteractivePaneBackend {
   mode: "cmux-pane" | "tmux-pane" | "herdr-pane";
   availabilityError(env?): string | null;
+  /** @deprecated direct-call compatibility; runAgent는 broker를 사용한다. */
   launch(options): Promise<InteractivePaneHandle>;
   inspect(handle): Promise<InteractivePaneSnapshot | undefined>;
   interrupt(handle): Promise<boolean>;
   close(handle): Promise<boolean>;
 }
 ```
+
+현재 `runAgent`의 allocation·durable publication·rollback은 `pane-launch-broker.mjs`가 소유한다. runner는 이 backend의 availability·inspect·interrupt·close·선택적 focus만 사용하며 `launch()`를 호출하지 않는다. exported `launch`와 options는 기존 direct caller의 호환성 때문에 유지하지만 broker의 layout/authority 계약을 대신하지 않는다.
 
 handle은 backend identity를 보존하는 discriminated union이다.
 

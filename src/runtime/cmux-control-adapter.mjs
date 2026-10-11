@@ -41,15 +41,15 @@ export async function readCmuxAppBundleVersion(identify, minimum = CMUX_MINIMUM_
   try {
     const bundle = path.resolve(identify.app_bundle_path);
     const canonicalBundle = await fs.realpath(bundle);
-    if (canonicalBundle !== bundle) return false;
+    if (canonicalBundle !== bundle) return null;
     const bundleStat = await fs.lstat(canonicalBundle, { bigint: true });
     const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : bundleStat.uid;
-    if (!bundleStat.isDirectory() || (bundleStat.mode & 0o022n) !== 0n || (bundleStat.uid !== 0n && bundleStat.uid !== uid)) return false;
+    if (!bundleStat.isDirectory() || (bundleStat.mode & 0o022n) !== 0n || (bundleStat.uid !== 0n && bundleStat.uid !== uid)) return null;
     const info = path.join(canonicalBundle, "Contents", "Info.plist");
     const handle = await fs.open(info, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
     try {
       const stat = await handle.stat({ bigint: true });
-      if (!stat.isFile() || stat.size <= 0n || stat.size > 1024n * 1024n || (stat.mode & 0o022n) !== 0n || (stat.uid !== 0n && stat.uid !== uid)) return false;
+      if (!stat.isFile() || stat.size <= 0n || stat.size > 1024n * 1024n || (stat.mode & 0o022n) !== 0n || (stat.uid !== 0n && stat.uid !== uid)) return null;
       const raw = await handle.readFile("utf8");
       // cmux's shipped plist is XML. Binary/unparseable plists fail closed rather
       // than invoking a system parser with an attacker-controlled path.

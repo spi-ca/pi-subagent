@@ -98,10 +98,19 @@ test("entrypoint captures native capability once for single, parallel, chain and
   const captured: Array<{ task: string; parentNativeCodemodeActive?: boolean }> = [];
   let releaseBlocker!: () => void;
   const blocker = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+  const entries = new Map<string, () => void>();
+  const entered = (task: string) => new Promise<void>((resolve) => { entries.set(task, resolve); });
+  const bounded = async (entry: Promise<void>) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([entry, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("mock runner entry timed out")), 2_000); })]);
+    } finally { clearTimeout(timer); }
+  };
   mock.module("../../src/runtime/runner", () => ({
     ...actualRunner,
     runAgent: async (options: Parameters<typeof actualRunner.runAgent>[0]) => {
       captured.push({ task: options.task, parentNativeCodemodeActive: options.parentNativeCodemodeActive });
+      entries.get(options.task)?.();
       if (options.task === "blocker") await blocker;
       return { agent: options.agentName, agentSource: "user", task: options.task, exitCode: 0, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
     },
@@ -169,8 +178,11 @@ test("entrypoint captures native capability once for single, parallel, chain and
     assert.deepEqual(captured.map((entry) => entry.parentNativeCodemodeActive), [true, true, true]);
     assert.equal(activeReads - beforeChain, 1);
     captured.length = 0;
+    const blockerEntered = entered("blocker");
+    const inactiveEntered = entered("queued-inactive");
+    const activeEntered = entered("queued-active");
     await invoke({ agent: "reader", task: "blocker", background: true });
-    for (let attempt = 0; attempt < 100 && captured.length === 0; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+    await bounded(blockerEntered);
     assert.equal(captured.length, 1);
     active = [];
     await invoke({ agent: "reader", task: "queued-inactive", background: true });
@@ -179,7 +191,7 @@ test("entrypoint captures native capability once for single, parallel, chain and
     active = [];
     owner = { source: "extension", path: "/later.ts" };
     releaseBlocker();
-    for (let attempt = 0; attempt < 100 && captured.length < 3; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+    await bounded(Promise.all([inactiveEntered, activeEntered]).then(() => undefined));
     assert.deepEqual(captured.map((entry) => entry.parentNativeCodemodeActive), [true, false, true], "queued/background runners retain each invocation's capability, not later registry state");
   } finally {
     releaseBlocker();

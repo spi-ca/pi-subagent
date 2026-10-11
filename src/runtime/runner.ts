@@ -29,7 +29,6 @@ import {
 import type { AgentConfig } from "../core/agents.js";
 import { DEFAULT_SUBAGENT_LIMITS, MAX_SUBAGENT_ACTIVE, SUBAGENT_LIMIT_DEFINITIONS, subagentLimitsToEnv, type SubagentLimits } from "../core/subagent-limits.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
-import { resolveInheritedChildToolSelection } from "./child-tool-selection.js";
 import { createJsonLineChunkProcessor } from "./runner-core.js";
 import {
   createCmuxControlCommandRunner,
@@ -4563,44 +4562,21 @@ export function assertManagedChildToolCompatibility(
   if (overridden.length > 0) throw new Error(`managed child policy cannot preserve extension overrides for built-in tools: ${overridden.join(", ")}`);
 }
 
-/** Ordinary inherit children retain native MCP independently of local tools. */
+/** --tools alone keeps indirect MCP capabilities on newer Pi hosts. */
 export function buildChildMcpArgs(
   agent: Pick<AgentConfig, "tools">,
   fallbackTools: string | undefined,
   childPolicy: ManagedChildPolicy,
   hostVersion: string = PiHost.VERSION,
-  fallbackNoTools = false,
 ): string[] {
+  // Children respawn the current host, not an unrelated PATH executable.
+  // Older Pi has no built-in MCP flag; managed --no-extensions still applies.
   if (!isStableSemverAtLeast(hostVersion, "1.0.4")) return [];
-  if (childPolicy === "managed") return ["--no-mcp"];
-  const selection = resolveInheritedChildToolSelection({ agentTools: agent.tools, fallbackTools, fallbackNoTools, hostVersion });
-  return selection.disableMcp ? ["--no-mcp"] : [];
-}
-
-function buildChildToolArgs(agent: Pick<AgentConfig, "tools">, childPolicy: ManagedChildPolicy, hostVersion: string, parentNativeCodemodeActive = false): string[] {
-  if (childPolicy === "managed") {
-    const tools = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools);
-    if (tools !== undefined) {
-      if (tools.length === 0) return ["--no-tools"];
-      return ["--tools", tools.join(",")];
-    }
-    return inheritedCliArgs.fallbackNoTools ? ["--no-tools"] : [];
-  }
-  const selection = resolveInheritedChildToolSelection({
-    agentTools: agent.tools,
-    fallbackTools: inheritedCliArgs.fallbackTools,
-    fallbackNoTools: inheritedCliArgs.fallbackNoTools,
-    alwaysProxy: [...inheritedCliArgs.alwaysProxy, ...inheritedCliArgs.extensionArgs],
-    hostVersion,
-    parentNativeCodemodeActive,
-  });
-  const args: string[] = [];
-  if (selection.disableMcp && isStableSemverAtLeast(hostVersion, "1.0.4") && !inheritedCliArgs.alwaysProxy.includes("--no-mcp")) {
-    args.push("--no-mcp");
-  }
-  if (selection.noTools) args.push("--no-tools");
-  else if (selection.tools !== undefined) args.push("--tools", selection.tools.join(","));
-  return args;
+  const tools = agent.tools ?? fallbackTools?.split(",").map((value) => value.trim()).filter(Boolean);
+  // +/- selections modify defaults, rather than specifying a full allowlist.
+  const allowlist = tools !== undefined && (tools.length === 0 || tools.some((name) => !/^[+-]/.test(name)));
+  const explicitMcp = tools?.some((name) => name.startsWith("mcp__")) ?? false;
+  return childPolicy === "managed" || (allowlist && !explicitMcp) ? ["--no-mcp"] : [];
 }
 
 export function buildManagedExtensionArgs(includeBridge: boolean, selfExtensionPath = resolveCurrentPackageExtensionEntrypoint(), childBridgePath = CHILD_BRIDGE_PATH, includeCodemode = false): string[] {
@@ -4687,14 +4663,11 @@ export function buildPiArgs(
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
-  /** Public parent registry evidence captured at invocation, never persisted. */
-  parentNativeCodemodeActive = false,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
   const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
-  const toolArgs = buildChildToolArgs(agent, childPolicy, hostVersion, parentNativeCodemodeActive);
   const args: string[] = [
-    ...(childPolicy === "managed" ? buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion) : []),
+    ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
     "--mode",
     "json",
     ...(childPolicy === "managed" ? buildManagedExtensionArgs(delegationMode === "fork" || phase0LiveProofEnabled(), undefined, undefined, includeCodemode) : delegationMode === "fork" ? buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs) : inheritedCliArgs.extensionArgs),
@@ -4713,7 +4686,16 @@ export function buildPiArgs(
 
   const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
-  args.push(...toolArgs);
+
+  if (agent.tools && agent.tools.length > 0) {
+    args.push("--tools", agent.tools.join(","));
+  } else if (agent.tools === undefined) {
+    if (inheritedCliArgs.fallbackTools !== undefined) {
+      args.push("--tools", inheritedCliArgs.fallbackTools);
+    } else if (inheritedCliArgs.fallbackNoTools) {
+      args.push("--no-tools");
+    }
+  }
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
   args.push(`@${taskFilePath}`);
@@ -4730,14 +4712,11 @@ export function buildInteractivePiArgs(
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
-  /** Public parent registry evidence captured at invocation, never persisted. */
-  parentNativeCodemodeActive = false,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
   const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
-  const toolArgs = buildChildToolArgs(agent, childPolicy, hostVersion, parentNativeCodemodeActive);
   const args: string[] = [
-    ...(childPolicy === "managed" ? buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion) : []),
+    ...buildChildMcpArgs(agent, inheritedCliArgs.fallbackTools, childPolicy, hostVersion),
     ...(childPolicy === "managed" ? buildManagedExtensionArgs(true, undefined, undefined, includeCodemode) : buildInteractiveExtensionArgs(inheritedCliArgs.extensionArgs)),
     ...getInheritedCliArgsForAgent(agent, inheritedCliArgs.alwaysProxy, inheritedCliArgs.fallbackModel, modelOverride),
     "--session",
@@ -4748,7 +4727,12 @@ export function buildInteractivePiArgs(
   if (model) args.push("--model", model);
   const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
-  args.push(...toolArgs);
+  if (agent.tools && agent.tools.length > 0) {
+    args.push("--tools", agent.tools.join(","));
+  } else if (agent.tools === undefined) {
+    if (inheritedCliArgs.fallbackTools !== undefined) args.push("--tools", inheritedCliArgs.fallbackTools);
+    else if (inheritedCliArgs.fallbackNoTools) args.push("--no-tools");
+  }
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
   args.push(`@${taskFilePath}`);
   return args;
@@ -4864,8 +4848,6 @@ export interface RunAgentOptions {
   model?: string;
   /** Invocation-scoped immutable parent session thinking level. */
   parentThinkingLevel?: string;
-  /** Invocation-scoped active native gateway evidence; not a tool snapshot. */
-  parentNativeCodemodeActive?: boolean;
   /** Context mode: spawn (fresh) or fork (session snapshot + task). */
   delegationMode: DelegationMode;
   /** Execution surface for child runs. */
@@ -4928,7 +4910,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     taskCwd,
     model: modelOverride,
     parentThinkingLevel,
-    parentNativeCodemodeActive,
     delegationMode,
     terminalMode,
     interactivePaneLayout = resolveInteractivePaneLayout(undefined),
@@ -5005,9 +4986,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   try {
-    const childPolicy = resolveManagedChildPolicy();
-    if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools, inheritedCliArgs.fallbackNoTools);
-    else buildChildToolArgs(agent, childPolicy, PiHost.VERSION, parentNativeCodemodeActive);
+    if (resolveManagedChildPolicy() === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools, inheritedCliArgs.fallbackNoTools);
   } catch (error) {
     result.exitCode = 1; result.stopReason = "error"; result.errorMessage = error instanceof Error ? error.message : String(error); result.stderr = result.errorMessage;
     await opts.forkSourceOwnership?.markTerminal(opts.forkChildId!, "no-launch").catch(() => undefined);
@@ -5106,7 +5085,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       taskCwd,
       modelOverride,
       parentThinkingLevel,
-      parentNativeCodemodeActive,
       delegationMode,
       interactivePaneLayout,
       forkSessionSnapshotJsonl,
@@ -5173,8 +5151,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       modelOverride,
       undefined,
       parentThinkingLevel,
-      PiHost.VERSION,
-      parentNativeCodemodeActive,
     );
     const effectiveCwd = taskCwd ?? cwd;
     applyChildProjectIsolation(piArgs, effectiveCwd);
@@ -5845,8 +5821,6 @@ interface RunAgentInInteractivePaneOptions {
   modelOverride?: string;
   /** Invocation-scoped immutable parent session thinking level. */
   parentThinkingLevel?: string;
-  /** Invocation-scoped active native gateway evidence; not a tool snapshot. */
-  parentNativeCodemodeActive?: boolean;
   delegationMode: DelegationMode;
   forkSessionSnapshotJsonl?: string;
   parentSessionId?: string;
@@ -6592,8 +6566,6 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       options.modelOverride,
       undefined,
       options.parentThinkingLevel,
-      PiHost.VERSION,
-      options.parentNativeCodemodeActive,
     );
     applyChildProjectIsolation(piArgs, effectiveCwd);
 

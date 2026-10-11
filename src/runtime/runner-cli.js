@@ -106,6 +106,7 @@ export function parseInheritedCliArgs(argv) {
   let i = 2; // skip executable + script name
   while (i < argv.length) {
     const raw = argv[i];
+    if (raw === "--") break;
     if (!raw.startsWith("-")) {
       i++;
       continue;
@@ -282,7 +283,13 @@ export function parseInheritedCliArgs(argv) {
     }
 
     if (flagName === "--tools" || flagName === "-t") {
-      const [value, skip] = getValue();
+      // Native Pi consumes modifier lists such as -codemode as the value too.
+      let value = inlineValue;
+      let skip = 1;
+      if (value === undefined && nextToken !== undefined) {
+        value = nextToken;
+        skip = 2;
+      }
       if (value !== undefined) fallbackTools = value;
       i += skip;
       continue;

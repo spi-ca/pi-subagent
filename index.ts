@@ -68,6 +68,7 @@ import { formatBoundedForegroundEnvelope, formatBoundedForegroundResultRecordEnv
 import { emptyAccountingUsage, finalizeForegroundUsage, type AccountingUsage } from "./src/core/accounting-usage.js";
 import { applySessionProjectTrustOverride, getConfigDir, getSessionProjectTrustOverride, isTrustedProjectAgentsDirWithSessionOverrides, resolveSessionProjectTrust } from "./src/core/project-trust.js";
 import { collectManagedOverriddenBuiltinTools, beginInteractiveShutdownForSession, focusInteractiveRun, forkSourceReconciliationFailureDiagnostic, getInteractiveShutdownGenerationForTest, inspectInteractiveRunForUx, keepInteractiveRun, listActiveInteractiveRunIds, listInteractiveRunUxSnapshots, mapConcurrent, promoteInteractiveRun, resetInteractiveShutdownForSession, resolveManagedChildPolicy, runAgent, shutdownActiveInteractiveRuns, startStaleInteractiveReaper, subscribeInteractiveRunChanges, type InteractiveRunUxSnapshot, type ReaperDiagnostic, type RunAgentOptions, type StaleInteractiveReaperHandle } from "./src/runtime/runner.js";
+import { captureParentNativeCodemodeActive } from "./src/runtime/child-tool-selection.js";
 import { ProcessLocalScheduler, type SchedulerHandle } from "./src/runtime/process-local-scheduler.js";
 import { ForkSourceOwnershipManager } from "./src/runtime/fork-source-ownership.js";
 import {
@@ -1353,6 +1354,7 @@ export default function (pi: ExtensionAPI) {
         // Capture once at tool invocation time so queued/background work cannot
         // observe a later parent-session thinking change.
         const parentThinkingLevel = ctx?.thinkingLevel;
+        const parentNativeCodemodeActive = captureParentNativeCodemodeActive(pi);
         const invocationDiagnosticGeneration = reaperDiagnosticGeneration;
         const terminalMode = getDefaultTerminalModeFromEnv();
         const rawValidationError = validateSubagentInvocation(params);
@@ -1719,6 +1721,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionFile,
               interactiveShutdownGeneration,
               parentThinkingLevel,
+              parentNativeCodemodeActive,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1743,6 +1746,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionFile,
               interactiveShutdownGeneration,
               parentThinkingLevel,
+              parentNativeCodemodeActive,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -1770,6 +1774,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionFile,
               interactiveShutdownGeneration,
               parentThinkingLevel,
+              parentNativeCodemodeActive,
               runnableAgents,
               ctx.cwd,
               executionSignal,
@@ -2032,6 +2037,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
     parentThinkingLevel: string | undefined,
+    parentNativeCodemodeActive: boolean,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -2059,6 +2065,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
       parentSessionFile,
       interactiveShutdownGeneration,
       parentThinkingLevel,
+      parentNativeCodemodeActive,
       parentDepth: currentDepth,
       parentAgentStack: ancestorAgentStack,
       maxDepth,
@@ -2108,6 +2115,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
     parentThinkingLevel: string | undefined,
+    parentNativeCodemodeActive: boolean,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -2257,6 +2265,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               parentSessionFile,
               interactiveShutdownGeneration,
               parentThinkingLevel,
+              parentNativeCodemodeActive,
               parentDepth: currentDepth,
               parentAgentStack: ancestorAgentStack,
               maxDepth,
@@ -2356,6 +2365,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         parentSessionFile,
         interactiveShutdownGeneration,
         parentThinkingLevel,
+        parentNativeCodemodeActive,
         parentDepth: currentDepth,
         parentAgentStack: ancestorAgentStack,
         maxDepth,
@@ -2440,6 +2450,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
     parentSessionFile: string | undefined,
     interactiveShutdownGeneration: number,
     parentThinkingLevel: string | undefined,
+    parentNativeCodemodeActive: boolean,
     agents: AgentConfig[],
     defaultCwd: string,
     signal: AbortSignal | undefined,
@@ -2508,6 +2519,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             parentSessionFile,
             interactiveShutdownGeneration,
             parentThinkingLevel,
+            parentNativeCodemodeActive,
             parentDepth: currentDepth,
             parentAgentStack: ancestorAgentStack,
             maxDepth,

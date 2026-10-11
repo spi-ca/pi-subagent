@@ -324,3 +324,10 @@ describe("inherited CLI args", () => {
     });
   });
 });
+
+test("captures negative-only tool modifiers and does not parse prompt flags after --", () => {
+  assert.equal(parseInheritedCliArgs(["node", "pi", "--tools", "-codemode"]).fallbackTools, "-codemode");
+  const parsed = parseInheritedCliArgs(["node", "pi", "-t", "read,mcp__docs__*", "-xt", "mcp__docs__delete", "--", "--no-mcp", "--tools", "mcp__other__*"]);
+  assert.equal(parsed.fallbackTools, "read,mcp__docs__*");
+  assert.deepEqual(parsed.alwaysProxy, ["-xt", "mcp__docs__delete"]);
+});

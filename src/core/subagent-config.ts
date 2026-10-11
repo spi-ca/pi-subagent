@@ -13,7 +13,7 @@ import type { AccountingUsage } from "./accounting-usage.js";
 export const BACKGROUND_BEHAVIOR_GUIDANCE = "background=true returns immediately; results auto-deliver; do not poll.";
 
 export const SUBAGENT_INVOCATION_SHAPES_GUIDANCE = "Provide exactly one: agent+task, tasks, chain, or action.";
-export const MODEL_OVERRIDE_DESCRIPTION = "Model overrides the agent default at any call, task, or stage.";
+export const MODEL_OVERRIDE_DESCRIPTION = "model overrides agent default; model/cwd: top-level for singles, per task/sequential stage; parallel stages use tasks. Top-level cwd ignored for tasks/chain.";
 export const MAX_AGENT_DESCRIPTION_CHARS = 96;
 
 export function truncateAgentDescription(description: string, maxChars = MAX_AGENT_DESCRIPTION_CHARS): string {
@@ -25,10 +25,10 @@ export function truncateAgentDescription(description: string, maxChars = MAX_AGE
 
 export function formatSubagentToolDescription(): string {
   return [
-    "Delegate to subagents.",
     SUBAGENT_INVOCATION_SHAPES_GUIDANCE,
-    `${MODEL_OVERRIDE_DESCRIPTION} Chain labels must be unique.`,
-    "Chain defaults to on_success; recovery requires continueOnError on the failed stage.",
+    MODEL_OVERRIDE_DESCRIPTION,
+    "status without id lists background jobs; cancel without id cancels all running background jobs. Cancel ACK is not terminal.",
+    "Chain labels unique; defaults to on_success; recovery requires continueOnError on failed stage.",
     `mode: spawn default; fork adds parent context. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
   ].join("\n");
 }

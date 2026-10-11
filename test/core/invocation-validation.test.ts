@@ -132,6 +132,21 @@ describe("raw subagent invocation validation", () => {
     }), null);
   });
 
+  test("accepts model/cwd on single calls, tasks, and sequential stages, not parallel stages", () => {
+    const task = { agent: "worker", task: "inspect", model: "model", cwd: "/workspace/task" };
+    assert.equal(validateSubagentInvocation(task), null);
+    assert.equal(validateSubagentInvocation({ tasks: [task], cwd: "/workspace/ignored" }), null);
+    assert.equal(validateSubagentInvocation({
+      chain: [task, { type: "parallel", tasks: [task] }], cwd: "/workspace/ignored",
+    }), null);
+    for (const shape of [{ tasks: [task] }, { chain: [task] }]) {
+      expectValidationError({ ...shape, model: "model" }, "option-combination", "model");
+    }
+    for (const option of [{ model: "model" }, { cwd: "/workspace/stage" }]) {
+      expectValidationError({ chain: [{ type: "parallel", tasks: [task], ...option }] }, "input-type", "chain[0]");
+    }
+  });
+
   test("preserves blank chain labels because execution falls back to numbered steps", () => {
     const stage = { label: " \t", agent: "worker", task: "inspect" };
     assert.equal(validateSubagentInvocation({ chain: [stage] }), null);
@@ -190,5 +205,7 @@ describe("raw subagent invocation validation", () => {
     assert.equal(schema.properties.chain.items.anyOf[0].properties.cwd.minLength, 1);
     assert.equal(schema.properties.chain.items.anyOf[0].additionalProperties, false);
     assert.equal(schema.properties.chain.items.anyOf[1].additionalProperties, false);
+    assert.equal(schema.properties.chain.items.anyOf[1].properties.model, undefined);
+    assert.equal(schema.properties.chain.items.anyOf[1].properties.cwd, undefined);
   });
 });

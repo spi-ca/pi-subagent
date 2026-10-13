@@ -1,5 +1,13 @@
 # 변경 기록
 
+## v20261013-1
+
+- 실행 중인 단일 background child에 정확한 전체 job ID로 `action: "steer"` 지시를 보낸다. 최대 512 UTF-8 바이트의 한 메시지만 접수하며 awaited `turn_end`에서 기존 실행의 컨텍스트에 반영한다. ACK는 inbox 접수일 뿐 모델 적용·수행을 보장하지 않으며 자동 재시도·주기 polling·새 prompt 실행은 없다.
+- `report_to_parent`로 단일·병렬·체인의 실행 중 leaf가 direct parent에 짧게 보고한다. 부모가 고정한 agent·job·child 식별과 단계/작업 위치를 표시하고, child 실행당 4회 시도·부모 세션당 32개 예약 ledger 및 취소·소유권·세션 fence를 적용한다.
+- 보고 자체는 모델 실행을 시작하지 않는다. Pi `1.2.0`에서는 `nextTurn`의 대기 보고가 다음 사용자 또는 최종 완료 알림의 custom-message 실행에서 한 번 소비될 수 있다. custom 실행에도 에이전트 안내를 유지하고 시작 중 큐잉·취소를 실제 host의 오프라인 회귀로 검증한다.
+- Pi 개발 의존성·lockfile·현재 CI graph를 exact `1.2.0`으로 갱신하고 현재 graph의 `chord`를 제거했다. Shared `@pi/presence`를 immutable `v2-20261013-1`로 동기화하며 V2 protocol·runtime API·ABI는 유지한다.
+- 실제 provider·multiplexer 검증은 자동 CI와 별도의 opt-in 작업이다.
+
 ## v20261009-1
 
 - Pi 개발 의존성과 현재 CI graph를 exact `1.1.0`으로 동기화했다. shared `@pi/presence`는 immutable `v2-20261009-1`로 고정하며, peeled commit·V2 protocol·ABI는 기존 `v2-20261004-1`과 같다.

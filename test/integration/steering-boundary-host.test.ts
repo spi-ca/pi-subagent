@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
-  VERSION, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+  createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
   type BoundaryState, type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft,
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import inlineBridge, { INLINE_STEERING_STATE_PATH_ENV } from "../../src/runtime/inline-steering-bridge";
 import { STEERING_CUSTOM_TYPE } from "../../src/runtime/steering-inbox";
 import { LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
+import { assertSelectedPiHost, SELECTED_PI_VERSION } from "../helpers/selected-pi-host";
 
 function latch() {
   let release!: () => void;
@@ -20,7 +21,7 @@ function latch() {
 // Exact installed host, public SDK and real authenticated socket. The only
 // synthetic seam is its public streamFunction; no native prompt/input mocks.
 async function fixture(inherited: (pi: ExtensionAPI) => void) {
-  assert.equal(VERSION, "1.1.0");
+  assertSelectedPiHost();
   const saved = { ...process.env }, originalFetch = globalThis.fetch;
   let forbiddenCalls = 0;
   const forbidden = (): never => { forbiddenCalls++; throw Error("Offline host forbids auth/network/provider/discovery"); };
@@ -103,7 +104,7 @@ async function fixture(inherited: (pi: ExtensionAPI) => void) {
 
 for (const boundary of ["turn_end"] as const) {
   for (const inputAction of ["transform", "handled"] as const) {
-    test(`Pi 1.1 socket inbox at ${boundary} bypasses inherited ${inputAction} input and continues exactly once`, { timeout: 15_000 }, async () => {
+    test(`Pi ${SELECTED_PI_VERSION} socket inbox at ${boundary} bypasses inherited ${inputAction} input and continues exactly once`, { timeout: 15_000 }, async () => {
       const reached = latch(), resume = latch();
       let inputCalls = 0, extensionInputCalls = 0, prompts = 0, boundaries = 0;
       const inheritedEntry: SessionBoundaryDraft = { type: "custom_message", customType: "inherited", content: "earlier boundary context", display: false };
@@ -155,7 +156,7 @@ for (const boundary of ["turn_end"] as const) {
 }
 
 for (const mode of ["completed", "abort-before-request"] as const) {
-  test(`Pi 1.1 pre-settle ${mode} rejects steering despite completed outcome and unaborted preceding signal`, { timeout: 15_000 }, async () => {
+  test(`Pi ${SELECTED_PI_VERSION} pre-settle ${mode} rejects steering despite completed outcome and unaborted preceding signal`, { timeout: 15_000 }, async () => {
     const reached = latch(), resume = latch();
     let context: ExtensionContext | undefined, precedingSignal: AbortSignal | undefined;
     let capturedOutcome: BoundaryState["outcome"] | undefined, prompts = 0;
@@ -194,7 +195,7 @@ for (const mode of ["completed", "abort-before-request"] as const) {
 }
 
 for (const mode of ["abort", "error", "settled"] as const) {
-  test(`Pi 1.1 ${mode} arrival makes zero new prompts/streams or steering transcript mutations`, { timeout: 15_000 }, async () => {
+  test(`Pi ${SELECTED_PI_VERSION} ${mode} arrival makes zero new prompts/streams or steering transcript mutations`, { timeout: 15_000 }, async () => {
     const reached = latch(), resume = latch();
     let context: ExtensionContext | undefined, prompts = 0;
     const f = await fixture((pi) => {

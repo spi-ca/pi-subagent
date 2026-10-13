@@ -4,7 +4,7 @@ Pi에서 전문화된 하위 에이전트에게 작업을 위임하는 확장 �
 
 저장소: <https://github.com/spi-ca/pi-subagent>
 
-> Presence는 shared [`@pi/presence` protocol (v2-20260907-1)](https://github.com/spi-ca/pi-presence/tree/v2-20260907-1)을 사용하며, 네 extension이 동일한 `github:spi-ca/pi-presence#v2-20260907-1` release tag를 사용합니다.
+> Presence는 shared [`@pi/presence` protocol (v2-20261013-1)](https://github.com/spi-ca/pi-presence/tree/v2-20261013-1)을 사용하며, 네 extension이 동일한 `github:spi-ca/pi-presence#v2-20261013-1` release tag를 사용합니다.
 
 ## 제공 기능
 

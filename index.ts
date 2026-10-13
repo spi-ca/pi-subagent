@@ -1339,7 +1339,7 @@ export default function (pi: ExtensionAPI) {
     await settleWithUnrefTimeout(handoffs, limits.backgroundShutdownSettleMs);
   });
 
-  // Inject available agents into the system prompt
+  // Both user- and custom-triggered runs need the available-agent instructions.
   pi.on("before_agent_start", async (event) => {
     if (!canDelegate) return;
     if (discoveredAgents.length === 0) return;

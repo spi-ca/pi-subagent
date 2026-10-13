@@ -71,6 +71,9 @@ describe("CI stage partition and external timeout boundary", () => {
 			assert.ok(required.every((file) => assigned.includes(file)));
 		}
 		assert.ok(inventory.core.includes("test/release/ci-stage-boundary.test.ts"), "boundary regression coverage stays in core");
+		for (const file of ["custom-turn-host", "steering-boundary-host", "parent-report-host", "managed-codemode-host"]) {
+			assert.ok(inventory.core.includes(`test/integration/${file}.test.ts`), `${file} must run in a fresh coordinator process`);
+		}
 		const missing = structuredClone(inventory);
 		missing.phase0 = [];
 		assert.throws(() => validateCiInventory(assigned, missing), /missing=.*performance-phase0|empty=phase0/);

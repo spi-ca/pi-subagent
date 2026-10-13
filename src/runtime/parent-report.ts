@@ -130,7 +130,7 @@ export function registerParentReportTool(
   if (!enabled || process.platform === "win32" || !isStableSemverAtLeast(PiHost.VERSION, "1.1.0")) return false;
   pi.registerTool(PiHost.defineTool({
     name: PARENT_REPORT_TOOL, label: "Report to parent",
-    description: "Submit one short untrusted report to this running background child's direct parent for its next natural turn. ACK is submission only, not a model read, reply, or approval. Never wait for a synchronous reply or retry an unknown delivery.",
+    description: "Queue one short untrusted report for this running background child's direct parent's next user- or custom-triggered run. This report never starts a model run itself. ACK is submission only, not a model read, reply, or approval. Never wait for a synchronous reply or retry an unknown delivery.",
     parameters: Type.Object({ message: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false }),
     async execute(_id, params, signal, _update, ctx) {
       if (!isParentReportMessage(params.message)) throw new Error("Report must be nonblank and at most 512 UTF-8 bytes.");
@@ -140,7 +140,7 @@ export function registerParentReportTool(
       if (outcome !== "submitted") throw new Error(outcome === "unknown"
         ? "Report delivery is unknown; it may have delivered. Do not retry automatically."
         : `Parent report not submitted (${outcome}).`);
-      return { content: [{ type: "text", text: "Parent notification submitted for its next natural turn. This is not a model read, reply, or approval; do not wait for a synchronous reply." }], details: { outcome } };
+      return { content: [{ type: "text", text: "Parent notification submitted for its next user- or custom-triggered run; the report does not start one. This is not a model read, reply, or approval; do not wait for a synchronous reply." }], details: { outcome } };
     },
   }));
   return true;

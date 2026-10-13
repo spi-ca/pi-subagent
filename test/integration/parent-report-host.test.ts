@@ -8,6 +8,7 @@ import { INLINE_STEERING_STATE_PATH_ENV } from "../../src/runtime/inline-steerin
 import { ParentReportAdmission, PARENT_REPORT_RECEIPT_TYPE, PARENT_REPORT_CUSTOM_TYPE, PARENT_REPORT_ENV, PARENT_REPORT_TOOL } from "../../src/runtime/parent-report";
 import { buildPiArgs, collectManagedOverriddenBuiltinTools } from "../../src/runtime/runner";
 import { LifecycleEventClient, LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
+import { assertSelectedPiHost, SELECTED_PI_VERSION } from "../helpers/selected-pi-host";
 
 function sender(jobId: string) { return { jobId, childId: `leaf-${jobId}`, agent: "reporter", mode: "single" as const }; }
 
@@ -22,9 +23,9 @@ function registerParentReportAdmission(pi: ExtensionAPI): ParentReportAdmission 
   return admission;
 }
 
-for (const active of [false, true]) for (const codemode of [false, true]) for (const multi of [false, true]) {
-  test(`real Pi 1.1 ${multi ? "multi-child" : "single-child"} ${codemode ? "native codemode" : "direct tool"} report to ${active ? "active" : "idle"} parent is nextTurn only`, { timeout: 20_000 }, async () => {
-    assert.equal(VERSION, "1.1.0");
+for (const active of [false, true]) for (const codemode of [false, true]) for (const multi of [false, true]) for (const trigger of ["user", "custom"] as const) {
+  test(`real Pi ${SELECTED_PI_VERSION} ${multi ? "multi-child" : "single-child"} ${codemode ? "native codemode" : "direct tool"} report to ${active ? "active" : "idle"} parent waits for ${trigger} run`, { timeout: 20_000 }, async () => {
+    assertSelectedPiHost();
     const saved = { ...process.env }, originalFetch = globalThis.fetch;
     let forbiddenCalls = 0;
     const forbidden = (): never => { forbiddenCalls++; throw Error("No auth discovery, network, or real provider allowed"); };
@@ -77,8 +78,8 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
         };
         return { session, manager, requests, errors };
       }
-      let admission!: ParentReportAdmission;
-      const parent = await host("parent", [pi => { admission = registerParentReportAdmission(pi); }], []);
+      let admission!: ParentReportAdmission, parentPi!: ExtensionAPI;
+      const parent = await host("parent", [pi => { parentPi = pi; admission = registerParentReportAdmission(pi); }], []);
       let parentRun: Promise<void> | undefined;
       if (active) { parentRun = parent.session.prompt("parent active natural task"); await reached.promise; }
       const identities = multi ? [
@@ -126,7 +127,13 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
       resume.release(); await parentRun;
       assert.equal(parent.requests.length, active ? 1 : 0);
       assert.equal(parent.manager.getBranch().some(e => e.type === "custom_message" && e.customType === PARENT_REPORT_CUSTOM_TYPE), false);
-      await parent.session.prompt("next natural user prompt");
+      if (trigger === "user") await parent.session.prompt("next natural user prompt");
+      else {
+        // Production background results use this public API to start a custom run.
+        // Pending reports join it, but never trigger a run independently.
+        parentPi.sendMessage({ customType: "subagent_result", content: "final background result", display: true }, { triggerTurn: true });
+        await parent.session.waitForIdle();
+      }
       assert.equal(parent.requests.length, active ? 2 : 1);
       const context = parent.requests.at(-1)!;
       const reports = context.filter(m => JSON.stringify(m.content).includes("/skill:literal 한글 report"));
@@ -145,6 +152,7 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
       }
       await parent.session.prompt("another natural prompt");
       assert.equal(parent.requests.at(-1)!.filter(m => JSON.stringify(m.content).includes("/skill:literal 한글 report")).length, identities.length);
+      assert.equal(parent.manager.getBranch().filter(e => e.type === "custom_message" && e.customType === PARENT_REPORT_CUSTOM_TYPE).length, identities.length, "each report committed only once");
       assert.deepEqual(parent.errors, []);
       for (const child of children) assert.deepEqual(child.errors, []);
       assert.equal(forbiddenCalls, 0);
@@ -162,7 +170,7 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
 
 for (const consumed of [false, true]) {
   test(`real Pi registration: 32 ${consumed ? "consumed" : "unconsumed"} reports survive reload/branch recreation; replacement gets fresh budget`, { timeout: 20_000 }, async () => {
-    assert.equal(VERSION, "1.1.0");
+    assertSelectedPiHost();
     const saved = { ...process.env }, originalFetch = globalThis.fetch;
     let forbiddenCalls = 0;
     const forbidden = (): never => { forbiddenCalls++; throw Error("No credentials, network or live providers"); };

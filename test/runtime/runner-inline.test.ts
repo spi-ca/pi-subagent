@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildStoppedBootstrapArgv, monitorInlineProcess, resolvePiSpawnForTest, resumeStoppedBootstrapForTest, resumeStoppedProcessForTest, runAgent, signalUnixProcessTree, STOPPED_BOOTSTRAP_WATCHDOG_SECONDS, type StoppedProcessResumeProbe } from "../../src/runtime/runner";
+import { buildPiArgs, buildStoppedBootstrapArgv, monitorInlineProcess, resolvePiSpawnForTest, resumeStoppedBootstrapForTest, resumeStoppedProcessForTest, runAgent, signalUnixProcessTree, STOPPED_BOOTSTRAP_WATCHDOG_SECONDS, type StoppedProcessResumeProbe } from "../../src/runtime/runner";
 import { getProcessStartedAt } from "../../src/runtime/run-protocol";
 import { AssistantSignatureIndex } from "../../src/runtime/assistant-signature-index";
 import { emptyUsage, getFinalOutput, normalizeCompletedResult } from "../../src/core/types";
@@ -494,6 +494,25 @@ describe("inline runner path", () => {
     assert.equal(monitored.exitCode, 1);
     assert.equal((result as any).sawAgentEnd, false);
     assert.equal(getFinalOutput(result.messages as any), "");
+  });
+
+  test("JSON -p keeps length-limited final text and stopReason instead of applying text-print failure semantics", async () => {
+    const agent = { name: "reader", description: "", systemPrompt: "", source: "user" as const, filePath: "/reader.md", tools: ["read"] };
+    const args = buildPiArgs(agent, null, "/task", "spawn", null);
+    assert.equal(args[args.indexOf("--mode") + 1], "json");
+    assert.ok(args.includes("-p"));
+    // Pi 1.2's length-limit exit error belongs to mode=text only. The JSON
+    // stream retains its completed assistant record and ordinary process exit.
+    const message = { role: "assistant", content: [{ type: "text", text: "bounded final response" }], stopReason: "length" };
+    const events = [{ type: "message_end", message }, { type: "agent_end", messages: [message] }, { type: "agent_settled", aborted: false }];
+    const proc = spawn(process.execPath, ["-e", `for (const event of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(event) + "\\n");`], { stdio: ["ignore", "pipe", "pipe"] });
+    const result = { agent: "reader", agentSource: "user" as const, task: "length limit", exitCode: -1, messages: [], stderr: "", usage: emptyUsage() };
+    const monitored = await monitorInlineProcess(proc as any, result as any, undefined, () => {});
+    result.exitCode = monitored.exitCode;
+    const normalized = normalizeCompletedResult(result as any, monitored.wasAborted);
+    assert.equal(normalized.exitCode, 0);
+    assert.equal(normalized.stopReason, "length");
+    assert.equal(getFinalOutput(normalized.messages), "bounded final response");
   });
 
   test("preserves semantic completion across chunked JSONL output", async () => {

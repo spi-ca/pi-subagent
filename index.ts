@@ -47,6 +47,7 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/structured-result.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
+import { ParentReportAdmission } from "./src/runtime/parent-report.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -85,6 +86,8 @@ import {
   BackgroundJobSessionFence,
   cancelBackgroundJobs,
   createBackgroundJobRecord,
+  snapshotBackgroundJob,
+  steerBackgroundJob,
   extractToolText,
   finalizeBackgroundJobForSession,
   formatBackgroundJobListEntry,
@@ -244,10 +247,10 @@ function backgroundJobStatusListDetails(jobs: BackgroundJobSnapshot[], event: "s
   };
 }
 
-function backgroundOperationForStructuredError(input: unknown): "start" | "status" | "cancel" | undefined {
+function backgroundOperationForStructuredError(input: unknown): "start" | "status" | "cancel" | "steer" | undefined {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
   const value = input as { action?: unknown; background?: unknown };
-  if (value.action === "status" || value.action === "cancel") return value.action;
+  if (value.action === "status" || value.action === "cancel" || value.action === "steer") return value.action;
   return value.background === true ? "start" : undefined;
 }
 
@@ -712,6 +715,7 @@ export default function (pi: ExtensionAPI) {
   const releaseForegroundPermitScope = async (scope: ForegroundDelegationScope): Promise<boolean> =>
     await foregroundPermitScopes.release(scope);
   const backgroundSessionFence = new BackgroundJobSessionFence();
+  const parentReports = new ParentReportAdmission(pi);
   const uxRegistry = new SubagentUxRegistry({ recentLimit: 20 });
   const reaperDiagnosticUx = new ReaperDiagnosticUx();
   let reaperDiagnosticGeneration = 0;
@@ -1010,7 +1014,38 @@ export default function (pi: ExtensionAPI) {
           : undefined;
         if (permitContext && !treePermitLease) return makeUnstartedAbortResult(options.agentName, options.task, options.stageLabel, options.model);
         try {
-          return await runAgent({ ...options, forkSourceOwnership: forkManager, forkChildId, treePermitLease, maxActive: limits.maxActive, limits, managedOverriddenBuiltinTools });
+          const backgroundJob = options.invocationId ? backgroundJobs.get(options.invocationId) : undefined;
+          const reportSession = backgroundSessionFence.capture();
+          let childRunning = true;
+          const childOptions = { ...options };
+          if (backgroundJob) {
+            const available = () => childRunning && !options.signal?.aborted
+              && backgroundJobs.get(backgroundJob.id) === backgroundJob && backgroundSessionFence.isCurrent(reportSession)
+              && backgroundJob.status === "running" && !backgroundJob.controller?.signal.aborted;
+            childOptions.onParentReport = parentReports.bind({
+              jobId: backgroundJob.id,
+              childId: crypto.randomUUID(),
+              agent: options.agentName,
+              mode: backgroundJob.mode,
+              ...options.reportPosition,
+            }, available);
+            // Reporting is per leaf. Steering remains an exact SINGLE job handle.
+            if (backgroundJob.mode === "single") {
+              childOptions.onSteeringReady = (handle: BackgroundJobRecord["steer"]) => {
+                if (!available()) return;
+                if (handle) backgroundJob.steer = handle;
+                else delete backgroundJob.steer;
+              };
+            }
+          }
+          try {
+            return await runAgent({ ...childOptions,
+              forkSourceOwnership: forkManager, forkChildId, treePermitLease, maxActive: limits.maxActive, limits, managedOverriddenBuiltinTools });
+          } finally {
+            // A completed leaf cannot report during later chain stages or while
+            // siblings still run, even if a transport retains its old callback.
+            childRunning = false;
+          }
         } finally {
           if (treePermitLease) {
             const releasedBeforeBind = await treePermitLease.release().catch(() => false);
@@ -1087,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
     // fence old finalizers before a slow config read can yield to them.
     const startupGeneration = ++sessionStartupGeneration;
     backgroundSessionFence.startSession();
+    parentReports.reset(ctx.sessionManager);
     reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
     cancelBackgroundJobs(backgroundJobs);
     backgroundJobs.clear();
@@ -1261,6 +1297,7 @@ export default function (pi: ExtensionAPI) {
     ++sessionStartupGeneration;
     sessionShuttingDown = true;
     backgroundSessionFence.invalidate();
+    parentReports.close();
     resetInlinePresentationWidget();
     reaperDiagnosticGeneration = reaperDiagnosticUx.invalidateSession();
     const priorSessionSettlements = Array.from(backgroundJobSettlements.values());
@@ -1302,7 +1339,7 @@ export default function (pi: ExtensionAPI) {
     await settleWithUnrefTimeout(handoffs, limits.backgroundShutdownSettleMs);
   });
 
-  // Inject available agents into the system prompt
+  // Both user- and custom-triggered runs need the available-agent instructions.
   pi.on("before_agent_start", async (event) => {
     if (!canDelegate) return;
     if (discoveredAgents.length === 0) return;
@@ -1432,6 +1469,25 @@ export default function (pi: ExtensionAPI) {
                   : "No background subagent jobs.",
               }],
               details: backgroundJobStatusListDetails(jobs),
+            };
+          }
+
+          if (action === "steer") {
+            // Map lookup is exact: no trimming, prefix guessing, history replay, or broadcast.
+            const sessionToken = backgroundSessionFence.capture();
+            const outcome = await steerBackgroundJob(backgroundJobs, params.id!, params.message!,
+              () => backgroundSessionFence.isCurrent(sessionToken) && canStartInvocation());
+            if (outcome === "not-found") return failOperational("runtime-policy", "Background subagent job was not found (exact full id required).");
+            if (outcome === "unsupported") return failOperational("runtime-policy", "Steering supports single-agent background jobs only.");
+            if (outcome !== "submitted") return failOperational("runtime-policy",
+              outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically." : "Child did not accept steering (unavailable, busy, or idle).");
+            const job = backgroundJobs.get(params.id!);
+            if (!job || job.status !== "running" || job.controller?.signal.aborted || !backgroundSessionFence.isCurrent(sessionToken)) {
+              return failOperational("runtime-policy", "Steering outcome is unknown after completion or session replacement; do not retry automatically.");
+            }
+            return {
+              content: [{ type: "text", text: `Child admitted steering to its bounded inbox for background subagent job ${job.id}. This is not native queue or model application confirmation; do not retry automatically.` }],
+              details: backgroundJobActionDetails("steering-submitted", snapshotBackgroundJob(job)),
             };
           }
 
@@ -2244,6 +2300,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
               agentName: task.agent,
               task: buildChainTaskFromStages(task.task, stages),
               stageLabel: label,
+              reportPosition: { stageIndex: index, stageLabel: label, taskIndex },
               taskCwd: task.cwd,
               model: task.model,
               delegationMode,
@@ -2343,6 +2400,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
         agentName: taskStage.agent,
         task: buildChainTaskFromStages(taskStage.task, stages),
         stageLabel: label,
+        reportPosition: { stageIndex: index, stageLabel: label },
         taskCwd: taskStage.cwd,
         model: taskStage.model,
         delegationMode,
@@ -2495,6 +2553,7 @@ This guard prevents self-recursion and cyclic handoffs (for example A -> B -> A)
             agents,
             agentName: t.agent,
             task: t.task,
+            reportPosition: { taskIndex: index },
             taskCwd: t.cwd,
             model: t.model,
             delegationMode,

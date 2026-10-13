@@ -7,12 +7,13 @@ import {
   DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { buildPiArgs } from "../../src/runtime/runner";
+import { assertSelectedPiHost, SELECTED_PI_VERSION } from "../helpers/selected-pi-host";
 
 // Real, exact installed Pi host; no Bun module mocks, model prompts, auth/config
 // reads, catalog refresh, MCP connection, or provider calls. The CI inventory
 // gives this file a fresh OS process, independent of mocked entrypoint tests.
-test("Pi 1.1.0 resource loader and native session execute managed builtin:codemode with only selected readers", { timeout: 20_000 }, async () => {
-  assert.equal(VERSION, "1.1.0");
+test(`Pi ${SELECTED_PI_VERSION} resource loader and native session execute managed builtin:codemode with only selected readers`, { timeout: 20_000 }, async () => {
+  assertSelectedPiHost();
   const tempParent = path.join(process.cwd(), ".bun-tmp");
   await fs.mkdir(tempParent, { recursive: true });
   const root = await fs.mkdtemp(path.join(tempParent, "managed-codemode-"));

@@ -29,6 +29,9 @@ import {
 import type { AgentConfig } from "../core/agents.js";
 import { DEFAULT_SUBAGENT_LIMITS, MAX_SUBAGENT_ACTIVE, SUBAGENT_LIMIT_DEFINITIONS, subagentLimitsToEnv, type SubagentLimits } from "../core/subagent-limits.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
+import { PARENT_REPORT_ENV, PARENT_REPORT_TOOL, prepareParentReportHandler } from "./parent-report.js";
+import { INLINE_STEERING_STATE_PATH_ENV } from "./inline-steering-bridge.js";
+import type { SteeringHandle } from "../core/subagent-steering.js";
 import { createJsonLineChunkProcessor } from "./runner-core.js";
 import {
   createCmuxControlCommandRunner,
@@ -936,6 +939,7 @@ export function watchDetachedInteractiveRunForRetirementForTest(runId: string): 
   const run = activeInteractiveRuns.get(runId);
   if (!run?.paths) return false;
   run.ownership = "detached";
+  lifecycleEventServer?.closeReporting(runId);
   run.updatedAt = Date.now();
   watchDetachedInteractiveRunForRetirement(run, 0);
   return detachedRetirementWatchers.has(runId);
@@ -1691,6 +1695,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
     notifyOwnershipUnknown ||= run.ownership === "detached";
     cancelCompletedHerdrRetirementWatcher(runId);
     run.ownership = "ownership-unknown";
+    lifecycleEventServer?.closeReporting(runId);
     run.updatedAt = Date.now();
     return "ownership-unknown";
   };
@@ -1757,6 +1762,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       // while the child is fencing and acknowledging the handoff.
       cancelCompletedHerdrRetirementWatcher(runId);
       run.ownership = "transferring";
+      lifecycleEventServer?.closeReporting(runId);
       run.updatedAt = Date.now();
       try {
         if (await publishImmutableJson(run.paths!.promotionRequestPath, request) === "exists") {
@@ -1777,6 +1783,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       request = winner;
       cancelCompletedHerdrRetirementWatcher(runId);
       run.ownership = "transferring";
+      lifecycleEventServer?.closeReporting(runId);
       run.updatedAt = Date.now();
     }
     try {
@@ -1797,6 +1804,7 @@ export async function promoteInteractiveRun(runId: string, detachedAt = Date.now
       const committed = await withInteractiveFenceMutex(() => {
         if (activeInteractiveRuns.get(runId) !== run || run.ownership !== "transferring") return false;
         run.ownership = "detached";
+        lifecycleEventServer?.closeReporting(runId);
         run.updatedAt = Date.now();
         return true;
       });
@@ -4429,6 +4437,8 @@ export function buildChildProcessEnv(opts: {
     SUBAGENT_LEASE_STALE_MS_ENV,
     SUBAGENT_EXPECTED_PARENT_PID_ENV,
     SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV,
+    PARENT_REPORT_ENV,
+    INLINE_STEERING_STATE_PATH_ENV,
     SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV,
     SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV,
     PHASE0_LIVE_PROOF_ID_ENV,
@@ -4522,7 +4532,7 @@ export function resolveManagedChildPolicy(env: NodeJS.ProcessEnv = process.env):
   throw new Error(`${SUBAGENT_MANAGED_CHILD_POLICY_ENV} must be exactly inherit or managed.`);
 }
 
-const MANAGED_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "codemode"]);
+const MANAGED_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "codemode", PARENT_REPORT_TOOL]);
 const MANAGED_DEFAULT_ACTIVE_TOOLS = ["read", "bash", "edit", "write", "subagent"] as const;
 
 function resolveChildToolSelection(agent: Pick<AgentConfig, "tools">, fallbackTools?: string): string[] | undefined {
@@ -4536,6 +4546,10 @@ export function collectManagedOverriddenBuiltinTools(tools: readonly {
   sourceInfo?: { source?: string; path?: string };
 }[]): string[] {
   return tools.filter((tool) => {
+    if (tool.name === PARENT_REPORT_TOOL) {
+      const ownedPaths = ["./inline-steering-bridge.ts", "./child-bridge.ts"].map((relative) => canonicalizeExtensionPath(fileURLToPath(new URL(relative, import.meta.url))));
+      return !tool.sourceInfo?.source || tool.sourceInfo.source === "builtin" || !tool.sourceInfo.path || !ownedPaths.includes(canonicalizeExtensionPath(tool.sourceInfo.path));
+    }
     if (tool.name === "codemode") {
       return tool.sourceInfo?.source !== "builtin" || tool.sourceInfo?.path !== "builtin:codemode";
     }
@@ -4552,6 +4566,9 @@ export function assertManagedChildToolCompatibility(
   const configured = resolveChildToolSelection(agent, fallbackTools);
   const unsupported = configured?.filter((name) => !MANAGED_BUILTIN_TOOLS.has(name)) ?? [];
   if (unsupported.length > 0) throw new Error(`managed child policy cannot preserve extension-owned tools: ${unsupported.join(", ")}`);
+  if (configured?.includes(PARENT_REPORT_TOOL) && !isStableSemverAtLeast(hostVersion, "1.1.0")) {
+    throw new Error("Direct-parent reporting requires a verified stable Pi >=1.1.0 host.");
+  }
   if (configured?.includes("codemode") && !isStableSemverAtLeast(hostVersion, "1.1.0")) {
     throw new Error("managed child codemode requires a verified stable Pi >=1.1.0 host.");
   }
@@ -4560,6 +4577,12 @@ export function assertManagedChildToolCompatibility(
   const effective = configured ?? (fallbackNoTools ? [] : [...MANAGED_DEFAULT_ACTIVE_TOOLS]);
   const overridden = effective.filter((name) => overriddenBuiltinTools.includes(name));
   if (overridden.length > 0) throw new Error(`managed child policy cannot preserve extension overrides for built-in tools: ${overridden.join(", ")}`);
+}
+
+export function selectsParentReport(agent: Pick<AgentConfig, "tools">, fallbackTools?: string, fallbackNoTools = false): boolean {
+  const selection = resolveChildToolSelection(agent, fallbackTools);
+  if (selection === undefined || (agent.tools === undefined && fallbackTools === undefined && fallbackNoTools)) return false;
+  return selection.includes(PARENT_REPORT_TOOL);
 }
 
 /** --tools alone keeps indirect MCP capabilities on newer Pi hosts. */
@@ -4840,6 +4863,8 @@ export interface RunAgentOptions {
   task: string;
   /** Optional chain stage label used for UI display. */
   stageLabel?: string;
+  /** Parent-owned leaf position for reports. Indices are zero-based. */
+  reportPosition?: Readonly<{ stageIndex?: number; stageLabel?: string; taskIndex?: number }>;
   /** Process-local parent invocation correlation; never persisted or emitted. */
   invocationId?: string;
   /** Optional override working directory. */
@@ -4882,6 +4907,10 @@ export interface RunAgentOptions {
   managedOverriddenBuiltinTools?: string[];
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
+  /** Private active-only steering transport for background single calls. */
+  onSteeringReady?: (handle: SteeringHandle | undefined) => void;
+  /** Only the exact current background parent supplies this leaf binding. */
+  onParentReport?: (message: string) => boolean;
   /** Streaming update callback. */
   onUpdate?: OnUpdateCallback;
   /** Invocation-scoped immutable fork source authority. */
@@ -4972,6 +5001,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     };
   }
 
+  const reportingSelected = selectsParentReport(agent, inheritedCliArgs.fallbackTools, inheritedCliArgs.fallbackNoTools);
   const result: SingleResult = {
     agent: agentName,
     agentSource: agent.source,
@@ -4986,6 +5016,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   };
 
   try {
+    if (reportingSelected
+      && (!opts.onParentReport || process.platform === "win32" || !isStableSemverAtLeast(PiHost.VERSION, "1.1.0"))) {
+      throw new Error("Direct-parent reporting supports only running background children on stable Pi >=1.1.0 Unix hosts.");
+    }
+    if (reportingSelected && managedOverriddenBuiltinTools?.includes(PARENT_REPORT_TOOL)) {
+      throw new Error("Direct-parent reporting cannot preserve an unrelated extension override of report_to_parent.");
+    }
     if (resolveManagedChildPolicy() === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools, inheritedCliArgs.fallbackNoTools);
   } catch (error) {
     result.exitCode = 1; result.stopReason = "error"; result.errorMessage = error instanceof Error ? error.message : String(error); result.stderr = result.errorMessage;
@@ -5081,6 +5118,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       result,
       agent,
       invocationId,
+      onSteeringReady: opts.onSteeringReady,
+      onParentReport: opts.onParentReport,
       cwd,
       taskCwd,
       modelOverride,
@@ -5114,6 +5153,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   let forkSessionTmpDir: string | null = null;
   let taskTmpDir: string | null = null;
   let inheritedApiKeyAgentDir: string | null = null;
+  let inlineLifecycleServer: LifecycleEventServer | null = null;
+  let inlineLifecycleRunId: string | undefined;
 
   try {
     const promptTmp = agent.systemPrompt.trim()
@@ -5152,16 +5193,61 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       undefined,
       parentThinkingLevel,
     );
+    let steeringEnv: Record<string, string> | undefined;
+    if ((opts.onSteeringReady || (opts.onParentReport && reportingSelected)) && !isWindows) {
+      inlineLifecycleServer = await getLifecycleEventServer();
+      if (reportingSelected && !inlineLifecycleServer) {
+        result.exitCode = 1;
+        result.stopReason = "error";
+        result.errorMessage = "Direct-parent reporting is unavailable: authenticated lifecycle socket could not be enabled.";
+        result.stderr = result.errorMessage;
+        return result;
+      }
+      if (inlineLifecycleServer && !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration)) {
+        inlineLifecycleRunId = createRunId();
+        const token = inlineLifecycleServer.registerRun(inlineLifecycleRunId, true);
+        const tokenPath = path.join(taskTmp.dir, "lifecycle-token");
+        await writeLifecycleBootstrapToken(tokenPath, token);
+        if (opts.onParentReport && reportingSelected) {
+          inlineLifecycleServer.setReportHandler(inlineLifecycleRunId, (message, eligible) =>
+            !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && eligible() && opts.onParentReport!(message), signal);
+        }
+        inlineLifecycleServer.activateRun(inlineLifecycleRunId);
+        steeringEnv = {
+          [SUBAGENT_RUN_ID_ENV]: inlineLifecycleRunId,
+          [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: inlineLifecycleServer.socketPath,
+          [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: tokenPath,
+          [INLINE_STEERING_STATE_PATH_ENV]: path.join(taskTmp.dir, "state.json"),
+          ...(opts.onParentReport && reportingSelected ? { [PARENT_REPORT_ENV]: "1" } : {}),
+        };
+        // Insert before the trailing task argument; stdin remains one-shot/closed.
+        const inlineBridgePath = fileURLToPath(new URL("./inline-steering-bridge.ts", import.meta.url));
+        for (let index = piArgs.length - 2; index >= 0; index--) {
+          if ((piArgs[index] === "--extension" || piArgs[index] === "-e") && piArgs[index + 1] && canonicalizeExtensionPath(piArgs[index + 1]!) === canonicalizeExtensionPath(inlineBridgePath)) piArgs.splice(index, 2);
+        }
+        piArgs.splice(piArgs.length - 1, 0, "--extension", inlineBridgePath);
+        const server = inlineLifecycleServer, runId = inlineLifecycleRunId;
+        opts.onSteeringReady?.((message) => !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration)
+          ? server.requestSteer(runId, message) : Promise.resolve("unavailable"));
+      }
+    }
+    if (signal?.aborted || !canStartInteractiveRun(interactiveShutdownGeneration)) {
+      result.exitCode = 130;
+      result.stopReason = "aborted";
+      return normalizeCompletedResult(result, true);
+    }
     const effectiveCwd = taskCwd ?? cwd;
     applyChildProjectIsolation(piArgs, effectiveCwd);
     return await runAgentInline({
-      result, cwd, taskCwd, piArgs, signal, onUpdate: emitUpdate,
+      result, cwd, taskCwd, piArgs, signal, steeringEnv, onUpdate: emitUpdate,
       parentDepth, parentAgentStack, maxDepth, maxActive, limits, preventCycles,
       interactivePaneLayout, trustedProjectRoots, deniedProjectRoots, makeDetails,
       inheritedApiKeyBinding, inheritedApiKeyAgentDir, phase0LiveProofEnv, assistantSignatureIndexDir: taskTmpDir,
       forkSourceOwnership, forkChildId, forkBootstrapPath, treePermitLease, runStateRoot,
     });
   } finally {
+    opts.onSteeringReady?.(undefined);
+    if (inlineLifecycleRunId) inlineLifecycleServer?.terminalRun(inlineLifecycleRunId);
     // Attempt every cleanup without replacing an already produced child result.
     // Cleanup failure is diagnostic and must not suppress later sensitive cleanup.
     await cleanupTempDirs(inheritedApiKeyAgentDir, taskTmpDir, forkSessionTmpDir, promptTmpDir)
@@ -5174,6 +5260,7 @@ interface RunAgentExecutionOptions {
   cwd: string;
   taskCwd?: string;
   piArgs: string[];
+  steeringEnv?: Record<string, string>;
   signal?: AbortSignal;
   onUpdate: () => void;
   parentDepth: number;
@@ -5395,6 +5482,8 @@ export async function monitorInlineProcess(
   outputLimitBytes?: number,
   expectedChildStartedAt?: number | null,
   identityUnavailableAbortTimeoutMs = SIGKILL_TIMEOUT_MS,
+  /** Steering can continue after agent_end; only settled/close is terminal. */
+  waitForSettled = false,
 ): Promise<{ exitCode: number; wasAborted: boolean }> {
   let wasAborted = false;
   const childPid = proc.pid;
@@ -5485,6 +5574,7 @@ export async function monitorInlineProcess(
     let queuedParserBytes = 0;
     let outputExceeded = false;
     let fatalTransportFailure = false;
+    let sawSettled = false;
     const disposeUnverifiedChild = () => {
       // No identity proof means no signal. Releasing local pipe handles still
       // bounds this invocation even if an unverified child outlives it.
@@ -5526,6 +5616,13 @@ export async function monitorInlineProcess(
       // Chaining keeps event/result/callback order identical to JSONL order.
       lineProcessing = lineProcessing.then(async () => {
         if (outputExceeded || settled) return;
+        if (waitForSettled) {
+          try {
+            const event = JSON.parse(line);
+            if (event.type === "agent_settled") sawSettled = true;
+            if (event.type === "agent_start") { sawSettled = false; clearSemanticCompletionTimer(); }
+          } catch { /* malformed records remain parser-owned */ }
+        }
         // The parser returns one combined change signal only after public
         // result mutation and signature-index publication are complete. This
         // keeps tool-only presentation refreshes useful without duplicating or
@@ -5543,7 +5640,7 @@ export async function monitorInlineProcess(
     const chunkProcessor = createJsonLineChunkProcessor(flushLine);
 
     maybeFinishFromAgentEnd = () => {
-      if (!result.sawAgentEnd || didClose || settled) return;
+      if (!result.sawAgentEnd || didClose || settled || (waitForSettled && !sawSettled)) return;
       clearSemanticCompletionTimer();
       semanticCompletionTimer = setTimeout(() => {
         if (didClose || settled || !result.sawAgentEnd) return;
@@ -5708,6 +5805,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
       phase0LiveProofEnv,
       runProtocolEnv: {
         [RUN_STATE_DIR_ENV]: runStateRoot,
+        ...opts.steeringEnv,
         ...(forkBootstrapPath ? { [SUBAGENT_FORK_BOOTSTRAP_PATH_ENV]: forkBootstrapPath } : {}),
       },
       treePermitEnv: buildTreePermitChildEnv(treePermitLease, runStateRoot),
@@ -5781,7 +5879,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
     await forkSourceOwnership?.markTerminal(forkChildId!, "launch-failed").catch(() => undefined);
     return normalizeCompletedResult(result, false);
   }
-  const { exitCode, wasAborted } = await monitorInlineProcess(proc, result, signal, onUpdate, assistantSignatureIndex, outputLimitBytes, childStartedAt);
+  const { exitCode, wasAborted } = await monitorInlineProcess(proc, result, signal, onUpdate, assistantSignatureIndex, outputLimitBytes, childStartedAt, SIGKILL_TIMEOUT_MS, Boolean(opts.steeringEnv));
   result.exitCode = exitCode;
   if (treePermitLease && proc.exitCode === null && proc.signalCode === null) {
     const exited = await new Promise<boolean>((resolve) => {
@@ -5811,6 +5909,9 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
 }
 
 interface RunAgentInInteractivePaneOptions {
+  onSteeringReady?: (handle: SteeringHandle | undefined) => void;
+  /** Only the exact current background parent supplies this leaf binding. */
+  onParentReport?: (message: string) => boolean;
   backend: InteractivePaneBackend;
   result: SingleResult;
   agent: AgentConfig;
@@ -5883,7 +5984,7 @@ const CHILD_BOOTSTRAP_ENV = new Set([
   TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV,
   SUBAGENT_PARENT_LEASE_PATH_ENV, SUBAGENT_CHILD_SESSION_PATH_ENV, SUBAGENT_RUN_OWNERSHIP_ENV, SUBAGENT_PROMOTION_REQUEST_PATH_ENV, SUBAGENT_PROMOTION_ACK_PATH_ENV, SUBAGENT_FORK_BOOTSTRAP_PATH_ENV, SUBAGENT_V3_FAILURE_BOUNDARY_CAPABILITY_ENV, SUBAGENT_V3_METADATA_TAIL_SUCCESS_BOUNDARY_CAPABILITY_ENV,
   SUBAGENT_LEASE_CHECK_MS_ENV, SUBAGENT_LEASE_STALE_MS_ENV, SUBAGENT_EXPECTED_PARENT_PID_ENV, SUBAGENT_EXPECTED_PARENT_STARTED_AT_ENV,
-  SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV,
+  PARENT_REPORT_ENV, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV,
   PHASE0_LIVE_GATE_ENV, PHASE0_LIVE_PROOF_SOCKET_ENV, PHASE0_LIVE_PROOF_ID_ENV, PHASE0_LIVE_PROOF_CAPABILITY_ENV, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV,
   ...Object.values(SUBAGENT_LIMIT_DEFINITIONS).map(({ env }) => env),
 ]);
@@ -6423,9 +6524,11 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
             const fence = await publishAndVerifyCompletionFence(terminalPaths, runId, completionFenceNonce);
             await publishAndVerifyCompletionFenceAck(terminalPaths, fence);
             completionFenced = true;
+            if (lifecycleRunId) lifecycleEventServer?.closeReporting(lifecycleRunId);
           } catch (error) {
             if (error instanceof CompletionFenceAuthorityError) {
               completionFenced = true;
+              if (lifecycleRunId) lifecycleEventServer?.closeReporting(lifecycleRunId);
               completionFenceInvalid = true;
             }
             throw error;
@@ -6486,6 +6589,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       if (error instanceof CancellationFenceAuthorityError) return "cancelled";
       if (!(error instanceof CompletionFenceAuthorityError)) throw error;
       completionFenced = true;
+      if (lifecycleRunId) lifecycleEventServer?.closeReporting(lifecycleRunId);
       completionFenceInvalid = true;
       return "invalid";
     }
@@ -6500,10 +6604,12 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     try {
       await publishAndVerifyCompletionFenceAck(paths, fence);
       completionFenced = true;
+      if (lifecycleRunId) lifecycleEventServer?.closeReporting(lifecycleRunId);
       return "fenced";
     } catch (error) {
       if (!(error instanceof CompletionFenceAuthorityError)) throw error;
       completionFenced = true;
+      if (lifecycleRunId) lifecycleEventServer?.closeReporting(lifecycleRunId);
       completionFenceInvalid = true;
       return "invalid";
     }
@@ -6727,14 +6833,26 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       if (!validatedIntent) throw new Error("Interactive layout launch intent failed validation.");
       if (await publishImmutableJson(runPaths.launchIntentPath, intent) !== "published") throw new Error("Interactive launch intent already exists.");
       const runLifecycleServer = await getLifecycleEventServer();
+      const reportingEnabled = Boolean(options.onParentReport) && selectsParentReport(options.agent, inheritedCliArgs.fallbackTools, inheritedCliArgs.fallbackNoTools);
+      if (reportingEnabled && !runLifecycleServer) throw new Error("Direct-parent reporting is unavailable: authenticated lifecycle socket could not be enabled.");
       let lifecycleProtocolEnv: Record<string, string> = {};
       if (runLifecycleServer) {
         const lifecycleToken = runLifecycleServer.registerRun(runId);
         lifecycleRunId = runId;
+        if (reportingEnabled) {
+          runLifecycleServer.setReportHandler(runId, prepareParentReportHandler(
+            () => !options.signal?.aborted && !completionFenced
+              && canStartInteractiveRun(options.interactiveShutdownGeneration)
+              && (activeInteractiveRuns.get(runId)?.ownership === "managed" || activeInteractiveRuns.get(runId)?.ownership === "kept"),
+            async () => !await readVerifiedCompletionFence(runPaths, runId, completionFenceNonce),
+            options.onParentReport!,
+          ), options.signal);
+        }
         await writeLifecycleBootstrapToken(runPaths.lifecycleTokenPath, lifecycleToken);
         lifecycleProtocolEnv = {
           [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: runLifecycleServer.socketPath,
           [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: runPaths.lifecycleTokenPath,
+          ...(reportingEnabled ? { [PARENT_REPORT_ENV]: "1" } : {}),
         };
       }
       const protocolEnv = {
@@ -6977,6 +7095,18 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     if (!validGateAuthority) {
       retainRecoveryMetadata = true;
       throw new Error("Interactive launch gate authority is malformed or belongs to another backend.");
+    }
+    if (lifecycleRunId && options.onSteeringReady) {
+      const server = lifecycleEventServer!, controlRunId = lifecycleRunId;
+      options.onSteeringReady(async (message) => {
+        const available = () => !options.signal?.aborted && !completionFenced
+          && canStartInteractiveRun(options.interactiveShutdownGeneration)
+          && (activeInteractiveRuns.get(controlRunId)?.ownership === "managed" || activeInteractiveRuns.get(controlRunId)?.ownership === "kept");
+        if (!available() || !paths) return "unavailable";
+        const fence = await readVerifiedCompletionFence(paths, controlRunId, completionFenceNonce).catch(() => true);
+        if (fence || !available()) return "unavailable";
+        return server.requestSteer(controlRunId, message);
+      });
     }
     if (backend.mode === "tmux-pane" && !options.treePermitLease) {
       const startupDeadline = Date.now() + 10_000;
@@ -7892,6 +8022,7 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     }
     signalHerdrWake();
     await stopLeaseWriterAndDrain();
+    options.onSteeringReady?.(undefined);
     if (lifecycleRunId) lifecycleEventServer?.terminalRun(lifecycleRunId);
     // All terminal closes occur at their winner site under the interactive
     // fence. Finally is deliberately non-mutating: it cannot turn a late

@@ -7,6 +7,8 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import childBridge, { readAssignedPhase0Barrier, registerChildBridge, registerPhase0LiveProviderProof } from "../../src/runtime/child-bridge";
+import { PARENT_REPORT_ENV, PARENT_REPORT_TOOL } from "../../src/runtime/parent-report";
+import { STEERING_CUSTOM_TYPE } from "../../src/runtime/steering-inbox";
 import { derivePhase0LiveProofCapability, Phase0LiveProofServer } from "../../src/runtime/phase0-live-proof";
 import { TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV } from "../../src/runtime/tree-permit-authority";
 
@@ -113,12 +115,15 @@ async function setupBridge(runId: string, options: {
 	expectedParent?: { pid: number; startedAt: number };
 	failureBoundaryCapability?: boolean;
 	metadataTailSuccessBoundaryCapability?: boolean;
+	parentReporting?: boolean;
 	herdrMetadataReporter?: { report(lifecycle: "ready" | "running" | "waiting" | "returning" | "failed"): void; close(): Promise<void> };
 	herdrEnvMismatch?: boolean;
 } = {}) {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-bridge-"));
 	tempDirs.push(root);
 	const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+	if (options.parentReporting) process.env[PARENT_REPORT_ENV] = "1";
+	else delete process.env[PARENT_REPORT_ENV];
 	process.env[SUBAGENT_RUN_ID_ENV] = runId;
 	process.env[SUBAGENT_RUN_STATE_PATH_ENV] = paths.statePath;
 	process.env[SUBAGENT_RUN_COMPLETION_PATH_ENV] = paths.completionPath;
@@ -203,7 +208,10 @@ async function setupBridge(runId: string, options: {
 	const shutdownReached = deferred<void>();
 	let sessionShutdownEmitted = false;
 	let shutdownAndDrainTask: Promise<void> | undefined;
+	const steeringMessages: unknown[][] = [];
+	const boundaryResults: unknown[] = [];
 	const pi = {
+		sendUserMessage(...args: unknown[]) { steeringMessages.push(args); },
 		on(event: string, handler: (event: any, ctx: any) => any) {
 			const current = handlers.get(event) ?? [];
 			current.push(handler);
@@ -219,8 +227,11 @@ async function setupBridge(runId: string, options: {
 	const lifecycle = { aborted: false, shutdown: false };
 	const titles: string[] = [];
 	const notifications: Array<{ message: string; level: string }> = [];
+	const operationAbort = new AbortController();
 	const ctx = {
-		abort: () => { lifecycle.aborted = true; },
+		isIdle: () => false,
+		signal: operationAbort.signal,
+		abort: () => { lifecycle.aborted = true; operationAbort.abort(); },
 		shutdown: () => { lifecycle.shutdown = true; shutdownReached.resolve(); },
 		waitForIdle: async () => undefined,
 		hasUI: options.hasUI ?? false,
@@ -231,7 +242,10 @@ async function setupBridge(runId: string, options: {
 		// actual emission so cleanup cannot skip the bridge's shutdown handler.
 		if (event === "session_shutdown") sessionShutdownEmitted = true;
 		return trackEventTask((async () => {
-			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+			for (const handler of handlers.get(event) ?? []) {
+				const result = await handler(payload, ctx);
+				if (event === "turn_end" || event === "agent_before_settle") boundaryResults.push(result);
+			}
 		})());
 	};
 	const shutdownAndDrain = () => shutdownAndDrainTask ??= (async () => {
@@ -244,7 +258,7 @@ async function setupBridge(runId: string, options: {
 	})();
 	activeBridgeShutdowns.push(shutdownAndDrain);
 	return {
-		paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit,
+		paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit, steeringMessages, boundaryResults,
 		heartbeat, stopAndDrainLeaseRenewals, shutdownAndDrain, drainEventTasks, waitForShutdown: () => shutdownReached.promise,
 	};
 }
@@ -262,6 +276,79 @@ function assistant(stopReason: string, text = "DONE") {
 }
 
 describe("child lifecycle bridge", () => {
+	test("interactive bridge submits only the literal new message and settlement closes steering without disturbing completion", async () => {
+		const bridge = await setupBridge("interactive-steering");
+		const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+		const token = server.registerRun("interactive-steering"); server.activateRun("interactive-steering");
+		await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+		process.env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV] = server.socketPath;
+		process.env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV] = bridge.paths.lifecycleTokenPath;
+		await bridge.emit("session_start");
+		assert.equal(await server.requestSteer("interactive-steering", "startup"), "unavailable");
+		const started = server.waitForEvent("interactive-steering", 200);
+		await bridge.emit("agent_start"); await started;
+		assert.equal(await server.requestSteer("interactive-steering", "/literal extra direction"), "submitted");
+		assert.deepEqual(bridge.steeringMessages, []);
+		assert.equal(await server.requestSteer("interactive-steering", "second pending"), "rejected");
+		await bridge.emit("turn_end", { entries: [], continue: false, outcome: "completed" });
+		assert.deepEqual(bridge.boundaryResults,
+			[{ entries: [{ type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/literal extra direction", display: true }], continue: true }]);
+		await bridge.emit("agent_end", { messages: [assistant("stop")] });
+		await bridge.emit("agent_settled");
+		const completed = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "interactive-steering");
+		assert.equal(completed?.status, "completed");
+		await bridge.shutdownAndDrain();
+		assert.notEqual(await server.requestSteer("interactive-steering", "late"), "submitted");
+		assert.equal(bridge.steeringMessages.length, 0);
+	});
+	test("interactive agent_end drops inbox and a normal continuation resumes admission", async () => {
+		const id = "interactive-steering-continuation";
+		const bridge = await setupBridge(id);
+		const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+		const token = server.registerRun(id); server.activateRun(id);
+		await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+		process.env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV] = server.socketPath;
+		process.env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV] = bridge.paths.lifecycleTokenPath;
+		await bridge.emit("session_start");
+		const started = server.waitForEvent(id, 200);
+		await bridge.emit("agent_start"); await started;
+		assert.equal(await server.requestSteer(id, "unconsumed"), "submitted");
+		const ended = server.waitForEvent(id, 200);
+		await bridge.emit("agent_end", { messages: [assistant("stop")] }); await ended;
+		assert.equal(await server.requestSteer(id, "pre-settle"), "unavailable");
+		assert.equal(bridge.handlers.has("agent_before_settle"), false);
+		const restarted = server.waitForEvent(id, 200);
+		await bridge.emit("agent_start"); await restarted;
+		await bridge.emit("turn_end", { entries: [], continue: false, outcome: "completed" });
+		assert.deepEqual(bridge.boundaryResults, [undefined]);
+		assert.equal(await server.requestSteer(id, "normal continuation"), "submitted");
+		await bridge.emit("turn_end", { entries: [], continue: false, outcome: "completed" });
+		assert.equal((bridge.boundaryResults[1] as any).entries[0].content, "normal continuation");
+		await bridge.shutdownAndDrain();
+	});
+	test("interactive aborted settlement drops inbox even when durable terminal remains false", async () => {
+		const bridge = await setupBridge("interactive-steering-aborted");
+		const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+		const token = server.registerRun("interactive-steering-aborted"); server.activateRun("interactive-steering-aborted");
+		await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+		process.env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV] = server.socketPath;
+		process.env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV] = bridge.paths.lifecycleTokenPath;
+		await bridge.emit("session_start");
+		const started = server.waitForEvent("interactive-steering-aborted", 200);
+		await bridge.emit("agent_start"); await started;
+		assert.equal(await server.requestSteer("interactive-steering-aborted", "pending"), "submitted");
+		await bridge.emit("agent_end", { messages: [assistant("aborted")] });
+		await bridge.emit("agent_settled", { aborted: true });
+		assert.equal(await readJsonFile(bridge.paths.completionPath), null); // unchanged completion authority
+		assert.notEqual(await server.requestSteer("interactive-steering-aborted", "late"), "submitted");
+		assert.equal(bridge.handlers.has("agent_before_settle"), false);
+		await bridge.emit("agent_before_settle", { entries: [], continue: false, outcome: "completed" });
+		await bridge.emit("turn_end", { entries: [], continue: false, outcome: "completed" });
+		assert.deepEqual(bridge.boundaryResults, [undefined]);
+		assert.equal(bridge.steeringMessages.length, 0);
+		assert.equal(bridge.handlers.has("before_agent_start"), false);
+		await bridge.shutdownAndDrain();
+	});
 	test("replaces read with the assigned FIFO-only tool and proves only after its successful provider-bound execution", async () => {
 		const root = await fs.promises.realpath(await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-phase0-proof-")));
 		tempDirs.push(root);
@@ -1397,4 +1484,60 @@ describe("child lifecycle bridge", () => {
 		assert.equal(fs.existsSync(bridge.paths.completionFencePath), true);
 		assert.equal(fs.existsSync(bridge.paths.completionFenceAckPath), false, "only a dead parent identity may bypass ACK");
 	});
+});
+
+for (const gate of ["abort", "completion", "ownership"] as const) {
+  test(`interactive reporting requires explicit eligibility and remains denied after ${gate} without changing lifecycle authority`, async () => {
+    const runId = `report-interactive-${gate}`;
+    const bridge = await setupBridge(runId, { isProcessIdentityAlive: () => true, parentReporting: true });
+    const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+    const token = server.registerRun(runId);
+    const received: string[] = [];
+    server.setReportHandler(runId, message => { received.push(message); return true; });
+    server.activateRun(runId);
+    await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+    Object.assign(process.env, { [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: server.socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: bridge.paths.lifecycleTokenPath });
+    const report = bridge.tools.get(PARENT_REPORT_TOOL); assert.ok(report);
+    assert.equal(process.env[PARENT_REPORT_ENV], undefined);
+    await bridge.emit("session_start");
+    await assert.rejects(report.execute("startup", { message: "not started" }, bridge.ctx.signal, undefined, bridge.ctx), /not submitted|unavailable/);
+    const wake = server.waitForEvent(runId, 1000);
+    await bridge.emit("agent_start"); await wake;
+    const result = await report.execute("report", { message: "literal short report" }, bridge.ctx.signal, undefined, bridge.ctx);
+    assert.deepEqual(result.details, { outcome: "submitted" });
+    assert.deepEqual(received, ["literal short report"]);
+    assert.equal(await readJsonFile(bridge.paths.completionPath), null, "reporting cannot produce a completion");
+    if (gate === "abort") bridge.ctx.abort();
+    if (gate === "completion") {
+      await bridge.emit("agent_end", { messages: [assistant("stop")] });
+      await bridge.emit("agent_settled", { aborted: false });
+      assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId)?.status, "completed");
+    }
+    if (gate === "ownership") {
+      const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+      await atomicWriteJson(bridge.paths.allocationPath, allocation);
+      const child = parseRunState(await readJsonFile(bridge.paths.statePath), runId)!;
+      await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174020", runId,
+        allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
+        parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+      await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), runId)), "reporting child ownership transfer");
+      assert.equal(await readJsonFile(bridge.paths.completionPath), null);
+    }
+    await assert.rejects(report.execute("denied", { message: "must not reach parent" }, bridge.ctx.signal, undefined, bridge.ctx), /unsupported or unavailable/);
+    assert.deepEqual(received, ["literal short report"]);
+    await bridge.shutdownAndDrain();
+    assert.equal((server as any).runs.get(runId)?.reportHandler, undefined);
+  });
+}
+
+test("interactive foreground connection alone never registers the parent reporting tool", async () => {
+  const runId = "report-foreground-denied";
+  const bridge = await setupBridge(runId, { isProcessIdentityAlive: () => true });
+  const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+  const token = server.registerRun(runId); server.activateRun(runId);
+  await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+  Object.assign(process.env, { [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: server.socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: bridge.paths.lifecycleTokenPath });
+  await bridge.emit("session_start"); await bridge.emit("agent_start");
+  assert.equal(server.isConnected(runId), true);
+  assert.equal(bridge.tools.has(PARENT_REPORT_TOOL), false);
 });

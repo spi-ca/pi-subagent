@@ -8,6 +8,7 @@ import {
 } from "./subagent-limits.js";
 import { canonicalizePathForTrust } from "./trust-path.js";
 import { DEFAULT_DELEGATION_MODE } from "./types.js";
+import { isSteeringMessage, MAX_STEERING_MESSAGE_BYTES, type SteeringHandle, type SteeringOutcome } from "./subagent-steering.js";
 import type { AccountingUsage } from "./accounting-usage.js";
 
 export const BACKGROUND_BEHAVIOR_GUIDANCE = "background=true returns immediately; results auto-deliver; do not poll.";
@@ -28,6 +29,7 @@ export function formatSubagentToolDescription(): string {
     SUBAGENT_INVOCATION_SHAPES_GUIDANCE,
     MODEL_OVERRIDE_DESCRIPTION,
     "status without id lists background jobs; cancel without id cancels all running background jobs. Cancel ACK is not terminal.",
+    "steer: full single background id+message (512 UTF-8 bytes); inbox admission ACK only.",
     "Chain labels unique; defaults to on_success; recovery requires continueOnError on failed stage.",
     `mode: spawn default; fork adds parent context. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
   ].join("\n");
@@ -47,7 +49,7 @@ Limits: depth ${options.currentDepth}/${options.maxDepth}; cycles ${options.prev
 
 export type InvocationMode = "single" | "parallel" | "chain";
 export type BackgroundJobStatus = "running" | "cancelling" | "completed" | "failed" | "cancelled";
-export type BackgroundJobAction = "status" | "cancel";
+export type BackgroundJobAction = "status" | "cancel" | "steer";
 
 export interface BackgroundJobToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -67,6 +69,8 @@ export interface BackgroundJobRecord {
   completedAt?: number;
   /** Present only while a job can still be cancelled; terminal history has no live controller. */
   controller?: AbortController;
+  /** Active-only transport; never serialized or retained in terminal history. */
+  steer?: SteeringHandle;
   result?: BackgroundJobToolResult;
   error?: string;
   /** Producer-derived byte count not retained in compacted `error`. */
@@ -77,11 +81,11 @@ export interface BackgroundJobRecord {
   chainStageCount?: number;
 }
 
-export type BackgroundJobSnapshot = Omit<BackgroundJobRecord, "controller">;
+export type BackgroundJobSnapshot = Omit<BackgroundJobRecord, "controller" | "steer">;
 
 export function parseBackgroundAction(raw: unknown): BackgroundJobAction | null {
   if (raw === undefined) return null;
-  if (raw === "status" || raw === "cancel") return raw;
+  if (raw === "status" || raw === "cancel" || raw === "steer") return raw;
   return null;
 }
 
@@ -97,10 +101,10 @@ export interface SubagentInvocationValidationError {
   message: string;
 }
 
-const VALID_ACTIONS = ["status", "cancel"] as const;
+const VALID_ACTIONS = ["status", "cancel", "steer"] as const;
 const VALID_MODES = ["spawn", "fork"] as const;
 const VALID_CONDITIONS = ["always", "on_success", "on_error", "on_completed_with_errors"] as const;
-const TOP_LEVEL_FIELDS = ["action", "id", "background", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
+const TOP_LEVEL_FIELDS = ["action", "id", "message", "background", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
 const TASK_ITEM_FIELDS = ["agent", "task", "cwd", "model"] as const;
 const CHAIN_TASK_STAGE_FIELDS = ["type", "label", "agent", "task", "cwd", "model", "condition", "continueOnError"] as const;
 const CHAIN_PARALLEL_STAGE_FIELDS = ["type", "label", "tasks", "condition", "continueOnError"] as const;
@@ -175,7 +179,10 @@ export function validateSubagentInvocation(raw: unknown): SubagentInvocationVali
   if (!isRecord(raw)) return validationError("input-type", "Subagent parameters must be an object.");
   if (hasUnsupportedOwnEnumerableField(raw, TOP_LEVEL_FIELDS)) return validationError("input-type", "Subagent parameters contain an unsupported field.");
 
-  if (raw.action !== undefined && !isStringEnum(raw.action, VALID_ACTIONS)) return validationError("input-type", "action must be status or cancel.");
+  if (raw.action !== undefined && !isStringEnum(raw.action, VALID_ACTIONS)) return validationError("input-type", "action must be status, cancel, or steer.");
+  if (raw.message !== undefined && !isSteeringMessage(raw.message)) return validationError("input-type", "message must be non-blank and at most 512 UTF-8 bytes.");
+  if (raw.action === "steer" && (!isNonBlankString(raw.id) || raw.message === undefined)) return validationError("invocation-shape", "steer requires an exact full background job id and message.");
+  if (raw.action !== "steer" && raw.message !== undefined) return validationError("option-combination", "message can only be used with action steer.");
   if (raw.id !== undefined && !isNonBlankString(raw.id)) return validationError("input-type", "id must be a non-blank string.");
   if (raw.background !== undefined && typeof raw.background !== "boolean") return validationError("input-type", "background must be a boolean.");
   if (raw.mode !== undefined && !isStringEnum(raw.mode, VALID_MODES)) return validationError("input-type", "mode is invalid.");
@@ -571,7 +578,7 @@ export function createBackgroundJobRecord(options: {
 export function snapshotBackgroundJob(
   job: BackgroundJobRecord,
 ): BackgroundJobSnapshot {
-  const { controller: _controller, ...snapshot } = job;
+  const { controller: _controller, steer: _steer, ...snapshot } = job;
   return { ...snapshot };
 }
 
@@ -616,6 +623,20 @@ export function releaseBackgroundJobReservation(
   if (registry.get(job.id) === job) registry.delete(job.id);
 }
 
+/** Exact lookup and session/job fences on both sides of the transport await. */
+export async function steerBackgroundJob(
+  registry: Map<string, BackgroundJobRecord>, id: string, message: string, isCurrent: () => boolean,
+): Promise<SteeringOutcome | "not-found" | "unsupported"> {
+  if (!isCurrent()) return "unavailable";
+  const job = registry.get(id);
+  if (!job) return "not-found";
+  if (job.mode !== "single") return "unsupported";
+  if (!isSteeringMessage(message) || job.status !== "running" || job.controller?.signal.aborted || !job.steer) return "unavailable";
+  const outcome = await job.steer(message).catch(() => "unknown" as const);
+  if (!isCurrent() || registry.get(id) !== job || job.status !== "running" || job.controller?.signal.aborted) return "unknown";
+  return outcome;
+}
+
 export function cancelBackgroundJobs(
   registry: Map<string, BackgroundJobRecord>,
   id?: string,
@@ -637,6 +658,7 @@ export function cancelBackgroundJobs(
   for (const job of targets) {
     if (job.status === "running" || job.status === "cancelling") {
       job.status = "cancelling";
+      delete job.steer;
       job.controller?.abort();
       registry.set(job.id, job);
       cancelled.push(snapshotBackgroundJob(job));
@@ -759,6 +781,7 @@ export function finalizeBackgroundJobForSession(options: {
   job.completedAt = options.now ?? Date.now();
   // Do not retain a live signal (and its listeners) in completed history.
   delete job.controller;
+  delete job.steer;
   job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result, options.outputMaxBytes);
   if (status === "cancelled" || !fallbackError) {
     job.error = undefined;
@@ -821,7 +844,8 @@ const ChainParallelStep = Type.Object({
 const ChainStep = Type.Union([ChainTaskStep, ChainParallelStep]);
 
 export const SubagentParams = Type.Object({
-  action: Type.Optional(StringEnum(["status", "cancel"])),
+  action: Type.Optional(StringEnum(["status", "cancel", "steer"])),
+  message: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_STEERING_MESSAGE_BYTES })),
   id: Type.Optional(Type.String({ minLength: 1 })),
   background: Type.Optional(Type.Boolean()),
   agent: Type.Optional(Type.String({ minLength: 1 })),

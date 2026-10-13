@@ -40,7 +40,7 @@ You are an expert technical writer. Improve clarity, accuracy, and concision.
 
 `tools`는 Pi `--tools`로 child에 전달하는 도구 선택입니다. Pi `1.1.0`에서 일반 이름만 지정한 `--tools`는 MCP 도구를 제거하지 않으므로, 이 패키지는 명시 allowlist에 `mcp__...`가 없으면 호환 host(`>=1.0.4`)에서 `--no-mcp`도 전달합니다. `codemode`만 추가해 MCP 전체가 우연히 열리는 것을 막습니다. MCP를 의도적으로 선택하려면 `inherit` profile에서 `read,codemode,mcp__docs__*`처럼 MCP 패턴을 명시하세요. 도구 선택은 sandbox가 아니며, hostile child를 격리하는 OS 보안 경계도 아닙니다. 편집 가능한 역할에는 필요한 도구만, `scout`·`reviewer` 같은 읽기 전용 역할에는 `read,find,ls,grep`를 우선 지정하세요. 변경 또는 명령 실행이 필요할 때만 `bash`, `edit`, `write`를 추가합니다.
 
-명시적 목록으로 nested delegation을 허용하려면 `subagent`도 넣어야 합니다. `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`에서는 `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`와, verified stable Pi `>=1.1.0`에서 명시한 정확한 이름 `codemode`만 허용합니다. 임의 extension/MCP 이름, wildcard, `+`/`-` 도구 선택은 launch 전에 fail-closed합니다. 읽기 도구를 묶어 결과를 줄이는 역할은 다음처럼 선택할 수 있습니다.
+명시적 목록으로 nested delegation을 허용하려면 `subagent`도 넣어야 합니다. `PI_SUBAGENT_CMUX_CHILD_POLICY=managed`에서는 `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `subagent`와, verified stable Pi `>=1.1.0`에서 명시한 정확한 이름 `codemode`, `report_to_parent`만 허용합니다. 임의 extension/MCP 이름, wildcard, `+`/`-` 도구 선택은 launch 전에 fail-closed합니다. 읽기 도구를 묶어 결과를 줄이는 역할은 다음처럼 선택할 수 있습니다.
 
 ```yaml
 tools: read,grep,find,ls,codemode
@@ -60,6 +60,16 @@ tools: read,grep,find,ls,codemode
 Pi `0.99.2` fork는 현재 branch의 raw entry를 보존한다. 초기/변경 system message의 prompt section과 tool loadout, `context_edit`의 omission/replacement, accounting-only `usage`, retain-none compaction의 자기 ID와 complete system checkpoint를 유지하며 projected 메시지로 평탄화하지 않는다. 알 수 없는 entry, 잘못된 shape/link/target은 snapshot을 거부한다. child 결과 observer는 raw assistant 출력·usage만 수집하므로 context edit을 새로운 출력으로 해석하거나 system prompt를 결과에 넣지 않는다.
 
 `spawn`이 기본값입니다. 블로킹 결과 래퍼, `background: true`, 상태 조회와 취소는 [사용법](./usage.md)을 참고하세요. 백그라운드 결과는 비신뢰 데이터로 처리하고, 자동 전달을 기다리는 동안 polling·sleep·대기 루프를 만들지 마세요.
+
+### 실행 중 direct parent에 짧게 보고하기
+
+보고가 필요한 역할의 전체 allowlist에 `report_to_parent`를 명시하세요. 자동으로 기본 도구에 추가하지 않습니다.
+
+```yaml
+tools: read,grep,find,ls,report_to_parent
+```
+
+Linux/macOS와 stable Pi `>=1.1.0`의 **`background: true` child**에서만 사용할 수 있습니다. 단일·병렬·체인(병렬 단계 포함)을 지원하며 foreground에는 이 도구를 요청하지 마세요. 알림에는 부모가 고정한 에이전트 이름과 leaf identity/위치가 표시됩니다. 부모→child steering은 별개이며 여전히 단일 background만 지원합니다. managed profile도 지원하며 `codemode`를 함께 선택하면 `tools.report_to_parent({message: "짧은 진행 상황"})`로 호출할 수 있습니다. ACK는 부모 알림 접수/제출이지 모델의 읽음·답변·승인이 아닙니다. 동기 답변을 기다리지 말고 맡은 작업을 계속하세요. 자세한 제한과 전달 시점은 [부모에게 보고하기](./usage.md#child에서-direct-parent에-보고하기)를 참고하세요.
 
 ## 작성 원칙
 

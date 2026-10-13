@@ -385,6 +385,10 @@ function renderBackgroundJobAction(
 	if (details.event === "accepted") {
 		return new Text(theme.fg("accent", theme.bold(`accepted · job ${compactBackgroundJobId(job.jobId, expanded)}`)), 0, 0);
 	}
+	if (details.event === "steering-submitted") {
+		return new Text(theme.fg("accent", theme.bold(`steering admitted · job ${compactBackgroundJobId(job.jobId, expanded)}`))
+			+ `\n${theme.fg("muted", "Inbox admission only; not native queue or model application confirmation.")}`, 0, 0);
+	}
 	if (details.event === "cancellation-requested") {
 		return new Text(theme.fg("warning", theme.bold(`cancelling · job ${compactBackgroundJobId(job.jobId, expanded)}`)), 0, 0);
 	}

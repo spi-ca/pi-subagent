@@ -60,6 +60,99 @@ async function expectStartupFailureWithCleanup(install: (originals: Record<strin
 }
 
 describe("private lifecycle socket", () => {
+	test("steering requires connected activated active run and yields only inbox admission ACK", async () => {
+		const fixture = await setup("steer-run", false);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "change direction"), "unavailable");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		const received: string[] = [];
+		client.setSteerHandler((message) => { received.push(message); return true; });
+		client.send("agent-started");
+		await delay(10);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "change direction"), "unavailable");
+		fixture.server.activateRun(fixture.runId);
+		const pending = fixture.server.requestSteer(fixture.runId, "한글\n/new-task");
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "second"), "busy");
+		assert.equal(await pending, "submitted");
+		assert.deepEqual(received, ["한글\n/new-task"]);
+		client.send("agent-ended"); await delay(10);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "before-settle"), "unavailable");
+		assert.deepEqual(received, ["한글\n/new-task"]);
+		client.send("agent-started"); await delay(10);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "normal continuation"), "submitted");
+		client.setSteerHandler(() => false);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "reject"), "rejected");
+		client.send("agent-settled"); await delay(10);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "terminal"), "unavailable");
+		client.close();
+	});
+
+	test("steering preserves abort sequencing and cancel wins over an in-flight submission", async () => {
+		const fixture = await setup("steer-abort");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		let submissions = 0, aborts = 0;
+		client.setSteerHandler(() => { submissions += 1; return true; });
+		client.setControlHandler(() => { aborts += 1; });
+		client.send("agent-started"); await delay(10);
+		const pending = fixture.server.requestSteer(fixture.runId, "race");
+		assert.equal(fixture.server.requestAbort(fixture.runId), true);
+		assert.equal(await pending, "unknown");
+		await delay(30);
+		assert.ok(submissions <= 1, "a socket write can precede cancel; no retry or duplicate");
+		assert.equal(aborts, 1);
+		assert.equal(fixture.server.isAbortAcknowledged(fixture.runId), true);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "post-cancel"), "unavailable");
+		client.close();
+	});
+
+	test("terminal cleanup resolves pending steer without retaining a handle or timer", async () => {
+		const fixture = await setup("steer-completion");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		client.send("agent-started"); await delay(10);
+		const pending = fixture.server.requestSteer(fixture.runId, "race");
+		fixture.server.terminalRun(fixture.runId);
+		assert.equal(await pending, "unknown");
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "late"), "unavailable");
+		client.close();
+	});
+
+	test("bounded steering backpressure/invalid messages do not destroy abort authority", async () => {
+		const fixture = await setup("steer-pressure");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		client.send("agent-started"); await delay(10);
+		const run = (fixture.server as any).runs.get(fixture.runId);
+		const socket = run.socket;
+		Object.defineProperty(socket, "writableLength", { configurable: true, get: () => 8192 });
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "bounded"), "busy");
+		assert.equal(socket.destroyed, false);
+		delete socket.writableLength;
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "한".repeat(200)), "unavailable");
+		assert.equal(await fixture.server.requestSteer(fixture.runId, " "), "unavailable");
+		client.setControlHandler(() => undefined);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true);
+		await delay(20);
+		assert.equal(fixture.server.isAbortAcknowledged(fixture.runId), true);
+		client.close();
+	});
+
+	test("missing ACK times out once as unknown, closes steering only, never retries", async () => {
+		const fixture = await setup("steer-timeout");
+		const raw = net.createConnection({ path: fixture.server.socketPath });
+		let frames = "";
+		raw.on("data", (chunk) => { frames += chunk.toString(); });
+		await new Promise<void>((resolve) => raw.once("connect", resolve));
+		raw.write(`${JSON.stringify({ version: 1, type: "hello", runId: fixture.runId, token: fixture.token, childPid: process.pid, sequence: 0 })}\n`);
+		raw.write(`${JSON.stringify({ version: 1, type: "agent-started", runId: fixture.runId, sequence: 1 })}\n`);
+		await delay(10);
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "one"), "unknown");
+		assert.equal(await fixture.server.requestSteer(fixture.runId, "two"), "unavailable");
+		assert.equal(frames.split("\n").filter((line) => line.includes('"type":"steer"')).length, 1);
+		assert.equal(fixture.server.requestAbort(fixture.runId), true);
+		raw.destroy();
+	});
 	test("consumes the transient token before connect and delivers bounded sequenced hints", async () => {
 		const fixture = await setup();
 		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);

@@ -11,6 +11,8 @@ export type BackgroundJobDetailEvent =
   | "cancel-list"
   | "cancellation-requested"
   | "already-terminal"
+  // Compatibility event name: confirms child inbox admission only.
+  | "steering-submitted"
   | "error";
 
 export interface BackgroundJobDetailSummary {
@@ -30,7 +32,7 @@ export interface BackgroundJobActionDetails {
   kind: typeof BACKGROUND_JOB_DETAILS_KIND;
   version: typeof BACKGROUND_JOB_DETAILS_VERSION;
   event: BackgroundJobDetailEvent;
-  operation?: "start" | "status" | "cancel";
+  operation?: "start" | "status" | "cancel" | "steer";
   job?: BackgroundJobDetailSummary;
   /** Retained top-level compatibility fields for accepted background starts. */
   jobId?: string;
@@ -44,9 +46,9 @@ export interface BackgroundJobActionDetails {
 const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STATUSES = new Set<BackgroundJobStatus>(["running", "cancelling", "completed", "failed", "cancelled"]);
 const EVENTS = new Set<BackgroundJobDetailEvent>([
-  "accepted", "status", "status-list", "cancel-list", "cancellation-requested", "already-terminal", "error",
+  "accepted", "status", "status-list", "cancel-list", "cancellation-requested", "already-terminal", "steering-submitted", "error",
 ]);
-const OPERATIONS = new Set(["start", "status", "cancel"]);
+const OPERATIONS = new Set(["start", "status", "cancel", "steer"]);
 const MAX_REASON_CODE_UNITS = 4 * 1024;
 const MAX_JOBS = 512;
 
@@ -235,7 +237,7 @@ export function parseBackgroundJobActionDetails(value: unknown): BackgroundJobAc
       kind: BACKGROUND_JOB_DETAILS_KIND,
       version: BACKGROUND_JOB_DETAILS_VERSION,
       event,
-      operation: value.operation as "start" | "status" | "cancel",
+      operation: value.operation as "start" | "status" | "cancel" | "steer",
       reason: value.reason,
     };
   }

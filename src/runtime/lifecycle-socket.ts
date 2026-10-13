@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
+import { isSteeringMessage, type SteeringOutcome } from "../core/subagent-steering.js";
 
 export const SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_SOCKET_PATH";
 export const SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_TOKEN_PATH";
@@ -38,6 +39,12 @@ interface RunRegistration {
 	controlSequence: number;
 	controlAcknowledged: number;
 	waiters: Set<() => void>;
+	noHeartbeat?: boolean;
+	steerSequence?: number;
+	steerAcknowledged?: number;
+	steerPending?: { sequence: number; resolve: (outcome: SteeringOutcome) => void };
+	steerRunning?: boolean;
+	steerClosed?: boolean;
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -193,10 +200,10 @@ export class LifecycleEventServer {
 		}
 	}
 
-	registerRun(runId: string): string {
+	registerRun(runId: string, noHeartbeat = false): string {
 		if (this.closed || !RUN_ID_PATTERN.test(runId) || this.runs.has(runId)) throw new Error("Invalid or duplicate lifecycle run registration.");
 		const token = crypto.randomBytes(32).toString("base64url");
-		this.runs.set(runId, { token, active: false, terminal: false, socket: null, lastSequence: 0, lastHeartbeatAt: performance.now(), controlSequence: 0, controlAcknowledged: 0, waiters: new Set() });
+		this.runs.set(runId, { token, noHeartbeat, active: false, terminal: false, socket: null, lastSequence: 0, lastHeartbeatAt: performance.now(), controlSequence: 0, controlAcknowledged: 0, waiters: new Set() });
 		return token;
 	}
 
@@ -210,6 +217,7 @@ export class LifecycleEventServer {
 	terminalRun(runId: string): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
+		run.steerPending?.resolve("unknown");
 		run.terminal = true;
 		run.token = "";
 		run.socket?.destroy();
@@ -228,6 +236,8 @@ export class LifecycleEventServer {
 	requestAbort(runId: string): boolean {
 		const run = this.runs.get(runId);
 		if (!run?.active || run.terminal || !run.socket || run.socket.destroyed) return false;
+		run.steerClosed = true;
+		run.steerPending?.resolve("unknown");
 		if (run.controlSequence > 0 && run.controlAcknowledged === run.controlSequence) return true;
 		if (run.controlSequence > run.controlAcknowledged) return true;
 		const sequence = ++run.controlSequence;
@@ -235,6 +245,29 @@ export class LifecycleEventServer {
 		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || run.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) { run.socket.destroy(); return false; }
 		run.socket.write(frame);
 		return true;
+	}
+
+	/** No retries. ACK means bounded child inbox admission, not native queue/model application. */
+	async requestSteer(runId: string, message: string): Promise<SteeringOutcome> {
+		const run = this.runs.get(runId);
+		if (!isSteeringMessage(message) || !run?.active || run.terminal || run.steerClosed || !run.steerRunning
+			|| !run.socket || run.socket.destroyed) return "unavailable";
+		if (run.steerPending) return "busy";
+		const sequence = (run.steerSequence ?? 0) + 1;
+		const frame = `${JSON.stringify({ version: VERSION, type: "steer", runId, sequence, message })}\n`;
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || run.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) return "busy";
+		return await new Promise<SteeringOutcome>((resolve) => {
+			const done = (outcome: SteeringOutcome) => {
+				clearTimeout(timer);
+				if (run.steerPending?.sequence === sequence) delete run.steerPending;
+				resolve(outcome);
+			};
+			// A bounded per-request deadline, never a monitor or retry timer.
+			const timer = setTimeout(() => { run.steerClosed = true; done("unknown"); }, 1000);
+			run.steerSequence = sequence;
+			run.steerPending = { sequence, resolve: done };
+			try { run.socket!.write(frame); } catch { run.steerClosed = true; done("unknown"); }
+		});
 	}
 
 	async waitForEvent(runId: string, timeoutMs: number): Promise<void> {
@@ -287,11 +320,21 @@ export class LifecycleEventServer {
 						|| !crypto.timingSafeEqual(Buffer.from(run.token), Buffer.from(value.token))) { fail(); return; }
 					authenticated = { runId: value.runId, run };
 					run.socket = socket;
+					if (run.noHeartbeat) socket.setTimeout(0); // inline relies on pipe/process exit, not liveness polling.
 					const helloAck = `${JSON.stringify({ version: VERSION, type: "hello-ack", runId: value.runId, sequence: 0 })}\n`;
 					if (Buffer.byteLength(helloAck) > MAX_FRAME_BYTES || socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) { fail(); return; }
 					socket.write(helloAck);
 					clearTimeout(helloTimer);
 					if (run.active) this.notify(run);
+					continue;
+				}
+				if (exactKeys(value, ["version", "type", "runId", "sequence", "steerSequence", "accepted"])
+					&& value.version === VERSION && value.type === "steer-ack" && value.runId === authenticated.runId
+					&& value.sequence === authenticated.run.lastSequence + 1 && typeof value.accepted === "boolean"
+					&& value.steerSequence === authenticated.run.steerSequence && value.steerSequence !== authenticated.run.steerAcknowledged) {
+					authenticated.run.lastSequence = value.sequence as number;
+					authenticated.run.steerAcknowledged = value.steerSequence as number;
+					authenticated.run.steerPending?.resolve(value.accepted ? "submitted" : "rejected");
 					continue;
 				}
 				if (exactKeys(value, ["version", "type", "runId", "sequence", "controlSequence"])
@@ -307,6 +350,12 @@ export class LifecycleEventServer {
 					|| typeof value.type !== "string" || !EVENT_TYPES.has(value.type) || value.runId !== authenticated.runId
 					|| !Number.isSafeInteger(value.sequence) || value.sequence !== authenticated.run.lastSequence + 1) { fail(); return; }
 				authenticated.run.lastSequence = value.sequence as number;
+				if (value.type === "agent-started") authenticated.run.steerRunning = true;
+				if (value.type === "agent-ended") authenticated.run.steerRunning = false;
+				if (["agent-settled", "completion-ready", "shutdown"].includes(value.type as string)) {
+					authenticated.run.steerClosed = true;
+					authenticated.run.steerPending?.resolve("unknown");
+				}
 				if (value.type === "heartbeat") authenticated.run.lastHeartbeatAt = performance.now();
 				if (authenticated.run.active) this.notify(authenticated.run);
 			}
@@ -317,6 +366,7 @@ export class LifecycleEventServer {
 			this.connections = Math.max(0, this.connections - 1);
 			this.connectionsSet.delete(socket);
 			if (authenticated?.run.socket === socket) {
+				authenticated.run.steerPending?.resolve("unknown");
 				authenticated.run.socket = null;
 				authenticated.run.active = false;
 				authenticated.run.token = ""; // reconnect requires a fresh explicit registration/handoff.
@@ -466,6 +516,11 @@ export class LifecycleEventClient {
 	private heartbeat: NodeJS.Timeout | null = null;
 	private usable = true;
 	private controlSequence = 0;
+	private steerSequence = 0;
+	private steerHandler: ((message: string) => boolean) | null = null;
+	private steerClosed = false;
+	/** true ACKs one inbox admission only; the child boundary owns consumption. */
+	setSteerHandler(handler: (message: string) => boolean): void { this.steerHandler = handler; }
 	private controlHandler: ((command: "abort") => Promise<void> | void) | null = null;
 	private readonly pendingControls: Array<{ command: "abort"; sequence: number }> = [];
 	private controlDraining = false;
@@ -493,7 +548,7 @@ export class LifecycleEventClient {
 		} finally { this.controlDraining = false; }
 	}
 
-	static async connectFromEnvironment(env: NodeJS.ProcessEnv, statePath: string): Promise<LifecycleEventClient | null> {
+	static async connectFromEnvironment(env: NodeJS.ProcessEnv, statePath: string, heartbeat = true): Promise<LifecycleEventClient | null> {
 		const socketPath = env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]?.trim();
 		const tokenPath = env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]?.trim();
 		delete env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV];
@@ -519,8 +574,9 @@ export class LifecycleEventClient {
 			const helloTimer = setTimeout(() => rejectProtocol(), HELLO_TIMEOUT_MS);
 			helloTimer.unref?.();
 			socket.on("data", (chunk: Buffer) => {
+				if (chunk.length > MAX_CONNECTION_CHUNK_BYTES) { rejectProtocol(); return; }
 				inbound = Buffer.concat([inbound, chunk]);
-				if (inbound.length > MAX_FRAME_BYTES + 1) { rejectProtocol(); return; }
+				if (inbound.length > MAX_FRAME_BYTES + 1 && !inbound.includes(0x0a)) { rejectProtocol(); return; }
 				for (;;) {
 					const lf = inbound.indexOf(0x0a); if (lf < 0) break;
 					const value = parseLine(inbound.subarray(0, lf)); inbound = inbound.subarray(lf + 1);
@@ -529,20 +585,37 @@ export class LifecycleEventClient {
 							|| value.version !== VERSION || value.type !== "hello-ack" || value.runId !== runId || value.sequence !== 0) { rejectProtocol(); return; }
 						acknowledged = true; clearTimeout(helloTimer); resolveHello(); continue;
 					}
+					if (value?.type === "steer") {
+						if (!exactKeys(value, ["version", "type", "runId", "sequence", "message"])
+							|| value.version !== VERSION || value.runId !== runId || value.sequence !== client.steerSequence + 1
+							|| !isSteeringMessage(value.message)) { rejectProtocol(); return; }
+						client.steerSequence = value.sequence as number;
+						let accepted = false;
+						try { accepted = !client.steerClosed && Boolean(client.steerHandler?.(value.message)); } catch { /* generic rejection only */ }
+						client.sequence += 1;
+						const ack = `${JSON.stringify({ version: VERSION, type: "steer-ack", runId, sequence: client.sequence, steerSequence: client.steerSequence, accepted })}\n`;
+						if (socket.writableLength + Buffer.byteLength(ack) > MAX_CLIENT_BUFFERED_BYTES) { rejectProtocol(); return; }
+						socket.write(ack);
+						continue;
+					}
 					if (!value || !exactKeys(value, ["version", "type", "command", "runId", "sequence"])
 						|| value.version !== VERSION || value.type !== "control" || !CONTROL_TYPES.has(value.command as string)
 						|| value.runId !== runId || !Number.isSafeInteger(value.sequence) || value.sequence !== client.controlSequence + 1) { rejectProtocol(); return; }
+					client.steerClosed = true; // abort always retains priority over steering.
 					client.controlSequence = value.sequence as number;
 					client.pendingControls.push({ command: value.command as "abort", sequence: client.controlSequence });
 					void client.drainControls();
 				}
+				if (inbound.length > MAX_FRAME_BYTES) rejectProtocol();
 			});
 			socket.on("error", () => { client.usable = false; if (!acknowledged) rejectHello(new Error("Lifecycle socket failed before hello acknowledgement.")); });
 			socket.on("close", () => { client.usable = false; if (!acknowledged) rejectHello(new Error("Lifecycle socket closed before hello acknowledgement.")); if (client.heartbeat) clearInterval(client.heartbeat); });
 			socket.write(helloFrame);
 			await helloAcknowledged;
-			client.heartbeat = setInterval(() => client.send("heartbeat"), 1000);
-			client.heartbeat.unref?.();
+			if (heartbeat) {
+				client.heartbeat = setInterval(() => client.send("heartbeat"), 1000);
+				client.heartbeat.unref?.();
+			}
 			return client;
 		} catch { socket.destroy(); return null; }
 	}
@@ -557,6 +630,7 @@ export class LifecycleEventClient {
 
 	send(type: "agent-started" | "agent-ended" | "agent-settled" | "completion-ready" | "shutdown" | "heartbeat"): boolean {
 		if (!this.usable || this.socket.destroyed) return false;
+		if (["agent-settled", "completion-ready", "shutdown"].includes(type)) this.steerClosed = true;
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type, runId: this.runId, sequence: this.sequence })}\n`;
 		const terminal = type === "completion-ready" || type === "shutdown";
@@ -575,6 +649,10 @@ export class LifecycleEventClient {
 	}
 
 	close(): void {
+		this.steerClosed = true;
+		this.steerHandler = null;
+		this.controlHandler = null;
+		this.pendingControls.length = 0;
 		if (this.heartbeat) clearInterval(this.heartbeat);
 		this.heartbeat = null;
 		this.socket.end();

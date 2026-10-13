@@ -85,6 +85,8 @@ import {
   BackgroundJobSessionFence,
   cancelBackgroundJobs,
   createBackgroundJobRecord,
+  snapshotBackgroundJob,
+  steerBackgroundJob,
   extractToolText,
   finalizeBackgroundJobForSession,
   formatBackgroundJobListEntry,
@@ -244,10 +246,10 @@ function backgroundJobStatusListDetails(jobs: BackgroundJobSnapshot[], event: "s
   };
 }
 
-function backgroundOperationForStructuredError(input: unknown): "start" | "status" | "cancel" | undefined {
+function backgroundOperationForStructuredError(input: unknown): "start" | "status" | "cancel" | "steer" | undefined {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
   const value = input as { action?: unknown; background?: unknown };
-  if (value.action === "status" || value.action === "cancel") return value.action;
+  if (value.action === "status" || value.action === "cancel" || value.action === "steer") return value.action;
   return value.background === true ? "start" : undefined;
 }
 
@@ -1010,7 +1012,16 @@ export default function (pi: ExtensionAPI) {
           : undefined;
         if (permitContext && !treePermitLease) return makeUnstartedAbortResult(options.agentName, options.task, options.stageLabel, options.model);
         try {
-          return await runAgent({ ...options, forkSourceOwnership: forkManager, forkChildId, treePermitLease, maxActive: limits.maxActive, limits, managedOverriddenBuiltinTools });
+          const steeringJob = options.invocationId ? backgroundJobs.get(options.invocationId) : undefined;
+          const steeringSession = backgroundSessionFence.capture();
+          return await runAgent({ ...options,
+            ...(steeringJob?.mode === "single" ? { onSteeringReady: (handle: BackgroundJobRecord["steer"]) => {
+              if (backgroundJobs.get(steeringJob.id) !== steeringJob || !backgroundSessionFence.isCurrent(steeringSession)
+                || steeringJob.status !== "running" || steeringJob.controller?.signal.aborted) return;
+              if (handle) steeringJob.steer = handle;
+              else delete steeringJob.steer;
+            } } : {}),
+            forkSourceOwnership: forkManager, forkChildId, treePermitLease, maxActive: limits.maxActive, limits, managedOverriddenBuiltinTools });
         } finally {
           if (treePermitLease) {
             const releasedBeforeBind = await treePermitLease.release().catch(() => false);
@@ -1432,6 +1443,25 @@ export default function (pi: ExtensionAPI) {
                   : "No background subagent jobs.",
               }],
               details: backgroundJobStatusListDetails(jobs),
+            };
+          }
+
+          if (action === "steer") {
+            // Map lookup is exact: no trimming, prefix guessing, history replay, or broadcast.
+            const sessionToken = backgroundSessionFence.capture();
+            const outcome = await steerBackgroundJob(backgroundJobs, params.id!, params.message!,
+              () => backgroundSessionFence.isCurrent(sessionToken) && canStartInvocation());
+            if (outcome === "not-found") return failOperational("runtime-policy", "Background subagent job was not found (exact full id required).");
+            if (outcome === "unsupported") return failOperational("runtime-policy", "Steering supports single-agent background jobs only.");
+            if (outcome !== "submitted") return failOperational("runtime-policy",
+              outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically." : "Child did not accept steering (unavailable, busy, or idle).");
+            const job = backgroundJobs.get(params.id!);
+            if (!job || job.status !== "running" || job.controller?.signal.aborted || !backgroundSessionFence.isCurrent(sessionToken)) {
+              return failOperational("runtime-policy", "Steering outcome is unknown after completion or session replacement; do not retry automatically.");
+            }
+            return {
+              content: [{ type: "text", text: `Child admitted steering to its bounded inbox for background subagent job ${job.id}. This is not native queue or model application confirmation; do not retry automatically.` }],
+              details: backgroundJobActionDetails("steering-submitted", snapshotBackgroundJob(job)),
             };
           }
 

@@ -518,7 +518,8 @@ describe("subagent tool schema", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(SubagentParams)), {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["status", "cancel"] },
+        action: { type: "string", enum: ["status", "cancel", "steer"] },
+        message: { type: "string", minLength: 1, maxLength: 512 },
         id: { type: "string", minLength: 1 },
         background: { type: "boolean" },
         agent: { type: "string", minLength: 1 },
@@ -677,6 +678,7 @@ describe("subagent tool schema", () => {
     assert.match(description, /status without id lists background jobs/);
     assert.match(description, /cancel without id cancels all running background jobs/);
     assert.match(description, /cancel ACK is not terminal/i);
+    assert.match(description, /steer: full single background id.*inbox admission ACK only/i);
     assert.match(description, /chain labels.*unique/i);
     assert.match(description, /defaults to on_success/i);
     assert.match(description, /recovery.*continueOnError.*failed stage/is);
@@ -697,7 +699,7 @@ describe("subagent tool schema", () => {
 
   test("keeps the serialized schema and description within the compact budget", () => {
     const staticChars = JSON.stringify(SubagentParams).length + formatSubagentToolDescription().length;
-    assert.ok(staticChars <= 2_400, `static schema and description are ${staticChars} characters`);
+    assert.ok(staticChars <= 2_550, `static schema and description are ${staticChars} characters`);
   });
 
 

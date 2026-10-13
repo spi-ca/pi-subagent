@@ -14,7 +14,7 @@ Pi `1.1.0`의 도구 render context에 유한한 0 이상의 `durationMs`가 있
 
 Pi `1.0.2`의 `registerToolRenderer()`로 호출·결과 표시를 실행 도구 등록과 분리한다. 위임 깊이 제한으로 도구가 등록되지 않아도 저장된 호출을 표시할 수 있지만, 실행 권한이나 reload 이전의 UI-only 상태를 복구하지 않는다.
 
-Pi `1.0.2`의 `outputSchema`/`structuredContent`를 지원한다. single/parallel/chain은 producer의 실제 결과에서 `results`(agent, exitCode, 최종 output 등)를, background 접수/status/cancel은 실제 registry details에서 `jobs`(jobId, status, 시간, 보존된 output/error 등)를 만든다. 사람용 `content`를 파싱하지 않는다. envelope는 `kind: "subagent.result"`, `version: 1`, `operation`과 omission/clipping 정보를 포함한다. codemode 호출은 이 데이터를 받으며 출력은 계속 비신뢰 데이터다.
+Pi `1.0.2`의 `outputSchema`/`structuredContent`를 지원한다. single/parallel/chain은 producer의 실제 결과에서 `results`(agent, exitCode, 최종 output 등)를, background 접수/status/cancel/steer는 실제 registry details에서 `jobs`(jobId, status, 시간, 보존된 output/error 등)를 만든다. 사람용 `content`를 파싱하지 않는다. envelope는 `kind: "subagent.result"`, `version: 1`, `operation`과 omission/clipping 정보를 포함한다. codemode 호출은 이 데이터를 받으며 출력은 계속 비신뢰 데이터다.
 
 각 배열은 최대 32행, 문자열은 최대 2048 UTF-16 code unit, JSON-escaped 전체 machine data는 최대 64 KiB다. 잘린 문자열/행은 `clipped`, `omittedResults`, `omittedJobs`로 표시한다. 원본 human text, TUI details, usage와 thrown 실패/취소 의미는 그대로 유지하며, 예외를 성공 data로 바꾸지 않는다. machine projection은 전체 transcript 또는 원본 출력 복구를 약속하지 않는다.
 
@@ -150,6 +150,18 @@ native classifier/image 모델, session store와 temp output은 tool allowlist �
 Pi TUI에서는 종료된 자동 결과를 간결하게 표시합니다. 접힌 카드는 상태, 짧은 job ID, 경과 시간과 **비신뢰** 본문을 보여 주며, 본문은 최대 4 KiB를 읽고 `previewLines` visual row만 표시합니다. 기본값은 8이며 전역 `~/.pi/agent/extensions/pi-tool-display/config.json`의 `previewLines`로 1–80 범위에서 설정합니다. `PI_CODING_AGENT_DIR`가 설정되면 그 agent directory 아래의 같은 경로를 사용하고, `~`와 `~/...`는 홈 디렉터리로 확장됩니다. 파일이 없거나 malformed·unsafe이면 안전하게 기본값 8을 사용합니다. 변경은 `/reload` 또는 새 세션의 `session_start`에서 동기화됩니다.
 
 전체 화면 TUI에서는 결과 카드의 왼쪽 클릭으로 그 카드만 펼치거나 접을 수 있습니다. 짧은 결과도 클릭하면 전체 job ID를 확인할 수 있습니다. `app.tools.expand` keybinding의 현재 host 설정이 모든 카드의 공통 hint로 표시되며, 설정을 읽을 수 없으면 기본 `Ctrl+O`를 사용합니다. 그 전역 상태가 바뀌면 모든 카드에 authoritative이며 기존 카드별 선택을 덮어씁니다. 펼친 카드는 full job ID와 별도 제목 없는 결과 본문을 보이며, 본문 head는 최대 12 KiB(인식할 수 없는 메시지 fallback은 4 KiB), 최대 64 logical line, ANSI-aware 폭 줄바꿈 뒤 최대 96 row입니다. 표시 상한에 닿은 `... (output clipped • /subagent-result <job-id>)`는 UI가 잘랐다는 뜻이며, producer가 보존하지 않은 바이트를 나타내는 별도 `... (N B not retained)` footer와 구별됩니다. producer의 유효한 `[Background output truncated: N bytes omitted.]`도 별도의 비신뢰 notice 행으로 보존합니다. `/subagent-result <job-id 또는 고유 prefix>`는 현재 branch에 보존된 결과만 display-only editor로 열며 편집·취소한 내용은 버립니다. 어느 표기도 전체 원문의 보존·복구를 약속하지 않으며, 이 TUI 표시 처리는 세션 컨텍스트와 steer 원본 메시지를 바꾸지 않습니다.
+
+## 실행 중인 단일 child에 추가 지시 보내기
+
+```js
+subagent({ action: "steer", id: "<접수 결과의 정확한 전체 jobId>", message: "현재 컨텍스트를 유지하고 테스트에 집중하세요." })
+```
+
+현재 세션의 `background: true` **단일 에이전트** 작업만 지원합니다. `id` prefix·생략, 병렬·체인 broadcast, foreground steering은 지원하지 않습니다. `message`는 공백만이 아닌 최대 **512 UTF-8 바이트**의 문자열이며, child의 한 메시지 inbox에 접수합니다. Pi **stable >=1.1.0**의 awaited `turn_end`에서만 기존 draft 뒤에 literal `custom_message`를 추가하고 continuation을 요청합니다. `agent_before_settle`에서는 전달하지 않습니다. history 재전송·새 prompt 시작·child 재시작·LLM ACK 요청·자동 재시도는 없고, 메시지는 명령/skill/template으로 확장하지 않습니다. native input handler를 통과하는 user input이 아니라 context message이며, Pi가 모델 요청에서는 그 내용을 user role로 변환합니다.
+
+Linux/macOS inline CLI JSON 실행은 필요한 작업에만 경량 bridge를 로드하고 기존 인증 lifecycle socket을 사용합니다. stdin/JSON stdout과 foreground 동작은 유지하며, steering용 주기 polling·monitor timer는 추가하지 않습니다. cmux/tmux/Herdr는 기존 interactive child bridge와 같은 inbox/socket을 사용합니다. Pi 1.1 boundary API가 없는 구형 child는 성공 ACK를 반환하지 않지만, 패키지 전체의 기존 backend 최소 버전 **>=0.80.10**은 변경하지 않습니다. Windows, socket이 없는 실행, 아직 queued/startup인 child, idle·settled·취소 중·종료·세션 교체된 작업은 거부합니다. 접수와 소비 모두 현재 low-level 실행의 `ctx.signal`이 존재하고 abort되지 않아야 합니다. `isIdle()`이 false여도 signal이 없으면 안전을 확인할 수 없어 거부합니다(fail-closed). low-level `agent_end` 뒤부터 다음 정상 retry/continuation의 `agent_start` 전까지는 접수하지 않으며, pre-settle steering은 지원하지 않습니다. interactive ownership이 이전되거나 completion fence가 관찰된 작업도 거부합니다.
+
+성공 응답 `Child admitted steering to its bounded inbox`은 **child inbox 접수만 확인하는 ACK**입니다. 호환성을 위해 details event 이름은 `steering-submitted`를 유지합니다. socket write만으로 성공을 보고하지 않지만, native steering queue·transcript commit·모델 적용·지시 수행을 확인한 것은 아닙니다. 소비 전에는 한 메시지만 보관하고 추가 접수는 즉시 거부합니다. boundary의 aborted/error outcome, abort signal, ownership·종료 상태를 다시 확인하며, 취소·오류·`agent_end`·settlement·shutdown이면 미소비 메시지를 폐기하며, 다음 low-level 실행으로 넘기지 않습니다. 따라서 접수 후에도 내용이 적용되지 않을 수 있습니다. native input 처리나 늦은 새 prompt를 예약하는 경로는 사용하지 않습니다. 한 run의 socket 전송도 하나만 진행하며, backpressure는 즉시 거부하고 ACK 대기는 한 번만 최대 1초로 제한합니다. 취소·완료·연결 종료 또는 deadline이 겹친 `unknown`은 적용되지 않았다는 뜻이 아닙니다. 자동 재시도하지 말고 최종 결과를 기다리세요. 전송 메시지·token·callback은 status snapshot이나 응답에 되풀이하지 않습니다.
 
 ## 상태 확인과 취소
 

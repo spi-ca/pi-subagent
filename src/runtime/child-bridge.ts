@@ -59,6 +59,7 @@ import {
 import { verifyAndAcknowledgeForkBootstrap } from "./fork-source-ownership.js";
 import { adoptTreePermitAuthority, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_ROOT_ENV } from "./tree-permit-authority.js";
 import { computeLegacySessionCompletionBoundary, computeSessionCompletionBoundary, computeSessionFailureBoundary } from "./completion-v3.js";
+import { SteeringInbox } from "./steering-inbox.js";
 import { LifecycleEventClient } from "./lifecycle-socket.js";
 import { createChildHerdrMetadataReporter, parseHerdrEnvironment, type ChildHerdrMetadataReporter, type HerdrPaneHandle } from "./herdr.js";
 import { capturePhase0LiveProofClientEnv, MAX_PHASE0_LIVE_PROOF_RELEASE_WINDOW_MS, parsePhase0LiveProofReleaseDeadline, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, Phase0LiveProofClient } from "./phase0-live-proof.js";
@@ -485,6 +486,11 @@ export function registerChildBridge(
 	let lastAssistant: LastAssistantStatus = { hasText: false };
 	let writeChain = Promise.resolve();
 	let lifecycleClient: LifecycleEventClient | null = null;
+	let lifecycleClosed = false;
+	let lifecycleGeneration = 0;
+	const steeringInbox = new SteeringInbox(
+		() => agentStarted && !terminal && !lifecycleClosed && !checkerStopped && ownership === "parent-owned");
+	steeringInbox.registerBoundaries(pi);
 	let herdrMetadataReporter: ChildHerdrMetadataReporter | null = null;
 	let acknowledgementReconciliationTimer: NodeJS.Timeout | undefined;
 	let ownership: RunOwnership = config.ownership;
@@ -665,6 +671,7 @@ export function registerChildBridge(
 		setRuntimeTitle(ctx, metadataLifecycle);
 		herdrMetadataReporter?.report(metadataLifecycle);
 		terminal = true;
+		steeringInbox.close();
 		stopChecker();
 		// The checker cannot await itself. Its raw I/O has already completed and
 		// stopChecker fenced scheduling before this publication.
@@ -732,6 +739,7 @@ export function registerChildBridge(
 	};
 	const acceptDetachedOwnership = () => {
 		ownership = "detached";
+		steeringInbox.close();
 		stopChecker();
 		lifecycleClient?.close();
 		lifecycleClient = null;
@@ -944,18 +952,24 @@ export function registerChildBridge(
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (!await rejectUnverifiedBootstrap(ctx)) return;
+		const generation = ++lifecycleGeneration;
+		if (!await rejectUnverifiedBootstrap(ctx) || lifecycleClosed) return;
 		// The private allocation and inherited initial Herdr identity bind this
 		// optional diagnostics channel; failure simply leaves it unavailable.
 		herdrMetadataReporter = await createBoundChildHerdrMetadataReporter(config, runtimeTitle, options.createHerdrMetadataReporter);
 		setRuntimeTitle(ctx, "ready");
 		herdrMetadataReporter?.report("ready");
 		await phase0ProofClient?.start();
-		lifecycleClient = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath).catch(() => null);
+		const connected = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath).catch(() => null);
+		if (lifecycleClosed || generation !== lifecycleGeneration || terminal) { connected?.close(); return; }
+		lifecycleClient = ownership === "parent-owned" ? connected : null;
+		if (ownership !== "parent-owned") connected?.close();
+		lifecycleClient?.setSteerHandler((message) => steeringInbox.submit(ctx, message));
 		lifecycleClient?.setControlHandler(async (command) => {
-			if (command !== "abort" || terminal) return;
+			if (command !== "abort" || terminal || lifecycleClosed) return;
 			// Authenticated parent control is cooperative: the bridge owns the
 			// child abort, durable completion, and session shutdown in that order.
+			steeringInbox.close();
 			ctx.abort();
 			await finish(ctx, "aborted", "parent-control", "surface-closed");
 		});
@@ -963,11 +977,14 @@ export function registerChildBridge(
 		await startChecker(ctx, monotonicNow()).catch(reportBridgeError); // initial check is a hard gate
 		if (!terminal) scheduleChecker(ctx); // an initial orphan must not create a timer
 	});
+
 	pi.on("agent_start", async (_event, ctx) => {
+		if (terminal) return;
 		if (!await rejectUnverifiedBootstrap(ctx)) return;
 		setRuntimeTitle(ctx, "running");
 		herdrMetadataReporter?.report("running");
 		agentStarted = true;
+		steeringInbox.start(ctx);
 		lifecycleClient?.send("agent-started");
 		await writeState("running", "agent_start").catch(reportBridgeError);
 	});
@@ -975,6 +992,7 @@ export function registerChildBridge(
 		setRuntimeTitle(ctx, "waiting");
 		herdrMetadataReporter?.report("waiting");
 		lastAssistant = getLastAssistantStatus(event.messages);
+		steeringInbox.pause();
 		// This is diagnostics only: it has no bearing on FIFO release, provider
 		// proof acceptance, or normal child completion. The client refuses this
 		// after read-start, so a blocked descriptor read is never called terminal.
@@ -983,6 +1001,7 @@ export function registerChildBridge(
 		await writeState("idle", "agent_end").catch(reportBridgeError);
 	});
 	(pi.on as unknown as AgentSettledRegistrar)("agent_settled", async (event, ctx) => {
+		steeringInbox.close();
 		if (!agentStarted || terminal) return;
 		lifecycleClient?.send("agent-settled");
 		// Pi 1.1 reports cancellation even after a successful assistant/tool
@@ -1001,6 +1020,9 @@ export function registerChildBridge(
 		else await finish(ctx, "completed", lastAssistant.stopReason);
 	});
 	pi.on("session_shutdown", async () => {
+		lifecycleClosed = true;
+		steeringInbox.close();
+		lifecycleGeneration += 1;
 		// If neither agent_end nor read-start won, retain only the fixed shutdown
 		// category. reportTerminal is one-shot and intentionally no-ops post-read.
 		phase0ProofClient?.reportTerminal("shutdown-before-read");

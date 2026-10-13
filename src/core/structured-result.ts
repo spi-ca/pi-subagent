@@ -19,7 +19,7 @@ const ResultSchema = Type.Object({
 /** A bounded data projection, independent of human formatting and TUI details. */
 export const SubagentOutputSchema = Type.Object({
   kind: Type.Literal("subagent.result"), version: Type.Literal(1),
-  operation: Type.Union(["single", "parallel", "chain", "background", "status", "cancel"].map((value) => Type.Literal(value))),
+  operation: Type.Union(["single", "parallel", "chain", "background", "status", "cancel", "steer"].map((value) => Type.Literal(value))),
   event: Type.Optional(text()), mode: Type.Optional(text()), delegationMode: Type.Optional(text()), terminalMode: Type.Optional(text()),
   results: Type.Array(ResultSchema, { maxItems: STRUCTURED_RESULT_MAX_ROWS }),
   jobs: Type.Array(JobSchema, { maxItems: STRUCTURED_RESULT_MAX_ROWS }),
@@ -81,6 +81,7 @@ export function withSubagentStructuredContent<T extends { details: unknown }>(re
   if (background) {
     if (details.event === "accepted") operation = "background";
     else if (["cancel-list", "cancellation-requested", "already-terminal"].includes(details.event)) operation = "cancel";
+    else if (details.event === "steering-submitted" || details.operation === "steer") operation = "steer";
     else operation = "status";
   }
   const data = {

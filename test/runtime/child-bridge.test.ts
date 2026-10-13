@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import childBridge, { readAssignedPhase0Barrier, registerChildBridge, registerPhase0LiveProviderProof } from "../../src/runtime/child-bridge";
+import { PARENT_REPORT_ENV, PARENT_REPORT_TOOL } from "../../src/runtime/parent-report";
 import { STEERING_CUSTOM_TYPE } from "../../src/runtime/steering-inbox";
 import { derivePhase0LiveProofCapability, Phase0LiveProofServer } from "../../src/runtime/phase0-live-proof";
 import { TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_MAX_ACTIVE_ENV, TREE_PERMIT_ROOT_ENV, TREE_PERMIT_ROOT_ID_ENV, TREE_PERMIT_TOKEN_ENV } from "../../src/runtime/tree-permit-authority";
@@ -114,12 +115,15 @@ async function setupBridge(runId: string, options: {
 	expectedParent?: { pid: number; startedAt: number };
 	failureBoundaryCapability?: boolean;
 	metadataTailSuccessBoundaryCapability?: boolean;
+	parentReporting?: boolean;
 	herdrMetadataReporter?: { report(lifecycle: "ready" | "running" | "waiting" | "returning" | "failed"): void; close(): Promise<void> };
 	herdrEnvMismatch?: boolean;
 } = {}) {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-bridge-"));
 	tempDirs.push(root);
 	const paths = await prepareRunArtifactPaths({ rootDir: root, runId });
+	if (options.parentReporting) process.env[PARENT_REPORT_ENV] = "1";
+	else delete process.env[PARENT_REPORT_ENV];
 	process.env[SUBAGENT_RUN_ID_ENV] = runId;
 	process.env[SUBAGENT_RUN_STATE_PATH_ENV] = paths.statePath;
 	process.env[SUBAGENT_RUN_COMPLETION_PATH_ENV] = paths.completionPath;
@@ -1480,4 +1484,60 @@ describe("child lifecycle bridge", () => {
 		assert.equal(fs.existsSync(bridge.paths.completionFencePath), true);
 		assert.equal(fs.existsSync(bridge.paths.completionFenceAckPath), false, "only a dead parent identity may bypass ACK");
 	});
+});
+
+for (const gate of ["abort", "completion", "ownership"] as const) {
+  test(`interactive reporting requires explicit eligibility and remains denied after ${gate} without changing lifecycle authority`, async () => {
+    const runId = `report-interactive-${gate}`;
+    const bridge = await setupBridge(runId, { isProcessIdentityAlive: () => true, parentReporting: true });
+    const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+    const token = server.registerRun(runId);
+    const received: string[] = [];
+    server.setReportHandler(runId, message => { received.push(message); return true; });
+    server.activateRun(runId);
+    await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+    Object.assign(process.env, { [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: server.socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: bridge.paths.lifecycleTokenPath });
+    const report = bridge.tools.get(PARENT_REPORT_TOOL); assert.ok(report);
+    assert.equal(process.env[PARENT_REPORT_ENV], undefined);
+    await bridge.emit("session_start");
+    await assert.rejects(report.execute("startup", { message: "not started" }, bridge.ctx.signal, undefined, bridge.ctx), /not submitted|unavailable/);
+    const wake = server.waitForEvent(runId, 1000);
+    await bridge.emit("agent_start"); await wake;
+    const result = await report.execute("report", { message: "literal short report" }, bridge.ctx.signal, undefined, bridge.ctx);
+    assert.deepEqual(result.details, { outcome: "submitted" });
+    assert.deepEqual(received, ["literal short report"]);
+    assert.equal(await readJsonFile(bridge.paths.completionPath), null, "reporting cannot produce a completion");
+    if (gate === "abort") bridge.ctx.abort();
+    if (gate === "completion") {
+      await bridge.emit("agent_end", { messages: [assistant("stop")] });
+      await bridge.emit("agent_settled", { aborted: false });
+      assert.equal(parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), runId)?.status, "completed");
+    }
+    if (gate === "ownership") {
+      const allocation = { version: 2, runId, terminalMode: "cmux-pane", target: { workspaceId: "123e4567-e89b-12d3-a456-426614174001", surfaceId: "123e4567-e89b-12d3-a456-426614174002", paneId: "123e4567-e89b-12d3-a456-426614174003" }, allocatedAt: 1 };
+      await atomicWriteJson(bridge.paths.allocationPath, allocation);
+      const child = parseRunState(await readJsonFile(bridge.paths.statePath), runId)!;
+      await atomicWriteJson(bridge.paths.promotionRequestPath, { contract: "pi-subagent.detached-transfer", version: 1, kind: "request", transferId: "123e4567-e89b-12d3-a456-426614174020", runId,
+        allocation: { algorithm: "sha256", digest: crypto.createHash("sha256").update(JSON.stringify(allocation)).digest("hex") },
+        parent: { pid: process.pid, startedAt: getCurrentProcessStartedAt()! }, child: { pid: child.childPid!, startedAt: child.childStartedAt! }, requestedAt: Date.now() });
+      await waitForCondition(async () => Boolean(parseOwnershipTransferAck(await readJsonFile(bridge.paths.promotionAckPath), runId)), "reporting child ownership transfer");
+      assert.equal(await readJsonFile(bridge.paths.completionPath), null);
+    }
+    await assert.rejects(report.execute("denied", { message: "must not reach parent" }, bridge.ctx.signal, undefined, bridge.ctx), /unsupported or unavailable/);
+    assert.deepEqual(received, ["literal short report"]);
+    await bridge.shutdownAndDrain();
+    assert.equal((server as any).runs.get(runId)?.reportHandler, undefined);
+  });
+}
+
+test("interactive foreground connection alone never registers the parent reporting tool", async () => {
+  const runId = "report-foreground-denied";
+  const bridge = await setupBridge(runId, { isProcessIdentityAlive: () => true });
+  const server = await LifecycleEventServer.start(); lifecycleServers.push(server);
+  const token = server.registerRun(runId); server.activateRun(runId);
+  await writeLifecycleBootstrapToken(bridge.paths.lifecycleTokenPath, token);
+  Object.assign(process.env, { [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: server.socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: bridge.paths.lifecycleTokenPath });
+  await bridge.emit("session_start"); await bridge.emit("agent_start");
+  assert.equal(server.isConnected(runId), true);
+  assert.equal(bridge.tools.has(PARENT_REPORT_TOOL), false);
 });

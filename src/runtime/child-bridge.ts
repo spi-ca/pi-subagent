@@ -60,6 +60,7 @@ import { verifyAndAcknowledgeForkBootstrap } from "./fork-source-ownership.js";
 import { adoptTreePermitAuthority, TREE_PERMIT_LEASE_ID_ENV, TREE_PERMIT_LEASE_TOKEN_ENV, TREE_PERMIT_ROOT_ENV } from "./tree-permit-authority.js";
 import { computeLegacySessionCompletionBoundary, computeSessionCompletionBoundary, computeSessionFailureBoundary } from "./completion-v3.js";
 import { SteeringInbox } from "./steering-inbox.js";
+import { registerParentReportTool } from "./parent-report.js";
 import { LifecycleEventClient } from "./lifecycle-socket.js";
 import { createChildHerdrMetadataReporter, parseHerdrEnvironment, type ChildHerdrMetadataReporter, type HerdrPaneHandle } from "./herdr.js";
 import { capturePhase0LiveProofClientEnv, MAX_PHASE0_LIVE_PROOF_RELEASE_WINDOW_MS, parsePhase0LiveProofReleaseDeadline, PHASE0_LIVE_PROOF_BARRIER_PATH_ENV, PHASE0_LIVE_PROOF_BEHAVIOR_ENV, PHASE0_LIVE_PROOF_RELEASE_DEADLINE_ENV, PHASE0_LIVE_PROOF_RELEASE_TOKEN_ENV, Phase0LiveProofClient } from "./phase0-live-proof.js";
@@ -486,6 +487,9 @@ export function registerChildBridge(
 	let lastAssistant: LastAssistantStatus = { hasText: false };
 	let writeChain = Promise.resolve();
 	let lifecycleClient: LifecycleEventClient | null = null;
+	const reporting = registerParentReportTool(pi, () => lifecycleClient, (ctx) =>
+		agentStarted && !terminal && !lifecycleClosed && !checkerStopped && ownership === "parent-owned"
+		&& Boolean(ctx.signal) && !ctx.signal?.aborted && !ctx.isIdle());
 	let lifecycleClosed = false;
 	let lifecycleGeneration = 0;
 	const steeringInbox = new SteeringInbox(
@@ -960,7 +964,7 @@ export function registerChildBridge(
 		setRuntimeTitle(ctx, "ready");
 		herdrMetadataReporter?.report("ready");
 		await phase0ProofClient?.start();
-		const connected = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath).catch(() => null);
+		const connected = await LifecycleEventClient.connectFromEnvironment(process.env, config.statePath, true, reporting).catch(() => null);
 		if (lifecycleClosed || generation !== lifecycleGeneration || terminal) { connected?.close(); return; }
 		lifecycleClient = ownership === "parent-owned" ? connected : null;
 		if (ownership !== "parent-owned") connected?.close();

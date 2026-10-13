@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { LifecycleEventClient } from "./lifecycle-socket.js";
+import { registerParentReportTool } from "./parent-report.js";
 import { SteeringInbox } from "./steering-inbox.js";
 
 export const INLINE_STEERING_STATE_PATH_ENV = "PI_SUBAGENT_INLINE_STEERING_STATE_PATH";
@@ -13,6 +14,7 @@ export default function inlineSteeringBridge(pi: ExtensionAPI): void {
   let running = false;
   let closed = false;
   let generation = 0;
+  const reporting = registerParentReportTool(pi, () => client, (ctx) => running && !closed && Boolean(ctx.signal) && !ctx.signal?.aborted && !ctx.isIdle());
   const inbox = new SteeringInbox(() => running && !closed);
   inbox.registerBoundaries(pi);
   const close = () => {
@@ -26,7 +28,7 @@ export default function inlineSteeringBridge(pi: ExtensionAPI): void {
   };
   pi.on("session_start", async (_event, ctx) => {
     const token = ++generation;
-    const connected = await LifecycleEventClient.connectFromEnvironment(process.env, statePath, false);
+    const connected = await LifecycleEventClient.connectFromEnvironment(process.env, statePath, false, reporting);
     if (closed || token !== generation) { connected?.close(); return; }
     client = connected;
     client?.setSteerHandler((message) => inbox.submit(ctx, message));

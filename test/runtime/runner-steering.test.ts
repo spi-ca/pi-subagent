@@ -91,3 +91,62 @@ test("inline runner retains one-shot JSON/stdin, loads bridge only on opt-in and
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("inline single-background runner binds reporting only when selected and strips ambient capability from foreground/nested env", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") return;
+  const root = await fs.mkdtemp(path.join(process.cwd(), ".bun-tmp/runner-report-"));
+  const oldArgv = process.argv[1], saved = { ...process.env };
+  const fake = path.join(root, "fake-pi.ts"), bridgePath = path.join(process.cwd(), "src/runtime/inline-steering-bridge.ts");
+  await fs.writeFile(fake, `
+    import bridge from ${JSON.stringify(bridgePath)};
+    const handlers = new Map(), tools = [];
+    const pi = { on(event, handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); }, registerTool(tool) { tools.push(tool); } };
+    const ctx = { isIdle: () => false, signal: new AbortController().signal, shutdown() {} };
+    const emit = async event => { for (const fn of handlers.get(event) ?? []) await fn({}, ctx); };
+    const output = text => process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" }] }) + "\\n");
+    if (process.argv.includes(${JSON.stringify(bridgePath)})) {
+      bridge(pi); await emit("session_start"); await emit("agent_start");
+      const selected = process.argv[process.argv.indexOf("--tools") + 1]?.split(",").includes("report_to_parent");
+      if (selected) {
+        if (tools.length !== 1 || tools[0].name !== "report_to_parent") throw Error("missing tool");
+        if (process.env.PI_SUBAGENT_PARENT_REPORT || process.env.PI_SUBAGENT_LIFECYCLE_TOKEN_PATH || process.env.PI_SUBAGENT_LIFECYCLE_SOCKET_PATH) throw Error("nested ambient leak");
+        const result = await tools[0].execute("call", { message: "/skill:literal report" }, ctx.signal, undefined, ctx);
+        output(result.content[0].text);
+      } else {
+        if (tools.length) throw Error("forbidden tool auto-enabled");
+        output("not selected");
+      }
+      await emit("agent_settled");
+      process.stdout.write(JSON.stringify({ type: "agent_settled", aborted: false }) + "\\n");
+    } else {
+      if (process.env.PI_SUBAGENT_PARENT_REPORT) throw Error("ambient report capability leak");
+      output("foreground untouched");
+    }
+  `);
+  process.argv[1] = fake;
+  process.env.TMPDIR = root;
+  process.env.PI_SUBAGENT_RUN_STATE_DIR = path.join(root, `pi-subagent-runs-${process.getuid?.()}`);
+  process.env.PI_SUBAGENT_PARENT_REPORT = "1"; // must not be inherited as authority
+  const agent = { name: "child", description: "", systemPrompt: "", source: "user" as const, filePath: path.join(root, "child.md"), tools: ["read"] };
+  const opts = { cwd: process.cwd(), agents: [agent], agentName: agent.name, task: "task", delegationMode: "spawn" as const, terminalMode: "inline" as const, parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true,
+    makeDetails: (results: any[]) => ({ mode: "single" as const, toolLabel: "Subagent", delegationMode: "spawn" as const, terminalMode: "inline" as const, projectAgentsDir: null, results }) };
+  const reports: string[] = [];
+  const onParentReport = (message: string) => { reports.push(message); return true; };
+  try {
+    const foreground = await runAgent(opts);
+    assert.equal(foreground.exitCode, 0); assert.equal(getFinalOutput(foreground.messages), "foreground untouched");
+    const notSelected = await runAgent({ ...opts, onSteeringReady: () => undefined, onParentReport });
+    assert.equal(notSelected.exitCode, 0); assert.equal(getFinalOutput(notSelected.messages), "not selected"); assert.deepEqual(reports, []);
+    const selected = await runAgent({ ...opts, agents: [{ ...agent, tools: ["read", "report_to_parent"] }], onSteeringReady: () => undefined, onParentReport });
+    assert.equal(selected.exitCode, 0, selected.stderr);
+    assert.match(getFinalOutput(selected.messages), /Parent notification submitted/);
+    assert.deepEqual(reports, ["/skill:literal report"]);
+    assert.equal(JSON.stringify(selected).includes("lifecycle-token"), false);
+  } finally {
+    process.argv[1] = oldArgv;
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    await resetInteractiveShutdownForSession();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

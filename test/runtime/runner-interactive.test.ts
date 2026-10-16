@@ -1311,6 +1311,24 @@ describe("interactive pane runner preparation", () => {
 		assert.ok(forkArgs.some((value) => value.endsWith("child-bridge.ts")));
 	});
 
+	test("managed omitted fork selections conservatively reject overrides only with Pi 1.3 restoration", () => {
+		for (const version of ["1.3.0", "1.3.1", "2.0.0"]) {
+			for (const name of ["grep", "find", "ls", "codemode"]) {
+				assert.throws(() => assertManagedChildToolCompatibility({}, undefined, [name], false, version, true), /extension overrides/);
+				assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, [name], false, version, false), "fresh spawn keeps defaults");
+				assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, [name], true, version, true), "no-tools prevents restoration");
+				assert.doesNotThrow(() => assertManagedChildToolCompatibility({ tools: [] }, undefined, [name], false, version, true));
+				assert.doesNotThrow(() => assertManagedChildToolCompatibility({ tools: ["read"] }, name, [name], false, version, true), "role list wins over fallback");
+				assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, "read", [name], false, version, true));
+				assert.throws(() => assertManagedChildToolCompatibility({ tools: [name] }, undefined, [name], false, version, true), /extension overrides/);
+			}
+			assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, [], false, version, true));
+		}
+		for (const version of ["1.2.0", "1.3.0-beta.1", "unknown"]) {
+			assert.doesNotThrow(() => assertManagedChildToolCompatibility({}, undefined, ["grep"], false, version, true), "restoration guard requires verified Pi >=1.3");
+		}
+	});
+
 	test("restricts built-in MCP for explicit child allowlists without changing general inheritance", () => {
 		const general = { name: "worker", description: "", systemPrompt: "", source: "user" as const, filePath: "/tmp/worker.md", tools: undefined };
 		const restricted = { ...general, tools: ["read", "codemode"] };

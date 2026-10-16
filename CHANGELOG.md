@@ -5,6 +5,13 @@
 - Codemode에서 여러 subagent 결과를 집계·선별하는 짧은 모델 지침과 사용 예시를 보강했다. 중요한 발견·agent 식별·실패·상태·clipping/누락 표시를 보존하고, 의미적 요약은 child에게 요청한다. 도구 schema·노출·기본 도구 선택과 background 전달 정책은 바꾸지 않는다.
 - Herdr protocol `22`의 호환성 설명을 `v0.9.5`까지 갱신했다. 설치된 `v0.9.3`–`v0.9.5`의 전체 bundled API schema가 동일하며 기존 protocol 허용 목록·호출 계약은 바꾸지 않는다. 실제 `v0.9.5` 서버에서의 interactive 동작 통과를 주장하지 않는다.
 
+## v20261016-1
+
+- Pi 개발 의존성·lockfile·현재 CI graph를 exact `1.3.0`으로 갱신했다. peer 범위와 shared `@pi/presence` Git pin은 유지한다.
+- fork/resume의 active tools 복원을 실제 설치 host의 오프라인 회귀로 검증한다. 역할의 명시 allowlist는 그대로 우선하고, 목록 생략 시 system delta·compaction checkpoint를 복원하며 `+/-`는 복원 결과 위에 적용한다. managed의 exact-selection 제한은 유지한다.
+- managed의 stable Pi `>=1.3.0` fork에서 도구 선택을 생략하면 복원 목록을 확정할 수 없으므로 알려진 부모 built-in override를 launch 전에 보수적으로 거부한다. 실제 복원 목록에 없어도 거부될 수 있으며, 명시 allowlist·`--no-tools`·spawn 검사는 유지한다.
+- Pi 1.3의 process-wide codemode worker 상한에 맞춰 오프라인 host 테스트의 script 호출을 묶거나 순차화한다. 기존 도구 거부·leaf attribution 검증은 유지하며 provider·실제 multiplexer 실행은 검증 범위에 포함하지 않는다.
+
 ## v20261013-1
 
 - 실행 중인 단일 background child에 정확한 전체 job ID로 `action: "steer"` 지시를 보낸다. 최대 512 UTF-8 바이트의 한 메시지만 접수하며 awaited `turn_end`에서 기존 실행의 컨텍스트에 반영한다. ACK는 inbox 접수일 뿐 모델 적용·수행을 보장하지 않으며 자동 재시도·주기 polling·새 prompt 실행은 없다.

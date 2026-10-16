@@ -1,12 +1,13 @@
-import { afterEach, test } from "bun:test";
+import { afterEach, jest, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
+import { getEventListeners } from "node:events";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ParentReportAdmission, isParentReportMessage, PARENT_REPORT_ENV, PARENT_REPORT_TOOL, PARENT_REPORT_RECEIPT_TYPE, prepareParentReportHandler, type ParentReportHandler, registerParentReportTool } from "../../src/runtime/parent-report";
-import { LifecycleEventClient, LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
+import { LOCAL_MESSAGE_WAIT_CAPACITY, LifecycleEventClient, LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
 import { selectsParentReport, assertManagedChildToolCompatibility, collectManagedOverriddenBuiltinTools, buildPiArgs, buildInteractivePiArgs, runAgent } from "../../src/runtime/runner";
 import { createBackgroundJobRecord, getBackgroundJobSnapshot } from "../../src/core/subagent-config";
 
@@ -127,7 +128,7 @@ test("authenticated reports require active running registered parent; four-run b
   client.close();
 });
 
-test("four accepted reports per child and one in-flight; backpressure does not consume budget or abort authority", async () => {
+test("four accepted reports per child with serialized waiting; backpressure does not consume budget or abort authority", async () => {
   let release!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
   let calls = 0;
@@ -140,13 +141,191 @@ test("four accepted reports per child and one in-flight; backpressure does not c
   delete socket.writableLength;
   assert.equal(await client.requestReport(" "), "unavailable");
   const pending = client.requestReport("first");
-  assert.equal(await client.requestReport("busy"), "busy");
-  release(); assert.equal(await pending, "submitted");
-  for (let i = 0; i < 3; i++) assert.equal(await client.requestReport("next"), "submitted");
+  const queued = client.requestReport("second");
+  release(); assert.deepEqual(await Promise.all([pending, queued]), ["submitted", "submitted"]);
+  for (let i = 0; i < 2; i++) assert.equal(await client.requestReport("next"), "submitted");
   assert.equal(await client.requestReport("overflow"), "limit"); assert.equal(calls, 4);
   client.setControlHandler(() => undefined);
   assert.equal(f.server.requestAbort(f.id), true); await delay(15);
   assert.equal(f.server.isAbortAcknowledged(f.id), true);
+  client.close();
+});
+
+test("bounded report FIFO waits for remote ACK, starts each deadline at dispatch, and charges only four sends", async () => {
+  const gates = Array.from({ length: 4 }, () => {
+    let enter!: () => void, release!: () => void;
+    return { entered: new Promise<void>(resolve => { enter = resolve; }),
+      blocked: new Promise<void>(resolve => { release = resolve; }), enter: () => enter(), release: () => release() };
+  });
+  const messages: string[] = [];
+  const f = await fixture(async message => {
+    const gate = gates[messages.length]!;
+    messages.push(message); gate.enter(); await gate.blocked; return true;
+  });
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  jest.useFakeTimers();
+  try {
+    const pending = [client.requestReport("report 0")];
+    let secondDone = false;
+    pending.push(client.requestReport("report 1").then(result => { secondDone = true; return result; }));
+    for (let i = 2; i <= LOCAL_MESSAGE_WAIT_CAPACITY; i++) pending.push(client.requestReport(`report ${i}`));
+    assert.equal(await client.requestReport("overflow"), "queue-full");
+    await gates[0]!.entered;
+    assert.equal(secondDone, false, "local queue acceptance must not ACK submission");
+    for (let i = 0; i < gates.length; i++) {
+      await gates[i]!.entered;
+      assert.deepEqual(messages, Array.from({ length: i + 1 }, (_, n) => `report ${n}`));
+      jest.advanceTimersByTime(900); // total queue residence exceeds one ACK deadline
+      gates[i]!.release();
+      assert.equal(await pending[i], "submitted");
+    }
+    assert.deepEqual(await Promise.all(pending.slice(4)), Array(LOCAL_MESSAGE_WAIT_CAPACITY - 3).fill("limit"));
+    assert.equal((client as any).reportCount, 4);
+    assert.equal((f.server as any).runs.get(f.id).reportCount, 4);
+    assert.equal((f.server as any).runs.get(f.id).reportPending, false);
+    assert.equal((client as any).reportPending, null);
+    assert.deepEqual((client as any).reportQueue, []);
+    jest.advanceTimersByTime(1000);
+    assert.equal((client as any).reportClosed, false, "settled timers must not fence later activity");
+  } finally { for (const gate of gates) gate.release(); jest.useRealTimers(); client.close(); }
+});
+
+test("report ACK defers one FIFO pump even when a new request arrives before the microtask", async () => {
+  const f = await fixture(() => true);
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  const socket = (client as any).socket, write = socket.write, frames: any[] = [];
+  socket.write = (frame: string) => { frames.push(JSON.parse(frame)); return true; };
+  const ack = (reportSequence: number) => socket.emit("data", Buffer.from(JSON.stringify({ version: 1, type: "report-ack",
+    runId: f.id, reportSequence, accepted: true }) + "\n"));
+  jest.useFakeTimers();
+  try {
+    const active = client.requestReport("active");
+    const queued = client.requestReport("queued");
+    ack(1);
+    const reentrant = client.requestReport("reentrant");
+    assert.deepEqual(frames.map(frame => frame.message), ["active"], "new request cannot bypass the deferred pump");
+    assert.equal(await active, "submitted");
+    assert.deepEqual(frames.map(frame => frame.message), ["active", "queued"]);
+    ack(2);
+    assert.equal(await queued, "submitted");
+    assert.deepEqual(frames.map(frame => frame.message), ["active", "queued", "reentrant"]);
+    ack(3);
+    assert.equal(await reentrant, "submitted");
+    assert.equal((client as any).reportDispatchScheduled, false);
+    assert.equal((client as any).reportPending, null);
+    assert.deepEqual((client as any).reportQueue, []);
+    jest.advanceTimersByTime(1000);
+    assert.equal((client as any).reportClosed, false);
+  } finally { socket.write = write; jest.useRealTimers(); client.close(); }
+});
+
+test("coalesced report ACK/abort never sends the next queued report", async () => {
+  const f = await fixture(() => true);
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  const socket = (client as any).socket, write = socket.write, frames: any[] = [];
+  socket.write = (frame: string) => { frames.push(JSON.parse(frame)); return true; };
+  const abort = new AbortController();
+  let aborts = 0;
+  client.setControlHandler(() => { aborts++; });
+  jest.useFakeTimers();
+  try {
+    const active = client.requestReport("active", abort.signal);
+    const queued = client.requestReport("unsent", abort.signal);
+    // Feed one coalesced batch through the connected client's real parser;
+    // recording socket writes catches a send even if the peer would reject it.
+    socket.emit("data", Buffer.from([
+      { version: 1, type: "report-ack", runId: f.id, reportSequence: 1, accepted: true },
+      { version: 1, type: "control", command: "abort", runId: f.id, sequence: 1 },
+    ].map(frame => JSON.stringify(frame) + "\n").join("")));
+    assert.deepEqual(frames.filter(frame => frame.type === "report").map(frame => frame.message), ["active"], "buffered abort must fence the queued report before any send");
+    assert.equal(await active, "submitted");
+    assert.equal(await queued, "unavailable");
+    assert.equal(aborts, 1);
+    assert.deepEqual(frames.map(frame => frame.type), ["report", "control-ack"]);
+    assert.equal((client as any).reportCount, 1);
+    assert.equal((client as any).reportPending, null);
+    assert.deepEqual((client as any).reportQueue, []);
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+    jest.advanceTimersByTime(1000);
+    assert.equal(await client.requestReport("after abort"), "unavailable");
+  } finally { socket.write = write; jest.useRealTimers(); client.close(); }
+});
+
+for (const end of ["signal", "agent-settled", "completion-ready", "shutdown", "close", "disconnect", "abort"] as const) {
+  test(`${end} settles active report as unknown and queued UNSENT requests as unavailable`, async () => {
+    let release!: () => void, enter!: () => void, calls = 0;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const f = await fixture(prepareParentReportHandler(() => true, async () => {
+      calls++; enter(); await blocked; return true;
+    }, () => true));
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+    await start(client, f.server, f.id);
+    const abort = new AbortController();
+    jest.useFakeTimers();
+    try {
+      const active = client.requestReport("active", abort.signal);
+      const queued = Array.from({ length: 3 }, () => client.requestReport("unsent", abort.signal));
+      await entered;
+      if (end === "signal") abort.abort();
+      else if (end === "close") client.close();
+      else if (end === "disconnect") f.server.terminalRun(f.id);
+      else if (end === "abort") { client.setControlHandler(() => {}); f.server.requestAbort(f.id); }
+      else client.send(end);
+      assert.equal(await active, "unknown");
+      assert.deepEqual(await Promise.all(queued), ["unavailable", "unavailable", "unavailable"]);
+      assert.equal((client as any).reportPending, null);
+      assert.deepEqual((client as any).reportQueue, []);
+      assert.equal(getEventListeners(abort.signal, "abort").length, 0, "all active and waiting abort listeners removed");
+      release();
+      jest.advanceTimersByTime(1000);
+      assert.equal(calls, 1, "no queued sends after an unknown result");
+      assert.equal(await client.requestReport("no retry"), "unavailable");
+    } finally { release(); jest.useRealTimers(); client.close(); }
+  });
+}
+
+test("queued report cancellation, revoked eligibility and agent_end discard never consume budget or leak into retry", async () => {
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const messages: string[] = [];
+  const f = await fixture(prepareParentReportHandler(() => true, async () => {
+    if (!messages.length) { enter(); await blocked; } return true;
+  }, message => { messages.push(message); return true; }));
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  const active = client.requestReport("first");
+  const abort = new AbortController();
+  const cancelled = client.requestReport("cancelled", abort.signal);
+  let eligible = true;
+  const revoked = client.requestReport("revoked", undefined, () => eligible);
+  await entered; abort.abort(); eligible = false;
+  assert.equal(await cancelled, "unavailable");
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  release(); assert.equal(await active, "submitted");
+  assert.equal(await revoked, "unavailable");
+  assert.equal((client as any).reportCount, 1);
+  // A new handler can hold the next active send while agent_end drains only UNSENT work.
+  let nextEnter!: () => void, nextRelease!: () => void;
+  const nextEntered = new Promise<void>(resolve => { nextEnter = resolve; });
+  const nextBlocked = new Promise<void>(resolve => { nextRelease = resolve; });
+  f.server.setReportHandler(f.id, prepareParentReportHandler(() => true, async () => {
+    nextEnter(); await nextBlocked; return true;
+  }, message => { messages.push(message); return true; }));
+  const old = client.requestReport("old active");
+  const unsent = client.requestReport("old queued");
+  await nextEntered;
+  const wake = f.server.waitForEvent(f.id, 1000); client.send("agent-ended"); await wake;
+  assert.equal(await unsent, "unavailable");
+  await start(client, f.server, f.id);
+  nextRelease(); assert.equal(await old, "rejected");
+  assert.equal(await client.requestReport("fresh"), "submitted");
+  assert.deepEqual(messages, ["first", "fresh"]);
+  assert.equal((client as any).reportCount, 3);
   client.close();
 });
 
@@ -156,11 +335,17 @@ test("one-second unknown deadline never retries or closes lifecycle; late ACK ma
   const f = await fixture(async () => { calls++; await blocked; return true; });
   const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
   await start(client, f.server, f.id);
-  const before = performance.now();
-  assert.equal(await client.requestReport("may have delivered"), "unknown");
-  assert.ok(performance.now() - before >= 900 && performance.now() - before < 1500);
-  assert.equal((client as any).reportPending, null);
-  assert.equal(await client.requestReport("no retry"), "unavailable");
+  jest.useFakeTimers();
+  try {
+    const active = client.requestReport("may have delivered");
+    const queued = client.requestReport("never sent");
+    jest.advanceTimersByTime(1000);
+    assert.equal(await active, "unknown");
+    assert.equal(await queued, "unavailable");
+    assert.equal((client as any).reportPending, null);
+    assert.deepEqual((client as any).reportQueue, []);
+    assert.equal(await client.requestReport("no retry"), "unavailable");
+  } finally { jest.useRealTimers(); }
   release(); await delay(20); assert.equal(calls, 1);
   assert.equal(f.server.isConnected(f.id), true);
   client.setControlHandler(() => undefined); assert.equal(f.server.requestAbort(f.id), true); await delay(15);
@@ -306,7 +491,14 @@ test("parent ACK backpressure admits nothing and preserves completion/abort chan
   await start(client, f.server, f.id);
   const run = (f.server as any).runs.get(f.id), socket = run.socket;
   Object.defineProperty(socket, "writableLength", { configurable: true, get: () => 8192 });
-  assert.equal(await client.requestReport("no ACK capacity"), "unknown");
+  jest.useFakeTimers();
+  try {
+    const received = new Promise<void>(resolve => socket.once("data", () => resolve()));
+    const pending = client.requestReport("no ACK capacity");
+    await received;
+    jest.advanceTimersByTime(1000);
+    assert.equal(await pending, "unknown");
+  } finally { jest.useRealTimers(); }
   assert.equal(calls, 0); assert.equal(socket.destroyed, false);
   delete socket.writableLength;
   client.setControlHandler(() => undefined); assert.equal(f.server.requestAbort(f.id), true); await delay(15);

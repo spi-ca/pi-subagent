@@ -74,6 +74,25 @@ describe("steering invocation contract", () => {
     assert.equal(await steerBackgroundJob(new Map([[job.id, job]]), job.id, "message", () => true), "unknown");
   });
 
+  test("dispatch eligibility follows session/job cancellation while known UNSENT outcomes stay unavailable", async () => {
+    for (const race of ["cancel", "completion", "replacement", "session"]) {
+      const job = createBackgroundJobRecord({ mode: "single" });
+      let dispatch!: () => void;
+      job.steer = (_message, eligible) => new Promise(resolve => {
+        dispatch = () => resolve(eligible!() ? "submitted" : "unavailable");
+      });
+      const registry = new Map([[job.id, job]]);
+      let current = true;
+      const pending = steerBackgroundJob(registry, job.id, "waiting", () => current);
+      if (race === "cancel") cancelBackgroundJobs(registry, job.id);
+      if (race === "completion") job.status = "completed";
+      if (race === "replacement") registry.delete(job.id);
+      if (race === "session") current = false;
+      dispatch();
+      assert.equal(await pending, "unavailable", race);
+    }
+  });
+
   test("steer structured result reports only submission, with no message/transport material", () => {
     const job = createBackgroundJobRecord({ mode: "single" });
     const details = { kind: "subagent.background-job", version: 1, event: "steering-submitted", job: buildBackgroundJobDetailSummary(snapshotBackgroundJob(job)) };

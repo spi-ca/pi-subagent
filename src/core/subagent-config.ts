@@ -632,8 +632,9 @@ export async function steerBackgroundJob(
   if (!job) return "not-found";
   if (job.mode !== "single") return "unsupported";
   if (!isSteeringMessage(message) || job.status !== "running" || job.controller?.signal.aborted || !job.steer) return "unavailable";
-  const outcome = await job.steer(message).catch(() => "unknown" as const);
-  if (!isCurrent() || registry.get(id) !== job || job.status !== "running" || job.controller?.signal.aborted) return "unknown";
+  const eligible = () => isCurrent() && registry.get(id) === job && job.status === "running" && !job.controller?.signal.aborted;
+  const outcome = await job.steer(message, eligible).catch(() => "unknown" as const);
+  if (!eligible() && (outcome === "submitted" || outcome === "rejected")) return "unknown";
   return outcome;
 }
 

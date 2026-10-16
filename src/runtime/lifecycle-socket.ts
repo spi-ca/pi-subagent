@@ -9,6 +9,8 @@ import { isParentReportMessage, type ParentReportHandler, type ReportOutcome } f
 export const SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_SOCKET_PATH";
 export const SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_TOKEN_PATH";
 const VERSION = 1 as const;
+/** Per direction: eight UNSENT requests in addition to one awaiting remote ACK. */
+export const LOCAL_MESSAGE_WAIT_CAPACITY = 8;
 const MAX_FRAME_BYTES = 4096;
 const MAX_CONNECTIONS = 64;
 const MAX_CONNECTION_CHUNK_BYTES = 64 * 1024;
@@ -30,6 +32,23 @@ export interface LifecycleEvent {
 	childPid?: number;
 }
 
+interface WaitingSteer {
+	message: string;
+	socket: net.Socket;
+	activityGeneration: number | undefined;
+	eligible: () => boolean;
+	resolve: (outcome: SteeringOutcome) => void;
+}
+
+interface WaitingReport {
+	message: string;
+	generation: number;
+	eligible: () => boolean;
+	signal?: AbortSignal;
+	cleanup: () => void;
+	resolve: (outcome: ReportOutcome) => void;
+}
+
 interface RunRegistration {
 	token: string;
 	active: boolean;
@@ -44,6 +63,8 @@ interface RunRegistration {
 	steerSequence?: number;
 	steerAcknowledged?: number;
 	steerPending?: { sequence: number; resolve: (outcome: SteeringOutcome) => void };
+	steerDispatchScheduled?: boolean;
+	steerQueue?: WaitingSteer[];
 	steerRunning?: boolean;
 	steerClosed?: boolean;
 	reportHandler?: ParentReportHandler;
@@ -253,7 +274,7 @@ export class LifecycleEventServer {
 	terminalRun(runId: string): void {
 		const run = this.runs.get(runId);
 		if (!run) return;
-		run.steerPending?.resolve("unknown");
+		this.closeSteering(run);
 		this.closeReporting(runId);
 		run.terminal = true;
 		run.token = "";
@@ -273,9 +294,8 @@ export class LifecycleEventServer {
 	requestAbort(runId: string): boolean {
 		const run = this.runs.get(runId);
 		if (!run?.active || run.terminal || !run.socket || run.socket.destroyed) return false;
-		run.steerClosed = true;
 		this.closeReporting(runId);
-		run.steerPending?.resolve("unknown");
+		this.closeSteering(run);
 		if (run.controlSequence > 0 && run.controlAcknowledged === run.controlSequence) return true;
 		if (run.controlSequence > run.controlAcknowledged) return true;
 		const sequence = ++run.controlSequence;
@@ -285,27 +305,64 @@ export class LifecycleEventServer {
 		return true;
 	}
 
-	/** No retries. ACK means bounded child inbox admission, not native queue/model application. */
-	async requestSteer(runId: string, message: string): Promise<SteeringOutcome> {
+	private discardSteeringQueue(run: RunRegistration): void {
+		for (const request of run.steerQueue?.splice(0) ?? []) request.resolve("unavailable");
+	}
+
+	private closeSteering(run: RunRegistration): void {
+		run.steerClosed = true; // Fence BEFORE settling the active request, which may dispatch the next.
+		this.discardSteeringQueue(run);
+		run.steerPending?.resolve("unknown");
+	}
+
+	/** No retries. Local waiting is not ACK; only remote inbox admission is submitted. */
+	async requestSteer(runId: string, message: string, eligible: () => boolean = () => true): Promise<SteeringOutcome> {
 		const run = this.runs.get(runId);
 		if (!isSteeringMessage(message) || !run?.active || run.terminal || run.steerClosed || !run.steerRunning
-			|| !run.socket || run.socket.destroyed) return "unavailable";
-		if (run.steerPending) return "busy";
+			|| !run.socket || run.socket.destroyed || !eligible()) return "unavailable";
+		const queue = run.steerQueue ??= [];
+		if (queue.length >= LOCAL_MESSAGE_WAIT_CAPACITY) return "queue-full";
+		return await new Promise<SteeringOutcome>((resolve) => {
+			queue.push({ message, socket: run.socket!, activityGeneration: run.activityGeneration, eligible, resolve });
+			this.dispatchSteering(runId, run);
+		});
+	}
+
+	private dispatchSteering(runId: string, run: RunRegistration): void {
+		if (run.steerPending || run.steerDispatchScheduled) return;
+		const request = run.steerQueue?.shift();
+		if (!request) return;
+		const { socket, message, resolve } = request;
+		if (this.closed || this.runs.get(runId) !== run || !run.active || run.terminal || run.steerClosed || !run.steerRunning
+			|| run.socket !== socket || socket.destroyed || run.activityGeneration !== request.activityGeneration || !request.eligible()) {
+			resolve("unavailable"); this.dispatchSteering(runId, run); return;
+		}
 		const sequence = (run.steerSequence ?? 0) + 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "steer", runId, sequence, message })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || run.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) return "busy";
-		return await new Promise<SteeringOutcome>((resolve) => {
-			const done = (outcome: SteeringOutcome) => {
-				clearTimeout(timer);
-				if (run.steerPending?.sequence === sequence) delete run.steerPending;
-				resolve(outcome);
-			};
-			// A bounded per-request deadline, never a monitor or retry timer.
-			const timer = setTimeout(() => { run.steerClosed = true; done("unknown"); }, 1000);
-			run.steerSequence = sequence;
-			run.steerPending = { sequence, resolve: done };
-			try { run.socket!.write(frame); } catch { run.steerClosed = true; done("unknown"); }
-		});
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) {
+			resolve("busy"); this.dispatchSteering(runId, run); return;
+		}
+		let settled = false;
+		const done = (outcome: SteeringOutcome) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			delete run.steerPending;
+			if (outcome === "unknown") { run.steerClosed = true; this.discardSteeringQueue(run); }
+			// Parse the rest of this inbound batch before rechecking queued work.
+			// The flag also prevents a reentrant request from pumping it early.
+			run.steerDispatchScheduled = true;
+			resolve(outcome);
+			queueMicrotask(() => {
+				run.steerDispatchScheduled = false;
+				this.dispatchSteering(runId, run);
+			});
+		};
+		// Waiting locally consumes no ACK deadline or sequence number.
+		const timer = setTimeout(() => done("unknown"), 1000);
+		run.steerSequence = sequence;
+		run.steerPending = { sequence, resolve: done };
+		try { socket.write(frame); } catch { done("unknown"); }
 	}
 
 	async waitForEvent(runId: string, timeoutMs: number): Promise<void> {
@@ -393,8 +450,8 @@ export class LifecycleEventServer {
 					run.reportCount = (run.reportCount ?? 0) + 1;
 					// Callback errors and denied admission never echo child text. No retry.
 					void Promise.resolve().then(() => eligible() ? handler!(value.message as string, eligible) : false)
-						.then((accepted) => ack(accepted === true), () => ack(false))
-						.finally(() => { run.reportPending = false; });
+						.then((accepted) => { run.reportPending = false; ack(accepted === true); },
+							() => { run.reportPending = false; ack(false); });
 					continue;
 				}
 				if (exactKeys(value, ["version", "type", "runId", "sequence", "steerSequence", "accepted"])
@@ -422,11 +479,11 @@ export class LifecycleEventServer {
 				if (value.type === "agent-started" || value.type === "agent-ended") {
 					authenticated.run.activityGeneration = (authenticated.run.activityGeneration ?? 0) + 1;
 					authenticated.run.steerRunning = value.type === "agent-started";
+					this.discardSteeringQueue(authenticated.run);
 				}
 				if (["agent-settled", "completion-ready", "shutdown"].includes(value.type as string)) {
-					authenticated.run.steerClosed = true;
+					this.closeSteering(authenticated.run);
 					this.closeReporting(authenticated.runId);
-					authenticated.run.steerPending?.resolve("unknown");
 				}
 				if (value.type === "heartbeat") authenticated.run.lastHeartbeatAt = performance.now();
 				if (authenticated.run.active) this.notify(authenticated.run);
@@ -438,7 +495,7 @@ export class LifecycleEventServer {
 			this.connections = Math.max(0, this.connections - 1);
 			this.connectionsSet.delete(socket);
 			if (authenticated?.run.socket === socket) {
-				authenticated.run.steerPending?.resolve("unknown");
+				this.closeSteering(authenticated.run);
 				this.closeReporting(authenticated.runId);
 				authenticated.run.reportPending = false;
 				authenticated.run.socket = null;
@@ -593,6 +650,9 @@ export class LifecycleEventClient {
 	private steerSequence = 0;
 	private reportSequence = 0;
 	private reportCount = 0;
+	private reportGeneration = 0;
+	private readonly reportQueue: WaitingReport[] = [];
+	private reportDispatchScheduled = false;
 	private reportAcknowledged = 0;
 	private reportClosed = false;
 	reportSupported = false;
@@ -711,37 +771,78 @@ export class LifecycleEventClient {
 		} catch { socket.destroy(); return null; }
 	}
 
-	private closeReports(): void {
-		this.reportClosed = true;
-		this.reportPending?.resolve("unknown");
-		this.reportPending = null;
+	private discardReportQueue(): void {
+		for (const request of this.reportQueue.splice(0)) {
+			request.cleanup();
+			request.resolve("unavailable");
+		}
 	}
 
-	/** One bounded ACK deadline. Unknown fences further reports; never retry. */
-	async requestReport(message: string, signal?: AbortSignal): Promise<ReportOutcome> {
-		if (!isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted) return "unavailable";
-		if (this.reportPending) return "busy";
+	private closeReports(): void {
+		this.reportClosed = true;
+		this.discardReportQueue();
+		this.reportPending?.resolve("unknown");
+	}
+
+	/** Only remote nextTurn admission is submitted. Unknown fences all further reports. */
+	async requestReport(message: string, signal?: AbortSignal, eligible: () => boolean = () => true): Promise<ReportOutcome> {
+		if (!isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted || !eligible()) return "unavailable";
 		if (this.reportCount >= 4) return "limit";
+		if (this.reportQueue.length >= LOCAL_MESSAGE_WAIT_CAPACITY) return "queue-full";
+		return await new Promise<ReportOutcome>((resolve) => {
+			const abort = () => {
+				const index = this.reportQueue.indexOf(request);
+				if (index < 0) return;
+				this.reportQueue.splice(index, 1);
+				request.cleanup();
+				resolve("unavailable"); // UNSENT cancellation cannot be unknown or fence the active request.
+			};
+			const request: WaitingReport = { message, signal, eligible, generation: this.reportGeneration, resolve,
+				cleanup: () => signal?.removeEventListener("abort", abort) };
+			signal?.addEventListener("abort", abort, { once: true });
+			this.reportQueue.push(request);
+			this.dispatchReport();
+		});
+	}
+
+	private dispatchReport(): void {
+		if (this.reportPending || this.reportDispatchScheduled) return;
+		const request = this.reportQueue.shift();
+		if (!request) return;
+		request.cleanup(); // Replace the waiting-only abort listener with the active one below.
+		const { signal, message, resolve } = request;
+		const refuse = (outcome: ReportOutcome) => { resolve(outcome); this.dispatchReport(); };
+		if (!this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted
+			|| request.generation !== this.reportGeneration || !request.eligible()) { refuse("unavailable"); return; }
+		if (this.reportCount >= 4) { refuse("limit"); return; }
 		const reportSequence = this.reportSequence + 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) return "busy";
-		return await new Promise<ReportOutcome>((resolve) => {
-			const done = (outcome: ReportOutcome) => {
-				clearTimeout(timer);
-				signal?.removeEventListener("abort", abort);
-				this.reportPending = null;
-				if (outcome === "unknown") this.reportClosed = true;
-				resolve(outcome);
-			};
-			const abort = () => done("unknown");
-			const timer = setTimeout(abort, 1000);
-			this.reportPending = { sequence: reportSequence, resolve: done };
-			this.reportSequence = reportSequence;
-			this.reportCount++;
-			this.sequence++;
-			signal?.addEventListener("abort", abort, { once: true });
-			try { this.socket.write(frame); } catch { done("unknown"); }
-		});
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }
+		let settled = false;
+		const done = (outcome: ReportOutcome) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			this.reportPending = null;
+			if (outcome === "unknown") { this.reportClosed = true; this.discardReportQueue(); }
+			// A buffered abort must be parsed before the next report can send.
+			// Reentrant requests share this one deferred FIFO pump.
+			this.reportDispatchScheduled = true;
+			resolve(outcome);
+			queueMicrotask(() => {
+				this.reportDispatchScheduled = false;
+				this.dispatchReport();
+			});
+		};
+		const abort = () => done("unknown");
+		const timer = setTimeout(abort, 1000);
+		this.reportPending = { sequence: reportSequence, resolve: done };
+		this.reportSequence = reportSequence;
+		this.reportCount++;
+		this.sequence++;
+		signal?.addEventListener("abort", abort, { once: true });
+		try { this.socket.write(frame); } catch { done("unknown"); }
 	}
 
 	private sendControlAck(controlSequence: number): boolean {
@@ -754,6 +855,7 @@ export class LifecycleEventClient {
 
 	send(type: "agent-started" | "agent-ended" | "agent-settled" | "completion-ready" | "shutdown" | "heartbeat"): boolean {
 		if (!this.usable || this.socket.destroyed) return false;
+		if (type === "agent-started" || type === "agent-ended") { this.reportGeneration++; this.discardReportQueue(); }
 		if (["agent-settled", "completion-ready", "shutdown"].includes(type)) { this.steerClosed = true; this.closeReports(); }
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type, runId: this.runId, sequence: this.sequence })}\n`;

@@ -1481,7 +1481,11 @@ export default function (pi: ExtensionAPI) {
             if (outcome === "not-found") return failOperational("runtime-policy", "Background subagent job was not found (exact full id required).");
             if (outcome === "unsupported") return failOperational("runtime-policy", "Steering supports single-agent background jobs only.");
             if (outcome !== "submitted") return failOperational("runtime-policy",
-              outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically." : "Child did not accept steering (unavailable, busy, or idle).");
+              outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically."
+                : outcome === "queue-full" ? "Local steering waiting queue is full; this message was not sent."
+                : outcome === "busy" ? "Steering transport is busy; this message was not sent."
+                : outcome === "unavailable" ? "Steering is unavailable for this run; this message was not sent."
+                : "Child rejected steering inbox admission (full, idle, or ineligible).");
             const job = backgroundJobs.get(params.id!);
             if (!job || job.status !== "running" || job.controller?.signal.aborted || !backgroundSessionFence.isCurrent(sessionToken)) {
               return failOperational("runtime-policy", "Steering outcome is unknown after completion or session replacement; do not retry automatically.");

@@ -5237,8 +5237,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         }
         piArgs.splice(piArgs.length - 1, 0, "--extension", inlineBridgePath);
         const server = inlineLifecycleServer, runId = inlineLifecycleRunId;
-        opts.onSteeringReady?.((message) => !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration)
-          ? server.requestSteer(runId, message) : Promise.resolve("unavailable"));
+        opts.onSteeringReady?.((message, eligible) => server.requestSteer(runId, message,
+          () => !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && (eligible?.() ?? true)));
       }
     }
     if (signal?.aborted || !canStartInteractiveRun(interactiveShutdownGeneration)) {
@@ -7108,14 +7108,14 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     }
     if (lifecycleRunId && options.onSteeringReady) {
       const server = lifecycleEventServer!, controlRunId = lifecycleRunId;
-      options.onSteeringReady(async (message) => {
-        const available = () => !options.signal?.aborted && !completionFenced
+      options.onSteeringReady(async (message, eligible) => {
+        const available = () => (eligible?.() ?? true) && !options.signal?.aborted && !completionFenced
           && canStartInteractiveRun(options.interactiveShutdownGeneration)
           && (activeInteractiveRuns.get(controlRunId)?.ownership === "managed" || activeInteractiveRuns.get(controlRunId)?.ownership === "kept");
         if (!available() || !paths) return "unavailable";
         const fence = await readVerifiedCompletionFence(paths, controlRunId, completionFenceNonce).catch(() => true);
         if (fence || !available()) return "unavailable";
-        return server.requestSteer(controlRunId, message);
+        return server.requestSteer(controlRunId, message, available);
       });
     }
     if (backend.mode === "tmux-pane" && !options.treePermitLease) {

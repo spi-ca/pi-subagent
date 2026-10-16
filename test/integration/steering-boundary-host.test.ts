@@ -131,19 +131,19 @@ for (const boundary of ["turn_end"] as const) {
         await reached.promise; await started;
         assert.equal(f.requests.length, 1);
         assert.equal(await f.server.requestSteer(f.id, "/skill:literal $ARGUMENTS"), "submitted");
-        assert.equal(await f.server.requestSteer(f.id, "bounded second"), "rejected");
+        assert.equal(await f.server.requestSteer(f.id, "bounded second"), "submitted");
         assert.equal(f.manager.getBranch().filter((entry) => entry.type === "custom_message").length, 0); // ACK is admission, not commit
         resume.release(); await run;
         assert.equal(f.requests.length, 2);
         assert.equal(prompts, 1); assert.equal(inputCalls, 1); assert.equal(extensionInputCalls, 0);
         assert.deepEqual(f.requests[1]!.slice(0, f.requests[0]!.length), f.requests[0]);
         const contents = f.requests[1]!.map((message) => JSON.stringify(message.content));
-        for (const text of ["existing context", "existing answer", "initial task", "earlier boundary context", "/skill:literal $ARGUMENTS"]) {
+        for (const text of ["existing context", "existing answer", "initial task", "earlier boundary context", "/skill:literal $ARGUMENTS", "bounded second"]) {
           assert.equal(contents.filter((content) => content.includes(text)).length, 1, text);
         }
         assert.equal(f.requests[1]!.at(-1)!.role, "user");
         const steering = f.manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === STEERING_CUSTOM_TYPE);
-        assert.equal(steering.length, 1);
+        assert.deepEqual(steering.map(entry => (entry as { content: unknown }).content), ["/skill:literal $ARGUMENTS", "bounded second"]);
         assert.deepEqual(f.manager.getBranch().slice(0, f.originalEntries.length), f.originalEntries);
         const settledTranscript = structuredClone(f.manager.getBranch());
         assert.notEqual(await f.server.requestSteer(f.id, "already settled"), "submitted");
@@ -221,7 +221,7 @@ for (const mode of ["abort", "error", "settled"] as const) {
         assert.equal(await f.server.requestSteer(f.id, "pending error outcome"), "submitted");
       }
       const before = structuredClone(f.manager.getBranch());
-      assert.equal(await f.server.requestSteer(f.id, "late arrival"), mode === "settled" ? "unavailable" : "rejected");
+      assert.equal(await f.server.requestSteer(f.id, "late arrival"), mode === "settled" ? "unavailable" : mode === "abort" ? "rejected" : "submitted");
       resume.release(); await run;
       assert.equal(f.requests.length, 1); assert.equal(prompts, 1);
       assert.deepEqual(f.manager.getBranch(), before);

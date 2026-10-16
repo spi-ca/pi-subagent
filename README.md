@@ -78,6 +78,8 @@ Pi에서 첫 작업을 위임합니다.
 
 이 호출은 즉시 **접수** 결과를 반환합니다. 이는 job이 registry에서 `running`으로 기록되었다는 뜻이지 child가 이미 실행 중이라는 보장은 아닙니다. 결과가 도착하기 전에 결과를 만들거나 요약하지 말고, 반복 polling·sleep·로그 tail·대기 루프를 사용하지 마세요. 독립 작업을 계속하거나 턴을 끝내면 실제 완료·실패·취소의 terminal 결과가 steer 메시지로 자동 전달됩니다. `cancel` 응답도 취소 요청을 접수해 `cancelling`으로 바꾼 acknowledgement일 뿐 terminal 결과가 아니므로 `status`로 실제 종료를 확인한 뒤에만 새 작업을 시작하세요. 현재 프로세스의 작업은 `subagent({ action: "status" })`와 `subagent({ action: "cancel", id })`로 확인·취소할 수 있습니다. TUI에서 표시 상한에 걸린 결과는 `/subagent-result <job-id 또는 고유 prefix>`로 현재 branch의 보존된 본문만 display-only로 열 수 있습니다. `pi-tool-display`의 전역 `extensions/pi-tool-display/config.json`의 `previewLines`(1–80)도 접힌 미리보기에 적용하며, 변경 뒤에는 `/reload` 또는 새 세션이 필요합니다. 보존 범위와 결과 wrapper를 포함한 정확한 계약은 [백그라운드 실행](docs/usage.md#백그라운드-실행-계약)을 참고하세요.
 
+실행 중 메시지는 [단일 child steering](docs/usage.md#실행-중인-단일-child에-추가-지시-보내기)과 opt-in [`report_to_parent`](docs/usage.md#child에서-direct-parent에-보고하기)를 지원합니다. steering inbox는 최대 8개 FIFO이며, 양방향 전송은 각각 진행 중 1개 외에 로컬 대기 최대 8개를 직렬 처리합니다. 성공 ACK는 로컬 대기가 아닌 원격 접수만 뜻하며, 병합·자동 재시도·child 재시작은 하지 않습니다.
+
 ## 실행과 신뢰 경계
 
 명시적 `PI_SUBAGENT_TERMINAL_MODE`가 없으면 실행 환경은 **cmux → Herdr → tmux → inline** 순으로 선택합니다. terminal backend를 선택한 뒤 검증에 실패하면 다른 backend나 inline으로 조용히 바꾸지 않습니다. `PI_SUBAGENT_TERMINAL_MODE`, `auto`/`split` layout, Pi 최소 버전과 문제 해결은 [실행 환경](docs/configuration.md#실행-환경)을 참고하세요.

@@ -1,10 +1,11 @@
-import { afterEach, describe, test } from "bun:test";
+import { afterEach, describe, jest, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	LOCAL_MESSAGE_WAIT_CAPACITY,
 	LifecycleEventClient,
 	LifecycleEventServer,
 	SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV,
@@ -72,12 +73,12 @@ describe("private lifecycle socket", () => {
 		assert.equal(await fixture.server.requestSteer(fixture.runId, "change direction"), "unavailable");
 		fixture.server.activateRun(fixture.runId);
 		const pending = fixture.server.requestSteer(fixture.runId, "한글\n/new-task");
-		assert.equal(await fixture.server.requestSteer(fixture.runId, "second"), "busy");
-		assert.equal(await pending, "submitted");
-		assert.deepEqual(received, ["한글\n/new-task"]);
+		const second = fixture.server.requestSteer(fixture.runId, "second");
+		assert.deepEqual(await Promise.all([pending, second]), ["submitted", "submitted"]);
+		assert.deepEqual(received, ["한글\n/new-task", "second"]);
 		client.send("agent-ended"); await delay(10);
 		assert.equal(await fixture.server.requestSteer(fixture.runId, "before-settle"), "unavailable");
-		assert.deepEqual(received, ["한글\n/new-task"]);
+		assert.deepEqual(received, ["한글\n/new-task", "second"]);
 		client.send("agent-started"); await delay(10);
 		assert.equal(await fixture.server.requestSteer(fixture.runId, "normal continuation"), "submitted");
 		client.setSteerHandler(() => false);
@@ -96,8 +97,10 @@ describe("private lifecycle socket", () => {
 		client.setControlHandler(() => { aborts += 1; });
 		client.send("agent-started"); await delay(10);
 		const pending = fixture.server.requestSteer(fixture.runId, "race");
+		const queued = fixture.server.requestSteer(fixture.runId, "unsent");
 		assert.equal(fixture.server.requestAbort(fixture.runId), true);
 		assert.equal(await pending, "unknown");
+		assert.equal(await queued, "unavailable");
 		await delay(30);
 		assert.ok(submissions <= 1, "a socket write can precede cancel; no retry or duplicate");
 		assert.equal(aborts, 1);
@@ -112,8 +115,10 @@ describe("private lifecycle socket", () => {
 		assert.ok(client);
 		client.send("agent-started"); await delay(10);
 		const pending = fixture.server.requestSteer(fixture.runId, "race");
+		const queued = fixture.server.requestSteer(fixture.runId, "unsent");
 		fixture.server.terminalRun(fixture.runId);
 		assert.equal(await pending, "unknown");
+		assert.equal(await queued, "unavailable");
 		assert.equal(await fixture.server.requestSteer(fixture.runId, "late"), "unavailable");
 		client.close();
 	});
@@ -147,12 +152,169 @@ describe("private lifecycle socket", () => {
 		raw.write(`${JSON.stringify({ version: 1, type: "hello", runId: fixture.runId, token: fixture.token, childPid: process.pid, sequence: 0 })}\n`);
 		raw.write(`${JSON.stringify({ version: 1, type: "agent-started", runId: fixture.runId, sequence: 1 })}\n`);
 		await delay(10);
-		assert.equal(await fixture.server.requestSteer(fixture.runId, "one"), "unknown");
-		assert.equal(await fixture.server.requestSteer(fixture.runId, "two"), "unavailable");
+		jest.useFakeTimers();
+		try {
+			const active = fixture.server.requestSteer(fixture.runId, "one");
+			const queued = fixture.server.requestSteer(fixture.runId, "unsent");
+			jest.advanceTimersByTime(1000);
+			assert.equal(await active, "unknown");
+			assert.equal(await queued, "unavailable");
+			assert.equal(await fixture.server.requestSteer(fixture.runId, "two"), "unavailable");
+			const run = (fixture.server as any).runs.get(fixture.runId);
+			assert.equal(run.steerPending, undefined);
+			assert.deepEqual(run.steerQueue, []);
+		} finally { jest.useRealTimers(); }
+		// A lifecycle heartbeat acts as a socket barrier, not a timing sleep.
+		const wake = fixture.server.waitForEvent(fixture.runId, 1000);
+		raw.write(`${JSON.stringify({ version: 1, type: "heartbeat", runId: fixture.runId, sequence: 2 })}\n`);
+		await wake;
 		assert.equal(frames.split("\n").filter((line) => line.includes('"type":"steer"')).length, 1);
 		assert.equal(fixture.server.requestAbort(fixture.runId), true);
 		raw.destroy();
 	});
+	test("steering waiting FIFO is bounded, ACK deadline starts at dispatch, and eligibility is rechecked", async () => {
+		const f = await setup("steer-fifo");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, f.statePath, false);
+		assert.ok(client);
+		const wake = f.server.waitForEvent(f.runId, 1000); client.send("agent-started"); await wake;
+		const run = (f.server as any).runs.get(f.runId), socket = run.socket;
+		const write = socket.write;
+		const frames: any[] = [];
+		// Hold outgoing steer frames at the real socket seam; deliver ACKs using
+		// the real child parser, without OS scheduling consuming the fake deadline.
+		socket.write = (frame: string) => { frames.push(JSON.parse(frame)); return true; };
+		jest.useFakeTimers();
+		try {
+			const active = f.server.requestSteer(f.runId, "first");
+			let eligible = true, secondDone = false;
+			const second = f.server.requestSteer(f.runId, "second").then(result => { secondDone = true; return result; });
+			const stale = f.server.requestSteer(f.runId, "revoked", () => eligible);
+			const rest = Array.from({ length: LOCAL_MESSAGE_WAIT_CAPACITY - 2 }, (_, i) => f.server.requestSteer(f.runId, `rest ${i}`));
+			assert.equal(await f.server.requestSteer(f.runId, "overflow"), "queue-full");
+			assert.equal(secondDone, false, "local wait admission is not remote ACK");
+			assert.equal(frames.length, 1);
+			jest.advanceTimersByTime(900);
+			write.call(socket, JSON.stringify(frames[0]) + "\n");
+			assert.equal(await active, "rejected"); // no child inbox handler
+			assert.equal(frames.length, 2);
+			eligible = false;
+			jest.advanceTimersByTime(900); // second has its own full deadline
+			assert.equal(secondDone, false);
+			write.call(socket, JSON.stringify(frames[1]) + "\n");
+			assert.equal(await second, "rejected");
+			assert.equal(await stale, "unavailable");
+			for (let i = 0; i < rest.length; i++) {
+				assert.equal(frames[i + 2].message, `rest ${i}`);
+				write.call(socket, JSON.stringify(frames[i + 2]) + "\n");
+				assert.equal(await rest[i], "rejected");
+			}
+			jest.advanceTimersByTime(1000);
+			assert.equal(run.steerClosed, undefined, "all ACK timers were cleared");
+			assert.deepEqual(frames.map(frame => frame.message), ["first", "second", ...rest.map((_, i) => `rest ${i}`)]);
+		} finally { socket.write = write; jest.useRealTimers(); client.close(); }
+	});
+
+	test("steer ACK defers one FIFO pump even when a new request arrives before the microtask", async () => {
+		const f = await setup("steer-deferred-fifo");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, f.statePath, false);
+		assert.ok(client);
+		const started = f.server.waitForEvent(f.runId, 1000); client.send("agent-started"); await started;
+		const run = (f.server as any).runs.get(f.runId), socket = run.socket;
+		const write = socket.write, frames: any[] = [];
+		socket.write = (frame: string) => { frames.push(JSON.parse(frame)); return true; };
+		const ack = (steerSequence: number) => socket.emit("data", Buffer.from(JSON.stringify({ version: 1, type: "steer-ack",
+			runId: f.runId, sequence: run.lastSequence + 1, steerSequence, accepted: true }) + "\n"));
+		jest.useFakeTimers();
+		try {
+			const active = f.server.requestSteer(f.runId, "active");
+			const queued = f.server.requestSteer(f.runId, "queued");
+			ack(1);
+			const reentrant = f.server.requestSteer(f.runId, "reentrant");
+			assert.deepEqual(frames.map(frame => frame.message), ["active"], "new request cannot bypass the deferred pump");
+			assert.equal(await active, "submitted");
+			assert.deepEqual(frames.map(frame => frame.message), ["active", "queued"]);
+			ack(2);
+			assert.equal(await queued, "submitted");
+			assert.deepEqual(frames.map(frame => frame.message), ["active", "queued", "reentrant"]);
+			ack(3);
+			assert.equal(await reentrant, "submitted");
+			assert.equal(run.steerDispatchScheduled, false);
+			assert.equal(run.steerPending, undefined);
+			assert.deepEqual(run.steerQueue, []);
+			jest.advanceTimersByTime(1000);
+			assert.equal(run.steerClosed, undefined);
+		} finally { socket.write = write; jest.useRealTimers(); client.close(); }
+	});
+
+	test("coalesced steer ACK/end/start never sends queued work across the activity boundary", async () => {
+		const f = await setup("steer-buffered-boundary");
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, f.statePath, false);
+		assert.ok(client);
+		const started = f.server.waitForEvent(f.runId, 1000); client.send("agent-started"); await started;
+		const run = (f.server as any).runs.get(f.runId), socket = run.socket;
+		const write = socket.write, frames: any[] = [];
+		socket.write = (frame: string) => { frames.push(JSON.parse(frame)); return true; };
+		jest.useFakeTimers();
+		try {
+			const active = f.server.requestSteer(f.runId, "active");
+			const queued = f.server.requestSteer(f.runId, "old unsent");
+			const sequence = run.lastSequence;
+			// One data event deterministically exercises the authenticated socket's
+			// real parser with all three frames in the same inbound batch.
+			socket.emit("data", Buffer.from([
+				{ version: 1, type: "steer-ack", runId: f.runId, sequence: sequence + 1, steerSequence: 1, accepted: true },
+				{ version: 1, type: "agent-ended", runId: f.runId, sequence: sequence + 2 },
+				{ version: 1, type: "agent-started", runId: f.runId, sequence: sequence + 3 },
+			].map(frame => JSON.stringify(frame) + "\n").join("")));
+			assert.deepEqual(frames.map(frame => frame.message), ["active"], "no UNSENT frame may escape before the buffered end/start");
+			assert.equal(await active, "submitted");
+			assert.equal(await queued, "unavailable");
+			assert.equal(run.steerPending, undefined);
+			assert.deepEqual(run.steerQueue, []);
+			const fresh = f.server.requestSteer(f.runId, "fresh");
+			assert.deepEqual(frames.map(frame => frame.message), ["active", "fresh"]);
+			socket.emit("data", Buffer.from(JSON.stringify({ version: 1, type: "steer-ack", runId: f.runId,
+				sequence: sequence + 4, steerSequence: 2, accepted: true }) + "\n"));
+			assert.equal(await fresh, "submitted");
+			jest.advanceTimersByTime(1000);
+			assert.equal(run.steerClosed, undefined, "no stale ACK deadline survives the transition");
+		} finally { socket.write = write; jest.useRealTimers(); client.close(); }
+	});
+
+	for (const end of ["agent-ended", "disconnect", "close"] as const) {
+		test(`${end} clears queued steering without sending stale work into a normal retry`, async () => {
+			const f = await setup(`steer-${end}`);
+			const client = await LifecycleEventClient.connectFromEnvironment(process.env, f.statePath, false);
+			assert.ok(client);
+			const started = f.server.waitForEvent(f.runId, 1000); client.send("agent-started"); await started;
+			const run = (f.server as any).runs.get(f.runId), socket = run.socket;
+			const write = socket.write, frames: string[] = [];
+			socket.write = (frame: string) => { frames.push(frame); return true; };
+			jest.useFakeTimers();
+			try {
+				const active = f.server.requestSteer(f.runId, "active");
+				const queued = f.server.requestSteer(f.runId, "unsent");
+				if (end === "agent-ended") {
+					const ended = f.server.waitForEvent(f.runId, 1000); client.send("agent-ended"); await ended;
+					assert.equal(await queued, "unavailable");
+					const restarted = f.server.waitForEvent(f.runId, 1000); client.send("agent-started"); await restarted;
+					write.call(socket, frames[0]); assert.equal(await active, "rejected");
+					const fresh = f.server.requestSteer(f.runId, "fresh");
+					write.call(socket, frames[1]); assert.equal(await fresh, "rejected");
+				} else {
+					if (end === "disconnect") { const closed = f.server.waitForEvent(f.runId, 1000); client.close(); await closed; }
+					else await f.server.close();
+					assert.equal(await active, "unknown");
+					assert.equal(await queued, "unavailable");
+				}
+				assert.deepEqual(frames.map(frame => JSON.parse(frame).message), end === "agent-ended" ? ["active", "fresh"] : ["active"]);
+				assert.equal(run.steerPending, undefined);
+				assert.deepEqual(run.steerQueue, []);
+				jest.advanceTimersByTime(1000);
+			} finally { socket.write = write; jest.useRealTimers(); client.close(); }
+		});
+	}
+
 	test("consumes the transient token before connect and delivers bounded sequenced hints", async () => {
 		const fixture = await setup();
 		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);

@@ -20,18 +20,25 @@ Pi `1.0.2`의 `outputSchema`/`structuredContent`를 지원한다. single/paralle
 
 ### Codemode에서 사용
 
-codemode가 활성인 부모에서는 독립적인 호출과 필요한 결과 필터링을 스크립트로 묶을 수 있습니다. child의 managed codemode는 별도 [명시적 도구 선택](./agents.md#도구와-권한)이 필요합니다. `tools.subagent()`는 human `content`가 아니라 위 구조화된 envelope를 받습니다.
+codemode가 활성인 부모에서는 **여러 결과의 집계·필요한 데이터 선별**에 활용해, 중간 결과 전체를 부모 context로 반환하지 않는 방식을 권장합니다. 단건 결과 전체를 읽어야 한다면 직접 호출해도 됩니다. 병렬 실행은 `tasks`도 지원하므로 codemode만의 이점은 아닙니다. 이는 모든 호출의 codemode 전환이나 토큰 절감을 보장하는 정책이 아닙니다.
+
+`tools.subagent()`는 human `content`가 아니라 위 구조화된 envelope를 받습니다. 중요한 발견, agent 식별, 실패·상태와 clipping/omission 표시는 보존하세요. JS는 필드 선택·집계용이며 의미적 요약은 child에게 요청합니다. 성공 결과를 통째로 버리거나 `output.slice()`로 무조건 자르지 마세요. 선별 전 machine projection부터 제한됐을 수 있어, 선별 결과만으로 전체 검토 완료를 판단하지 않습니다. child의 managed codemode는 별도 [명시적 도구 선택](./agents.md#도구와-권한)이 필요하며, 더 좁은 역할·작업별 정책을 우회하지 않습니다.
 
 ```js
-const batches = await Promise.allSettled([
-  tools.subagent({ agent: "scout", task: "Inspect API routes" }),
-  tools.subagent({ agent: "reviewer", task: "Review error handling" }),
-]);
-for (const batch of batches) {
-  if (batch.status === "rejected") { text({ error: String(batch.reason) }); continue; }
+const calls = [
+  { agent: "scout", task: "Inspect API routes; return material findings and a concise summary" },
+  { agent: "reviewer", task: "Review error handling; return material findings and a concise summary" },
+];
+const batches = await Promise.allSettled(calls.map(args => tools.subagent(args)));
+for (const [i, batch] of batches.entries()) {
+  if (batch.status === "rejected") {
+    text({ agent: calls[i].agent, status: "rejected", error: String(batch.reason) }); continue;
+  }
   const data = batch.value;
-  text({ results: data.results.map(r => ({ agent: r.agent, exitCode: r.exitCode, output: r.output })),
-    clipped: data.clipped, omittedResults: data.omittedResults });
+  text({ results: data.results.map(r => ({ agent: r.agent, exitCode: r.exitCode,
+      output: r.output, stopReason: r.stopReason, clipped: r.clipped })),
+    jobs: data.jobs, clipped: data.clipped,
+    omittedResults: data.omittedResults, omittedJobs: data.omittedJobs });
 }
 ```
 
@@ -41,7 +48,8 @@ for (const batch of batches) {
 
 ```js
 const accepted = await tools.subagent({ agent: "scout", task: "Inspect local modules", background: true });
-text({ jobs: accepted.jobs, clipped: accepted.clipped, omittedJobs: accepted.omittedJobs });
+text({ jobs: accepted.jobs, clipped: accepted.clipped,
+  omittedResults: accepted.omittedResults, omittedJobs: accepted.omittedJobs });
 // 접수는 완료가 아니다. 이후 자동 전달에 의존하고 독립적인 작업만 계속한다.
 ```
 

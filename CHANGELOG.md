@@ -1,5 +1,10 @@
 # 변경 기록
 
+## 미출시
+
+- Codemode에서 여러 subagent 결과를 집계·선별하는 짧은 모델 지침과 사용 예시를 보강했다. 중요한 발견·agent 식별·실패·상태·clipping/누락 표시를 보존하고, 의미적 요약은 child에게 요청한다. 도구 schema·노출·기본 도구 선택과 background 전달 정책은 바꾸지 않는다.
+- Herdr protocol `22`의 호환성 설명을 `v0.9.5`까지 갱신했다. 설치된 `v0.9.3`–`v0.9.5`의 전체 bundled API schema가 동일하며 기존 protocol 허용 목록·호출 계약은 바꾸지 않는다. 실제 `v0.9.5` 서버에서의 interactive 동작 통과를 주장하지 않는다.
+
 ## v20261016-1
 
 - Pi 개발 의존성·lockfile·현재 CI graph를 exact `1.3.0`으로 갱신했다. peer 범위와 shared `@pi/presence` Git pin은 유지한다.

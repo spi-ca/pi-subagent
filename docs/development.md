@@ -259,6 +259,8 @@ docs/guidelines/            — 문서와 에이전트 지침 작성 가이드
 
 ### Herdr 테스트 경계
 
+Herdr `v0.9.5`의 bundled API schema는 설치된 `v0.9.3`·`v0.9.4`와 전체가 동일하며 protocol은 **22**입니다. 각 바이너리의 `herdr api schema --json | jq -S . | sha256sum` 결과는 `9e2af207e9aa8183d4aeca5fde9cc48e7909bb40cdbd7cf21608a6d3ea78075b`입니다. 이 비교는 기존 protocol 19/20/22 허용 목록이나 호출 계약을 바꾸지 않습니다. schema 일치는 실제 `v0.9.5` 서버에서의 allocation·focus·cancel·metadata 동작 통과를 의미하지 않으며, 기존 protocol-19 smoke의 증거 범위도 넓히지 않습니다. 설치 바이너리의 `herdr --version`과 실행 서버의 `herdr status server`는 별도로 확인하고, 사용자 승인 없이 서버 재시작·handoff를 실행하지 않습니다.
+
 Herdr 테스트에는 fake owner-only Unix socket을 사용하며 live mutating Herdr acceptance test는 실행하지 않습니다. 집중 검증 근거는 `bun test test/runtime/herdr.test.ts test/runtime/pane-launch-broker.test.ts test/runtime/interactive-reaper.test.ts test/runtime/runner-interactive.test.ts test/runtime/run-protocol.test.ts`입니다. protocol 19/20/22 workspace-scoped `layout.apply` 한 번(`tab_id` 없음, `focus: false`, root direct wrapper argv), strict `layout_apply.layout.root` 뒤의 `pane.get` terminal binding, `agent.get`/bounded `agent.wait`/single `agent.focus`, `pane.report_metadata`, 조용한 gate rejection, auto에서 `pane.send_text`와 parent mutation을 사용하지 않는 동작을 다룹니다. terminal `present|absent|unknown`, socket 교체와 legacy record fail-closed도 검증합니다. 현재 smoke는 non-mutating protocol-19 `agent.get`/`agent.wait`뿐이며 live focus 또는 metadata mutation을 주장하지 않습니다.
 
 ## 자동 CI 호환성 매트릭스

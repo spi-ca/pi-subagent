@@ -11,7 +11,7 @@ import {
 
 export { HERDR_MAX_PUBLIC_ID_BYTES, isHerdrPublicId, parseHerdrEnvironment } from "../core/herdr-environment.js";
 
-/** v0.8.0 speaks protocol 19; preview builds speak 20; v0.9.0–0.9.3 speak 22. */
+/** v0.8.0 speaks protocol 19; preview builds speak 20; v0.9.0–0.9.5 speak 22. */
 export const HERDR_SUPPORTED_PROTOCOLS = new Set([19, 20, 22] as const);
 export type HerdrProtocolVersion = 19 | 20 | 22;
 export function isSupportedHerdrProtocol(value: unknown): value is HerdrProtocolVersion {

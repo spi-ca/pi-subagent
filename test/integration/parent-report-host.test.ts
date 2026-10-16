@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
-import { VERSION, createAgentSession, createAgentSessionRuntime, createCodemodeExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type InlineExtension } from "@earendil-works/pi-coding-agent";
+import { VERSION, createAgentSession, createAgentSessionRuntime, createCodemodeExtension, createReadTool, createGrepTool, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type InlineExtension } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import { INLINE_STEERING_STATE_PATH_ENV } from "../../src/runtime/inline-steering-bridge";
 import { ParentReportAdmission, PARENT_REPORT_RECEIPT_TYPE, PARENT_REPORT_CUSTOM_TYPE, PARENT_REPORT_ENV, PARENT_REPORT_TOOL } from "../../src/runtime/parent-report";
@@ -76,19 +76,18 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
         role: "assistant", content, api: model.api, provider: model.provider, model: model.id, timestamp: 0, stopReason,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       });
-      async function host(name: string, factories: Array<((pi: ExtensionAPI) => void) | InlineExtension>, tools: string[], extensionPaths: string[] = []) {
+      async function host(name: string, factories: Array<((pi: ExtensionAPI) => void) | InlineExtension>, tools: string[] | undefined, extensionPaths: string[] = [], restoredManager?: SessionManager, excludeTools?: string[]) {
         const cwd = path.join(root, name); await fs.mkdir(cwd);
         const settingsManager = SettingsManager.inMemory({ extensions: [], packages: [], compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" });
         const loader = new DefaultResourceLoader({ cwd, agentDir: path.join(cwd, "agent"), settingsManager,
           noExtensions: true, additionalExtensionPaths: extensionPaths, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: factories });
         await loader.reload({ resolveProjectTrust: async () => false });
         assert.deepEqual(loader.getExtensions().errors, []);
-        const manager = SessionManager.inMemory(cwd);
-        const { session } = await createAgentSession({ cwd, agentDir: path.join(cwd, "agent"), modelRuntime, model, thinkingLevel: "off", settingsManager, resourceLoader: loader, sessionManager: manager, tools });
+        const manager = restoredManager ?? SessionManager.inMemory(cwd);
+        const { session } = await createAgentSession({ cwd, agentDir: path.join(cwd, "agent"), modelRuntime, model, thinkingLevel: "off", settingsManager, resourceLoader: loader, sessionManager: manager, tools, excludeTools });
         sessions.push(session);
         const errors: unknown[] = [];
         await session.bindExtensions({ onError: e => { errors.push(e); } });
-        session.setActiveToolsByName(tools);
         const requests: Message[][] = [];
         session.agent.streamFunction = (_model, ctx) => {
           requests.push(structuredClone(ctx.messages));
@@ -130,17 +129,36 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
         await writeLifecycleBootstrapToken(tokenPath, token);
         Object.assign(process.env, { PI_SUBAGENT_RUN_ID: id, [INLINE_STEERING_STATE_PATH_ENV]: path.join(runDir, "state.json"),
           [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: server.socketPath, [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: tokenPath, [PARENT_REPORT_ENV]: "1" });
-        const selected = codemode ? [PARENT_REPORT_TOOL, "codemode"] : [PARENT_REPORT_TOOL];
-        const args = buildPiArgs({ name: "reporter", description: "", systemPrompt: "", source: "user", filePath: "/reporter.md", tools: selected }, null, "/task", "spawn", null, undefined, "managed", undefined, VERSION);
+        let roleTools: string[] | undefined = ["read"];
+        if (codemode) roleTools = ["read", "codemode"];
+        else if (multi) roleTools = undefined;
+        const delegationMode = roleTools === undefined ? "fork" : "spawn";
+        const args = buildPiArgs({ name: "reporter", description: "", systemPrompt: "", source: "user", filePath: "/reporter.md", tools: roleTools }, null, "/task", delegationMode, "/session", undefined, "managed", undefined, VERSION, true);
+        let restoredManager: SessionManager | undefined;
+        if (roleTools === undefined) {
+          assert.equal(args.includes("--tools"), false, "automatic report must not replace omitted tool selection");
+          restoredManager = SessionManager.inMemory(root);
+          const declarations = [createReadTool(root), createGrepTool(root)].map(({ name, description, parameters }) => ({ name, description, parameters }));
+          restoredManager.appendMessage({ role: "system", content: "", toolsAdded: declarations, timestamp: 0 });
+        }
+        const toolsIndex = args.indexOf("--tools");
+        const selected = toolsIndex < 0 ? undefined : args[toolsIndex + 1]!.split(",");
         assert.ok(args.includes("--no-extensions") && args.includes("--no-mcp"));
         const factories = codemode ? [{ name: "codemode", factory: createCodemodeExtension({ mode: "only" }), builtin: true, replaceable: true }] : [];
         const extensionPaths = [path.join(process.cwd(), "src/runtime/inline-steering-bridge.ts"), ...args.filter(arg => arg === "builtin:codemode")];
-        const child = await host(`child-${index}`, factories, selected, extensionPaths);
+        const child = await host(`child-${index}`, factories, selected, extensionPaths, restoredManager);
+        assert.deepEqual(child.session.getActiveToolNames().sort(), [...(roleTools ?? ["read", "grep"]), PARENT_REPORT_TOOL].sort(), "only reporting supplements role or restored tools");
         assert.deepEqual(collectManagedOverriddenBuiltinTools(child.session.getAllTools()), []);
         assert.equal(process.env[PARENT_REPORT_ENV], undefined);
         assert.equal(process.env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV], undefined);
         assert.equal(child.session.getActiveToolNames().includes(PARENT_REPORT_TOOL), true);
         children.push(child);
+      }
+      if (!active && !codemode && !multi && trigger === "user") {
+        Object.assign(process.env, { [PARENT_REPORT_ENV]: "1", [INLINE_STEERING_STATE_PATH_ENV]: path.join(root, "excluded-state.json") });
+        const excluded = await host("excluded", [], ["read", PARENT_REPORT_TOOL], [path.join(process.cwd(), "src/runtime/inline-steering-bridge.ts")], undefined, [PARENT_REPORT_TOOL]);
+        assert.deepEqual(excluded.session.getActiveToolNames(), ["read"], "automatic reporting never bypasses inherited --exclude-tools");
+        assert.equal(excluded.session.getAllTools().some(tool => tool.name === PARENT_REPORT_TOOL), false);
       }
       const parentBefore = structuredClone(parent.manager.getBranch());
       // Production children have separate processes. These SDK children share

@@ -752,6 +752,8 @@ test("registered subagent exposes outputSchema and actual structured empty statu
   assert.deepEqual(tool.outputSchema, SubagentOutputSchema);
   assert.equal(tool.exposure, undefined, "default direct exposure is unchanged");
   assert.equal(tool.description, formatSubagentToolDescription(), "compact description stays unchanged");
+  assert.match(tool.promptGuidelines.join("\n"), /When codemode is available.*aggregate subagent results.*select needed data.*parent context/);
+  assert.match(tool.promptGuidelines.join("\n"), /Preserve material findings, agent attribution, failures\/status and clipping\/omissions.*semantic summaries.*blindly truncating/);
   assert.match(tool.promptGuidelines.join("\n"), /results\[\]\.exitCode.*jobs\[\]\.status/);
   assert.match(tool.promptGuidelines.join("\n"), /clipped\/omitted.*not proof of completion/);
   assert.match(tool.promptGuidelines.join("\n"), /await.*background start.*automatic result delivery.*do not poll/);

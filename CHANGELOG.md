@@ -1,5 +1,10 @@
 # 변경 기록
 
+## 미출시
+
+- Codemode에서 여러 subagent 결과를 집계·선별하는 짧은 모델 지침과 사용 예시를 보강했다. 중요한 발견·agent 식별·실패·상태·clipping/누락 표시를 보존하고, 의미적 요약은 child에게 요청한다. 도구 schema·노출·기본 도구 선택과 background 전달 정책은 바꾸지 않는다.
+- Herdr protocol `22`의 호환성 설명을 `v0.9.5`까지 갱신했다. 설치된 `v0.9.3`–`v0.9.5`의 전체 bundled API schema가 동일하며 기존 protocol 허용 목록·호출 계약은 바꾸지 않는다. 실제 `v0.9.5` 서버에서의 interactive 동작 통과를 주장하지 않는다.
+
 ## v20261013-1
 
 - 실행 중인 단일 background child에 정확한 전체 job ID로 `action: "steer"` 지시를 보낸다. 최대 512 UTF-8 바이트의 한 메시지만 접수하며 awaited `turn_end`에서 기존 실행의 컨텍스트에 반영한다. ACK는 inbox 접수일 뿐 모델 적용·수행을 보장하지 않으며 자동 재시도·주기 polling·새 prompt 실행은 없다.

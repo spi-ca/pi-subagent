@@ -43,7 +43,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     delete process.env.PI_SUBAGENT_DEPTH; delete process.env.PI_SUBAGENT_STACK;
     process.env.PI_SUBAGENT_TERMINAL_MODE = "inline";
     await fs.mkdir(path.join(root, "agents"));
-    for (const name of ["reporter", "other"]) await fs.writeFile(path.join(root, "agents", `${name}.md`), `---\nname: ${name}\ndescription: Reporter\ntools: report_to_parent\n---\nReport\n`);
+    for (const name of ["reporter", "other"]) await fs.writeFile(path.join(root, "agents", `${name}.md`), `---\nname: ${name}\ndescription: Reporter\ntools: read\n---\nReport\n`);
     register({ registerToolRenderer: () => {}, registerMessageRenderer: () => {}, registerFlag: () => {},
       getFlag: (name: string) => name === "subagent-max-active" ? "2" : undefined,
       registerCommand: () => {}, registerTool: (value: any) => { if (value.name === "subagent") tool = value; },
@@ -55,6 +55,11 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const invoke = (params: any) => tool.execute("call", params, new AbortController().signal, undefined, ctx);
     const reports = () => sent.filter(s => s.message.customType === PARENT_REPORT_CUSTOM_TYPE);
     const checkReport = (leaf: typeof leaves[number], expected: any) => {
+      const role = leaf.options.agents.find(agent => agent.name === leaf.options.agentName)!;
+      assert.deepEqual(role.tools, ["read"], "background leaf binding needs no role messaging permission");
+      const args = runner.buildPiArgs(role, null, "/task", "spawn", null, undefined, "managed", undefined, "1.3.0", Boolean(leaf.options.onParentReport));
+      assert.equal(args[args.indexOf("--tools") + 1], "read,report_to_parent");
+      assert.equal(args.includes("builtin:codemode"), false);
       assert.equal(leaf.options.onParentReport?.(`body-${reports().length}`), true);
       const last = reports().at(-1)!;
       assert.deepEqual(last.options, { deliverAs: "nextTurn", triggerTurn: false });

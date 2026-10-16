@@ -5,7 +5,7 @@ import { SteeringInbox } from "./steering-inbox.js";
 
 export const INLINE_STEERING_STATE_PATH_ENV = "PI_SUBAGENT_INLINE_STEERING_STATE_PATH";
 
-/** Explicitly loaded only for steerable inline background singles. No SDK/RPC session or timers. */
+/** Loaded for inline background reporting or single-child steering. No SDK/RPC session or timers. */
 export default function inlineSteeringBridge(pi: ExtensionAPI): void {
   const statePath = process.env[INLINE_STEERING_STATE_PATH_ENV];
   delete process.env[INLINE_STEERING_STATE_PATH_ENV];

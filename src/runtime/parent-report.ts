@@ -143,5 +143,11 @@ export function registerParentReportTool(
       return { content: [{ type: "text", text: "Parent notification submitted for its next user- or custom-triggered run; the report does not start one. This is not a model read, reply, or approval; do not wait for a synchronous reply." }], details: { outcome } };
     },
   }));
+  pi.on("session_start", () => {
+    // Pi >=1.3 restores fork tools before session_start. Do not replace that
+    // selection with defaults; add only our capability (host exclusions apply).
+    const tools = pi.getActiveTools();
+    if (!tools.includes(PARENT_REPORT_TOOL)) pi.setActiveTools([...tools, PARENT_REPORT_TOOL]);
+  });
   return true;
 }

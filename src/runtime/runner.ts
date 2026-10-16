@@ -4535,8 +4535,13 @@ export function resolveManagedChildPolicy(env: NodeJS.ProcessEnv = process.env):
 const MANAGED_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "codemode", PARENT_REPORT_TOOL]);
 const MANAGED_DEFAULT_ACTIVE_TOOLS = ["read", "bash", "edit", "write", "subagent"] as const;
 
-function resolveChildToolSelection(agent: Pick<AgentConfig, "tools">, fallbackTools?: string): string[] | undefined {
-  return agent.tools ?? fallbackTools?.split(",").map((value) => value.trim()).filter(Boolean);
+function resolveChildToolSelection(agent: Pick<AgentConfig, "tools">, fallbackTools?: string, reportingEnabled = false): string[] | undefined {
+  const tools = agent.tools ?? fallbackTools?.split(",").map((value) => value.trim()).filter(Boolean);
+  // Leave unspecified selections unspecified: Pi 1.3 forks restore session tools,
+  // not necessarily defaults. The bridge adds reporting after that restoration.
+  if (!reportingEnabled || !tools?.length || tools.includes(PARENT_REPORT_TOOL)) return tools;
+  const report = tools.every((name) => /^[+-]/.test(name)) ? `+${PARENT_REPORT_TOOL}` : PARENT_REPORT_TOOL;
+  return [...tools, report];
 }
 
 /** Capture owner provenance before scheduling; never substitute native codemode
@@ -4691,6 +4696,7 @@ export function buildPiArgs(
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
+  reportingEnabled = false,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
   const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
@@ -4715,14 +4721,12 @@ export function buildPiArgs(
   const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
 
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  } else if (agent.tools === undefined) {
-    if (inheritedCliArgs.fallbackTools !== undefined) {
-      args.push("--tools", inheritedCliArgs.fallbackTools);
-    } else if (inheritedCliArgs.fallbackNoTools) {
-      args.push("--no-tools");
-    }
+  const tools = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools, reportingEnabled);
+  if (tools !== undefined) {
+    if (tools.length > 0) args.push("--tools", tools.join(","));
+    else args.push("--no-tools");
+  } else if (inheritedCliArgs.fallbackNoTools) {
+    args.push("--no-tools");
   }
 
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
@@ -4740,6 +4744,7 @@ export function buildInteractivePiArgs(
   /** Invocation-scoped parent session value captured before any launch delay. */
   parentThinkingLevel?: string,
   hostVersion: string = PiHost.VERSION,
+  reportingEnabled = false,
 ): string[] {
   if (childPolicy === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, [], inheritedCliArgs.fallbackNoTools, hostVersion);
   const includeCodemode = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools)?.includes("codemode") ?? false;
@@ -4755,11 +4760,12 @@ export function buildInteractivePiArgs(
   if (model) args.push("--model", model);
   const thinking = resolveChildThinkingLevel(agent.thinking, parentThinkingLevel, inheritedCliArgs.fallbackThinking);
   if (thinking) args.push("--thinking", thinking);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  } else if (agent.tools === undefined) {
-    if (inheritedCliArgs.fallbackTools !== undefined) args.push("--tools", inheritedCliArgs.fallbackTools);
-    else if (inheritedCliArgs.fallbackNoTools) args.push("--no-tools");
+  const tools = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools, reportingEnabled);
+  if (tools !== undefined) {
+    if (tools.length > 0) args.push("--tools", tools.join(","));
+    else args.push("--no-tools");
+  } else if (inheritedCliArgs.fallbackNoTools) {
+    args.push("--no-tools");
   }
   if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
   args.push(`@${taskFilePath}`);
@@ -5007,6 +5013,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   }
 
   const reportingSelected = selectsParentReport(agent, inheritedCliArgs.fallbackTools, inheritedCliArgs.fallbackNoTools);
+  const toolSelection = resolveChildToolSelection(agent, inheritedCliArgs.fallbackTools);
+  const noTools = toolSelection === undefined ? inheritedCliArgs.fallbackNoTools : toolSelection.length === 0;
+  let parentReportServer: LifecycleEventServer | null = null;
   const result: SingleResult = {
     agent: agentName,
     agentSource: agent.source,
@@ -5025,14 +5034,33 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       && (!opts.onParentReport || process.platform === "win32" || !isStableSemverAtLeast(PiHost.VERSION, "1.1.0"))) {
       throw new Error("Direct-parent reporting supports only running background children on stable Pi >=1.1.0 Unix hosts.");
     }
-    if (reportingSelected && managedOverriddenBuiltinTools?.includes(PARENT_REPORT_TOOL)) {
-      throw new Error("Direct-parent reporting cannot preserve an unrelated extension override of report_to_parent.");
-    }
+    const reportingEligible = Boolean(opts.onParentReport) && !noTools
+      && process.platform !== "win32" && isStableSemverAtLeast(PiHost.VERSION, "1.1.0");
     if (resolveManagedChildPolicy() === "managed") {
       assertManagedChildToolCompatibility(
         agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools,
         inheritedCliArgs.fallbackNoTools, PiHost.VERSION, delegationMode === "fork",
       );
+    }
+    // Fence stale or cancelled invocations before preparing shared resources.
+    if (signal?.aborted || !canStartInteractiveRun(interactiveShutdownGeneration)) {
+      result.exitCode = 130;
+      result.stopReason = "aborted";
+      result.errorMessage = signal?.aborted
+        ? "Cancellation fenced this subagent invocation before it started."
+        : "Parent session shutdown fenced this subagent invocation before it started.";
+      result.stderr = result.errorMessage;
+      await opts.forkSourceOwnership?.markTerminal(opts.forkChildId!, "no-launch").catch(() => undefined);
+      return result;
+    }
+    // Prepare once for both launch surfaces. Automatic reporting is optional;
+    // an unavailable socket must not turn an ordinary task into a failure.
+    if (reportingEligible) parentReportServer = await getLifecycleEventServer();
+    if (parentReportServer && managedOverriddenBuiltinTools?.includes(PARENT_REPORT_TOOL)) {
+      throw new Error("Direct-parent reporting cannot preserve an unrelated extension override of report_to_parent.");
+    }
+    if (reportingSelected && !parentReportServer) {
+      throw new Error("Direct-parent reporting is unavailable: authenticated lifecycle socket could not be enabled.");
     }
   } catch (error) {
     result.exitCode = 1; result.stopReason = "error"; result.errorMessage = error instanceof Error ? error.message : String(error); result.stderr = result.errorMessage;
@@ -5042,10 +5070,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
 
   // A delayed background queue item must not become valid after a new session
   // starts. The extension threads its invocation-time capture here.
-  if (!canStartInteractiveRun(interactiveShutdownGeneration)) {
+  if (signal?.aborted || !canStartInteractiveRun(interactiveShutdownGeneration)) {
     result.exitCode = 130;
     result.stopReason = "aborted";
-    result.errorMessage = "Parent session shutdown fenced this subagent invocation before it started.";
+    result.errorMessage = signal?.aborted
+      ? "Cancellation fenced this subagent invocation before it started."
+      : "Parent session shutdown fenced this subagent invocation before it started.";
     result.stderr = result.errorMessage;
     await opts.forkSourceOwnership?.markTerminal(opts.forkChildId!, "no-launch").catch(() => undefined);
     return result;
@@ -5129,7 +5159,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       agent,
       invocationId,
       onSteeringReady: opts.onSteeringReady,
-      onParentReport: opts.onParentReport,
+      onParentReport: parentReportServer ? opts.onParentReport : undefined,
+      parentReportServer,
       cwd,
       taskCwd,
       modelOverride,
@@ -5202,23 +5233,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       modelOverride,
       undefined,
       parentThinkingLevel,
+      PiHost.VERSION,
+      Boolean(parentReportServer),
     );
     let steeringEnv: Record<string, string> | undefined;
-    if ((opts.onSteeringReady || (opts.onParentReport && reportingSelected)) && !isWindows) {
-      inlineLifecycleServer = await getLifecycleEventServer();
-      if (reportingSelected && !inlineLifecycleServer) {
-        result.exitCode = 1;
-        result.stopReason = "error";
-        result.errorMessage = "Direct-parent reporting is unavailable: authenticated lifecycle socket could not be enabled.";
-        result.stderr = result.errorMessage;
-        return result;
-      }
+    if ((opts.onSteeringReady || parentReportServer) && !isWindows) {
+      inlineLifecycleServer = parentReportServer ?? await getLifecycleEventServer();
       if (inlineLifecycleServer && !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration)) {
         inlineLifecycleRunId = createRunId();
         const token = inlineLifecycleServer.registerRun(inlineLifecycleRunId, true);
         const tokenPath = path.join(taskTmp.dir, "lifecycle-token");
         await writeLifecycleBootstrapToken(tokenPath, token);
-        if (opts.onParentReport && reportingSelected) {
+        if (opts.onParentReport && parentReportServer) {
           inlineLifecycleServer.setReportHandler(inlineLifecycleRunId, (message, eligible) =>
             !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && eligible() && opts.onParentReport!(message), signal);
         }
@@ -5228,7 +5254,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
           [SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]: inlineLifecycleServer.socketPath,
           [SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]: tokenPath,
           [INLINE_STEERING_STATE_PATH_ENV]: path.join(taskTmp.dir, "state.json"),
-          ...(opts.onParentReport && reportingSelected ? { [PARENT_REPORT_ENV]: "1" } : {}),
+          ...(parentReportServer ? { [PARENT_REPORT_ENV]: "1" } : {}),
         };
         // Insert before the trailing task argument; stdin remains one-shot/closed.
         const inlineBridgePath = fileURLToPath(new URL("./inline-steering-bridge.ts", import.meta.url));
@@ -5922,6 +5948,7 @@ interface RunAgentInInteractivePaneOptions {
   onSteeringReady?: (handle: SteeringHandle | undefined) => void;
   /** Only the exact current background parent supplies this leaf binding. */
   onParentReport?: (message: string) => boolean;
+  parentReportServer: LifecycleEventServer | null;
   backend: InteractivePaneBackend;
   result: SingleResult;
   agent: AgentConfig;
@@ -6682,6 +6709,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
       options.modelOverride,
       undefined,
       options.parentThinkingLevel,
+      PiHost.VERSION,
+      Boolean(options.parentReportServer),
     );
     applyChildProjectIsolation(piArgs, effectiveCwd);
 
@@ -6842,9 +6871,8 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
         : parseLaunchIntentV2(intent, runId, runPaths.runDir);
       if (!validatedIntent) throw new Error("Interactive layout launch intent failed validation.");
       if (await publishImmutableJson(runPaths.launchIntentPath, intent) !== "published") throw new Error("Interactive launch intent already exists.");
-      const runLifecycleServer = await getLifecycleEventServer();
-      const reportingEnabled = Boolean(options.onParentReport) && selectsParentReport(options.agent, inheritedCliArgs.fallbackTools, inheritedCliArgs.fallbackNoTools);
-      if (reportingEnabled && !runLifecycleServer) throw new Error("Direct-parent reporting is unavailable: authenticated lifecycle socket could not be enabled.");
+      const runLifecycleServer = options.parentReportServer ?? await getLifecycleEventServer();
+      const reportingEnabled = Boolean(options.parentReportServer);
       let lifecycleProtocolEnv: Record<string, string> = {};
       if (runLifecycleServer) {
         const lifecycleToken = runLifecycleServer.registerRun(runId);

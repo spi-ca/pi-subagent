@@ -210,7 +210,10 @@ async function setupBridge(runId: string, options: {
 	let shutdownAndDrainTask: Promise<void> | undefined;
 	const steeringMessages: unknown[][] = [];
 	const boundaryResults: unknown[] = [];
+	let activeTools = ["read"];
 	const pi = {
+		getActiveTools() { return [...activeTools]; },
+		setActiveTools(names: string[]) { activeTools = [...names]; },
 		sendUserMessage(...args: unknown[]) { steeringMessages.push(args); },
 		on(event: string, handler: (event: any, ctx: any) => any) {
 			const current = handlers.get(event) ?? [];
@@ -259,6 +262,7 @@ async function setupBridge(runId: string, options: {
 	activeBridgeShutdowns.push(shutdownAndDrain);
 	return {
 		paths, handlers, commands, tools, lifecycle, titles, notifications, ctx, emit, steeringMessages, boundaryResults,
+		getActiveTools: () => pi.getActiveTools(),
 		heartbeat, stopAndDrainLeaseRenewals, shutdownAndDrain, drainEventTasks, waitForShutdown: () => shutdownReached.promise,
 	};
 }
@@ -1500,6 +1504,7 @@ for (const gate of ["abort", "completion", "ownership"] as const) {
     const report = bridge.tools.get(PARENT_REPORT_TOOL); assert.ok(report);
     assert.equal(process.env[PARENT_REPORT_ENV], undefined);
     await bridge.emit("session_start");
+    assert.deepEqual(bridge.getActiveTools(), ["read", PARENT_REPORT_TOOL], "only reporting supplements existing interactive tools");
     await assert.rejects(report.execute("startup", { message: "not started" }, bridge.ctx.signal, undefined, bridge.ctx), /not submitted|unavailable/);
     const wake = server.waitForEvent(runId, 1000);
     await bridge.emit("agent_start"); await wake;

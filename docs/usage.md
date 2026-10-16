@@ -173,13 +173,13 @@ Linux/macOS inline CLI JSON 실행은 필요한 작업에만 경량 bridge를 �
 
 ## Child에서 direct parent에 보고하기
 
-보고할 child 에이전트의 [도구 allowlist](./agents.md#실행-중-direct-parent에-짧게-보고하기)에 `report_to_parent`를 명시하고, 부모에서 단일·병렬·체인 중 하나를 `background: true`로 실행하세요. 체인의 병렬 단계도 지원합니다. child에서는 다음처럼 호출합니다.
+부모에서 단일·병렬·체인 중 하나를 `background: true`로 실행하면 지원되는 child에 `report_to_parent`가 자동으로 제공됩니다. 역할별 도구/메시징 권한 설정은 필요하지 않으며 체인의 병렬 단계도 지원합니다. child에서는 다음처럼 호출합니다.
 
 ```js
 report_to_parent({ message: "API 변경은 끝났고 집중 테스트를 확인 중입니다." })
 ```
 
-현재 실행 중인 child에서 **정확한 direct parent 세션**으로만 전달합니다. child가 parent/job ID를 선택하거나 형제·조상에게 보내는 기능은 없습니다. Linux/macOS inline·cmux/tmux/Herdr의 기존 인증 lifecycle socket을 재사용하며, stable Pi `>=1.1.0`이 필요합니다. Windows·구형 host·socket이 없는 실행·foreground는 지원하지 않습니다. 보고 지원과 달리 부모에서 child로 보내는 `action: "steer"`는 여전히 단일 background 작업만 지원합니다. 도구 생략/다른 명시 allowlist/no-tools를 이 기능으로 확장하지 않습니다. managed profile에서도 임의 extension 도구 허용은 그대로 금지합니다.
+현재 실행 중인 child에서 **정확한 direct parent 세션**으로만 전달합니다. child가 parent/job ID를 선택하거나 형제·조상에게 보내는 기능은 없습니다. Linux/macOS inline·cmux/tmux/Herdr의 기존 인증 lifecycle socket을 재사용하며, stable Pi `>=1.1.0`이 필요합니다. Windows·구형 host·socket이 없는 실행·foreground는 지원하지 않습니다. 보고 지원과 달리 부모에서 child로 보내는 `action: "steer"`는 여전히 단일 background 작업만 지원합니다. 미지원 환경이나 인증 socket 준비 실패 시 자동 보고만 생략하고 일반 작업은 계속합니다. 명시 allowlist에는 보고 도구만 추가하고, 도구 선택 생략 시 Pi 기본값과 fork의 복원된 도구를 그대로 보존합니다. 유효한 no-tools 선택은 도구 없이 유지합니다(역할의 명시 목록은 부모 CLI fallback보다 우선). `subagent`·MCP·codemode 등 다른 도구를 자동 활성화하지 않으며 inherited 도구 제외도 유지합니다. managed profile에서도 임의 extension 도구 허용은 그대로 금지합니다. 자세한 선택 규칙은 [에이전트 도구](./agents.md#실행-중-direct-parent에-짧게-보고하기)를 참고하세요.
 
 알림에는 부모가 고정한 `jobId`, leaf별 고유 `childId`, 정확한 `agent`, 호출 형태 `mode`가 포함됩니다. 체인은 `stageIndex`/`stageLabel`, 병렬 작업은 `taskIndex`도 포함하며, metadata 인덱스는 **0부터**, 사람용 단계/작업 번호는 **1부터** 시작합니다. 같은 에이전트나 표시 라벨이어도 leaf identity로 구분합니다. sender details의 `kind: "subagent.parent-report"`, `version: 2`는 기존 v1의 `jobId` 계약에 이 필드를 추가합니다. 저장된 v1 메시지는 그대로 표시하며 agent/leaf를 추정하지 않습니다. 이름·라벨은 제한된 길이의 escaped 비신뢰 문자열로 표시하고, task·cwd·model·history를 보고 metadata에 포함하지 않습니다. child API는 `{message}`뿐이며 identity를 선택할 수 없습니다. 건너뛴/시작하지 않은 leaf나 완료된 이전 단계는 보고할 수 없습니다.
 

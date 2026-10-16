@@ -1,4 +1,7 @@
 import { afterEach, jest, test } from "bun:test";
+// @ts-expect-error Bun runtime mock is absent from the project's Node-only types.
+import { mock } from "bun:test";
+import * as PiHost from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import { getEventListeners } from "node:events";
@@ -73,7 +76,7 @@ test("strict UTF8 limits and bounded parent session admission wrap literal data;
 
 test("tool registration requires consumed explicit eligibility, and rejects idle/aborted/missing signal without echo", async () => {
   const tools: any[] = [];
-  const pi = { registerTool: (tool: any) => tools.push(tool) };
+  const pi = { registerTool: (tool: any) => tools.push(tool), on: () => {} };
   delete process.env[PARENT_REPORT_ENV];
   assert.equal(registerParentReportTool(pi as never, () => null, () => true), false);
   process.env[PARENT_REPORT_ENV] = "1";
@@ -103,7 +106,29 @@ test("managed selection admits only package-owned reporting and leaves default/a
     assert.ok(args.includes("--no-extensions") && args.includes("--no-mcp") && args.includes("builtin:codemode"));
     assert.equal(args[args.indexOf("--tools") + 1], agent.tools.join(","));
   }
-  // No parent binding exists for foreground execution.
+  // Automatic selection supplements only the report tool, not role permissions.
+  for (const policy of ["inherit", "managed"] as const) {
+    for (const tools of [["read"], undefined, []]) {
+      const config = { ...agent, tools };
+      const variants = [
+        buildPiArgs(config, null, "/task", "spawn", null, undefined, policy, undefined, "1.3.0", true),
+        buildPiArgs(config, null, "/task", "fork", "/session", undefined, policy, undefined, "1.3.0", true),
+        buildInteractivePiArgs(config, null, "/task", "/session", undefined, policy, undefined, "1.3.0", true),
+      ];
+      for (const args of variants) {
+        assert.equal(args.includes("builtin:codemode"), false);
+        if (tools?.length) {
+          assert.equal(args[args.indexOf("--tools") + 1], "read,report_to_parent");
+          assert.ok(args.includes("--no-mcp"));
+        } else {
+          assert.equal(args.includes("--tools"), false, "omitted fork selection must retain host restoration");
+          assert.equal(args.includes("--no-tools"), tools !== undefined);
+        }
+      }
+      assert.deepEqual(config.tools, tools, "do not mutate role configuration");
+    }
+  }
+  // No parent binding exists for foreground execution of legacy explicit reporting.
   const result = await runAgent({ cwd: process.cwd(), agents: [agent], agentName: "child", task: "never launch", delegationMode: "spawn", terminalMode: "inline", parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true, makeDetails: results => ({ mode: "single", results, toolLabel: "Subagent", delegationMode: "spawn", terminalMode: "inline", projectAgentsDir: null }) });
   assert.equal(result.exitCode, 1); assert.deepEqual(result.messages, []);
   assert.match(result.errorMessage ?? "", /only running background/);
@@ -575,4 +600,37 @@ test("revocation after successful synchronous enqueue does not turn a truthful s
   assert.equal(delivered, 1);
   assert.equal(await client.requestReport("no new admission"), "rejected");
   client.close();
+});
+
+test("automatic eligibility omits reporting on unsupported hosts/platforms, foreground and effective no-tools", async () => {
+  const host = { ...PiHost }, platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const start = LifecycleEventServer.start;
+  let starts = 0;
+  LifecycleEventServer.start = async () => { starts++; throw Error("must not request a reporting socket"); };
+  const agent = { name: "child", description: "", systemPrompt: "", source: "user" as const, filePath: "/child.md", tools: ["read"] };
+  const opts = { cwd: process.cwd(), agents: [agent], agentName: agent.name, task: "never launch", delegationMode: "spawn" as const,
+    terminalMode: "inline" as const, interactiveShutdownGeneration: -1,
+    parentDepth: 0, parentAgentStack: [], maxDepth: 3, preventCycles: true,
+    makeDetails: (results: any[]) => ({ mode: "single" as const, results, toolLabel: "Subagent", delegationMode: "spawn" as const, terminalMode: "inline" as const, projectAgentsDir: null }) };
+  try {
+    for (const version of ["1.0.4", "1.1.0-beta.1", "unknown"]) {
+      mock.module("@earendil-works/pi-coding-agent", () => ({ ...host, VERSION: version }));
+      assert.equal(PiHost.VERSION, version);
+      const automatic = await runAgent({ ...opts, onParentReport: () => true });
+      assert.equal(automatic.exitCode, 130, automatic.stderr);
+      const explicit = await runAgent({ ...opts, agents: [{ ...agent, tools: ["report_to_parent"] }], onParentReport: () => true });
+      assert.equal(explicit.exitCode, 1); assert.match(explicit.errorMessage ?? "", /stable Pi >=1.1.0/);
+    }
+    mock.module("@earendil-works/pi-coding-agent", () => host);
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    assert.equal((await runAgent({ ...opts, onParentReport: () => true })).exitCode, 130);
+    Object.defineProperty(process, "platform", platform);
+    assert.equal((await runAgent(opts)).exitCode, 130, "foreground has no automatic report");
+    assert.equal((await runAgent({ ...opts, agents: [{ ...agent, tools: [] }], onParentReport: () => true })).exitCode, 130);
+    assert.equal(starts, 0);
+  } finally {
+    mock.module("@earendil-works/pi-coding-agent", () => host);
+    Object.defineProperty(process, "platform", platform);
+    LifecycleEventServer.start = start;
+  }
 });

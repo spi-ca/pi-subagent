@@ -157,9 +157,9 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 이 focused 범위는 실제 cmux/tmux acceptance를 실행하지 않습니다. 따라서 이 변경에 대해 live cmux/tmux acceptance 통과를 주장하지 않습니다. 실제 multiplexer를 의도적으로 승인해 검증할 때만 위의 `PI_SUBAGENT_LIVE_TMUX` 또는 `PI_SUBAGENT_LIVE_CMUX` 명령을 사용합니다.
 
-## Pi 1.2 집중 회귀 검증
+## Pi 1.3 집중 회귀 검증
 
-설치된 Pi `1.2.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 nextTurn 소비와 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 기존 dependencies로도 서로 독립된 Bun process에서 실행할 수 있지만, exact `1.2.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
+설치된 Pi `1.3.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 nextTurn 소비와 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 서로 독립된 Bun process에서 실행하며, exact `1.3.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
 
 ```bash
 bun test --max-concurrency 1 test/runtime/child-bridge.test.ts
@@ -171,6 +171,7 @@ bun test --max-concurrency 1 test/entrypoint/index.test.ts
 bun test --max-concurrency 1 test/entrypoint/thinking-inheritance.test.ts
 bun test --max-concurrency 1 test/runtime/runner-codemode.test.ts
 bun test --max-concurrency 1 test/integration/managed-codemode-host.test.ts
+bun test --max-concurrency 1 test/integration/session-tools-host.test.ts
 bun test --max-concurrency 1 test/integration/custom-turn-host.test.ts
 bun test --max-concurrency 1 test/integration/steering-boundary-host.test.ts
 bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
@@ -178,11 +179,13 @@ bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 
 이 범위는 실제 provider/MCP 연결 또는 live terminal acceptance를 실행하거나 증명하지 않습니다. 취소 event만으로 completion proof를 만들지 않는 동작과 기존 fence/lease/ownership 검증을 함께 유지합니다.
 
-`runner-codemode.test.ts`는 managed inline/fork/interactive builder, fallback 우선순위, exact selection, version guard와 codemode override 오류를 검사합니다. `managed-codemode-host.test.ts`는 exact installed Pi `1.2.0`의 resource loader에서 `--no-extensions` + `builtin:codemode`를 로드하고 native session/QuickJS/nested-tool pipeline으로 읽기 도구 batch를 실행하는 provider-free 통합 테스트입니다. project 내부의 격리 temporary agent/workspace, in-memory 설정·session과 static model catalog를 사용하며 auth/config credential 조회·network/provider 호출을 차단합니다. `read`/`grep`/`find`/`ls`만 callable인지 검사하고 실제 batch는 `read` 두 호출과 `ls`로 실행합니다. native `grep`/`find`의 rg/fd 자동 다운로드 가능성을 피하려고 이 테스트에서는 그 도구를 실행하지 않습니다. bash/edit/write/recursive codemode/nested delegation, discovered extension과 MCP가 열리지 않는지 검증합니다. synthetic assistant entry는 provider 없이 native nested-call의 issuing-message 조건만 충족합니다. 기본 CI inventory가 자동 발견하며 timeout은 제한돼 있습니다. native `models=true`는 유지하지만 classifier/image 호출·session-store persistence·temp output 기능 또는 OS/no-network sandbox를 검증한 것으로 해석하지 않습니다.
+`runner-codemode.test.ts`는 managed inline/fork/interactive builder, fallback 우선순위, exact selection, version guard와 codemode override 오류를 검사합니다. `managed-codemode-host.test.ts`는 exact installed Pi `1.3.0`의 resource loader에서 `--no-extensions` + `builtin:codemode`를 로드하고 native session/QuickJS/nested-tool pipeline으로 읽기 도구 batch를 실행하는 provider-free 통합 테스트입니다. project 내부의 격리 temporary agent/workspace, in-memory 설정·session과 static model catalog를 사용하며 auth/config credential 조회·network/provider 호출을 차단합니다. `read`/`grep`/`find`/`ls`만 callable인지 검사하고 실제 batch는 `read` 두 호출과 `ls`로 실행합니다. native `grep`/`find`의 rg/fd 자동 다운로드 가능성을 피하려고 이 테스트에서는 그 도구를 실행하지 않습니다. bash/edit/write/recursive codemode/nested delegation, discovered extension과 MCP가 열리지 않는지 검증합니다. synthetic assistant entry는 provider 없이 native nested-call의 issuing-message 조건만 충족합니다. 기본 CI inventory가 자동 발견하며 timeout은 제한돼 있습니다. native `models=true`는 유지하지만 classifier/image 호출·session-store persistence·temp output 기능 또는 OS/no-network sandbox를 검증한 것으로 해석하지 않습니다. Pi 1.3의 process-wide codemode worker 상한에 맞춰 금지 도구 검사는 한 script로 묶고, `parent-report-host.test.ts`의 같은 프로세스 안 native codemode child 실행만 실제 worker `exit`를 최대 5초 기다리는 observer로 순차화합니다. sandbox·worker admission을 대체하거나 sleep/retry로 결과를 숨기지 않습니다. direct report의 병렬 admission과 모든 leaf별 attribution 검증은 유지합니다.
+
+`session-tools-host.test.ts`는 exact installed Pi `1.3.0`의 CLI parser와 native SDK/session manager를 연결해 raw fork snapshot과 재개 파일의 active tools를 검증합니다. 명시적 역할 allowlist가 복원보다 우선하고, 목록 생략 시 system tool delta·retain-none compaction checkpoint를 복원하며, `+/-`는 현재 host 기본값이 아닌 복원된 목록에 적용되는지 확인합니다. 빈 transcript loadout과 `--no-tools`, managed의 modifier 거부도 검사합니다. extension provenance로 수집한 `grep` override와 목록 생략 fork는 `runAgent`의 launch 이전 호환성 검사에서 거부하고, `grep` 없는 명시 목록과 spawn은 다음 shutdown fence까지 통과하는지 확인합니다. 복원 목록을 prelaunch에서 확정하지 않으므로 이 거부는 보수적이며 실제 목록에 override가 포함되는지 재해석하지 않습니다. project 내부 temporary workspace·agent/session 파일, in-memory 설정과 static model catalog를 사용하며 global 설정·credential 조회 및 network/provider 호출 없이 실행합니다. package/bridge extension 실행이나 실제 CLI subprocess·TUI acceptance를 증명하지는 않습니다.
 
 ## 개발 의존성
 
-클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.2.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
+클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.3.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
 
 Pi 관련 peer dependency는 host 설치를 막지 않도록 `"*"`로 유지합니다. interactive pane 실행에 필요한 Pi `>=0.80.10`은 peer range가 아니라 runtime version policy로 검사합니다.
 
@@ -264,9 +267,9 @@ push와 pull request의 일반 CI는 provider 인증 정보, provider 요청, li
 
 | lane | Bun | Pi development graph | install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.2.0 lockfile 해석 | `bun install --frozen-lockfile` |
-| current compatibility | 1.4.2 | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.2.0로 맞춘 임시 graph | `bun install --no-save` |
+| locked baseline | 1.3.14 (`packageManager`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.3.0 lockfile 해석 | `bun install --frozen-lockfile` |
+| current compatibility | 1.4.2 | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.3.0로 맞춘 임시 graph | `bun install --no-save` |
 
-각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.2.0`, compatibility mapping은 `1.2.0`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 Pi 패키지만 포함하며 Pi 1.2 runtime에서 제거된 `@earendil-works/chord`와 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.2.0`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane 모두 선택된 Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
+각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.3.0`, compatibility mapping은 `1.3.0`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 Pi 패키지만 포함하며 Pi 1.2 runtime에서 제거된 `@earendil-works/chord`와 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.3.0`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane 모두 선택된 Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
 
 retained Phase 0/7 fixture의 strict current-source verifier는 의도적으로 일반 CI에 포함하지 않는다. unit CI는 synthetic evidence로 source-binding 비교 로직만 다룬다. `benchmark:phase0:live:verify`와 `benchmark:phase7:verify`는 opt-in strict evidence gate로 남으며, source 변경 뒤 historical fixture hash를 자동 갱신하지 않는다. 따라서 retained fixture는 현재 worktree의 새 성능 측정 증거가 아니다.

@@ -2,6 +2,7 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import { VERSION, createAgentSession, createAgentSessionRuntime, createCodemodeExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type InlineExtension } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
 import { INLINE_STEERING_STATE_PATH_ENV } from "../../src/runtime/inline-steering-bridge";
@@ -13,6 +14,34 @@ import { assertSelectedPiHost, SELECTED_PI_VERSION } from "../helpers/selected-p
 function sender(jobId: string) { return { jobId, childId: `leaf-${jobId}`, agent: "reporter", mode: "single" as const }; }
 
 function latch() { let release!: () => void; const promise = new Promise<void>(r => { release = r; }); return { promise, release }; }
+
+// Observe real worker exit without replacing the native sandbox or its worker
+// admission. Pi 1.3 returns script results before Bun worker teardown completes.
+async function withCodemodeWorkerExit(run: () => Promise<void>): Promise<void> {
+  const descriptor = Object.getOwnPropertyDescriptor(Worker.prototype, "once");
+  const once = Worker.prototype.once;
+  const seen = new WeakSet<Worker>(), exits: Promise<void>[] = [];
+  Worker.prototype.once = function (this: Worker, event: string, listener: (...args: any[]) => void) {
+    if (event === "exit" && !seen.has(this)) {
+      seen.add(this);
+      exits.push(new Promise<void>(resolve => { once.call(this, "exit", () => resolve()); }));
+    }
+    return once.call(this, event, listener);
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await run();
+    assert.equal(exits.length, 1, "native codemode must create one real worker");
+    await Promise.race([
+      Promise.all(exits),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Native codemode worker did not exit")), 5000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (descriptor) Object.defineProperty(Worker.prototype, "once", descriptor);
+    else Reflect.deleteProperty(Worker.prototype, "once");
+  }
+}
 
 // Register the production admission against real Pi lifecycle events, as index.ts
 // does in its existing session hooks. Never manually reset it around host reload.
@@ -114,7 +143,12 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
         children.push(child);
       }
       const parentBefore = structuredClone(parent.manager.getBranch());
-      await Promise.all(children.map(child => child.session.prompt("child natural task")));
+      // Production children have separate processes. These SDK children share
+      // Pi 1.3's process-wide two-worker codemode cap, so serialize only native
+      // codemode scripts through actual worker exit (not a sleep or retry).
+      // Direct reporting still exercises concurrent admission.
+      if (codemode) for (const child of children) await withCodemodeWorkerExit(() => child.session.prompt("child natural task"));
+      else await Promise.all(children.map(child => child.session.prompt("child natural task")));
       for (const child of children) {
         const toolResults = child.session.messages.filter(m => m.role === "toolResult");
         assert.equal(toolResults.length, 1);

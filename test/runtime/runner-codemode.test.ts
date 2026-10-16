@@ -37,6 +37,24 @@ test("managed builders load only literal native codemode when exactly selected, 
   assert.equal(buildPiArgs(agent, null, "/task", "spawn", null, undefined, "inherit", undefined, "1.1.0").includes("builtin:codemode"), false);
 });
 
+test("Pi 1.3 role allowlists stay authoritative over inherited CLI tools for spawn, fork and interactive", () => {
+  const role = { ...agent, tools: ["read", "ls"] };
+  for (const policy of ["inherit", "managed"] as const) {
+    const selections = [
+      buildPiArgs(role, null, "/task", "spawn", null, undefined, policy, undefined, "1.3.0"),
+      buildPiArgs(role, null, "/task", "fork", "/session", undefined, policy, undefined, "1.3.0"),
+      buildInteractivePiArgs(role, null, "/task", "/session", undefined, policy, undefined, "1.3.0"),
+    ];
+    for (const args of selections) {
+      assert.equal(args.filter(arg => arg === "--tools").length, 1);
+      assert.equal(args[args.indexOf("--tools") + 1], "read,ls");
+      assert.equal(args.includes("read,grep,codemode"), false);
+      assert.equal(args.includes("builtin:codemode"), false);
+      assert.ok(args.includes("--no-mcp"));
+    }
+  }
+});
+
 test("codemode compatibility fails closed on versions and non-exact tool selections", () => {
   for (const version of ["1.0.4", "1.0.99", "1.1.0-beta.1", "1.2.0-rc.1", "unknown", "", "garbage"]) {
     assert.throws(() => assertManagedChildToolCompatibility({ tools: ["codemode"] }, undefined, [], false, version), /verified stable Pi >=1.1.0/);

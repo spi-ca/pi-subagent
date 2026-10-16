@@ -4562,6 +4562,7 @@ export function assertManagedChildToolCompatibility(
   overriddenBuiltinTools: readonly string[] = [],
   fallbackNoTools = false,
   hostVersion: string = PiHost.VERSION,
+  restoresSessionTools = false,
 ): void {
   const configured = resolveChildToolSelection(agent, fallbackTools);
   const unsupported = configured?.filter((name) => !MANAGED_BUILTIN_TOOLS.has(name)) ?? [];
@@ -4572,9 +4573,13 @@ export function assertManagedChildToolCompatibility(
   if (configured?.includes("codemode") && !isStableSemverAtLeast(hostVersion, "1.1.0")) {
     throw new Error("managed child codemode requires a verified stable Pi >=1.1.0 host.");
   }
-  // With no explicit allowlist Pi still activates its default built-ins. Managed
-  // mode must not silently replace an inherited override of one of those tools.
-  const effective = configured ?? (fallbackNoTools ? [] : [...MANAGED_DEFAULT_ACTIVE_TOOLS]);
+  // Fresh sessions use defaults; Pi >=1.3 forks can instead restore non-default
+  // tools from the transcript. Without an explicit selection that effective set
+  // is unknown here, so conservatively check every known built-in override.
+  let effective = configured ?? (fallbackNoTools ? [] : [...MANAGED_DEFAULT_ACTIVE_TOOLS]);
+  if (configured === undefined && !fallbackNoTools && restoresSessionTools && isStableSemverAtLeast(hostVersion, "1.3.0")) {
+    effective = [...MANAGED_BUILTIN_TOOLS];
+  }
   const overridden = effective.filter((name) => overriddenBuiltinTools.includes(name));
   if (overridden.length > 0) throw new Error(`managed child policy cannot preserve extension overrides for built-in tools: ${overridden.join(", ")}`);
 }
@@ -5023,7 +5028,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     if (reportingSelected && managedOverriddenBuiltinTools?.includes(PARENT_REPORT_TOOL)) {
       throw new Error("Direct-parent reporting cannot preserve an unrelated extension override of report_to_parent.");
     }
-    if (resolveManagedChildPolicy() === "managed") assertManagedChildToolCompatibility(agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools, inheritedCliArgs.fallbackNoTools);
+    if (resolveManagedChildPolicy() === "managed") {
+      assertManagedChildToolCompatibility(
+        agent, inheritedCliArgs.fallbackTools, managedOverriddenBuiltinTools,
+        inheritedCliArgs.fallbackNoTools, PiHost.VERSION, delegationMode === "fork",
+      );
+    }
   } catch (error) {
     result.exitCode = 1; result.stopReason = "error"; result.errorMessage = error instanceof Error ? error.message : String(error); result.stderr = result.errorMessage;
     await opts.forkSourceOwnership?.markTerminal(opts.forkChildId!, "no-launch").catch(() => undefined);

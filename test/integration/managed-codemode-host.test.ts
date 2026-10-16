@@ -102,12 +102,21 @@ text(JSON.stringify({names: ALL_TOOLS.map(t => t.name).sort(), rows: rows.map(ro
     assert.equal(data.rows[1].value, "gamma\n");
     assert.match(data.rows[2].value, /a.txt/);
     assert.match(data.rows[2].value, /b.txt/);
-    for (const name of ["bash", "edit", "write", "codemode", "subagent"]) {
-      const denied = await codemode.execute(`denied-${name}`, { code: `// @options: {"timeout_ms": 1000}\nawait tools.${name}({});` }, signal);
-      assert.equal(denied.isError, true, `${name} must not be callable`);
-      const errorText = denied.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-      assert.match(errorText, /does not exist/, `${name} must be absent, not merely time out`);
-    }
+    // Pi 1.3 caps workers still running/shutting down at two. Probe every
+    // denied name in one script, rather than racing teardown with five workers.
+    const deniedNames = ["bash", "edit", "write", "codemode", "subagent"];
+    const denied = await codemode.execute("denied-tools", { code: `// @options: {"timeout_ms": 1000}
+const denied = [];
+for (const name of ${JSON.stringify(deniedNames)}) {
+  try { await tools[name]({}); denied.push({name, error: null}); }
+  catch (error) { denied.push({name, error: String(error)}); }
+}
+text(JSON.stringify({denied}));` }, signal);
+    assert.notEqual(denied.isError, true);
+    const deniedText = denied.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+    const deniedRows = JSON.parse(deniedText.slice(deniedText.indexOf('{"denied"'))).denied;
+    assert.deepEqual(deniedRows.map((row: { name: string }) => row.name), deniedNames);
+    for (const row of deniedRows) assert.match(row.error, /does not exist/, `${row.name} must be absent, not merely time out`);
     assert.equal(await fs.readFile(path.join(cwd, "a.txt"), "utf8"), "alpha\nbeta\n");
     assert.equal(forbiddenCalls, 0);
   } finally {

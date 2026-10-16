@@ -4,12 +4,13 @@ import { isSteeringMessage } from "../core/subagent-steering.js";
 import { isStableSemverAtLeast } from "./version-policy.mjs";
 
 export const MINIMUM_STEERING_PI_VERSION = "1.1.0";
+export const STEERING_INBOX_CAPACITY = 8;
 export const STEERING_CUSTOM_TYPE = "pi-subagent-steering";
 type SteeringContext = Pick<ExtensionContext, "isIdle" | "signal">;
 
-/** One literal context message, owned by the current run. No native input pipeline or new prompt. */
+/** Literal FIFO context messages, owned by the current run. No native input pipeline or new prompt. */
 export class SteeringInbox {
-  private pending: string | undefined;
+  private pending: string[] = [];
   private active = false;
   private closed = false;
   readonly supported: boolean;
@@ -29,15 +30,15 @@ export class SteeringInbox {
     this.active = true;
   }
   /** End this low-level run without fencing a normal retry/continuation. */
-  pause(): void { this.active = false; this.pending = undefined; }
+  pause(): void { this.active = false; this.pending = []; }
   close(): void { this.closed = true; this.pause(); }
   observeOutcome(outcome: AgentActivityOutcome): void { if (outcome !== "completed") this.pause(); }
 
   /** ACK means bounded inbox admission only, not transcript commit or model application. */
   submit(ctx: SteeringContext, message: string): boolean {
-    if (!this.canAccept(ctx)) { this.pending = undefined; return false; }
-    if (this.pending !== undefined || !isSteeringMessage(message)) return false;
-    this.pending = message;
+    if (!this.canAccept(ctx)) { this.pending = []; return false; }
+    if (this.pending.length >= STEERING_INBOX_CAPACITY || !isSteeringMessage(message)) return false;
+    this.pending.push(message);
     return true;
   }
 
@@ -51,15 +52,14 @@ export class SteeringInbox {
 
   drain(event: BoundaryState, ctx: SteeringContext): BoundaryResult | undefined {
     this.observeOutcome(event.outcome);
-    if (!this.canAccept(ctx)) { this.pending = undefined; return; }
-    if (this.pending === undefined) return; // Leave earlier handlers' entries/continue untouched.
-    const message = this.pending;
-    this.pending = undefined;
-    const entry: SessionBoundaryDraft = {
-      type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: message, display: true,
-    };
+    if (!this.canAccept(ctx)) { this.pending = []; return; }
+    if (this.pending.length === 0) return; // Leave earlier handlers' entries/continue untouched.
+    const entries: SessionBoundaryDraft[] = this.pending.map(content => ({
+      type: "custom_message", customType: STEERING_CUSTOM_TYPE, content, display: true,
+    }));
+    this.pending = [];
     // Custom content becomes a user-role model message. Appending it makes this
     // continuation valid even when the prior preview ended in an assistant.
-    return { entries: [...event.entries, entry], continue: true };
+    return { entries: [...event.entries, ...entries], continue: true };
   }
 }

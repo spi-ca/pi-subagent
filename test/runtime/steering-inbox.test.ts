@@ -1,7 +1,7 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import type { BoundaryState, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-import { SteeringInbox, STEERING_CUSTOM_TYPE } from "../../src/runtime/steering-inbox";
+import { SteeringInbox, STEERING_CUSTOM_TYPE, STEERING_INBOX_CAPACITY } from "../../src/runtime/steering-inbox";
 
 const ctx = () => ({ isIdle: () => false, signal: new AbortController().signal });
 const boundary = (overrides: Partial<BoundaryState> = {}): BoundaryState => ({
@@ -19,13 +19,29 @@ describe("bounded boundary steering inbox", () => {
     const event = boundary({ entries: [earlier], continue: true });
     assert.equal(handlers.get("turn_end")!(event, context), undefined);
     assert.equal(inbox.submit(context, "/skill:literal $ARGUMENTS"), true);
-    assert.equal(inbox.submit(context, "bounded second"), false);
+    assert.equal(inbox.submit(context, "bounded second"), true);
     const result = handlers.get("turn_end")!(event, context);
-    assert.deepEqual(result, { entries: [earlier, { type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/skill:literal $ARGUMENTS", display: true }], continue: true });
+    assert.deepEqual(result, { entries: [earlier, { type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/skill:literal $ARGUMENTS", display: true }, { type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "bounded second", display: true }], continue: true });
     assert.deepEqual(event.entries, [earlier]);
     assert.equal(handlers.get("turn_end")!(event, context), undefined);
     assert.equal(inbox.submit(context, "next admission after drain"), true);
     assert.equal(inbox.drain(boundary(), context)?.continue, true);
+    assert.equal(inbox.drain(boundary(), context), undefined);
+  });
+
+  test("eight-message FIFO rejects overflow without replacing accepted entries and recovers after drain", () => {
+    const inbox = new SteeringInbox(() => true), context = ctx();
+    inbox.start(context);
+    const messages = Array.from({ length: STEERING_INBOX_CAPACITY }, (_, i) => `message ${i}`);
+    for (const message of messages) assert.equal(inbox.submit(context, message), true);
+    assert.equal(inbox.submit(context, "overflow"), false);
+    assert.equal(inbox.submit(context, "한".repeat(171)), false);
+    const result = inbox.drain(boundary(), context)!;
+    assert.deepEqual(result.entries!.map(entry => (entry as { content: string }).content), messages);
+    assert.equal(result.continue, true);
+    assert.equal(inbox.drain(boundary(), context), undefined);
+    assert.equal(inbox.submit(context, "after drain"), true);
+    inbox.pause(); inbox.start(context);
     assert.equal(inbox.drain(boundary(), context), undefined);
   });
 

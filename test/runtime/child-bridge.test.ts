@@ -289,10 +289,10 @@ describe("child lifecycle bridge", () => {
 		await bridge.emit("agent_start"); await started;
 		assert.equal(await server.requestSteer("interactive-steering", "/literal extra direction"), "submitted");
 		assert.deepEqual(bridge.steeringMessages, []);
-		assert.equal(await server.requestSteer("interactive-steering", "second pending"), "rejected");
+		assert.equal(await server.requestSteer("interactive-steering", "second pending"), "submitted");
 		await bridge.emit("turn_end", { entries: [], continue: false, outcome: "completed" });
 		assert.deepEqual(bridge.boundaryResults,
-			[{ entries: [{ type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/literal extra direction", display: true }], continue: true }]);
+			[{ entries: [{ type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/literal extra direction", display: true }, { type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "second pending", display: true }], continue: true }]);
 		await bridge.emit("agent_end", { messages: [assistant("stop")] });
 		await bridge.emit("agent_settled");
 		const completed = parseCompletionAuthority(await readJsonFile(bridge.paths.completionPath), "interactive-steering");

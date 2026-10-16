@@ -55,9 +55,9 @@ describe("inline CLI steering extension", () => {
     await f.emit("agent_start"); await wake;
     assert.equal(await f.server.requestSteer(f.id, "/skill:literal new message"), "submitted");
     assert.deepEqual(f.sent, []);
-    assert.equal(await f.server.requestSteer(f.id, "busy"), "rejected");
+    assert.equal(await f.server.requestSteer(f.id, "second"), "submitted");
     assert.deepEqual(await f.emit("turn_end", { entries: [], continue: false, outcome: "completed" }),
-      [{ entries: [{ type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/skill:literal new message", display: true }], continue: true }]);
+      [{ entries: [{ type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "/skill:literal new message", display: true }, { type: "custom_message", customType: STEERING_CUSTOM_TYPE, content: "second", display: true }], continue: true }]);
     assert.deepEqual(await f.emit("turn_end", { entries: [], continue: false, outcome: "completed" }), [undefined]);
     f.setIdle(true);
     assert.equal(await f.server.requestSteer(f.id, "idle"), "rejected");

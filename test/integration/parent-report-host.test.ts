@@ -264,7 +264,7 @@ for (const consumed of [false, true]) {
         assert.ok(client);
         try {
           const started = server.waitForEvent(id, 1000); client.send("agent-started"); await started;
-          for (let i = 0; i < count; i++) assert.equal(await client.requestReport("budget report body"), expect);
+          assert.deepEqual(await Promise.all(Array.from({ length: count }, () => client.requestReport("budget report body"))), Array(count).fill(expect));
         } finally { client.close(); server.terminalRun(id); }
       };
       const streamsBefore = contexts.length;

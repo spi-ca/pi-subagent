@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { PARENT_REPORT_CUSTOM_TYPE } from "../../src/runtime/parent-report";
+import { PARENT_REPORT_CUSTOM_TYPE, type ParentReportKind } from "../../src/runtime/parent-report";
 
 // Keep real discovery, invocation validation, scheduler, fanout and admission.
 // Only replace process launch and durable permit startup; no provider/backend.
@@ -54,15 +54,16 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     await handlers.get("session_start")!({}, ctx);
     const invoke = (params: any) => tool.execute("call", params, new AbortController().signal, undefined, ctx);
     const reports = () => sent.filter(s => s.message.customType === PARENT_REPORT_CUSTOM_TYPE);
-    const checkReport = (leaf: typeof leaves[number], expected: any) => {
+    const checkReport = (leaf: typeof leaves[number], expected: any, kind?: ParentReportKind) => {
       const role = leaf.options.agents.find(agent => agent.name === leaf.options.agentName)!;
       assert.deepEqual(role.tools, ["read"], "background leaf binding needs no role messaging permission");
       const args = runner.buildPiArgs(role, null, "/task", "spawn", null, undefined, "managed", undefined, "1.3.0", Boolean(leaf.options.onParentReport));
       assert.equal(args[args.indexOf("--tools") + 1], "read,report_to_parent");
       assert.equal(args.includes("builtin:codemode"), false);
-      assert.equal(leaf.options.onParentReport?.(`body-${reports().length}`), true);
+      assert.equal(leaf.options.onParentReport?.(`body-${reports().length}`, kind), true);
       const last = reports().at(-1)!;
-      assert.deepEqual(last.options, { deliverAs: "nextTurn", triggerTurn: false });
+      assert.deepEqual(last.options, kind && kind !== "progress" ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "nextTurn", triggerTurn: false });
+      assert.equal(last.message.details.reportKind, kind ?? "progress");
       assert.equal(last.message.details.agent, leaf.options.agentName);
       assert.equal(last.message.details.version, 2);
       for (const [key, value] of Object.entries(expected)) assert.equal(last.message.details[key], value);
@@ -72,7 +73,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     await invoke({ agent: "other", task: "single", background: true }); await until(() => leaves.length === 1);
     const single = leaves[0]!;
     assert.equal(typeof single.options.onSteeringReady, "function");
-    checkReport(single, { mode: "single" }); single.finish();
+    checkReport(single, { mode: "single" }, "finding"); single.finish();
     await new Promise(r => setTimeout(r, 0));
     assert.equal(single.options.onParentReport!("completed single"), false);
 
@@ -80,7 +81,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     await until(() => leaves.length === 3);
     const [a, b] = leaves.slice(1);
     assert.equal(a!.options.task, "parallel-a"); assert.equal(b!.options.task, "parallel-b");
-    const ai = checkReport(a!, { mode: "parallel", taskIndex: 0 });
+    const ai = checkReport(a!, { mode: "parallel", taskIndex: 0 }, "question");
     const bi = checkReport(b!, { mode: "parallel", taskIndex: 1 });
     assert.equal(ai.jobId, bi.jobId); assert.notEqual(ai.childId, bi.childId);
     assert.equal(a!.options.onSteeringReady, undefined); assert.equal(b!.options.onSteeringReady, undefined);
@@ -103,7 +104,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const fi = checkReport(first, { mode: "chain", stageIndex: 0, stageLabel: "step-1" });
     first.finish(); await until(() => leaves.length === 6);
     assert.equal(first.options.onParentReport!("previous stage"), false);
-    const pi = checkReport(leaves[4]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 0 });
+    const pi = checkReport(leaves[4]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 0 }, "blocked");
     const qi = checkReport(leaves[5]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 1 });
     assert.equal(fi.jobId, pi.jobId); assert.equal(pi.jobId, qi.jobId);
     for (const leaf of leaves.slice(3, 6)) assert.equal(leaf.options.onSteeringReady, undefined);

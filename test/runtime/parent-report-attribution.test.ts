@@ -16,7 +16,7 @@ test("sender identity snapshots exact IDs/names/zero-based positions; bounded un
   identity.childId = "swapped-leaf"; identity.agent = "swapped-agent"; identity.stageIndex = 9; identity.stageLabel = "swapped-stage"; identity.taskIndex = 4;
   assert.equal(bound("body"), true);
   const message = sent[0];
-  assert.deepEqual(message.details, { kind: "subagent.parent-report", version: 2,
+  assert.deepEqual(message.details, { kind: "subagent.parent-report", version: 2, reportKind: "progress",
     jobId: "exact-job", childId: "exact-leaf", agent, mode: "chain", stageIndex: 2, stageLabel: label, taskIndex: 0 });
   assert.match(message.content, /chain stage 3 task 1/);
   assert.match(message.content, /Sender names\/labels \(untrusted/);

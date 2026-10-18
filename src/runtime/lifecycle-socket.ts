@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { isSteeringMessage, type SteeringOutcome } from "../core/subagent-steering.js";
-import { isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, type ParentReportHandler, type ReportOutcome } from "./parent-report.js";
+import { isParentReportKind, isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, type ParentReportHandler, type ParentReportKind, type ReportOutcome } from "./parent-report.js";
 
 export const SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_SOCKET_PATH";
 export const SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_TOKEN_PATH";
@@ -49,6 +49,7 @@ interface WaitingSteer {
 
 interface WaitingReport {
 	message: string;
+	kind: ParentReportKind;
 	generation: number;
 	eligible: () => boolean;
 	signal?: AbortSignal;
@@ -435,7 +436,8 @@ export class LifecycleEventServer {
 				}
 				if (value.type === "report") {
 					const { run, runId } = authenticated;
-					if (!exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message"])
+					if (!(exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message"])
+						|| (exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message", "kind"]) && isParentReportKind(value.kind)))
 						|| value.version !== VERSION || value.runId !== runId || !Number.isSafeInteger(value.sequence) || value.sequence !== run.lastSequence + 1
 						|| !Number.isSafeInteger(value.reportSequence) || value.reportSequence !== (run.reportSequence ?? 0) + 1 || !isParentReportMessage(value.message)) { fail(); return; }
 					run.lastSequence = value.sequence as number;
@@ -458,7 +460,7 @@ export class LifecycleEventServer {
 					run.reportPending = true;
 					run.reportCount = (run.reportCount ?? 0) + 1;
 					// Callback errors and denied admission never echo child text. No retry.
-					void Promise.resolve().then(() => eligible() ? handler!(value.message as string, eligible) : false)
+					void Promise.resolve().then(() => eligible() ? handler!(value.message as string, eligible, (value.kind ?? "progress") as ParentReportKind) : false)
 						.then((accepted) => { run.reportPending = false; ack(accepted === true); },
 							() => { run.reportPending = false; ack(false); });
 					continue;
@@ -796,9 +798,9 @@ export class LifecycleEventClient {
 		this.reportPending?.resolve("unknown");
 	}
 
-	/** Only remote nextTurn admission is submitted. Unknown fences all further reports. */
-	async requestReport(message: string, signal?: AbortSignal, eligible: () => boolean = () => true): Promise<ReportOutcome> {
-		if (!isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted || !eligible()) return "unavailable";
+	/** Only remote API admission is submitted. Unknown fences all further reports. */
+	async requestReport(message: string, signal?: AbortSignal, eligible: () => boolean = () => true, kind: ParentReportKind = "progress"): Promise<ReportOutcome> {
+		if (!isParentReportKind(kind) || !isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted || !eligible()) return "unavailable";
 		if (this.reportCount >= 4) return "limit";
 		if (this.reportQueue.length >= LOCAL_MESSAGE_WAIT_CAPACITY) return "queue-full";
 		return await new Promise<ReportOutcome>((resolve) => {
@@ -809,7 +811,7 @@ export class LifecycleEventClient {
 				request.cleanup();
 				resolve("unavailable"); // UNSENT cancellation cannot be unknown or fence the active request.
 			};
-			const request: WaitingReport = { message, signal, eligible, generation: this.reportGeneration, resolve,
+			const request: WaitingReport = { message, kind, signal, eligible, generation: this.reportGeneration, resolve,
 				cleanup: () => signal?.removeEventListener("abort", abort) };
 			signal?.addEventListener("abort", abort, { once: true });
 			this.reportQueue.push(request);
@@ -822,13 +824,13 @@ export class LifecycleEventClient {
 		const request = this.reportQueue.shift();
 		if (!request) return;
 		request.cleanup(); // Replace the waiting-only abort listener with the active one below.
-		const { signal, message, resolve } = request;
+		const { signal, message, kind, resolve } = request;
 		const refuse = (outcome: ReportOutcome) => { resolve(outcome); this.dispatchReport(); };
 		if (!this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted
 			|| request.generation !== this.reportGeneration || !request.eligible()) { refuse("unavailable"); return; }
 		if (this.reportCount >= 4) { refuse("limit"); return; }
 		const reportSequence = this.reportSequence + 1;
-		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message })}\n`;
+		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message, kind })}\n`;
 		const frameBytes = Buffer.byteLength(frame);
 		if (frameBytes > MAX_REPORT_FRAME_BYTES || this.socket.writableLength >= NONTERMINAL_BUFFER_LIMIT_BYTES
 			|| this.socket.writableLength + frameBytes > REPORT_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }

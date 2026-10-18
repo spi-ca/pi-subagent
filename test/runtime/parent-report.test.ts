@@ -59,7 +59,7 @@ test("strict UTF8 limits and bounded parent session admission wrap literal data;
   assert.equal(submit(literal), true);
   assert.equal(sent[0].message.content.endsWith(JSON.stringify(literal)), true);
   assert.deepEqual(sent[0].options, { deliverAs: "nextTurn", triggerTurn: false });
-  assert.deepEqual(sent[0].message.details, { kind: "subagent.parent-report", version: 2, ...sender("exact-parent-job") });
+  assert.deepEqual(sent[0].message.details, { kind: "subagent.parent-report", version: 2, ...sender("exact-parent-job"), reportKind: "progress" });
   for (let i = 1; i < 32; i++) assert.equal(submit("short"), true);
   assert.equal(submit("overflow"), false); assert.equal(sent.length, 32);
   admission.reset(manager); assert.equal(submit("stale"), false);
@@ -121,7 +121,8 @@ for (const [name, message] of [
     const admission = new ParentReportAdmission({ sendMessage: message => { received.push(message.content as string); },
       appendEntry: (type, data) => { manager.appendCustomEntry(type, data); } });
     admission.reset(manager);
-    const f = await fixture(admission.bind(sender("max-body"), () => true), true, "r".repeat(128));
+    const submit = admission.bind(sender("max-body"), () => true);
+    const f = await fixture((body, _eligible, kind) => submit(body, kind), true, "r".repeat(128));
     const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
     await start(client, f.server, f.id);
     const socket = (client as any).socket, write = socket.write;
@@ -551,7 +552,7 @@ test("foreground connected interactive without report eligibility cannot expose 
   assert.equal(client.send("agent-ended"), true); client.close();
 });
 
-for (const invalid of ["token", "run", "sequence", "reportSequence", "size", "duplicate", "keys"] as const) {
+for (const invalid of ["token", "run", "sequence", "reportSequence", "size", "duplicate", "keys", "kind", "kind-null", "kind-object", "kind-number"] as const) {
   test(`report protocol rejects ${invalid} without wrong-run dispatch or raw-text echo`, async () => {
     let calls = 0;
     const f = await fixture(() => { calls++; return true; });
@@ -564,6 +565,10 @@ for (const invalid of ["token", "run", "sequence", "reportSequence", "size", "du
     raw.write(JSON.stringify({ version: 1, type: "agent-started", runId: f.id, sequence: 1 }) + "\n");
     const frame: any = { version: 1, type: "report", runId: invalid === "run" ? "wrong-run" : f.id, sequence: invalid === "sequence" ? 3 : 2, reportSequence: invalid === "reportSequence" ? 2 : 1, message: invalid === "size" ? "한".repeat(1365) + "aa" : "private-message" };
     if (invalid === "keys") frame.parentId = "attacker-selected-parent";
+    if (invalid === "kind") frame.kind = "important";
+    if (invalid === "kind-null") frame.kind = null;
+    if (invalid === "kind-object") frame.kind = { finding: true };
+    if (invalid === "kind-number") frame.kind = 1;
     raw.write(JSON.stringify(frame) + "\n");
     if (invalid === "duplicate") raw.write(JSON.stringify(frame) + "\n");
     await closed;
@@ -606,7 +611,7 @@ for (const revoke of ["closeReporting", "agent-ended", "agent-settled", "socket-
     const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
     await start(client, f.server, f.id);
     const childAbort = new AbortController();
-    const pending = client.requestReport("pending", childAbort.signal);
+    const pending = client.requestReport("pending", childAbort.signal, () => true, "finding");
     await reached; // the exact production admission seam is awaiting its fence read
     if (revoke === "closeReporting") { f.server.closeReporting(f.id); childAbort.abort(); }
     else if (revoke === "abort") parentAbort.abort();
@@ -623,7 +628,7 @@ for (const revoke of ["closeReporting", "agent-ended", "agent-settled", "socket-
     assert.equal((client as any).reportPending, null);
     if (revoke === "agent-ended" || revoke === "retry" || revoke === "replace-handler") {
       if (revoke === "agent-ended") await start(client, f.server, f.id);
-      assert.equal(await client.requestReport("fresh activity"), "submitted");
+      assert.equal(await client.requestReport("fresh activity", undefined, () => true, "finding"), "submitted");
       assert.equal(delivered, 1);
     }
     client.close();
@@ -632,7 +637,8 @@ for (const revoke of ["closeReporting", "agent-ended", "agent-settled", "socket-
 
 test("server independently enforces four-report run budget against a client bypassing local limits", async () => {
   let calls = 0;
-  const f = await fixture(() => { calls++; return true; });
+  const kinds: unknown[] = [];
+  const f = await fixture((_message, _eligible, kind) => { calls++; kinds.push(kind); return true; });
   const raw = net.createConnection({ path: f.server.socketPath });
   let buffered = "", waiting: (() => void) | undefined;
   const replies: any[] = [];
@@ -653,7 +659,7 @@ test("server independently enforces four-report run budget against a client bypa
     raw.write(JSON.stringify({ version: 1, type: "report", runId: f.id, sequence: i + 1, reportSequence: i, message: "short" }) + "\n"); await ack;
     assert.equal(replies.at(-1).accepted, i <= 4);
   }
-  assert.equal(calls, 4); raw.destroy();
+  assert.equal(calls, 4); assert.deepEqual(kinds, Array(4).fill("progress"), "legacy frames without kind default to progress"); raw.destroy();
 });
 
 test("parent ACK backpressure admits nothing and preserves completion/abort channel", { timeout: 4000 }, async () => {
@@ -779,5 +785,90 @@ test("automatic eligibility omits reporting on unsupported hosts/platforms, fore
     mock.module("@earendil-works/pi-coding-agent", () => host);
     Object.defineProperty(process, "platform", platform);
     LifecycleEventServer.start = start;
+  }
+});
+
+test("kind-aware admission routes important reports and updates only a bounded sanitized progress status; UI failures never deny admission", () => {
+  const manager = SessionManager.inMemory(), sent: any[] = [], statuses: Array<[string, string | undefined]> = [];
+  let notifications = 0, uiThrows = false;
+  const ui = { setStatus: (key: string, text?: string) => {
+    statuses.push([key, text]); if (uiThrows) throw Error("UI unavailable");
+  }, notify: () => { notifications++; } };
+  const admission = new ParentReportAdmission({ sendMessage: (message, options) => { sent.push({ message, options }); },
+    appendEntry: (type, data) => { manager.appendCustomEntry(type, data); } });
+  const ctx = { hasUI: true, ui } as never;
+  admission.reset(manager, ctx);
+  const submit = admission.bind({ ...sender("job"), agent: '\x1b\n\u202e' + "x".repeat(300) }, () => true);
+  for (const kind of ["finding", "question", "blocked"] as const) {
+    assert.equal(submit("important body", kind), true);
+    assert.deepEqual(sent.at(-1).options, { deliverAs: "steer", triggerTurn: true });
+    assert.equal(sent.at(-1).message.details.reportKind, kind);
+    assert.match(sent.at(-1).message.content, new RegExp(`Report kind: ${kind}`));
+  }
+  assert.equal(statuses.filter(([, text]) => text !== undefined).length, 0);
+  const body = '\r\n\x1b[31m\x9b\u2066' + "한".repeat(300);
+  assert.equal(submit(body), true);
+  assert.deepEqual(sent.at(-1).options, { deliverAs: "nextTurn", triggerTurn: false });
+  const [key, status] = statuses.at(-1)!;
+  assert.equal(key, "pi-subagent-reports"); assert.ok(status && status.length < 400);
+  assert.match(status, /Progress \(untrusted\)/); assert.match(status, /leaf-job/);
+  assert.equal(/[\x00-\x1f\x7f-\x9f\u202e\u2066]/u.test(status), false);
+  assert.equal(notifications, 0);
+  assert.equal(submit("secret", "bad" as never), false);
+  assert.equal(sent.length, 4);
+  uiThrows = true;
+  assert.equal(submit("still admitted"), true);
+  admission.reset(manager, ctx);
+  assert.deepEqual(statuses.at(-1), [key, undefined]);
+  assert.equal(submit("stale", "finding"), false);
+  assert.equal(admission.bind(sender("fresh"), () => true)("new UI failure"), true);
+  admission.close(); assert.deepEqual(statuses.at(-1), [key, undefined]);
+});
+
+for (const kind of ["progress", "finding", "question", "blocked"] as const) {
+  test(`${kind} crosses authenticated transport and async preparation with parent-owned attribution`, async () => {
+    const manager = SessionManager.inMemory(), sent: any[] = [];
+    const admission = new ParentReportAdmission({ sendMessage: (message, options) => { sent.push({ message, options }); },
+      appendEntry: (type, data) => { manager.appendCustomEntry(type, data); } });
+    admission.reset(manager);
+    const f = await fixture(prepareParentReportHandler(() => true, async () => true, admission.bind(sender("owned"), () => true)));
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+    try {
+      await start(client, f.server, f.id);
+      assert.equal(await client.requestReport("private body", undefined, () => true, kind), "submitted");
+      assert.equal(sent.length, 1); assert.equal(sent[0].message.details.reportKind, kind);
+      assert.equal(sent[0].message.details.jobId, "owned");
+      assert.deepEqual(sent[0].options, kind === "progress" ? { deliverAs: "nextTurn", triggerTurn: false } : { deliverAs: "steer", triggerTurn: true });
+    } finally { client.close(); }
+  });
+}
+
+test("kind-aware report tool rejects malformed kind/keys without echo; ACK is submission, not delivery/read/approval", async () => {
+  const tools: any[] = [], received: any[] = [];
+  process.env[PARENT_REPORT_ENV] = "1";
+  let outcome = "submitted";
+  const connection = { reportSupported: true, requestReport: async (...args: any[]) => { received.push(args); return outcome; } };
+  registerParentReportTool({ registerTool: (tool: any) => tools.push(tool), on: () => {} } as never, () => connection as never, () => true);
+  const tool = tools[0], message = "private-report-body";
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.deepEqual(tool.parameters.properties.kind.anyOf.map((v: any) => v.const), ["progress", "finding", "question", "blocked"]);
+  for (const params of [{ message, kind: "important" }, { message, kind: null }, { message, kind: 1 }, { message, kind: {} },
+    { message, kind: undefined }, { message, kind: "finding", parentId: "forged" }]) {
+    await assert.rejects(tool.execute("call", params, undefined, undefined, {}), (error: Error) => {
+      assert.equal(error.message, "Invalid parent report arguments or kind."); assert.equal(error.message.includes(message), false); return true;
+    });
+  }
+  assert.equal(received.length, 0);
+  for (const kind of [undefined, "progress", "finding", "question", "blocked"]) {
+    const result = await tool.execute("call", kind === undefined ? { message } : { message, kind }, undefined, undefined, {});
+    assert.equal(received.at(-1)[3], kind ?? "progress");
+    assert.match(result.content[0].text, /ACK is API admission\/submission only, not delivery, model read, reply or approval/);
+    assert.equal(result.content[0].text.includes(message), false);
+  }
+  for (const failure of ["rejected", "unknown", "unavailable", "limit"]) {
+    outcome = failure;
+    await assert.rejects(tool.execute("call", { message, kind: "blocked" }, undefined, undefined, {}), (error: Error) => {
+      assert.equal(error.message.includes(message), false); return true;
+    });
   }
 });

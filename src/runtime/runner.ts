@@ -29,7 +29,7 @@ import {
 import type { AgentConfig } from "../core/agents.js";
 import { DEFAULT_SUBAGENT_LIMITS, MAX_SUBAGENT_ACTIVE, SUBAGENT_LIMIT_DEFINITIONS, subagentLimitsToEnv, type SubagentLimits } from "../core/subagent-limits.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
-import { PARENT_REPORT_ENV, PARENT_REPORT_TOOL, prepareParentReportHandler } from "./parent-report.js";
+import { PARENT_REPORT_ENV, PARENT_REPORT_TOOL, prepareParentReportHandler, type ParentReportSubmit } from "./parent-report.js";
 import { INLINE_STEERING_STATE_PATH_ENV } from "./inline-steering-bridge.js";
 import type { SteeringHandle } from "../core/subagent-steering.js";
 import { createJsonLineChunkProcessor } from "./runner-core.js";
@@ -4921,7 +4921,7 @@ export interface RunAgentOptions {
   /** Private active-only steering transport for background single calls. */
   onSteeringReady?: (handle: SteeringHandle | undefined) => void;
   /** Only the exact current background parent supplies this leaf binding. */
-  onParentReport?: (message: string) => boolean;
+  onParentReport?: ParentReportSubmit;
   /** Streaming update callback. */
   onUpdate?: OnUpdateCallback;
   /** Invocation-scoped immutable fork source authority. */
@@ -5245,8 +5245,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         const tokenPath = path.join(taskTmp.dir, "lifecycle-token");
         await writeLifecycleBootstrapToken(tokenPath, token);
         if (opts.onParentReport && parentReportServer) {
-          inlineLifecycleServer.setReportHandler(inlineLifecycleRunId, (message, eligible) =>
-            !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && eligible() && opts.onParentReport!(message), signal);
+          inlineLifecycleServer.setReportHandler(inlineLifecycleRunId, (message, eligible, kind) =>
+            !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && eligible() && opts.onParentReport!(message, kind), signal);
         }
         inlineLifecycleServer.activateRun(inlineLifecycleRunId);
         steeringEnv = {
@@ -5947,7 +5947,7 @@ async function runAgentInline(opts: RunAgentExecutionOptions): Promise<SingleRes
 interface RunAgentInInteractivePaneOptions {
   onSteeringReady?: (handle: SteeringHandle | undefined) => void;
   /** Only the exact current background parent supplies this leaf binding. */
-  onParentReport?: (message: string) => boolean;
+  onParentReport?: ParentReportSubmit;
   parentReportServer: LifecycleEventServer | null;
   backend: InteractivePaneBackend;
   result: SingleResult;

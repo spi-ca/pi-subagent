@@ -1122,7 +1122,7 @@ export default function (pi: ExtensionAPI) {
     // fence old finalizers before a slow config read can yield to them.
     const startupGeneration = ++sessionStartupGeneration;
     backgroundSessionFence.startSession();
-    parentReports.reset(ctx.sessionManager);
+    parentReports.reset(ctx.sessionManager, ctx);
     reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
     cancelBackgroundJobs(backgroundJobs);
     backgroundJobs.clear();

@@ -206,8 +206,10 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
         const attributed = (entries[0] as any).details.reports.filter((details: any) => details.childId === identity.childId);
         assert.equal(attributed.length, 1);
         assert.equal((entries[0] as any).display, true);
-        const { admissionId, ...details } = attributed[0]; assert.equal(typeof admissionId, "string");
-        assert.deepEqual(details, { kind: "subagent.parent-report", version: 2, ...identity, reportKind: "progress" });
+        const { reportId, receivedAtMs, submittedAtMs, ...details } = attributed[0];
+        assert.match(reportId, /^[a-f0-9-]{36}$/); assert.ok(Number.isSafeInteger(receivedAtMs)); assert.ok(submittedAtMs >= receivedAtMs);
+        assert.ok((entries[0] as any).content.includes(`Report ID: ${reportId}; parent receivedAtMs: ${receivedAtMs}; first submittedAtMs: ${submittedAtMs}`));
+        assert.deepEqual(details, { kind: "subagent.parent-report", version: 3, ...identity, reportKind: "progress" });
         assert.ok((entries[0] as any).content.includes(JSON.stringify(body)));
         assert.equal(context.filter(m => JSON.stringify(m.content).includes(body)).length, 1);
       }
@@ -484,8 +486,10 @@ for (const kind of ["finding", "question", "blocked"] as const) for (const mode 
       }
       const reports = manager.getBranch().filter(e => e.type === "custom_message" && e.customType === PARENT_REPORT_CUSTOM_TYPE);
       assert.equal(reports.length, 1);
-      const { admissionId, ...details } = (reports[0] as any).details; assert.equal(typeof admissionId, "string");
-      assert.deepEqual(details, { kind: "subagent.parent-report", version: 2, ...identity, reportKind: kind });
+      const { reportId, receivedAtMs, submittedAtMs, ...details } = (reports[0] as any).details;
+      assert.match(reportId, /^[a-f0-9-]{36}$/); assert.ok(Number.isSafeInteger(receivedAtMs)); assert.ok(submittedAtMs >= receivedAtMs);
+      assert.ok((reports[0] as any).content.includes(`Report ID: ${reportId}; parent receivedAtMs: ${receivedAtMs}; first submittedAtMs: ${submittedAtMs}`));
+      assert.deepEqual(details, { kind: "subagent.parent-report", version: 3, ...identity, reportKind: kind });
       assert.equal((admission as any).important.length, 0, "safe lifecycle reconciles confirmed native commit");
       assert.equal((reports[0] as any).content.endsWith(JSON.stringify(body)), true);
       assert.deepEqual(notifications, []); assert.equal(statuses.filter((args: any) => args[1] !== undefined).length, 0);
@@ -498,7 +502,7 @@ for (const kind of ["finding", "question", "blocked"] as const) for (const mode 
   });
 }
 
-test(`real Pi ${SELECTED_PI_VERSION} rejects malformed report arguments before native coercion/null normalization or argument echo`, { timeout: 15_000 }, async () => {
+test(`real Pi ${SELECTED_PI_VERSION} validates arguments before coercion/echo and replays identical native tool-call IDs`, { timeout: 15_000 }, async () => {
   assertSelectedPiHost();
   const saved = { ...process.env }, originalFetch = globalThis.fetch;
   let forbiddenCalls = 0;
@@ -536,11 +540,12 @@ test(`real Pi ${SELECTED_PI_VERSION} rejects malformed report arguments before n
     const invalid: JsonObject[] = [{ message, kind: null }, { message, kind: "important" }, { message, kind: 1 }, { message, kind: {} },
       { message, kind: "finding", parentId: "forged-parent" }, { message: 123 }, { message: "한".repeat(1366) }, { message: " \n" }];
     let requests = 0;
+    let calls = invalid.map((args, index) => ({
+      type: "toolCall" as const, id: `invalid-${index}`, name: PARENT_REPORT_TOOL, arguments: args,
+    }));
     session.agent.streamFunction = () => {
       const toolCalls = ++requests === 1;
-      const result: AssistantMessage = { role: "assistant", content: toolCalls ? invalid.map((args, index) => ({
-        type: "toolCall" as const, id: `invalid-${index}`, name: PARENT_REPORT_TOOL, arguments: args,
-      })) : [{ type: "text", text: "offline answer" }], api: model.api, provider: model.provider, model: model.id,
+      const result: AssistantMessage = { role: "assistant", content: toolCalls ? calls : [{ type: "text", text: "offline answer" }], api: model.api, provider: model.provider, model: model.id,
         timestamp: 0, stopReason: toolCalls ? "toolUse" : "stop",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
       const stream = createAssistantMessageEventStream(); stream.push({ type: "done", reason: toolCalls ? "toolUse" : "stop", message: result }); return stream;
@@ -556,6 +561,23 @@ test(`real Pi ${SELECTED_PI_VERSION} rejects malformed report arguments before n
       assert.match(text, /Invalid parent report arguments or kind|Report must be nonblank; actual UTF-8 bytes/);
     }
     assert.deepEqual(received, []); assert.equal((client as any).reportRate.sent.length, 0);
+    calls = Array.from({ length: 2 }, () => ({ type: "toolCall" as const, id: "native-repeat", name: PARENT_REPORT_TOOL, arguments: { message } }));
+    requests = 0;
+    await session.prompt("native duplicate tool ID in the same batch");
+    assert.deepEqual(received, [{ body: message, kind: "progress" }]);
+    const successes = session.messages.filter(m => m.role === "toolResult").filter(m => m.toolCallId === "native-repeat");
+    assert.equal(successes.length, 2); assert.ok(successes.every(m => !m.isError));
+    assert.deepEqual(successes[0]!.content, successes[1]!.content);
+    requests = 0;
+    await session.prompt("native repeat after settlement of the tool call");
+    assert.equal(received.length, 1); assert.equal((client as any).reportRate.sent.length, 1);
+    calls = [{ type: "toolCall", id: "native-repeat", name: PARENT_REPORT_TOOL, arguments: { message: "private-conflict" } }];
+    requests = 0;
+    await session.prompt("native conflict must not transmit or echo payload");
+    const conflict = session.messages.filter(m => m.role === "toolResult").filter(m => m.toolCallId === "native-repeat").at(-1)!;
+    assert.equal(conflict.isError, true); assert.match(JSON.stringify(conflict.content), /conflicts/);
+    assert.equal(JSON.stringify(conflict.content).includes("private-conflict"), false);
+    assert.equal(received.length, 1);
     assert.deepEqual(errors, []); assert.equal(forbiddenCalls, 0);
   } finally {
     client?.close(); session?.dispose(); await server.close(); globalThis.fetch = originalFetch;

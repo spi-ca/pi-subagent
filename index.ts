@@ -47,7 +47,8 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/structured-result.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
-import { ParentReportAdmission, registerParentReportHooks } from "./src/runtime/parent-report.js";
+import { ParentReportAdmission, registerParentReportHooks, PARENT_REPORT_CUSTOM_TYPE } from "./src/runtime/parent-report.js";
+import { renderParentReport } from "./src/ui/parent-report-render.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -612,6 +613,7 @@ export default function (pi: ExtensionAPI) {
   };
   pi.registerToolRenderer((toolName, next) => toolName === "subagent" ? subagentRenderers : next());
   let clearInlinePresentationWidget: (() => void) | undefined;
+  pi.registerMessageRenderer(PARENT_REPORT_CUSTOM_TYPE, renderParentReport);
   pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
     backgroundResultRenderer(message, options, theme),
   );

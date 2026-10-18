@@ -77,7 +77,10 @@ test("production background leaf binding: single, same-agent parallel, chain pos
       const details = last.message.details.reports?.[0] ?? last.message.details;
       assert.equal(details.reportKind, kind ?? "progress");
       assert.equal(details.agent, leaf.options.agentName);
-      assert.equal(details.version, 2);
+      assert.equal(details.version, 3);
+      assert.match(details.reportId, /^[a-f0-9-]{36}$/);
+      assert.ok(Number.isSafeInteger(details.receivedAtMs));
+      assert.ok(Number.isSafeInteger(details.submittedAtMs));
       for (const [key, value] of Object.entries(expected)) assert.equal(details[key], value);
       for (const key of ["task", "cwd", "model", "history"]) assert.equal(key in details, false);
       return details;

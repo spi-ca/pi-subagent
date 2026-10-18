@@ -171,7 +171,7 @@ describe("production dashboard boundary", () => {
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
   });
 
-  test("registers the display-only background result renderer even when depth disables the tool", () => {
+  test("registers display-only background result and parent report renderers even when depth disables the tool", () => {
     const renderers = new Map<string, unknown>();
     const registeredEvents: string[] = [];
     let registeredTools = 0;
@@ -188,7 +188,8 @@ describe("production dashboard boundary", () => {
       getCommands: () => [],
     } as never);
     assert.equal(registeredTools, 0);
-    assert.equal(renderers.size, 1);
+    assert.equal(renderers.size, 2);
+    assert.equal(typeof renderers.get("pi-subagent-parent-report"), "function");
     assert.ok(!registeredEvents.includes("tool_result"), "depth-disabled extensions must not alter another extension's subagent result");
     const renderer = renderers.get("subagent_result") as (message: unknown, options: unknown, theme: unknown) => { children: Array<{ render: (width: number) => string[] }> };
     assert.equal(typeof renderer, "function");

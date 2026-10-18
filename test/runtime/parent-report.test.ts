@@ -9,7 +9,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { ParentReportAdmission, formatParentReport, isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, PARENT_REPORT_ENV, PARENT_REPORT_TOOL, registerParentReportHooks, MAX_PARENT_REPORT_OUTSTANDING_BYTES, MAX_PARENT_REPORT_BATCH_BYTES, prepareParentReportHandler, type ParentReportHandler, registerParentReportTool } from "../../src/runtime/parent-report";
+import { ParentReportAdmission, isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, PARENT_REPORT_ENV, PARENT_REPORT_TOOL, registerParentReportHooks, MAX_PARENT_REPORT_OUTSTANDING_BYTES, MAX_PARENT_REPORT_BATCH_BYTES, prepareParentReportHandler, type ParentReportHandler, registerParentReportTool } from "../../src/runtime/parent-report";
 import { LOCAL_MESSAGE_WAIT_CAPACITY, LifecycleEventClient, LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
 import { selectsParentReport, assertManagedChildToolCompatibility, collectManagedOverriddenBuiltinTools, buildPiArgs, buildInteractivePiArgs, runAgent } from "../../src/runtime/runner";
 import { ParentReportRate } from "../../src/runtime/parent-report-rate";
@@ -41,10 +41,10 @@ async function start(client: LifecycleEventClient, server: LifecycleEventServer,
   const wake = server.waitForEvent(id, 1000); client.send("agent-started"); await wake;
 }
 
-function admissionFixture() {
+function admissionFixture(now?: () => number) {
   const manager = SessionManager.inMemory(), sent: any[] = [], hooks: Record<string, any> = {}, statuses: any[] = [];
   let reads = 0;
-  const admission = new ParentReportAdmission({ sendMessage: (message, options) => { sent.push({ message, options }); } });
+  const admission = new ParentReportAdmission({ sendMessage: (message, options) => { sent.push({ message, options }); } }, now);
   registerParentReportHooks({ on: (name: string, handler: any) => { hooks[name] = handler; } } as never, admission);
   const ctx = { hasUI: true, ui: { setStatus: (...args: any[]) => statuses.push(args) } };
   admission.reset({ getSessionId: () => manager.getSessionId(), getEntries: () => { reads++; return manager.getEntries(); } }, ctx as never);
@@ -117,14 +117,14 @@ test("serialized byte budgets include escaped content and exact metadata; batch 
 
 test("native important serialized envelope exactly at 128KiB fits; one escaped metadata byte beyond does not", () => {
   const identity = { ...sender("exact-byte-cap"), agent: "x".repeat(256) };
-  const sample = { customType: "pi-subagent-parent-report", content: formatParentReport(identity, "body", "finding"), display: true,
-    details: { kind: "subagent.parent-report", version: 2, ...identity, reportKind: "finding", admissionId: "x".repeat(36) } };
-  const sampleBytes = Buffer.byteLength(JSON.stringify(sample));
+  const sample = admissionFixture(() => 1_800_000_000_000);
+  assert.equal(sample.admission.bind(identity, () => true)("body", "finding"), true);
+  const sampleBytes = Buffer.byteLength(JSON.stringify(sample.sent[0].message));
   identity.agent += "x".repeat(MAX_PARENT_REPORT_OUTSTANDING_BYTES - sampleBytes);
-  const over = admissionFixture();
+  const over = admissionFixture(() => 1_800_000_000_000);
   assert.equal(over.admission.bind({ ...identity, agent: identity.agent + "x" }, () => true)("body", "finding"), false);
   assert.equal(over.sent.length, 0);
-  const exact = admissionFixture();
+  const exact = admissionFixture(() => 1_800_000_000_000);
   assert.equal(exact.admission.bind(identity, () => true)("body", "finding"), true);
   assert.equal(Buffer.byteLength(JSON.stringify(exact.sent[0].message)), MAX_PARENT_REPORT_OUTSTANDING_BYTES);
   assert.equal(exact.admission.bind(sender("overflow"), () => true)("x"), false);
@@ -934,15 +934,114 @@ test("kind-aware report tool rejects malformed kind/keys without echo; ACK is su
   }
   assert.equal(received.length, 0);
   for (const kind of [undefined, "progress", "finding", "question", "blocked"]) {
-    const result = await tool.execute("call", kind === undefined ? { message } : { message, kind }, undefined, undefined, {});
+    const result = await tool.execute(`call-${kind}`, kind === undefined ? { message } : { message, kind }, undefined, undefined, {});
     assert.equal(received.at(-1)[3], kind ?? "progress");
     assert.match(result.content[0].text, /ACK is API admission\/submission only, not delivery, model read, reply or approval/);
     assert.equal(result.content[0].text.includes(message), false);
   }
   for (const failure of ["rejected", "unknown", "unavailable", "limit"]) {
     outcome = failure;
-    await assert.rejects(tool.execute("call", { message, kind: "blocked" }, undefined, undefined, {}), (error: Error) => {
+    await assert.rejects(tool.execute(`failure-${failure}`, { message, kind: "blocked" }, undefined, undefined, {}), (error: Error) => {
       assert.equal(error.message.includes(message), false); return true;
     });
   }
+});
+
+for (const ending of ["agent-ended", "agent-settled"] as const) {
+  test(`${ending} crosses large-report backpressure and revokes deferred admission before preparation resumes`, async () => {
+    let enter!: () => void, release!: () => void, finish!: () => void, admitted = 0;
+    const entered = new Promise<void>(r => { enter = r; });
+    const blocked = new Promise<void>(r => { release = r; });
+    const finished = new Promise<void>(r => { finish = r; });
+    const handler = prepareParentReportHandler(() => true, async () => { enter(); await blocked; return true; },
+      () => { admitted++; return true; });
+    const f = await fixture(async (...args) => { try { return await handler(...args); } finally { finish(); } });
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+    await start(client, f.server, f.id);
+    const socket = (client as any).socket;
+    const pending = client.requestReport("\0".repeat(4096));
+    await entered;
+    Object.defineProperty(socket, "writableLength", { configurable: true, get: () => 24 * 1024 });
+    try {
+      assert.equal(client.send("heartbeat"), false);
+      const wake = f.server.waitForEvent(f.id, 1000);
+      assert.equal(client.send(ending), true, "ordered revocation uses reserved headroom, not heartbeat watermark");
+      await wake;
+      const run = (f.server as any).runs.get(f.id);
+      if (ending === "agent-ended") assert.equal(run.steerRunning, false);
+      else { assert.equal(run.steerClosed, true); assert.equal(run.reportHandler, undefined); }
+      release();
+      assert.notEqual(await pending, "submitted");
+      await finished; assert.equal(admitted, 0);
+      if (ending === "agent-ended") {
+        // Retry activity must not be dropped either or resurrect the old handler.
+        await start(client, f.server, f.id);
+        assert.equal((f.server as any).runs.get(f.id).steerRunning, true);
+      } else assert.equal((f.server as any).runs.get(f.id).reportHandler, undefined);
+      assert.equal(socket.destroyed, false);
+    } finally { release(); delete socket.writableLength; client.close(); }
+  });
+}
+
+for (const type of ["agent-started", "agent-ended", "agent-settled", "completion-ready", "shutdown", "control-ack"] as const) {
+  test(`${type} fails closed when its frame would cross the hard report-client buffer bound`, async () => {
+    const f = await fixture(() => true);
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+    await start(client, f.server, f.id);
+    const socket = (client as any).socket;
+    const hardCap = 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096 + 16 * 1024;
+    Object.defineProperty(socket, "writableLength", { configurable: true, get: () => hardCap - 1 });
+    try {
+      const result = type === "control-ack" ? (client as any).sendControlAck(1) : client.send(type);
+      assert.equal(result, false); assert.equal(socket.destroyed, true);
+      assert.equal(await client.requestReport("closed"), "unavailable");
+    } finally { delete socket.writableLength; client.close(); }
+  });
+}
+
+test("parent receipt/first submission times and IDs remain stable across draft retries; final serialized caps were reserved", () => {
+  let now = 9;
+  const f = admissionFixture(() => now), submit = f.admission.bind(sender("timestamps"), () => true);
+  assert.equal(submit("\0".repeat(4096)), true);
+  const pending = (f.admission as any).pending[0];
+  assert.equal(pending.message.details.receivedAtMs, 9);
+  assert.equal(pending.message.details.submittedAtMs, undefined);
+  const id = pending.message.details.reportId;
+  now = Number.MAX_SAFE_INTEGER;
+  const first = f.start(); const details = first.details.reports[0];
+  assert.equal(details.reportId, id); assert.equal(details.receivedAtMs, 9); assert.equal(details.submittedAtMs, now);
+  assert.ok(Buffer.byteLength(JSON.stringify(first)) <= pending.bytes, "worst-width final timestamp and escaped envelope fit admission reservation");
+  assert.ok(Buffer.byteLength(JSON.stringify(first)) <= MAX_PARENT_REPORT_BATCH_BYTES);
+  assert.match(first.content, /handoff\/draft only, not commit, delivery or model read/);
+  now = 10;
+  assert.deepEqual(f.start(), first, "clock changes cannot mutate first handoff snapshot");
+  assert.equal(submit("new pending"), true);
+  assert.notEqual((f.admission as any).pending[0].message.details.reportId, id);
+  f.commit({ ...first, details: { ...first.details, reports: [{ ...details, submittedAtMs: 10 }] } });
+  f.hooks.turn_start(); assert.deepEqual(f.start(), first, "same token with changed timestamp is NOT commit evidence");
+  f.commit(first); f.hooks.turn_start();
+  const next = f.start(); assert.equal(next.details.reports[0].submittedAtMs, 10);
+  assert.equal(submit("important", "finding"), true);
+  const important = f.sent[0].message;
+  assert.equal(important.details.receivedAtMs, 10); assert.equal(important.details.submittedAtMs, 10);
+  assert.ok(important.content.includes(`Report ID: ${important.details.reportId}; parent receivedAtMs: 10; first submittedAtMs: 10`));
+});
+
+test("progress final timestamp/metadata envelope exactly at 64KiB was reserved before ACK; one byte beyond rejects", () => {
+  let now = 9;
+  const identity = { ...sender("exact-progress-cap"), agent: "x".repeat(256) };
+  const sample = admissionFixture(() => now);
+  assert.equal(sample.admission.bind(identity, () => true)("body"), true);
+  const reserved = (sample.admission as any).pending[0].bytes;
+  identity.agent += "x".repeat(MAX_PARENT_REPORT_BATCH_BYTES - reserved);
+  const over = admissionFixture(() => now);
+  assert.equal(over.admission.bind({ ...identity, agent: identity.agent + "x" }, () => true)("body"), false);
+  assert.equal(over.start(), undefined);
+  const exact = admissionFixture(() => now);
+  assert.equal(exact.admission.bind(identity, () => true)("body"), true);
+  assert.equal((exact.admission as any).pending[0].bytes, MAX_PARENT_REPORT_BATCH_BYTES);
+  now = Number.MAX_SAFE_INTEGER;
+  const message = exact.start();
+  assert.equal(Buffer.byteLength(JSON.stringify(message)), MAX_PARENT_REPORT_BATCH_BYTES);
+  assert.deepEqual(exact.start(), message);
 });

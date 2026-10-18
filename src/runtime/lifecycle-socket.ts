@@ -23,7 +23,7 @@ const IDLE_TIMEOUT_MS = 15_000;
 const NONTERMINAL_BUFFER_LIMIT_BYTES = 8 * 1024;
 const REPORT_BUFFER_LIMIT_BYTES = MAX_REPORT_FRAME_BYTES + NONTERMINAL_BUFFER_LIMIT_BYTES;
 // Preserve 8 KiB of headroom beyond the report write budget for control ACKs
-// and terminal hints. Coalescible events retain the old low watermark.
+// and ordered activity/revocation events. Only heartbeat may be dropped.
 const MAX_REPORT_CLIENT_BUFFERED_BYTES = REPORT_BUFFER_LIMIT_BYTES + 8 * 1024;
 const MAX_CLIENT_BUFFERED_BYTES = 16 * 1024;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -870,7 +870,7 @@ export class LifecycleEventClient {
 		if (!this.usable || this.socket.destroyed || !Number.isSafeInteger(controlSequence) || controlSequence < 1) return false;
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "control-ack", runId: this.runId, sequence: this.sequence, controlSequence })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > this.bufferedByteLimit) { this.usable = false; this.socket.destroy(); return false; }
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > this.bufferedByteLimit) { this.usable = false; this.closeReports(); this.socket.destroy(); return false; }
 		this.socket.write(frame); return true;
 	}
 
@@ -880,17 +880,17 @@ export class LifecycleEventClient {
 		if (["agent-settled", "completion-ready", "shutdown"].includes(type)) { this.steerClosed = true; this.closeReports(); }
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type, runId: this.runId, sequence: this.sequence })}\n`;
-		const terminal = type === "completion-ready" || type === "shutdown";
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > this.bufferedByteLimit) {
-			this.usable = false; this.socket.destroy(); return false;
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > this.bufferedByteLimit) {
+			this.usable = false; this.closeReports(); this.socket.destroy(); return false;
 		}
-		if (!terminal && this.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) {
-			this.sequence -= 1; // dropped coalescible hint must not create a sequence gap.
+		if (type === "heartbeat" && this.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) {
+			this.sequence -= 1; // dropped heartbeat must not create a sequence gap.
 			return false;
 		}
-		// write(false) means queued backpressure, not failure. Nonterminal frames
-		// stop above the low watermark, reserving bounded space for terminal hints;
-		// socket.end() later flushes queued completion-ready/shutdown frames.
+		// write(false) means ordered queued backpressure, not failure. Activity
+		// and revocation MUST follow buffered reports; if headroom runs out the
+		// socket closes instead of leaving the server's running authority stale.
+		// socket.end() later flushes queued lifecycle frames.
 		this.socket.write(frame);
 		return true;
 	}

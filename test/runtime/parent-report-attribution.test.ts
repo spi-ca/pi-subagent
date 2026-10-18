@@ -15,8 +15,10 @@ test("sender identity snapshots exact IDs/names/zero-based positions; bounded un
   identity.childId = "swapped-leaf"; identity.agent = "swapped-agent"; identity.stageIndex = 9; identity.stageLabel = "swapped-stage"; identity.taskIndex = 4;
   assert.equal(bound("body", "finding"), true);
   const message = sent[0];
-  const { admissionId, ...details } = message.details; assert.equal(typeof admissionId, "string");
-  assert.deepEqual(details, { kind: "subagent.parent-report", version: 2, reportKind: "finding",
+  const { reportId, receivedAtMs, submittedAtMs, ...details } = message.details;
+  assert.match(reportId, /^[a-f0-9-]{36}$/);
+  assert.ok(Number.isSafeInteger(receivedAtMs)); assert.ok(submittedAtMs >= receivedAtMs);
+  assert.deepEqual(details, { kind: "subagent.parent-report", version: 3, reportKind: "finding",
     jobId: "exact-job", childId: "exact-leaf", agent, mode: "chain", stageIndex: 2, stageLabel: label, taskIndex: 0 });
   assert.match(message.content, /chain stage 3 task 1/);
   assert.match(message.content, /Sender names\/labels \(untrusted/);

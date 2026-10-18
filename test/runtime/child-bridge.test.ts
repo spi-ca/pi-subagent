@@ -1509,7 +1509,7 @@ for (const gate of ["abort", "completion", "ownership"] as const) {
     const wake = server.waitForEvent(runId, 1000);
     await bridge.emit("agent_start"); await wake;
     const result = await report.execute("report", { message: "literal short report" }, bridge.ctx.signal, undefined, bridge.ctx);
-    assert.deepEqual(result.details, { outcome: "submitted" });
+    assert.deepEqual(result.details, { outcome: "submitted", kind: "progress" });
     assert.deepEqual(received, ["literal short report"]);
     assert.equal(await readJsonFile(bridge.paths.completionPath), null, "reporting cannot produce a completion");
     if (gate === "abort") bridge.ctx.abort();

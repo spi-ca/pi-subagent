@@ -171,7 +171,7 @@ describe("production dashboard boundary", () => {
     assert.doesNotMatch(source, /pi\.exec\s*\(\s*["']cmux["']/u);
   });
 
-  test("registers the display-only background result renderer even when depth disables the tool", () => {
+  test("registers display-only background result and parent report renderers even when depth disables the tool", () => {
     const renderers = new Map<string, unknown>();
     const registeredEvents: string[] = [];
     let registeredTools = 0;
@@ -188,7 +188,8 @@ describe("production dashboard boundary", () => {
       getCommands: () => [],
     } as never);
     assert.equal(registeredTools, 0);
-    assert.equal(renderers.size, 1);
+    assert.equal(renderers.size, 2);
+    assert.equal(typeof renderers.get("pi-subagent-parent-report"), "function");
     assert.ok(!registeredEvents.includes("tool_result"), "depth-disabled extensions must not alter another extension's subagent result");
     const renderer = renderers.get("subagent_result") as (message: unknown, options: unknown, theme: unknown) => { children: Array<{ render: (width: number) => string[] }> };
     assert.equal(typeof renderer, "function");
@@ -471,9 +472,11 @@ describe("production dashboard boundary", () => {
       assert.equal(typeof rootHandlers.get("agent_settled"), "function");
       const childHandlers = register("1");
       assert.equal(childHandlers.has("agent_start"), false);
-      assert.equal(childHandlers.has("agent_settled"), false);
+      assert.equal(typeof childHandlers.get("agent_settled"), "function", "report commit reconciliation is not root-only presence");
 
       presenceLifecycleCalls.length = 0;
+      (childHandlers.get("agent_settled") as () => void)();
+      assert.deepEqual(presenceLifecycleCalls, [], "child report hooks do not publish presence");
       const settle = rootHandlers.get("agent_settled") as (event: unknown, ctx: { isIdle: () => boolean }) => void;
       let idleChecks = 0;
       settle({}, { isIdle: () => { idleChecks += 1; return false; } });

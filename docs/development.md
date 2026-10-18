@@ -159,7 +159,7 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 ## Pi 1.3 집중 회귀 검증
 
-설치된 Pi `1.3.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 nextTurn 소비와 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 서로 독립된 Bun process에서 실행하며, exact `1.3.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
+설치된 Pi `1.3.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 앱 소유 progress batch/native important commit reconciliation과 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 서로 독립된 Bun process에서 실행하며, exact `1.3.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
 
 ```bash
 bun test --max-concurrency 1 test/runtime/child-bridge.test.ts
@@ -174,8 +174,15 @@ bun test --max-concurrency 1 test/integration/managed-codemode-host.test.ts
 bun test --max-concurrency 1 test/integration/session-tools-host.test.ts
 bun test --max-concurrency 1 test/integration/custom-turn-host.test.ts
 bun test --max-concurrency 1 test/integration/steering-boundary-host.test.ts
+bun test --max-concurrency 1 test/runtime/parent-report.test.ts
+bun test --max-concurrency 1 test/runtime/parent-report-attribution.test.ts
+bun test --max-concurrency 1 test/runtime/parent-report-memo.test.ts
+bun test --max-concurrency 1 test/ui/parent-report-render.test.ts
+bun test --max-concurrency 1 test/entrypoint/parent-report-fanout.test.ts
 bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 ```
+
+`parent-report.test.ts`는 4096 UTF-8 본문/실제 JSON escaping 예산, pending coalescing, 32개 초과 drain, 16개/64 KiB batch, handed-off snapshot의 commit 전 예산 유지와 injected clock의 client/server 독립 16회/30초 sliding window를 확인합니다. 부모 소유 `reportId`/접수·최초 제출 시각의 retry 안정성, 최대 timestamp를 포함한 **접수 전** 64 KiB progress envelope 예약과 128 KiB important envelope의 정확한 byte 경계도 검사합니다. deferred prepare 중 24 KiB 쓰기 backpressure에서 end/settled가 실제 server에 도착한 뒤 admission을 막는지, ordered activity가 버려지지 않고 hard cap에서는 frame 크기까지 포함해 fail-closed하는지도 검사합니다. `parent-report-memo.test.ts`는 같은 tool ID의 동시/반복 성공·오류·unknown, payload/kind 충돌, 별도 ID, 256개 pending 포함 상한과 완료부터 10분 TTL/reset/close를 fake clock으로 확인합니다. `parent-report-render.test.ts`는 실제 Pi `Text`의 4–160열 Unicode·emoji·combining 렌더링, compact batch/important, full expand, terminal/bidi escape, 구형/비정상 metadata fallback과 표시 크기 제한을 확인합니다. `parent-report-host.test.ts`는 production과 같은 `registerParentReportHooks()`를 사용해 user/custom 시작, 성공 turn 경계, 뒤 handler의 draft 교체, abort/error·시작 실패 후 자연스러운 복구, reload·branch·세션 교체와 native important의 idle/busy 전달을 검증합니다. 기존 offline host fixture에서 같은 native tool-call ID를 한 batch와 후속 prompt에 반복해도 socket report/rate charge가 하나이며, 다른 payload는 본문 echo 없이 충돌하는지도 검사합니다. progress는 `nextTurn`이나 continuation을 사용하지 않으며, 예전 lifetime ledger를 복구하지 않습니다. reset/close는 앱 pending/in-flight/status를 지우지만 이미 native 제출한 important를 철회하지 못합니다.
 
 이 범위는 실제 provider/MCP 연결 또는 live terminal acceptance를 실행하거나 증명하지 않습니다. 취소 event만으로 completion proof를 만들지 않는 동작과 기존 fence/lease/ownership 검증을 함께 유지합니다.
 
@@ -214,7 +221,7 @@ index.ts                    — Pi 패키지 manifest가 참조하는 확장 진
 src/core/                   — 에이전트 발견, 신뢰/경로 검사, 스키마, 체인 헬퍼, 이벤트 파싱, 공통 타입
 src/runtime/                — 자식 runner, process-local scheduler와 durable tree permit/source ownership, cmux/tmux/Herdr adapter, one-shot `pane-launch-broker.mjs`, 공통 interactive-pane backend, child bridge, lifecycle/broker protocol, session tail, inline 경로
 src/integration/            — `pi-cmux` 연동과 shared V2 root-only presence producer
-src/ui/                     — subagent 도구 호출과 결과를 위한 TUI 렌더링
+src/ui/                     — subagent 도구 호출·결과와 부모 보고 custom message의 TUI 렌더링
 test/core/                  — 발견, 신뢰, 메타데이터, 체인 동작, 공통 타입 단위 테스트
 test/runtime/               — runner, cmux/tmux/Herdr backend/bridge/protocol/reaper, 인증 전파, CLI 파싱 테스트
 test/integration/           — presence producer, fake-adapter e2e 같은 통합 테스트

@@ -51,10 +51,13 @@ export const PACKAGE_REGISTRATION_EXPECTED_FLAGS = [
   "subagent-prevent-cycles",
   "subagent-pane-layout",
 ] as const;
-export const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "tool_result", "agent_start", "agent_settled", "session_shutdown", "before_agent_start"] as const;
+// Exact handler multiplicities: reporting and presence/prompt augmentation
+// intentionally share agent_settled and before_agent_start.
+export const PACKAGE_REGISTRATION_EXPECTED_EVENTS = ["session_start", "tool_result", "agent_start", "agent_settled", "session_shutdown", "before_agent_start",
+  "before_agent_start", "turn_start", "turn_end", "agent_before_settle", "agent_settled"] as const;
 const PACKAGE_REGISTRATION_EXPECTED_TOOLS = ["subagent"] as const;
 export const PACKAGE_REGISTRATION_EXPECTED_COMMANDS = ["subagent-result", "subagents"] as const;
-const PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS = ["subagent_result"] as const;
+export const PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS = ["subagent_result", "pi-subagent-parent-report"] as const;
 export const PACKAGE_PROBE_EVENT_CHANNELS = ["pi-subagent:dashboard:v1", "pi-subagent:aggregate-completed:v1"] as const;
 
 type PackageProbeEvents = {
@@ -90,7 +93,7 @@ export function createBoundedPackageProbeEvents(): PackageProbeEvents {
   };
 }
 
-/** Reject unexpected, duplicate, and missing registrations without depending on registration order. */
+/** Enforce exact registration multiplicities without depending on order. */
 export const assertExactPackageRegistrationNames = (
   actual: readonly unknown[],
   expected: readonly string[],
@@ -99,10 +102,11 @@ export const assertExactPackageRegistrationNames = (
   for (const value of actual) {
     if (typeof value !== "string" || !expected.includes(value)) throw new Error(`unexpected ${kind} registration: ${String(value)}`);
   }
-  for (const name of expected) {
+  for (const name of new Set(expected)) {
+    const required = expected.filter((value) => value === name).length;
     const count = actual.filter((value) => value === name).length;
-    if (count === 0) throw new Error(`missing ${kind} registration: ${name}`);
-    if (count > 1) throw new Error(`duplicate ${kind} registration: ${name}`);
+    if (count < required) throw new Error(`missing ${kind} registration: ${name}`);
+    if (count > required) throw new Error(`duplicate ${kind} registration: ${name}`);
   }
 };
 const BROKER_RECONCILIATION_TIMEOUT_MS = 5_000;

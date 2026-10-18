@@ -1,10 +1,11 @@
+import { ParentReportRate } from "./parent-report-rate.js";
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { isSteeringMessage, type SteeringOutcome } from "../core/subagent-steering.js";
-import { isParentReportMessage, type ParentReportHandler, type ReportOutcome } from "./parent-report.js";
+import { isParentReportKind, isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, type ParentReportHandler, type ParentReportKind, type ReportOutcome } from "./parent-report.js";
 
 export const SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_SOCKET_PATH";
 export const SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_TOKEN_PATH";
@@ -12,12 +13,19 @@ const VERSION = 1 as const;
 /** Per direction: eight UNSENT requests in addition to one awaiting remote ACK. */
 export const LOCAL_MESSAGE_WAIT_CAPACITY = 8;
 const MAX_FRAME_BYTES = 4096;
+// JSON can expand each body byte to six bytes (e.g. NUL -> \\u0000).
+// Keep a fixed envelope budget; only authenticated report frames get this cap.
+const MAX_REPORT_FRAME_BYTES = 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + MAX_FRAME_BYTES;
 const MAX_CONNECTIONS = 64;
 const MAX_CONNECTION_CHUNK_BYTES = 64 * 1024;
 const HELLO_TIMEOUT_MS = 1000;
 const IDLE_TIMEOUT_MS = 15_000;
-const MAX_CLIENT_BUFFERED_BYTES = 16 * 1024;
 const NONTERMINAL_BUFFER_LIMIT_BYTES = 8 * 1024;
+const REPORT_BUFFER_LIMIT_BYTES = MAX_REPORT_FRAME_BYTES + NONTERMINAL_BUFFER_LIMIT_BYTES;
+// Preserve 8 KiB of headroom beyond the report write budget for control ACKs
+// and ordered activity/revocation events. Only heartbeat may be dropped.
+const MAX_REPORT_CLIENT_BUFFERED_BYTES = REPORT_BUFFER_LIMIT_BYTES + 8 * 1024;
+const MAX_CLIENT_BUFFERED_BYTES = 16 * 1024;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const EVENT_TYPES = new Set(["agent-started", "agent-ended", "agent-settled", "completion-ready", "shutdown", "heartbeat"]);
@@ -42,6 +50,7 @@ interface WaitingSteer {
 
 interface WaitingReport {
 	message: string;
+	kind: ParentReportKind;
 	generation: number;
 	eligible: () => boolean;
 	signal?: AbortSignal;
@@ -71,7 +80,7 @@ interface RunRegistration {
 	reportHandlerGeneration?: number;
 	activityGeneration?: number;
 	reportSequence?: number;
-	reportCount?: number;
+	reportRate?: ParentReportRate;
 	reportPending?: boolean;
 	reportClosed?: boolean;
 	reportAbortCleanup?: () => void;
@@ -87,12 +96,13 @@ function object(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseLine(line: Buffer): Record<string, unknown> | null {
-	if (line.length === 0 || line.length > MAX_FRAME_BYTES || line.includes(0x0d) || line.includes(0x00)) return null;
+function parseLine(line: Buffer, allowReport = false): Record<string, unknown> | null {
+	if (line.length === 0 || line.length > (allowReport ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES)
+		|| line.includes(0x0d) || line.includes(0x00)) return null;
 	try {
 		const text = new TextDecoder("utf-8", { fatal: true }).decode(line);
 		const value = JSON.parse(text);
-		return object(value) ? value : null;
+		return object(value) && (line.length <= MAX_FRAME_BYTES || (allowReport && value.type === "report")) ? value : null;
 	} catch { return null; }
 }
 
@@ -134,6 +144,7 @@ type LifecycleStartupOperations = {
 	open?: typeof fs.open;
 	createServer?: typeof net.createServer;
 	afterMkdtemp?: (directory: string) => void | Promise<void>;
+	now?: () => number;
 };
 
 export class LifecycleEventServer {
@@ -151,7 +162,7 @@ export class LifecycleEventServer {
 	private readonly connectionsSet = new Set<net.Socket>();
 	private closed = false;
 
-	private constructor(directory: string) {
+	private constructor(directory: string, private readonly now: () => number) {
 		this.directory = directory;
 		this.socketPath = path.join(directory, "events.sock");
 		this.markerPath = path.join(directory, "generation");
@@ -170,7 +181,7 @@ export class LifecycleEventServer {
 			// Arm failure cleanup as soon as mkdtemp returns. If its first identity
 			// probe fails, cleanup intentionally retains the directory: pathname-only
 			// I/O cannot prove an unrecorded artifact still belongs to this startup.
-			instance = new LifecycleEventServer(directory);
+			instance = new LifecycleEventServer(directory, operations.now ?? (() => performance.now()));
 			await operations.afterMkdtemp?.(directory);
 			const initialDirectoryStats = await lstat(directory, { bigint: true });
 			instance.directoryIdentity = { dev: initialDirectoryStats.dev, ino: initialDirectoryStats.ino };
@@ -260,7 +271,7 @@ export class LifecycleEventServer {
 		run.reportAbortCleanup?.();
 		delete run.reportAbortCleanup;
 		delete run.reportHandler;
-		delete run.reportCount;
+		delete run.reportRate;
 		run.reportPending = false;
 	}
 
@@ -397,14 +408,15 @@ export class LifecycleEventServer {
 				const preAuthBytes = buffer.length + (lf >= 0 ? lf : chunk.length);
 				if (preAuthBytes > MAX_FRAME_BYTES) { fail(); return; }
 			}
+			// At most one partial bounded frame plus one bounded chunk is retained.
 			buffer = Buffer.concat([buffer, chunk]);
-			if (buffer.length > MAX_FRAME_BYTES + 1 && !buffer.includes(0x0a)) { fail(); return; }
+			if (buffer.length > (authenticated ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES) + 1 && !buffer.includes(0x0a)) { fail(); return; }
 			while (true) {
 				const lf = buffer.indexOf(0x0a);
 				if (lf < 0) break;
 				const line = buffer.subarray(0, lf);
 				buffer = buffer.subarray(lf + 1);
-				const value = parseLine(line);
+				const value = parseLine(line, authenticated !== null);
 				if (!value) { fail(); return; }
 				if (!authenticated) {
 					if (!(exactKeys(value, ["version", "type", "runId", "token", "childPid", "sequence"])
@@ -426,7 +438,8 @@ export class LifecycleEventServer {
 				}
 				if (value.type === "report") {
 					const { run, runId } = authenticated;
-					if (!exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message"])
+					if (!(exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message"])
+						|| (exactKeys(value, ["version", "type", "runId", "sequence", "reportSequence", "message", "kind"]) && isParentReportKind(value.kind)))
 						|| value.version !== VERSION || value.runId !== runId || !Number.isSafeInteger(value.sequence) || value.sequence !== run.lastSequence + 1
 						|| !Number.isSafeInteger(value.reportSequence) || value.reportSequence !== (run.reportSequence ?? 0) + 1 || !isParentReportMessage(value.message)) { fail(); return; }
 					run.lastSequence = value.sequence as number;
@@ -445,11 +458,12 @@ export class LifecycleEventServer {
 						socket.write(frame);
 					};
 					if (socket.writableLength + 256 > NONTERMINAL_BUFFER_LIMIT_BYTES) continue; // no admission without ACK buffer space
-					if (!eligible() || run.reportPending || (run.reportCount ?? 0) >= 4) { ack(false); continue; }
+					if (!eligible() || run.reportPending) { ack(false); continue; }
+					run.reportRate ??= new ParentReportRate(this.now);
+					if (!run.reportRate.take()) { ack(false); continue; }
 					run.reportPending = true;
-					run.reportCount = (run.reportCount ?? 0) + 1;
 					// Callback errors and denied admission never echo child text. No retry.
-					void Promise.resolve().then(() => eligible() ? handler!(value.message as string, eligible) : false)
+					void Promise.resolve().then(() => eligible() ? handler!(value.message as string, eligible, (value.kind ?? "progress") as ParentReportKind) : false)
 						.then((accepted) => { run.reportPending = false; ack(accepted === true); },
 							() => { run.reportPending = false; ack(false); });
 					continue;
@@ -488,7 +502,7 @@ export class LifecycleEventServer {
 				if (value.type === "heartbeat") authenticated.run.lastHeartbeatAt = performance.now();
 				if (authenticated.run.active) this.notify(authenticated.run);
 			}
-			if (buffer.length > MAX_FRAME_BYTES) fail();
+			if (buffer.length > (authenticated ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES)) fail();
 		});
 		const ended = () => {
 			clearTimeout(helloTimer);
@@ -649,7 +663,7 @@ export class LifecycleEventClient {
 	private controlSequence = 0;
 	private steerSequence = 0;
 	private reportSequence = 0;
-	private reportCount = 0;
+	private readonly reportRate: ParentReportRate;
 	private reportGeneration = 0;
 	private readonly reportQueue: WaitingReport[] = [];
 	private reportDispatchScheduled = false;
@@ -664,7 +678,12 @@ export class LifecycleEventClient {
 	private controlHandler: ((command: "abort") => Promise<void> | void) | null = null;
 	private readonly pendingControls: Array<{ command: "abort"; sequence: number }> = [];
 	private controlDraining = false;
-	private constructor(private readonly socket: net.Socket, private readonly runId: string) {}
+	private constructor(private readonly socket: net.Socket, private readonly runId: string, now: () => number) {
+		this.reportRate = new ParentReportRate(now);
+	}
+	private get bufferedByteLimit(): number {
+		return this.reportSupported ? MAX_REPORT_CLIENT_BUFFERED_BYTES : MAX_CLIENT_BUFFERED_BYTES;
+	}
 
 	setControlHandler(handler: (command: "abort") => Promise<void> | void): void {
 		this.controlHandler = handler;
@@ -688,7 +707,7 @@ export class LifecycleEventClient {
 		} finally { this.controlDraining = false; }
 	}
 
-	static async connectFromEnvironment(env: NodeJS.ProcessEnv, statePath: string, heartbeat = true, report = false): Promise<LifecycleEventClient | null> {
+	static async connectFromEnvironment(env: NodeJS.ProcessEnv, statePath: string, heartbeat = true, report = false, now: () => number = () => performance.now()): Promise<LifecycleEventClient | null> {
 		const socketPath = env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV]?.trim();
 		const tokenPath = env[SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV]?.trim();
 		delete env[SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV];
@@ -706,7 +725,7 @@ export class LifecycleEventClient {
 			const hello = { version: VERSION, type: "hello", runId, token, childPid: process.pid, sequence: 0, ...(report ? { report: true } : {}) };
 			const helloFrame = `${JSON.stringify(hello)}\n`;
 			if (Buffer.byteLength(helloFrame) > MAX_FRAME_BYTES || socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) throw new Error("Lifecycle hello buffer is unavailable.");
-			const client = new LifecycleEventClient(socket, runId);
+			const client = new LifecycleEventClient(socket, runId, now);
 			let inbound = Buffer.alloc(0), acknowledged = false;
 			let resolveHello!: () => void, rejectHello!: (error: Error) => void;
 			const helloAcknowledged = new Promise<void>((resolve, reject) => { resolveHello = resolve; rejectHello = reject; });
@@ -744,7 +763,7 @@ export class LifecycleEventClient {
 						try { accepted = !client.steerClosed && Boolean(client.steerHandler?.(value.message)); } catch { /* generic rejection only */ }
 						client.sequence += 1;
 						const ack = `${JSON.stringify({ version: VERSION, type: "steer-ack", runId, sequence: client.sequence, steerSequence: client.steerSequence, accepted })}\n`;
-						if (socket.writableLength + Buffer.byteLength(ack) > MAX_CLIENT_BUFFERED_BYTES) { rejectProtocol(); return; }
+						if (socket.writableLength + Buffer.byteLength(ack) > client.bufferedByteLimit) { rejectProtocol(); return; }
 						socket.write(ack);
 						continue;
 					}
@@ -784,10 +803,10 @@ export class LifecycleEventClient {
 		this.reportPending?.resolve("unknown");
 	}
 
-	/** Only remote nextTurn admission is submitted. Unknown fences all further reports. */
-	async requestReport(message: string, signal?: AbortSignal, eligible: () => boolean = () => true): Promise<ReportOutcome> {
-		if (!isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted || !eligible()) return "unavailable";
-		if (this.reportCount >= 4) return "limit";
+	/** Only remote API admission is submitted. Unknown fences all further reports. */
+	async requestReport(message: string, signal?: AbortSignal, eligible: () => boolean = () => true, kind: ParentReportKind = "progress"): Promise<ReportOutcome> {
+		if (!isParentReportKind(kind) || !isParentReportMessage(message) || !this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted || !eligible()) return "unavailable";
+		if (!this.reportRate.available()) return "limit";
 		if (this.reportQueue.length >= LOCAL_MESSAGE_WAIT_CAPACITY) return "queue-full";
 		return await new Promise<ReportOutcome>((resolve) => {
 			const abort = () => {
@@ -797,7 +816,7 @@ export class LifecycleEventClient {
 				request.cleanup();
 				resolve("unavailable"); // UNSENT cancellation cannot be unknown or fence the active request.
 			};
-			const request: WaitingReport = { message, signal, eligible, generation: this.reportGeneration, resolve,
+			const request: WaitingReport = { message, kind, signal, eligible, generation: this.reportGeneration, resolve,
 				cleanup: () => signal?.removeEventListener("abort", abort) };
 			signal?.addEventListener("abort", abort, { once: true });
 			this.reportQueue.push(request);
@@ -810,14 +829,16 @@ export class LifecycleEventClient {
 		const request = this.reportQueue.shift();
 		if (!request) return;
 		request.cleanup(); // Replace the waiting-only abort listener with the active one below.
-		const { signal, message, resolve } = request;
+		const { signal, message, kind, resolve } = request;
 		const refuse = (outcome: ReportOutcome) => { resolve(outcome); this.dispatchReport(); };
 		if (!this.reportSupported || !this.usable || this.reportClosed || this.socket.destroyed || signal?.aborted
 			|| request.generation !== this.reportGeneration || !request.eligible()) { refuse("unavailable"); return; }
-		if (this.reportCount >= 4) { refuse("limit"); return; }
+		if (!this.reportRate.available()) { refuse("limit"); return; }
 		const reportSequence = this.reportSequence + 1;
-		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }
+		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message, kind })}\n`;
+		const frameBytes = Buffer.byteLength(frame);
+		if (frameBytes > MAX_REPORT_FRAME_BYTES || this.socket.writableLength >= NONTERMINAL_BUFFER_LIMIT_BYTES
+			|| this.socket.writableLength + frameBytes > REPORT_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }
 		let settled = false;
 		const done = (outcome: ReportOutcome) => {
 			if (settled) return;
@@ -839,7 +860,7 @@ export class LifecycleEventClient {
 		const timer = setTimeout(abort, 1000);
 		this.reportPending = { sequence: reportSequence, resolve: done };
 		this.reportSequence = reportSequence;
-		this.reportCount++;
+		this.reportRate.take();
 		this.sequence++;
 		signal?.addEventListener("abort", abort, { once: true });
 		try { this.socket.write(frame); } catch { done("unknown"); }
@@ -849,7 +870,7 @@ export class LifecycleEventClient {
 		if (!this.usable || this.socket.destroyed || !Number.isSafeInteger(controlSequence) || controlSequence < 1) return false;
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "control-ack", runId: this.runId, sequence: this.sequence, controlSequence })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) { this.usable = false; this.socket.destroy(); return false; }
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > this.bufferedByteLimit) { this.usable = false; this.closeReports(); this.socket.destroy(); return false; }
 		this.socket.write(frame); return true;
 	}
 
@@ -859,17 +880,17 @@ export class LifecycleEventClient {
 		if (["agent-settled", "completion-ready", "shutdown"].includes(type)) { this.steerClosed = true; this.closeReports(); }
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type, runId: this.runId, sequence: this.sequence })}\n`;
-		const terminal = type === "completion-ready" || type === "shutdown";
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) {
-			this.usable = false; this.socket.destroy(); return false;
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > this.bufferedByteLimit) {
+			this.usable = false; this.closeReports(); this.socket.destroy(); return false;
 		}
-		if (!terminal && this.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) {
-			this.sequence -= 1; // dropped coalescible hint must not create a sequence gap.
+		if (type === "heartbeat" && this.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) {
+			this.sequence -= 1; // dropped heartbeat must not create a sequence gap.
 			return false;
 		}
-		// write(false) means queued backpressure, not failure. Nonterminal frames
-		// stop above the low watermark, reserving bounded space for terminal hints;
-		// socket.end() later flushes queued completion-ready/shutdown frames.
+		// write(false) means ordered queued backpressure, not failure. Activity
+		// and revocation MUST follow buffered reports; if headroom runs out the
+		// socket closes instead of leaving the server's running authority stale.
+		// socket.end() later flushes queued lifecycle frames.
 		this.socket.write(frame);
 		return true;
 	}

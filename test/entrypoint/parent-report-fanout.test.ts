@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { PARENT_REPORT_CUSTOM_TYPE } from "../../src/runtime/parent-report";
+import { PARENT_REPORT_CUSTOM_TYPE, type ParentReportKind } from "../../src/runtime/parent-report";
 
 // Keep real discovery, invocation validation, scheduler, fanout and admission.
 // Only replace process launch and durable permit startup; no provider/backend.
@@ -47,32 +47,48 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     register({ registerToolRenderer: () => {}, registerMessageRenderer: () => {}, registerFlag: () => {},
       getFlag: (name: string) => name === "subagent-max-active" ? "2" : undefined,
       registerCommand: () => {}, registerTool: (value: any) => { if (value.name === "subagent") tool = value; },
-      on: (event: string, handler: any) => handlers.set(event, handler), events: { emit: () => {} },
+      on: (event: string, handler: any) => {
+        const previous = handlers.get(event);
+        if (!previous) handlers.set(event, handler);
+        else handlers.set(event, async (...args: any[]) => { await previous(...args); return handler(...args); });
+      }, events: { emit: () => {} },
       sendMessage: (message: any, options: any) => sent.push({ message, options }),
       appendEntry: (type: string, data: any) => manager.appendCustomEntry(type, data), getAllTools: () => [], getCommands: () => [],
     } as never);
     await handlers.get("session_start")!({}, ctx);
     const invoke = (params: any) => tool.execute("call", params, new AbortController().signal, undefined, ctx);
     const reports = () => sent.filter(s => s.message.customType === PARENT_REPORT_CUSTOM_TYPE);
-    const checkReport = (leaf: typeof leaves[number], expected: any) => {
+    const checkReport = (leaf: typeof leaves[number], expected: any, kind?: ParentReportKind) => {
       const role = leaf.options.agents.find(agent => agent.name === leaf.options.agentName)!;
       assert.deepEqual(role.tools, ["read"], "background leaf binding needs no role messaging permission");
       const args = runner.buildPiArgs(role, null, "/task", "spawn", null, undefined, "managed", undefined, "1.3.0", Boolean(leaf.options.onParentReport));
       assert.equal(args[args.indexOf("--tools") + 1], "read,report_to_parent");
       assert.equal(args.includes("builtin:codemode"), false);
-      assert.equal(leaf.options.onParentReport?.(`body-${reports().length}`), true);
+      assert.equal(leaf.options.onParentReport?.(`body-${reports().length}`, kind), true);
+      if (!kind || kind === "progress") {
+        const boundary = handlers.get("turn_end")!({ entries: [], continue: false, outcome: "completed" }, ctx);
+        const { type, ...message } = boundary.entries[0];
+        sent.push({ message, options: undefined });
+        manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+        handlers.get("turn_start")!({}, ctx);
+      }
       const last = reports().at(-1)!;
-      assert.deepEqual(last.options, { deliverAs: "nextTurn", triggerTurn: false });
-      assert.equal(last.message.details.agent, leaf.options.agentName);
-      assert.equal(last.message.details.version, 2);
-      for (const [key, value] of Object.entries(expected)) assert.equal(last.message.details[key], value);
-      for (const key of ["task", "cwd", "model", "history"]) assert.equal(key in last.message.details, false);
-      return last.message.details;
+      assert.deepEqual(last.options, kind && kind !== "progress" ? { deliverAs: "steer", triggerTurn: true } : undefined);
+      const details = last.message.details.reports?.[0] ?? last.message.details;
+      assert.equal(details.reportKind, kind ?? "progress");
+      assert.equal(details.agent, leaf.options.agentName);
+      assert.equal(details.version, 3);
+      assert.match(details.reportId, /^[a-f0-9-]{36}$/);
+      assert.ok(Number.isSafeInteger(details.receivedAtMs));
+      assert.ok(Number.isSafeInteger(details.submittedAtMs));
+      for (const [key, value] of Object.entries(expected)) assert.equal(details[key], value);
+      for (const key of ["task", "cwd", "model", "history"]) assert.equal(key in details, false);
+      return details;
     };
     await invoke({ agent: "other", task: "single", background: true }); await until(() => leaves.length === 1);
     const single = leaves[0]!;
     assert.equal(typeof single.options.onSteeringReady, "function");
-    checkReport(single, { mode: "single" }); single.finish();
+    checkReport(single, { mode: "single" }, "finding"); single.finish();
     await new Promise(r => setTimeout(r, 0));
     assert.equal(single.options.onParentReport!("completed single"), false);
 
@@ -80,7 +96,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     await until(() => leaves.length === 3);
     const [a, b] = leaves.slice(1);
     assert.equal(a!.options.task, "parallel-a"); assert.equal(b!.options.task, "parallel-b");
-    const ai = checkReport(a!, { mode: "parallel", taskIndex: 0 });
+    const ai = checkReport(a!, { mode: "parallel", taskIndex: 0 }, "question");
     const bi = checkReport(b!, { mode: "parallel", taskIndex: 1 });
     assert.equal(ai.jobId, bi.jobId); assert.notEqual(ai.childId, bi.childId);
     assert.equal(a!.options.onSteeringReady, undefined); assert.equal(b!.options.onSteeringReady, undefined);
@@ -103,7 +119,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const fi = checkReport(first, { mode: "chain", stageIndex: 0, stageLabel: "step-1" });
     first.finish(); await until(() => leaves.length === 6);
     assert.equal(first.options.onParentReport!("previous stage"), false);
-    const pi = checkReport(leaves[4]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 0 });
+    const pi = checkReport(leaves[4]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 0 }, "blocked");
     const qi = checkReport(leaves[5]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 1 });
     assert.equal(fi.jobId, pi.jobId); assert.equal(pi.jobId, qi.jobId);
     for (const leaf of leaves.slice(3, 6)) assert.equal(leaf.options.onSteeringReady, undefined);
@@ -115,7 +131,7 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     checkReport(leaves[6]!, { agent: "reporter", stageIndex: 3, stageLabel: "last", taskIndex: undefined });
     assert.equal(leaves.some(l => l.options.task === "SKIPPED"), false);
     // Distinct identities for every scheduled leaf, even same names/labels.
-    assert.equal(new Set(reports().map(r => r.message.details.childId)).size, 7);
+    assert.equal(new Set(reports().flatMap(r => (r.message.details.reports ?? [r.message.details]).map((details: any) => details.childId))).size, 7);
     leaves[6]!.finish(); await new Promise(r => setTimeout(r, 0));
     assert.equal(leaves[6]!.options.onParentReport!("completed chain"), false);
 
@@ -145,11 +161,16 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const before = leaves.length;
     await invoke({ tasks: [{ agent: "reporter", task: "budget-a" }, { agent: "reporter", task: "budget-b" }], background: true });
     await until(() => leaves.length === before + 2);
-    // This runner seam bypasses the unchanged socket's four-attempt budget;
-    // prove all leaves share the SAME persisted lifetime 32-reservation ledger.
-    while (reports().length < 32) checkReport(leaves[before + reports().length % 2]!, { mode: "parallel" });
-    assert.equal(leaves[before]!.options.onParentReport!("33rd"), false);
-    assert.equal(leaves[before + 1]!.options.onParentReport!("34th"), false);
+    // Bypass socket rate only at this runner seam. Native important reports
+    // and progress share outstanding capacity; no lifetime reservation ledger.
+    const firstBudgetMessage = reports().length;
+    for (let i = 0; i < 32; i++) checkReport(leaves[before + i % 2]!, { mode: "parallel" }, "finding");
+    assert.equal(leaves[before]!.options.onParentReport!("33rd", "blocked"), false);
+    assert.equal(leaves[before + 1]!.options.onParentReport!("progress cannot bypass full important budget"), false);
+    for (const { message } of reports().slice(firstBudgetMessage)) manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+    assert.equal(leaves[before]!.options.onParentReport!("not reconciled yet", "finding"), false);
+    handlers.get("turn_start")!({}, ctx);
+    checkReport(leaves[before]!, { mode: "parallel" }, "question");
   } finally {
     for (const leaf of leaves) leaf.finish();
     await handlers.get("session_shutdown")?.({}, ctx);

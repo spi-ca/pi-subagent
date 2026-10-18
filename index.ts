@@ -47,7 +47,8 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/structured-result.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
-import { ParentReportAdmission } from "./src/runtime/parent-report.js";
+import { ParentReportAdmission, registerParentReportHooks, PARENT_REPORT_CUSTOM_TYPE } from "./src/runtime/parent-report.js";
+import { renderParentReport } from "./src/ui/parent-report-render.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -612,6 +613,7 @@ export default function (pi: ExtensionAPI) {
   };
   pi.registerToolRenderer((toolName, next) => toolName === "subagent" ? subagentRenderers : next());
   let clearInlinePresentationWidget: (() => void) | undefined;
+  pi.registerMessageRenderer(PARENT_REPORT_CUSTOM_TYPE, renderParentReport);
   pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
     backgroundResultRenderer(message, options, theme),
   );
@@ -716,6 +718,7 @@ export default function (pi: ExtensionAPI) {
     await foregroundPermitScopes.release(scope);
   const backgroundSessionFence = new BackgroundJobSessionFence();
   const parentReports = new ParentReportAdmission(pi);
+  registerParentReportHooks(pi, parentReports);
   const uxRegistry = new SubagentUxRegistry({ recentLimit: 20 });
   const reaperDiagnosticUx = new ReaperDiagnosticUx();
   let reaperDiagnosticGeneration = 0;
@@ -1122,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
     // fence old finalizers before a slow config read can yield to them.
     const startupGeneration = ++sessionStartupGeneration;
     backgroundSessionFence.startSession();
-    parentReports.reset(ctx.sessionManager);
+    parentReports.reset(ctx.sessionManager, ctx);
     reaperDiagnosticGeneration = reaperDiagnosticUx.startSession();
     cancelBackgroundJobs(backgroundJobs);
     backgroundJobs.clear();

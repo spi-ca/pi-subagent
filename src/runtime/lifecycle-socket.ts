@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { isSteeringMessage, type SteeringOutcome } from "../core/subagent-steering.js";
-import { isParentReportMessage, type ParentReportHandler, type ReportOutcome } from "./parent-report.js";
+import { isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, type ParentReportHandler, type ReportOutcome } from "./parent-report.js";
 
 export const SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_SOCKET_PATH";
 export const SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV = "PI_SUBAGENT_LIFECYCLE_TOKEN_PATH";
@@ -12,12 +12,19 @@ const VERSION = 1 as const;
 /** Per direction: eight UNSENT requests in addition to one awaiting remote ACK. */
 export const LOCAL_MESSAGE_WAIT_CAPACITY = 8;
 const MAX_FRAME_BYTES = 4096;
+// JSON can expand each body byte to six bytes (e.g. NUL -> \\u0000).
+// Keep a fixed envelope budget; only authenticated report frames get this cap.
+const MAX_REPORT_FRAME_BYTES = 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + MAX_FRAME_BYTES;
 const MAX_CONNECTIONS = 64;
 const MAX_CONNECTION_CHUNK_BYTES = 64 * 1024;
 const HELLO_TIMEOUT_MS = 1000;
 const IDLE_TIMEOUT_MS = 15_000;
-const MAX_CLIENT_BUFFERED_BYTES = 16 * 1024;
 const NONTERMINAL_BUFFER_LIMIT_BYTES = 8 * 1024;
+const REPORT_BUFFER_LIMIT_BYTES = MAX_REPORT_FRAME_BYTES + NONTERMINAL_BUFFER_LIMIT_BYTES;
+// Preserve 8 KiB of headroom beyond the report write budget for control ACKs
+// and terminal hints. Coalescible events retain the old low watermark.
+const MAX_REPORT_CLIENT_BUFFERED_BYTES = REPORT_BUFFER_LIMIT_BYTES + 8 * 1024;
+const MAX_CLIENT_BUFFERED_BYTES = 16 * 1024;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const EVENT_TYPES = new Set(["agent-started", "agent-ended", "agent-settled", "completion-ready", "shutdown", "heartbeat"]);
@@ -87,12 +94,13 @@ function object(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseLine(line: Buffer): Record<string, unknown> | null {
-	if (line.length === 0 || line.length > MAX_FRAME_BYTES || line.includes(0x0d) || line.includes(0x00)) return null;
+function parseLine(line: Buffer, allowReport = false): Record<string, unknown> | null {
+	if (line.length === 0 || line.length > (allowReport ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES)
+		|| line.includes(0x0d) || line.includes(0x00)) return null;
 	try {
 		const text = new TextDecoder("utf-8", { fatal: true }).decode(line);
 		const value = JSON.parse(text);
-		return object(value) ? value : null;
+		return object(value) && (line.length <= MAX_FRAME_BYTES || (allowReport && value.type === "report")) ? value : null;
 	} catch { return null; }
 }
 
@@ -397,14 +405,15 @@ export class LifecycleEventServer {
 				const preAuthBytes = buffer.length + (lf >= 0 ? lf : chunk.length);
 				if (preAuthBytes > MAX_FRAME_BYTES) { fail(); return; }
 			}
+			// At most one partial bounded frame plus one bounded chunk is retained.
 			buffer = Buffer.concat([buffer, chunk]);
-			if (buffer.length > MAX_FRAME_BYTES + 1 && !buffer.includes(0x0a)) { fail(); return; }
+			if (buffer.length > (authenticated ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES) + 1 && !buffer.includes(0x0a)) { fail(); return; }
 			while (true) {
 				const lf = buffer.indexOf(0x0a);
 				if (lf < 0) break;
 				const line = buffer.subarray(0, lf);
 				buffer = buffer.subarray(lf + 1);
-				const value = parseLine(line);
+				const value = parseLine(line, authenticated !== null);
 				if (!value) { fail(); return; }
 				if (!authenticated) {
 					if (!(exactKeys(value, ["version", "type", "runId", "token", "childPid", "sequence"])
@@ -488,7 +497,7 @@ export class LifecycleEventServer {
 				if (value.type === "heartbeat") authenticated.run.lastHeartbeatAt = performance.now();
 				if (authenticated.run.active) this.notify(authenticated.run);
 			}
-			if (buffer.length > MAX_FRAME_BYTES) fail();
+			if (buffer.length > (authenticated ? MAX_REPORT_FRAME_BYTES : MAX_FRAME_BYTES)) fail();
 		});
 		const ended = () => {
 			clearTimeout(helloTimer);
@@ -665,6 +674,9 @@ export class LifecycleEventClient {
 	private readonly pendingControls: Array<{ command: "abort"; sequence: number }> = [];
 	private controlDraining = false;
 	private constructor(private readonly socket: net.Socket, private readonly runId: string) {}
+	private get bufferedByteLimit(): number {
+		return this.reportSupported ? MAX_REPORT_CLIENT_BUFFERED_BYTES : MAX_CLIENT_BUFFERED_BYTES;
+	}
 
 	setControlHandler(handler: (command: "abort") => Promise<void> | void): void {
 		this.controlHandler = handler;
@@ -744,7 +756,7 @@ export class LifecycleEventClient {
 						try { accepted = !client.steerClosed && Boolean(client.steerHandler?.(value.message)); } catch { /* generic rejection only */ }
 						client.sequence += 1;
 						const ack = `${JSON.stringify({ version: VERSION, type: "steer-ack", runId, sequence: client.sequence, steerSequence: client.steerSequence, accepted })}\n`;
-						if (socket.writableLength + Buffer.byteLength(ack) > MAX_CLIENT_BUFFERED_BYTES) { rejectProtocol(); return; }
+						if (socket.writableLength + Buffer.byteLength(ack) > client.bufferedByteLimit) { rejectProtocol(); return; }
 						socket.write(ack);
 						continue;
 					}
@@ -817,7 +829,9 @@ export class LifecycleEventClient {
 		if (this.reportCount >= 4) { refuse("limit"); return; }
 		const reportSequence = this.reportSequence + 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "report", runId: this.runId, sequence: this.sequence + 1, reportSequence, message })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength + Buffer.byteLength(frame) > NONTERMINAL_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }
+		const frameBytes = Buffer.byteLength(frame);
+		if (frameBytes > MAX_REPORT_FRAME_BYTES || this.socket.writableLength >= NONTERMINAL_BUFFER_LIMIT_BYTES
+			|| this.socket.writableLength + frameBytes > REPORT_BUFFER_LIMIT_BYTES) { refuse("busy"); return; }
 		let settled = false;
 		const done = (outcome: ReportOutcome) => {
 			if (settled) return;
@@ -849,7 +863,7 @@ export class LifecycleEventClient {
 		if (!this.usable || this.socket.destroyed || !Number.isSafeInteger(controlSequence) || controlSequence < 1) return false;
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type: "control-ack", runId: this.runId, sequence: this.sequence, controlSequence })}\n`;
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) { this.usable = false; this.socket.destroy(); return false; }
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > this.bufferedByteLimit) { this.usable = false; this.socket.destroy(); return false; }
 		this.socket.write(frame); return true;
 	}
 
@@ -860,7 +874,7 @@ export class LifecycleEventClient {
 		this.sequence += 1;
 		const frame = `${JSON.stringify({ version: VERSION, type, runId: this.runId, sequence: this.sequence })}\n`;
 		const terminal = type === "completion-ready" || type === "shutdown";
-		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > MAX_CLIENT_BUFFERED_BYTES) {
+		if (Buffer.byteLength(frame) > MAX_FRAME_BYTES || this.socket.writableLength > this.bufferedByteLimit) {
 			this.usable = false; this.socket.destroy(); return false;
 		}
 		if (!terminal && this.socket.writableLength > NONTERMINAL_BUFFER_LIMIT_BYTES) {

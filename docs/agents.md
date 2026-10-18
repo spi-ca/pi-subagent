@@ -65,7 +65,7 @@ Pi `0.99.2` fork는 현재 branch의 raw entry를 보존한다. 초기/변경 sy
 
 ### 실행 중 direct parent에 짧게 보고하기
 
-지원되는 **`background: true` child**는 역할의 `tools`에 따로 명시하지 않아도 `report_to_parent`를 받습니다. 읽기 전용 allowlist에는 이 보고 도구만 추가하며 `subagent`·편집 도구·MCP·codemode를 자동으로 열지 않습니다. 도구 선택을 생략하면 Pi 기본/복원 도구를 그대로 두고 보고 도구만 보충합니다. 유효한 `--no-tools` 선택에는 추가하지 않으며, 역할의 명시적 도구 목록은 부모의 no-tools fallback보다 우선합니다.
+지원되는 **`background: true` child**는 역할의 `tools`에 따로 명시하지 않아도 `report_to_parent`를 받습니다. 보고 본문 `message`는 공백만이 아닌 최대 **4096 UTF-8 바이트**이며, 문자 수나 JSON escaping 후 크기가 아닌 본문 바이트 수로 제한합니다. 초과·공백 본문 오류는 실제/최대 바이트 수를 알리되 본문은 노출하지 않습니다. 읽기 전용 allowlist에는 이 보고 도구만 추가하며 `subagent`·편집 도구·MCP·codemode를 자동으로 열지 않습니다. 도구 선택을 생략하면 Pi 기본/복원 도구를 그대로 두고 보고 도구만 보충합니다. 유효한 `--no-tools` 선택에는 추가하지 않으며, 역할의 명시적 도구 목록은 부모의 no-tools fallback보다 우선합니다.
 
 Linux/macOS와 stable Pi `>=1.1.0`에서 단일·병렬·체인(병렬 단계 포함), inline·interactive, spawn·fork를 지원합니다. foreground에는 자동 추가하지 않습니다. 미지원 host/platform이나 인증 socket 준비 실패 시 자동 보고만 생략하고 작업은 계속합니다. 기존 방식으로 도구를 명시한 호출에는 호환성 오류가 반환될 수 있습니다. 알림에는 부모가 고정한 에이전트 이름과 leaf identity/위치가 표시됩니다. 부모→child steering은 별개이며 여전히 단일 background만 지원합니다. managed profile도 지원하며 `codemode`를 함께 선택하면 `tools.report_to_parent({message: "짧은 진행 상황"})`로 호출할 수 있습니다. ACK는 부모 알림 접수/제출이지 모델의 읽음·답변·승인이 아닙니다. 동기 답변을 기다리지 말고 맡은 작업을 계속하세요. 자세한 제한과 전달 시점은 [부모에게 보고하기](./usage.md#child에서-direct-parent에-보고하기)를 참고하세요.
 

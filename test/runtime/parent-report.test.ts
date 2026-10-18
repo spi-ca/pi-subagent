@@ -9,7 +9,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { ParentReportAdmission, isParentReportMessage, PARENT_REPORT_ENV, PARENT_REPORT_TOOL, PARENT_REPORT_RECEIPT_TYPE, prepareParentReportHandler, type ParentReportHandler, registerParentReportTool } from "../../src/runtime/parent-report";
+import { ParentReportAdmission, isParentReportMessage, MAX_PARENT_REPORT_MESSAGE_BYTES, PARENT_REPORT_ENV, PARENT_REPORT_TOOL, PARENT_REPORT_RECEIPT_TYPE, prepareParentReportHandler, type ParentReportHandler, registerParentReportTool } from "../../src/runtime/parent-report";
 import { LOCAL_MESSAGE_WAIT_CAPACITY, LifecycleEventClient, LifecycleEventServer, SUBAGENT_LIFECYCLE_SOCKET_PATH_ENV, SUBAGENT_LIFECYCLE_TOKEN_PATH_ENV, writeLifecycleBootstrapToken } from "../../src/runtime/lifecycle-socket";
 import { selectsParentReport, assertManagedChildToolCompatibility, collectManagedOverriddenBuiltinTools, buildPiArgs, buildInteractivePiArgs, runAgent } from "../../src/runtime/runner";
 import { createBackgroundJobRecord, getBackgroundJobSnapshot } from "../../src/core/subagent-config";
@@ -25,11 +25,11 @@ afterEach(async () => {
   for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
   Object.assign(process.env, saved);
 });
-async function fixture(handler?: ParentReportHandler, activate = true) {
+async function fixture(handler?: ParentReportHandler, activate = true, id = "report-child") {
   await fs.mkdir(path.join(process.cwd(), ".bun-tmp"), { recursive: true });
   const root = await fs.mkdtemp(path.join(process.cwd(), ".bun-tmp/report-unit-")); roots.push(root);
   const server = await LifecycleEventServer.start(); servers.push(server);
-  const id = "report-child", token = server.registerRun(id, true);
+  const token = server.registerRun(id, true);
   if (handler) server.setReportHandler(id, handler);
   if (activate) server.activateRun(id);
   const tokenPath = path.join(root, "lifecycle-token"), statePath = path.join(root, "state.json");
@@ -42,8 +42,12 @@ async function start(client: LifecycleEventClient, server: LifecycleEventServer,
 }
 
 test("strict UTF8 limits and bounded parent session admission wrap literal data; stale bindings and exceptions fail closed", () => {
-  for (const message of ["", " \n", "한".repeat(171), "a".repeat(513), null, 1]) assert.equal(isParentReportMessage(message), false);
-  assert.equal(isParentReportMessage("한".repeat(170) + "aa"), true);
+  assert.equal(MAX_PARENT_REPORT_MESSAGE_BYTES, 4096);
+  for (const message of ["", " \n", "한".repeat(1366), "a".repeat(4097), null, 1]) assert.equal(isParentReportMessage(message), false);
+  for (const message of ["a".repeat(4095), "a".repeat(4096), "한".repeat(1365), "한".repeat(1365) + "a",
+    "😀".repeat(1024), "\0".repeat(4096)]) assert.equal(isParentReportMessage(message), true);
+  assert.equal(isParentReportMessage("한".repeat(1365) + "aa"), false);
+  assert.equal(isParentReportMessage("😀".repeat(1024) + "a"), false);
   const sent: any[] = [];
   const manager = SessionManager.inMemory();
   const admission = new ParentReportAdmission({ sendMessage: (message, options) => { sent.push({ message, options }); },
@@ -84,8 +88,151 @@ test("tool registration requires consumed explicit eligibility, and rejects idle
   assert.equal(process.env[PARENT_REPORT_ENV], undefined);
   assert.equal(registerParentReportTool(pi as never, () => null, () => true), false); // no second registration
   await assert.rejects(tools[0].execute("id", { message: "secret" }, undefined, undefined, {}), /unsupported or unavailable/);
-  await assert.rejects(tools[0].execute("id", { message: "한".repeat(171) }, undefined, undefined, {}), /512 UTF-8/);
+  assert.equal(tools[0].parameters.properties.message.maxLength, undefined, "a character cap cannot describe a UTF-8 byte bound");
+  assert.match(tools[0].parameters.properties.message.description, /4096 UTF-8 bytes/);
+  for (const message of ["한".repeat(1365) + "aa", "a".repeat(4097), "", " \n"]) {
+    await assert.rejects(tools[0].execute("id", { message }, undefined, undefined, {}), (error: Error) => {
+      assert.equal(error.message, `Report must be nonblank; actual UTF-8 bytes: ${Buffer.byteLength(message)}; maximum: 4096.`);
+      return true;
+    });
+  }
 });
+
+test("report tool submits an exact-limit Korean body without a character maxLength", async () => {
+  const tools: any[] = [], received: string[] = [];
+  process.env[PARENT_REPORT_ENV] = "1";
+  const connection = { reportSupported: true, requestReport: async (message: string) => { received.push(message); return "submitted"; } };
+  assert.equal(registerParentReportTool({ registerTool: (tool: any) => tools.push(tool), on: () => {} } as never,
+    () => connection as never, () => true), true);
+  const message = "한".repeat(1365) + "a";
+  await tools[0].execute("id", { message }, undefined, undefined, {});
+  assert.deepEqual(received, [message]);
+});
+
+for (const [name, message] of [
+  ["ASCII", "a".repeat(4096)],
+  ["Korean", "한".repeat(1365) + "a"],
+  ["escaped controls", "\0".repeat(4096)],
+  ["quotes and backslashes", '"\\'.repeat(2048)],
+]) {
+  test(`exact 4096-byte ${name} report crosses the authenticated socket intact`, async () => {
+    const received: string[] = [];
+    const manager = SessionManager.inMemory();
+    const admission = new ParentReportAdmission({ sendMessage: message => { received.push(message.content as string); },
+      appendEntry: (type, data) => { manager.appendCustomEntry(type, data); } });
+    admission.reset(manager);
+    const f = await fixture(admission.bind(sender("max-body"), () => true), true, "r".repeat(128));
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+    await start(client, f.server, f.id);
+    const socket = (client as any).socket, write = socket.write;
+    let frameBytes = 0;
+    socket.write = function(frame: string) {
+      if (JSON.parse(frame).type !== "report") return write.call(this, frame);
+      frameBytes = Buffer.byteLength(frame);
+      if (name !== "escaped controls") return write.call(this, frame);
+      // A real socket write split above the old 4 KiB parser cap exercises
+      // bounded retention of a partial escaped report before its delimiter.
+      const written = write.call(this, frame.slice(0, 5000));
+      setTimeout(() => write.call(this, frame.slice(5000)), 10);
+      return written;
+    };
+    try {
+      assert.equal(Buffer.byteLength(message), MAX_PARENT_REPORT_MESSAGE_BYTES);
+      assert.equal(await client.requestReport(message + "a"), "unavailable");
+      assert.equal((client as any).reportCount, 0, "oversize validation consumes no send budget");
+      assert.equal(await client.requestReport(message), "submitted");
+      assert.equal(received.length, 1);
+      assert.equal(received[0].endsWith(JSON.stringify(message)), true);
+      assert.equal(f.server.isConnected(f.id), true);
+      assert.ok(frameBytes <= 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096);
+      if (name === "escaped controls") assert.ok(frameBytes > 16 * 1024, "worst escaping exceeds both old frame/write budgets");
+    } finally { socket.write = write; client.close(); }
+  });
+}
+
+test("authenticated report frame accepts its exact bounded line cap including envelope whitespace", async () => {
+  const received: string[] = [];
+  const f = await fixture(message => { received.push(message); return true; });
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  const socket = (client as any).socket, write = socket.write;
+  socket.write = function(frame: string) {
+    return write.call(this, frame.trimEnd().padEnd(6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096, " ") + "\n");
+  };
+  try {
+    assert.equal(await client.requestReport("exact frame cap"), "submitted");
+    assert.deepEqual(received, ["exact frame cap"]);
+  } finally { socket.write = write; client.close(); }
+});
+
+for (const invalid of ["report frame", "partial report frame", "non-report frame", "hello frame", "partial hello frame"] as const) {
+  test(`${invalid} exceeding its bounded byte cap closes without dispatch or body echo`, async () => {
+    let calls = 0;
+    const f = await fixture(() => { calls++; return true; });
+    const raw = net.createConnection({ path: f.server.socketPath });
+    let reply = ""; raw.on("data", chunk => { reply += chunk.toString(); });
+    await new Promise<void>(resolve => raw.once("connect", resolve));
+    const closed = new Promise<void>(resolve => raw.once("close", resolve));
+    const hello = JSON.stringify({ version: 1, type: "hello", runId: f.id, token: f.token, childPid: process.pid, sequence: 0, report: true });
+    if (invalid.includes("hello")) {
+      raw.write(invalid.startsWith("partial") ? " ".repeat(4097) : hello.padEnd(4097, " ") + "\n");
+    } else {
+      const ack = new Promise<void>(resolve => raw.once("data", () => resolve()));
+      raw.write(hello + "\n"); await ack;
+      const wake = f.server.waitForEvent(f.id, 1000);
+      raw.write(JSON.stringify({ version: 1, type: "agent-started", runId: f.id, sequence: 1 }) + "\n"); await wake;
+      const frameCap = 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096;
+      const report = JSON.stringify({ version: 1, type: "report", runId: f.id, sequence: 2, reportSequence: 1, message: "private-message" });
+      if (invalid === "report frame") raw.write(report.padEnd(frameCap + 1, " ") + "\n");
+      else if (invalid === "partial report frame") raw.write(report.padEnd(frameCap + 1, " "));
+      else raw.write(JSON.stringify({ version: 1, type: "heartbeat", runId: f.id, sequence: 2 }).padEnd(4097, " ") + "\n");
+    }
+    await closed;
+    assert.equal(calls, 0);
+    assert.equal(reply.includes("private-message"), false);
+    assert.equal(reply.includes(f.token), false);
+  });
+}
+
+test("a buffered worst-case escaped report preserves bounded backpressure, abort ACK and terminal headroom", async () => {
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(async () => { enter(); await blocked; return true; });
+  const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, true); assert.ok(client);
+  await start(client, f.server, f.id);
+  const socket = (client as any).socket;
+  const pending = client.requestReport("\0".repeat(4096));
+  await entered;
+  Object.defineProperty(socket, "writableLength", { configurable: true, get: () => 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096 });
+  try {
+    assert.equal(client.send("heartbeat"), false, "coalescible events retain their old low watermark");
+    client.setControlHandler(() => undefined);
+    const wake = f.server.waitForEvent(f.id, 1000);
+    assert.equal(f.server.requestAbort(f.id), true);
+    assert.equal(await pending, "unknown");
+    await wake;
+    assert.equal(f.server.isAbortAcknowledged(f.id), true);
+    assert.equal(socket.destroyed, false);
+    assert.equal(client.send("completion-ready"), true);
+    assert.equal(client.send("shutdown"), true);
+  } finally { release(); delete socket.writableLength; client.close(); }
+});
+
+for (const report of [false, true]) {
+  test(`${report ? "report-capable" : "ordinary"} client retains a hard bounded output buffer`, async () => {
+    const f = await fixture(report ? () => true : undefined);
+    const client = await LifecycleEventClient.connectFromEnvironment(f.env, f.statePath, false, report); assert.ok(client);
+    assert.equal(client.reportSupported, report);
+    const socket = (client as any).socket;
+    const limit = report ? 6 * MAX_PARENT_REPORT_MESSAGE_BYTES + 4096 + 16 * 1024 : 16 * 1024;
+    Object.defineProperty(socket, "writableLength", { configurable: true, get: () => limit + 1 });
+    try {
+      assert.equal(client.send("completion-ready"), false);
+      assert.equal(socket.destroyed, true, "terminal headroom is bounded too");
+    } finally { delete socket.writableLength; client.close(); }
+  });
+}
 
 test("managed selection admits only package-owned reporting and leaves default/allowlist/no-tools/codemode isolation intact", async () => {
   assert.equal(selectsParentReport({ tools: [PARENT_REPORT_TOOL] }, "read"), true);
@@ -415,7 +562,7 @@ for (const invalid of ["token", "run", "sequence", "reportSequence", "size", "du
     const hello = { version: 1, type: "hello", runId: f.id, token: invalid === "token" ? "a".repeat(43) : f.token, childPid: process.pid, sequence: 0, report: true };
     raw.write(JSON.stringify(hello) + "\n");
     raw.write(JSON.stringify({ version: 1, type: "agent-started", runId: f.id, sequence: 1 }) + "\n");
-    const frame: any = { version: 1, type: "report", runId: invalid === "run" ? "wrong-run" : f.id, sequence: invalid === "sequence" ? 3 : 2, reportSequence: invalid === "reportSequence" ? 2 : 1, message: invalid === "size" ? "한".repeat(171) : "private-message" };
+    const frame: any = { version: 1, type: "report", runId: invalid === "run" ? "wrong-run" : f.id, sequence: invalid === "sequence" ? 3 : 2, reportSequence: invalid === "reportSequence" ? 2 : 1, message: invalid === "size" ? "한".repeat(1365) + "aa" : "private-message" };
     if (invalid === "keys") frame.parentId = "attacker-selected-parent";
     raw.write(JSON.stringify(frame) + "\n");
     if (invalid === "duplicate") raw.write(JSON.stringify(frame) + "\n");

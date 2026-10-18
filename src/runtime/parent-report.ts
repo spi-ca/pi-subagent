@@ -6,6 +6,7 @@ import { isStableSemverAtLeast } from "./version-policy.mjs";
 
 export const PARENT_REPORT_ENV = "PI_SUBAGENT_PARENT_REPORT";
 export const PARENT_REPORT_TOOL = "report_to_parent";
+export const MAX_PARENT_REPORT_MESSAGE_BYTES = 4096;
 export const PARENT_REPORT_CUSTOM_TYPE = "pi-subagent-parent-report";
 /** V2 adds leaf attribution to V1's kind/version/jobId. Stored V1 messages
  * remain literal displayable content; no parser or migration is required.
@@ -40,7 +41,7 @@ export function formatParentReport(sender: ParentReportSender, message: string):
 
 export type ReportOutcome = "submitted" | "rejected" | "unavailable" | "busy" | "queue-full" | "limit" | "unknown";
 export function isParentReportMessage(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 512;
+  return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= MAX_PARENT_REPORT_MESSAGE_BYTES;
 }
 
 // Private custom entries: no report body, job data, messages, tokens or model context.
@@ -131,9 +132,13 @@ export function registerParentReportTool(
   pi.registerTool(PiHost.defineTool({
     name: PARENT_REPORT_TOOL, label: "Report to parent",
     description: "Queue one short untrusted report for this running background child's direct parent's next user- or custom-triggered run. This report never starts a model run itself. ACK is submission only, not a model read, reply, or approval. Never wait for a synchronous reply or retry an unknown delivery.",
-    parameters: Type.Object({ message: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false }),
+    parameters: Type.Object({ message: Type.String({ minLength: 1,
+      description: `Nonblank report body, at most ${MAX_PARENT_REPORT_MESSAGE_BYTES} UTF-8 bytes (not characters).`,
+    }) }, { additionalProperties: false }),
     async execute(_id, params, signal, _update, ctx) {
-      if (!isParentReportMessage(params.message)) throw new Error("Report must be nonblank and at most 512 UTF-8 bytes.");
+      if (!isParentReportMessage(params.message)) throw new Error(
+        `Report must be nonblank; actual UTF-8 bytes: ${Buffer.byteLength(params.message, "utf8")}; maximum: ${MAX_PARENT_REPORT_MESSAGE_BYTES}.`,
+      );
       const connection = client();
       if (signal?.aborted || !available(ctx) || !connection?.reportSupported) throw new Error("Direct-parent reporting is unsupported or unavailable for this run.");
       const outcome = await connection.requestReport(params.message, signal, () => available(ctx));

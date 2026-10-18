@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getProcessStartedAt, prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
 import { acceptanceAllocationCheckpointPath } from "./acceptance-allocation-checkpoint";
-import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, createBoundedPackageProbeEvents, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_COMMANDS, PACKAGE_REGISTRATION_EXPECTED_EVENTS, PACKAGE_REGISTRATION_EXPECTED_FLAGS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
+import { assertExactPackageRegistrationNames, assertFixtureRunReaped, awaitOwnedIdentityTermination, bindAcceptanceTmuxAllocation, createBoundedPackageProbeEvents, hasOverlappingCmuxIdentity, isIdentityStopped, PACKAGE_REGISTRATION_EXPECTED_COMMANDS, PACKAGE_REGISTRATION_EXPECTED_EVENTS, PACKAGE_REGISTRATION_EXPECTED_FLAGS, PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS, parseHarnessArgs, parseRequiredCmuxVersion, parseTmuxPanePairProbe, probeProcessState, reconcileFixtureBroker, requireDisjointAcceptanceCmuxWorkspace, requiredLiveGate, requireLiveGate, safeSignalFixture, safeResumeBroker, spawnFixture, terminateOwnedIdentity, terminateStoppedPreallocationBroker, type FixtureTracker, verifyFixtureTerminationState, verifyProcessIdentity } from "./live-harness";
 
 async function waitForStartedAt(pid: number): Promise<number> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -98,10 +98,13 @@ describe("live acceptance harness safety guards", () => {
     assertExactPackageRegistrationNames(lifecycle, PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event");
     assertExactPackageRegistrationNames(tools, ["subagent"], "tool");
     assertExactPackageRegistrationNames(commands, PACKAGE_REGISTRATION_EXPECTED_COMMANDS, "command");
-    assertExactPackageRegistrationNames(renderers, ["subagent_result"], "message renderer");
-    assert.throws(() => assertExactPackageRegistrationNames([...lifecycle, "tool_result"], PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /duplicate event/);
+    assertExactPackageRegistrationNames(renderers, PACKAGE_REGISTRATION_EXPECTED_MESSAGE_RENDERERS, "message renderer");
+    for (const event of ["tool_result", "agent_settled", "before_agent_start"]) {
+      assert.throws(() => assertExactPackageRegistrationNames([...lifecycle, event], PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /duplicate event/);
+      const missingOne = lifecycle.filter((_, index) => index !== lifecycle.indexOf(event));
+      assert.throws(() => assertExactPackageRegistrationNames(missingOne, PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /missing event/);
+    }
     assert.throws(() => assertExactPackageRegistrationNames([...lifecycle, "unknown"], PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /unexpected event/);
-    assert.throws(() => assertExactPackageRegistrationNames(lifecycle.filter((name) => name !== "agent_settled"), PACKAGE_REGISTRATION_EXPECTED_EVENTS, "event"), /missing event/);
   });
 
   test("keeps bounded dashboard events separate from lifecycle registrations", () => {

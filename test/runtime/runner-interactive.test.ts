@@ -633,14 +633,19 @@ describe("interactive pane runner preparation", () => {
 		const completion = { version: 2 as const, runId, status: "completed" as const, completedAt: 1 };
 		const handle = { mode: "herdr-pane" as const, native: { socketPath: "/tmp/herdr.sock", socketDev: "1", socketIno: "2", workspaceId: "workspace", tabId: "tab", paneId: "pane", terminalId: "terminal", allocatedTabId: "tab", protocol: 20 as const }, placement: { layout: "auto" as const, placement: "herdr-new-tab" as const } };
 		let inspections = 0, removals = 0;
+		let enteredCleanupBoundary!: () => void, releaseFailure!: () => void;
+		const cleanupBoundary = new Promise<void>((resolve) => { enteredCleanupBoundary = resolve; });
+		const failureRelease = new Promise<void>((resolve) => { releaseFailure = resolve; });
 		const originalRm = fs.promises.rm;
 		(fs.promises as { rm: typeof fs.promises.rm }).rm = async (target, options) => {
 			if (target === paths.runDir) {
 				removals += 1;
 				if (removals === 1) {
 					// Simulate recursive rm deleting its durable authority before its
-					// first failure is reported.
+					// first failure is reported, holding that boundary for assertions.
 					await originalRm(paths.completionPath, { force: true });
+					enteredCleanupBoundary();
+					await failureRelease;
 					throw Object.assign(new Error("planned partial cleanup failure"), { code: "EACCES" });
 				}
 			}
@@ -657,13 +662,15 @@ describe("interactive pane runner preparation", () => {
 			await fs.promises.writeFile(paths.taskPath, "sensitive\n", { mode: 0o600 });
 			assert.equal(registerCommittedInteractiveRun({ runId, backend, handle, paths, generation: getInteractiveShutdownGenerationForTest() }), true);
 			assert.equal(watchCompletedHerdrDirectRunForRetirementForTest(runId, completion), true);
-			await waitFor(() => removals === 1);
+			await cleanupBoundary;
 			assert.equal(fs.existsSync(paths.completionPath), false, "the first recursive cleanup failure removed durable authority");
 			assert.equal(listActiveInteractiveRunIds().includes(runId), true, "the committed cleanup is still draining");
+			releaseFailure();
 			await waitFor(() => !listActiveInteractiveRunIds().includes(runId));
 			assert.equal(removals, 2, "the finite in-operation retry completes without reopening authority");
 			assert.equal(inspections, 2, "post-commit retry never polls Herdr again");
 		} finally {
+			releaseFailure();
 			(fs.promises as { rm: typeof fs.promises.rm }).rm = originalRm;
 			unregisterCommittedInteractiveRun(runId, true);
 			await resetInteractiveShutdownForSession();

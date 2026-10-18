@@ -159,7 +159,7 @@ bun test test/integration/fake-adapter-runner.e2e.test.ts
 
 ## Pi 1.3 집중 회귀 검증
 
-설치된 Pi `1.3.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 nextTurn 소비와 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 서로 독립된 Bun process에서 실행하며, exact `1.3.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
+설치된 Pi `1.3.0`의 계약을 기준으로 user/custom 시작의 system prompt 유지, startup queue·취소, 부모 보고의 앱 소유 progress batch/native important commit reconciliation과 기존 steering boundary·settlement·MCP child 선택을 검증합니다. 아래 파일은 서로 독립된 Bun process에서 실행하며, exact `1.3.0` graph 설치 뒤 `bun run ci`를 대체하지는 않습니다. manifest pin 변경 시 lockfile 재생성과 설치를 순차적으로 완료한 뒤 전체 CI를 실행하세요.
 
 ```bash
 bun test --max-concurrency 1 test/runtime/child-bridge.test.ts
@@ -174,8 +174,13 @@ bun test --max-concurrency 1 test/integration/managed-codemode-host.test.ts
 bun test --max-concurrency 1 test/integration/session-tools-host.test.ts
 bun test --max-concurrency 1 test/integration/custom-turn-host.test.ts
 bun test --max-concurrency 1 test/integration/steering-boundary-host.test.ts
+bun test --max-concurrency 1 test/runtime/parent-report.test.ts
+bun test --max-concurrency 1 test/runtime/parent-report-attribution.test.ts
+bun test --max-concurrency 1 test/entrypoint/parent-report-fanout.test.ts
 bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 ```
+
+`parent-report.test.ts`는 4096 UTF-8 본문/실제 JSON escaping 예산, pending coalescing, 32개 초과 drain, 16개/64 KiB batch, handed-off snapshot의 commit 전 예산 유지와 injected clock의 client/server 독립 16회/30초 sliding window를 확인합니다. `parent-report-host.test.ts`는 production과 같은 `registerParentReportHooks()`를 사용해 user/custom 시작, 성공 turn 경계, 뒤 handler의 draft 교체, abort/error·시작 실패 후 자연스러운 복구, reload·branch·세션 교체와 native important의 idle/busy 전달을 검증합니다. progress는 `nextTurn`이나 continuation을 사용하지 않으며, 예전 lifetime ledger를 복구하지 않습니다. reset/close는 앱 pending/in-flight/status를 지우지만 이미 native 제출한 important를 철회하지 못합니다.
 
 이 범위는 실제 provider/MCP 연결 또는 live terminal acceptance를 실행하거나 증명하지 않습니다. 취소 event만으로 completion proof를 만들지 않는 동작과 기존 fence/lease/ownership 검증을 함께 유지합니다.
 

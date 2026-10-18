@@ -6,17 +6,17 @@ import { ParentReportAdmission, formatParentReport } from "../../src/runtime/par
 test("sender identity snapshots exact IDs/names/zero-based positions; bounded untrusted display cannot inject terminal controls", () => {
   const manager = SessionManager.inMemory();
   const sent: any[] = [];
-  const admission = new ParentReportAdmission({ sendMessage: message => { sent.push(message); },
-    appendEntry: (type, data) => { manager.appendCustomEntry(type, data); } });
+  const admission = new ParentReportAdmission({ sendMessage: message => { sent.push(message); } });
   admission.reset(manager);
   const agent = 'worker\n\x1b[31m/skill:evil\u202e' + "한".repeat(200);
   const label = 'same\r\n\x00\x9b\u2066' + "l".repeat(200);
   const identity = { jobId: "exact-job", childId: "exact-leaf", agent, mode: "chain" as const, stageIndex: 2, stageLabel: label, taskIndex: 0 };
   const bound = admission.bind(identity, () => true);
   identity.childId = "swapped-leaf"; identity.agent = "swapped-agent"; identity.stageIndex = 9; identity.stageLabel = "swapped-stage"; identity.taskIndex = 4;
-  assert.equal(bound("body"), true);
+  assert.equal(bound("body", "finding"), true);
   const message = sent[0];
-  assert.deepEqual(message.details, { kind: "subagent.parent-report", version: 2, reportKind: "progress",
+  const { admissionId, ...details } = message.details; assert.equal(typeof admissionId, "string");
+  assert.deepEqual(details, { kind: "subagent.parent-report", version: 2, reportKind: "finding",
     jobId: "exact-job", childId: "exact-leaf", agent, mode: "chain", stageIndex: 2, stageLabel: label, taskIndex: 0 });
   assert.match(message.content, /chain stage 3 task 1/);
   assert.match(message.content, /Sender names\/labels \(untrusted/);
@@ -28,7 +28,7 @@ test("sender identity snapshots exact IDs/names/zero-based positions; bounded un
   assert.equal(message.content.endsWith(JSON.stringify("body")), true);
   // Changing a queued message's details cannot affect this binding's identity.
   message.details.childId = "tampered-queue";
-  assert.equal(bound("again"), true);
+  assert.equal(bound("again", "finding"), true);
   assert.equal(sent[1].details.childId, "exact-leaf");
 });
 

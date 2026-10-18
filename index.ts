@@ -47,7 +47,7 @@ import { buildForkBranchSourceJsonl } from "./src/core/fork-session.js";
 import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/structured-result.js";
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
-import { ParentReportAdmission } from "./src/runtime/parent-report.js";
+import { ParentReportAdmission, registerParentReportHooks } from "./src/runtime/parent-report.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -716,6 +716,7 @@ export default function (pi: ExtensionAPI) {
     await foregroundPermitScopes.release(scope);
   const backgroundSessionFence = new BackgroundJobSessionFence();
   const parentReports = new ParentReportAdmission(pi);
+  registerParentReportHooks(pi, parentReports);
   const uxRegistry = new SubagentUxRegistry({ recentLimit: 20 });
   const reaperDiagnosticUx = new ReaperDiagnosticUx();
   let reaperDiagnosticGeneration = 0;

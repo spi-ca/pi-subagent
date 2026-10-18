@@ -471,9 +471,11 @@ describe("production dashboard boundary", () => {
       assert.equal(typeof rootHandlers.get("agent_settled"), "function");
       const childHandlers = register("1");
       assert.equal(childHandlers.has("agent_start"), false);
-      assert.equal(childHandlers.has("agent_settled"), false);
+      assert.equal(typeof childHandlers.get("agent_settled"), "function", "report commit reconciliation is not root-only presence");
 
       presenceLifecycleCalls.length = 0;
+      (childHandlers.get("agent_settled") as () => void)();
+      assert.deepEqual(presenceLifecycleCalls, [], "child report hooks do not publish presence");
       const settle = rootHandlers.get("agent_settled") as (event: unknown, ctx: { isIdle: () => boolean }) => void;
       let idleChecks = 0;
       settle({}, { isIdle: () => { idleChecks += 1; return false; } });

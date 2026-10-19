@@ -75,7 +75,7 @@ describe("tool-display preview configuration", () => {
     } as never).render(120);
     assert.match(lines.join("\n"), /row 80/);
     assert.doesNotMatch(lines.join("\n"), /row 81/);
-    assert.match(lines.join("\n"), /1 more line/);
+    assert.match(lines.join("\n"), /\[display clipped\]/);
   });
 
   test("reads only bounded regular JSON config files and defaults for absent, invalid, or symlinked input", async () => {

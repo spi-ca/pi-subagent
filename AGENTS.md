@@ -15,7 +15,8 @@ sequential chains, with explicit control over context handoff (`spawn` vs
 
 ## Runtime
 
-Use `bun` (see `packageManager` in `package.json`), not `npm`/`npx`.
+Use the latest stable `bun` satisfying `engines.bun` in `package.json`, not
+`npm`/`npx`.
 
 ```bash
 bun install --frozen-lockfile

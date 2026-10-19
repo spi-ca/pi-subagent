@@ -113,6 +113,31 @@ describe("release packaging and live acceptance workflow", () => {
     }
   });
 
+  test("declares a Bun minimum and selects latest stable in every CI and live lane", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    assert.equal(manifest.packageManager, undefined, "Bun must not be fixed to one package-manager release");
+    assert.equal(manifest.engines.bun, ">=1.4.2");
+    const minimumGate = `bun -e 'if (!Bun.semver.satisfies(Bun.version, ">=1.4.2")) throw new Error("Bun 1.4.2 or newer is required")'`;
+    for (const [filename, setupCount, versionCount] of [
+      ["ci.yml", 1, 9],
+      ["live-acceptance.yml", 2, 2],
+    ] as const) {
+      const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows", filename), "utf8");
+      const versions = [...workflow.matchAll(/^\s+bun-version: (.+)$/gm)].map((match) => match[1]);
+      assert.equal(versions.length, versionCount);
+      assert.ok(versions.every((version) => version === "latest" || version === "${{ matrix.bun-version }}"));
+      assert.equal([...workflow.matchAll(/- uses: oven-sh\/setup-bun@[^\n]+\n\s+id: bun\n/g)].length, setupCount);
+      assert.equal(workflow.split('test "$(bun --version)" = "${{ steps.bun.outputs.bun-version }}"').length - 1, setupCount);
+      assert.equal(workflow.split(minimumGate).length - 1, setupCount);
+      assert.ok(!workflow.includes('test "$(bun --version)" = "${{ matrix.bun-version }}"'));
+    }
+    const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
+    assert.equal([...workflow.matchAll(/bun-version: latest/g)].length, 8);
+    assert.match(workflow, /if: matrix\.pi-version == ''\n\s+run: bun install --frozen-lockfile/);
+    assert.match(workflow, /name: Install selected Pi compatibility graph\n\s+if: matrix\.pi-version != ''/);
+    assert.match(workflow, /bun install --no-save/);
+  });
+
   test("rejects malformed selected Pi graph input instead of falling back to the baseline", () => {
     assert.throws(() => selectedPiCoreDependencies("not-json"), /PI_GRAPH_EXPECTED must be a JSON package\/version map/);
     assert.throws(() => selectedPiCoreDependencies("{}"), /must provide an exact version for @earendil-works\/pi-agent-core/);

@@ -48,7 +48,7 @@ import { SubagentOutputSchema, withSubagentStructuredContent } from "./src/core/
 import { parseHerdrEnvironment } from "./src/core/herdr-environment.js";
 import { probeHerdrReadiness } from "./src/runtime/herdr.js";
 import { ParentReportAdmission, registerParentReportHooks, PARENT_REPORT_CUSTOM_TYPE } from "./src/runtime/parent-report.js";
-import { renderParentReport } from "./src/ui/parent-report-render.js";
+import { createParentReportRenderer } from "./src/ui/parent-report-render.js";
 import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
@@ -600,6 +600,7 @@ export default function (pi: ExtensionAPI) {
   // The registered wrapper stays stable while session_start swaps in the current
   // global tool-display preview budget (including after /reload).
   let backgroundResultRenderer = createBackgroundResultRenderer();
+  let parentReportRenderer = createParentReportRenderer();
   // Presentation only: these registries never enter tool details or session data.
   // Foreground cards and background widgets have isolated expansion state.
   const foregroundInlinePresentationRegistry = new InlinePresentationRegistry();
@@ -613,7 +614,9 @@ export default function (pi: ExtensionAPI) {
   };
   pi.registerToolRenderer((toolName, next) => toolName === "subagent" ? subagentRenderers : next());
   let clearInlinePresentationWidget: (() => void) | undefined;
-  pi.registerMessageRenderer(PARENT_REPORT_CUSTOM_TYPE, renderParentReport);
+  pi.registerMessageRenderer(PARENT_REPORT_CUSTOM_TYPE, (message, options, theme) =>
+    parentReportRenderer(message, options, theme),
+  );
   pi.registerMessageRenderer(BACKGROUND_RESULT_CUSTOM_TYPE, (message, options, theme) =>
     backgroundResultRenderer(message, options, theme),
   );
@@ -1119,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
     // The host rebuilds message components for replacement/reload. Do not let
     // an old card's local click state cross that session boundary.
     backgroundResultRenderer.reset();
+    parentReportRenderer.reset();
     resetInlinePresentationWidget();
     const toolDisplayPreviewLines = loadToolDisplayPreviewLines();
     // This preamble intentionally has no await. A replacement session must
@@ -1187,6 +1191,7 @@ export default function (pi: ExtensionAPI) {
     // This session-local renderer factory applies only the documented global
     // tool-display previewLines setting; expanded output keeps its fixed cap.
     backgroundResultRenderer = createBackgroundResultRenderer({ previewLines });
+    parentReportRenderer = createParentReportRenderer({ previewLines });
     limits = resolvedLimits;
     installInlinePresentationWidget(ctx);
     // Scheduler subscriptions publish immediately. Reset its queue before

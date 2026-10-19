@@ -187,7 +187,7 @@ describe("background result renderer", () => {
     assert.equal(lines.length, 10, "header, eight preview lines, and one expansion hint");
     assert.match(text, /row 8/);
     assert.doesNotMatch(text, /row 9/);
-    assert.match(text, /\.\.\. \(1 more line • Ctrl\+O to expand\)/);
+    assert.match(text, /\[display clipped\] · Ctrl\+O to expand/);
   });
 
   test("styles the complete compact hint as muted without nested key styling", () => {
@@ -198,27 +198,27 @@ describe("background result renderer", () => {
     } };
     rendered(message(Array.from({ length: 24 }, (_, i) => `row ${i}`).join("\n")), false, 120, 0, recordingTheme);
     assert.ok(calls.some(({ color, text }) => color === "muted"
-      && text === "... (16 more lines • Ctrl+O to expand)"));
+      && text === "[display clipped] · Ctrl+O to expand"));
   });
 
-  test("counts compact hidden source lines for byte, logical, and visual clipping", () => {
+  test("uses only the concise clipping marker for byte, logical, and visual clipping", () => {
     const byteClipped = rendered(message("x".repeat(8_000)), false, 120).join("\n");
-    assert.match(byteClipped, /\.\.\. \(1 more line • Ctrl\+O to expand\)/);
+    assert.match(byteClipped, /\[display clipped\] · Ctrl\+O to expand/);
 
     const logicalClipped = rendered(message(Array.from({ length: 80 }, (_, i) => `row ${i + 1}`).join("\n")), false, 120).join("\n");
-    assert.match(logicalClipped, /\.\.\. \(72 more lines • Ctrl\+O to expand\)/);
+    assert.match(logicalClipped, /\[display clipped\] · Ctrl\+O to expand/);
 
     const visualClipped = rendered(message(`${"x".repeat(4_096)}\nnext`), false, 20);
     assert.ok(visualClipped.length <= 96);
     assert.ok(visualClipped.every((line) => visibleWidth(line) <= 20));
-    assert.match(visualClipped.join(""), /\.\.\. \(2 more lines • Ctrl\+O to expand\)/);
+    assert.match(visualClipped.join(""), /\[display clipped\] · Ctrl\+O to expand/);
   });
 
   test("caps compact body visual rows separately from headings and footers", () => {
     const box = renderBackgroundResult(message("x".repeat(1_000)), { expanded: false, outputPad: 0 }, theme as never);
     const narrow = box.render(20);
     assert.equal(narrow.filter((line) => /^x/.test(line)).length, 8, "only the output body consumes the preview row budget");
-    assert.match(narrow.join(""), /1 more line/);
+    assert.match(narrow.join(""), /display clipped/);
     assert.ok(narrow.length <= 96);
     assert.ok(narrow.every((line) => visibleWidth(line) <= 20));
   });
@@ -292,7 +292,7 @@ describe("background result renderer", () => {
     const narrow = box.render(20);
     assert.ok(narrow.length <= 96);
     assert.ok(narrow.every((line) => visibleWidth(line) <= 20));
-    assert.match(narrow.join(""), /more lines/);
+    assert.match(narrow.join(""), /display clipped/);
     assert.notDeepEqual(narrow, box.render(120));
   });
 
@@ -388,7 +388,7 @@ describe("background result renderer", () => {
     assert.ok(Number.isSafeInteger(omittedBytes));
     const current = { kind: "subagent.background-result" as const, version: 1 as const, ...metadata, omittedBytes };
     const text = rendered(terminalMessage(output, current), true, 120).join("\n");
-    assert.match(text, /output clipped/);
+    assert.match(text, /display clipped/);
     assert.match(text, new RegExp(`\\.\\.\\. \\(${omittedBytes} B not retained\\)`));
     assert.doesNotMatch(text, /Producer untrusted notice:|Background output truncated:/);
   });
@@ -401,7 +401,7 @@ describe("background result renderer", () => {
     for (const notice of invalidNotices) {
       const text = rendered(message(`body\n\n${notice}`), true, 120).join("\n");
       assert.doesNotMatch(text, /Producer untrusted notice:|not retained/);
-      assert.match(text, /output clipped|9007199254740992/);
+      assert.match(text, /display clipped|9007199254740992/);
     }
   });
 
@@ -409,16 +409,16 @@ describe("background result renderer", () => {
     const lines = rendered(message("x".repeat(12_000)), true, 50);
     assert.ok(lines.length <= 96);
     assert.ok(lines.every((line) => visibleWidth(line) <= 50));
-    assert.match(lines.join("\n"), /output clipped/);
-    assert.equal((lines.join("\n").match(/output clipped/g) ?? []).length, 1);
+    assert.match(lines.join("\n"), /display clipped/);
+    assert.equal((lines.join("\n").match(/display clipped/g) ?? []).length, 1);
   });
 
   test("shows one retained-output hint when source and visual limits both clip", () => {
     const lines = rendered(message("x".repeat(20_000)), true, 80);
     const text = lines.join("\n");
-    assert.equal((text.match(/output clipped/g) ?? []).length, 1);
+    assert.equal((text.match(/display clipped/g) ?? []).length, 1);
     assert.ok(text.replace(/\s/g, "").includes(`/subagent-result${metadata.jobId}`));
-    assert.doesNotMatch(text, /\[display clipped\]|<job-id>|Use \/subagent-result/);
+    assert.doesNotMatch(text, /output clipped|<job-id>|Use \/subagent-result/);
     assert.ok(lines.length <= 96);
     assert.ok(lines.every((line) => visibleWidth(line) <= 80));
   });
@@ -470,7 +470,7 @@ describe("background result renderer", () => {
 
   test("truncates expanded Unicode output on UTF-8 boundaries", () => {
     const text = rendered(message("😀".repeat(5_000)), true, 120).join("\n");
-    assert.match(text, /output clipped/);
+    assert.match(text, /display clipped/);
     assert.match(text, /😀/);
     assertNoUnpairedSurrogates(text);
   });

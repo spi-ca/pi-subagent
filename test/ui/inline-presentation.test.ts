@@ -1,10 +1,10 @@
 import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
-import { ensureInlinePresentation } from "../../src/core/runner-events";
+import { ensureInlinePresentation, processPiEvent } from "../../src/core/runner-events";
 import { renderCall, renderResult } from "../../src/ui/render";
 import { ToolExecutionComponent } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
-import { InlinePresentationRegistry } from "../../src/ui/inline-presentation";
+import { InlinePresentationRegistry, INLINE_PRESENTATION_MAX_CARDS } from "../../src/ui/inline-presentation";
 import { InlinePresentationWidget } from "../../src/ui/inline-presentation-widget";
 import { Box, Container, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -54,7 +54,8 @@ describe("inline execution presentation", () => {
     const text = card(registry, value);
     assert.match(text, /▸ scout[\s\S]*scout completed/);
     assert.match(text, /▸ reviewer[\s\S]*review completed/);
-    assert.doesNotMatch(text, /task|arguments|tool output/i);
+    assert.match(text, /Task: scout task/);
+    assert.doesNotMatch(text, /arguments|tool output/i);
   });
 
   test("keeps the collapsed card to one preview line, then expands only from the header", () => {
@@ -76,7 +77,7 @@ describe("inline execution presentation", () => {
     assert.equal(mouse?.target.component, firstCard, "Pi 0.87 target-bearing handled response preserves nested dispatch");
     const expanded = first.render(160).join("\n");
     assert.match(expanded, /one\s+\ntwo\s+\nthree\s+\nfour/);
-    assert.match(expanded, /tool-0 · done/);
+    assert.match(expanded, /tool-0 · ✓ completed/);
   });
 
   nestedMouseTest("unpadded results and host duration preserve nested card expansion and error snapshots", () => {
@@ -147,7 +148,7 @@ describe("inline execution presentation", () => {
     const value = details([result("worker", fullOutput, [])]);
     value.results[0]!.messages = [{ role: "assistant", content: [{ type: "text", text: fullOutput }] }] as any;
     const rendered = component(registry, value, false) as any;
-    assert.match(rendered.render(8_000).join("\n"), /Response preview \(clipped\)/, "the in-memory snapshot remains explicitly bounded");
+    assert.match(rendered.render(8_000).join("\n"), /\[display clipped\]/, "the in-memory snapshot remains explicitly bounded");
     rendered.children[0].handleMouse({ type: "click", button: "left", y: 0 });
     const expanded = rendered.render(8_000).join("\n");
     assert.match(expanded, /tail marker/);
@@ -468,4 +469,82 @@ describe("inline execution presentation", () => {
     assert.equal(allRunning.get("terminal-arrival", [result("completed-arrival", "answer", [])], 0), undefined);
     assert.equal(allRunning.state("running", expandedRunning.identity, false).expanded, true, "discarding the arrival leaves retained card state intact");
   });
+});
+
+test("expanded authoritative results survive the 64-card cap and partial registry eviction", () => {
+  initTheme("dark", false);
+  for (const count of [65, 256]) {
+    const registry = new InlinePresentationRegistry();
+    const value = details(Array.from({ length: count }, (_, i) => {
+      const item = result(`agent-${i}`, "bounded snapshot", []);
+      item.messages = [{ role: "assistant", content: [{ type: "text", text: `authoritative-output-${i}-tail` }] }] as any;
+      return item;
+    }));
+    const before = JSON.stringify(value);
+    registry.capture("large", value, { retainAuthoritativeResults: true });
+    assert.equal(INLINE_PRESENTATION_MAX_CARDS, 64);
+    assert.equal(registry.all().length, 64);
+    const expanded = renderResult({ content: [], details: value }, true, theme, { toolCallId: "large" }, registry).render(160).join("\n");
+    for (let i = 0; i < count; i++) assert.ok(expanded.includes(`authoritative-output-${i}-tail`), `output ${i} of ${count}`);
+    assert.doesNotMatch(expanded, /results omitted/);
+    assert.equal(registry.all().length, 64, "expanded fallback never grows retention");
+    assert.equal(JSON.stringify(value), before);
+  }
+  const registry = new InlinePresentationRegistry();
+  const value = details(Array.from({ length: 3 }, (_, i) => {
+    const item = result(`original-${i}`, "snapshot", []);
+    item.messages = [{ role: "assistant", content: [{ type: "text", text: `original-output-${i}` }] }] as any;
+    return item;
+  }));
+  registry.capture("original", value);
+  registry.capture("active", details(Array.from({ length: 63 }, (_, i) => result(`active-${i}`, "working", [], { exitCode: -1 }))));
+  assert.equal(registry.all().filter(entry => entry.toolCallId === "original").length, 1);
+  const expanded = renderResult({ content: [], details: value }, true, theme, { toolCallId: "original" }, registry).render(160).join("\n");
+  for (let i = 0; i < 3; i++) assert.match(expanded, new RegExp(`original-output-${i}`));
+});
+
+test("scheduler placeholders remain pending in generic, registry and widget until real observer evidence", () => {
+  const registry = new InlinePresentationRegistry();
+  const placeholder = { ...result("not-dispatched", "", [], { exitCode: -1 }), agentSource: "unknown" as const };
+  const value = { ...details([]), mode: "parallel" as const, results: [placeholder] };
+  const before = JSON.stringify(value);
+  registry.capture("queued", value, { retainAuthoritativeResults: true });
+  assert.equal(registry.get("queued", value.results, 0)?.status, "pending");
+  const widget = new InlinePresentationWidget({ requestRender() {} }, registry, theme);
+  const render = (cards: boolean) => renderResult({ content: [], details: value }, false, theme, { toolCallId: "queued", isPartial: true }, cards ? registry : undefined).render(160).join("\n");
+  for (const output of [render(false), render(true), widget.render(160).join("\n")]) {
+    assert.match(output, /◷ pending/);
+    assert.doesNotMatch(output, /● running|✓ completed/);
+  }
+  assert.equal(registry.authoritativeMessages("queued", registry.get("queued", value.results, 0)!.identity), undefined);
+  // Empty WeakMap initialization and known agent source alone prove no child activity.
+  placeholder.agentSource = "user" as any;
+  assert.match(render(false), /◷ pending/);
+  placeholder.agentSource = "unknown";
+  assert.equal(processPiEvent({ type: "tool_execution_start", toolCallId: "observed", toolName: "read" }, placeholder, { presentation: ensureInlinePresentation(placeholder) }), true);
+  assert.equal(placeholder.messages.length, 0, "tool-only observer evidence need not create model-facing messages");
+  registry.capture("queued", value);
+  for (const output of [render(false), render(true), widget.render(160).join("\n")]) assert.match(output, /● running/);
+  assert.equal(JSON.stringify(value), before, "presentation evidence never changes serialized results");
+  widget.dispose();
+});
+
+test("fifth hidden pending, running or cancelled child remains counted in compact inline and retained summaries", () => {
+  for (const status of ["pending", "running", "cancelled"] as const) {
+    const hidden = result("hidden-child", status === "running" ? "observed work" : "", [], {
+      exitCode: status === "cancelled" ? 130 : -1,
+      ...(status === "cancelled" ? { stopReason: "aborted" } : {}),
+    });
+    const value = details([...Array.from({ length: 4 }, (_, i) => result(`visible-${i}`, "done", [])), hidden]);
+    const registry = new InlinePresentationRegistry();
+    registry.capture("hidden", value);
+    for (const payload of [{ content: [], details: value }, { content: [{ type: "text", text: "host error" }] }]) {
+      const rendered = renderResult(payload, false, theme, { toolCallId: "hidden", isPartial: true }, registry);
+      const text = rendered.render(160).join("\n");
+      assert.match(text, new RegExp(`1 ${status}`));
+      assert.doesNotMatch(text, /hidden-child/);
+      assert.ok(text.indexOf("visible-0") < text.indexOf("visible-3"));
+      for (const width of [1, 4, 40, 160]) assert.ok(rendered.render(width).length <= 16);
+    }
+  }
 });

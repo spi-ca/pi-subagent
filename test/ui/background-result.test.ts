@@ -56,7 +56,7 @@ describe("background result envelope parser", () => {
       const content = `Background subagent job ${details.jobId} ${status}.`;
       assert.deepEqual(parseBackgroundResultMessage({ content, details }), { metadata: details, output: "" });
     }
-    assert.match(rendered({ content: `Background subagent job ${metadata.jobId} completed.`, details: metadata }, false).join("\n"), /2s/);
+    assert.match(rendered({ content: `Background subagent job ${metadata.jobId} completed.`, details: metadata }, false).join("\n"), /2\.50s/);
   });
 
   test("labels empty completed and cancelled output without an omission or expand claim", () => {
@@ -171,7 +171,7 @@ describe("background result renderer", () => {
     const lines = rendered(message("  \u001b[31mFirst\u001b[0m meaningful line\nsecond"), false, 100, 2);
     const text = lines.join("\n");
     const normalized = text.replace(/\s+/g, " ");
-    assert.match(normalized, /completed · job 12345678-123… · 2s/);
+    assert.match(normalized, /job 12345678-123… · ✓ completed · Job elapsed: 2\.50s/);
     assert.match(normalized, /First meaningful line/);
     assert.match(normalized, /second/);
     assert.doesNotMatch(normalized, /Untrusted subagent output \(compact; limited\):|omitted in this view|to expand/);
@@ -242,9 +242,9 @@ describe("background result renderer", () => {
       type: "click",
       button: "left",
       x: 4,
-      y: 3,
+      y: 0,
       screenX: 24,
-      screenY: 13,
+      screenY: 10,
       width: 120,
       height: 10,
     }), {
@@ -461,9 +461,9 @@ describe("background result renderer", () => {
     const malformed = { content: `legacy\u0000\x1b[31m${"x".repeat(8_000)}`, details: { old: true } };
     const collapsed = rendered(malformed, false).join("\n");
     const expanded = rendered(malformed, true).join("\n");
-    assert.match(collapsed, /Untrusted message preview:/);
-    assert.match(collapsed, /Untrusted content is omitted in this view/);
-    assert.match(expanded, /Untrusted message content:/);
+    assert.match(collapsed, /Stored preview:/);
+    assert.match(collapsed, /Unrecognized envelope; details unavailable/);
+    assert.match(expanded, /Stored content \(unrecognized envelope\):/);
     assert.match(expanded, /\[display clipped\]/);
     assert.doesNotMatch(expanded, /\x1b\[31m|\u0000/);
   });

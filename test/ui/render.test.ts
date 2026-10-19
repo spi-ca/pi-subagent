@@ -85,8 +85,8 @@ test("chain call rendering uses canonical trimmed and generated labels", () => {
 		],
 	}, theme);
 	const text = component.render(160).join("\n");
-	assert.match(text, /step-1\(scout\)/);
-	assert.match(text, /plan\(planner\)/);
+	assert.match(text, /step-1 \(scout\)/);
+	assert.match(text, /plan \(planner\)/);
 	assert.doesNotMatch(text, / plan /);
 });
 
@@ -163,7 +163,7 @@ describe("background action rendering", () => {
 		};
 		const compact = renderResult({ content: [{ type: "text", text: "raw model content" }], details: accepted }, false, theme).render(160).join("\n").trimEnd();
 		const full = renderResult({ content: [{ type: "text", text: "raw model content" }], details: accepted }, true, theme).render(160).join("\n").trimEnd();
-		assert.match(compact, /accepted · job 12345678-123…/);
+		assert.match(compact, /job 12345678-123… · ◷ accepted/);
 		assert.doesNotMatch(compact, /running · job|raw model content/);
 		assert.match(full, new RegExp(jobId));
 
@@ -171,14 +171,14 @@ describe("background action rendering", () => {
 			kind: "subagent.background-job", version: 1, event: "cancellation-requested",
 			job: { jobId, status: "cancelling", startedAt: 1, omittedBytes: 0 },
 		};
-		assert.match(renderResult({ content: [{ type: "text", text: "raw" }], details: cancellation }, false, theme).render(160).join("\n"), /cancelling · job/);
+		assert.match(renderResult({ content: [{ type: "text", text: "raw" }], details: cancellation }, false, theme).render(160).join("\n"), /job .* · – cancelling \(requested\)/);
 
 		const failed = {
 			kind: "subagent.background-job", version: 1, event: "status",
 			job: { jobId, status: "failed", startedAt: 1, completedAt: 2, errorReason: "child failed", omittedBytes: 517 },
 		};
 		const failedText = renderResult({ content: [{ type: "text", text: "raw" }], details: failed }, false, theme).render(160).join("\n");
-		assert.match(failedText, /failed · job[\s\S]*child failed[\s\S]*517 B not retained/);
+		assert.match(failedText, /job .* · ✗ failed[\s\S]*child failed[\s\S]*517 B not retained/);
 
 		const listed = {
 			kind: "subagent.background-job", version: 1, event: "status-list",
@@ -188,7 +188,7 @@ describe("background action rendering", () => {
 			],
 		};
 		const listText = renderResult({ content: [{ type: "text", text: "raw" }], details: listed }, false, theme).render(160).join("\n");
-		assert.match(listText, /completed · job[\s\S]*failed · job[\s\S]*child failed[\s\S]*3 B not retained/);
+		assert.match(listText, /job .* · ✓ completed[\s\S]*job .* · ✗ failed[\s\S]*child failed[\s\S]*3 B not retained/);
 
 		const error = {
 			kind: "subagent.background-job", version: 1, event: "error", operation: "status", reason: "job was not found",
@@ -243,14 +243,14 @@ describe("background action rendering", () => {
 	test("rejects forged structured details and keeps the existing raw fallback", () => {
 		const forged = { kind: "subagent.background-job", version: 1, event: "accepted", job: { jobId: "wrong", status: "running", startedAt: 1, omittedBytes: 0 } };
 		const text = renderResult({ content: [{ type: "text", text: "existing fallback" }], details: forged }, false, theme).render(160).join("\n").trimEnd();
-		assert.equal(text, "existing fallback");
+		assert.equal(text, "Subagent · details unavailable\nexisting fallback");
 	});
 });
 
 describe("foreground expansion hints and restored fallbacks", () => {
 	test("uses the configured binding as one muted tool-display-style hint only when parallel expansion adds detail", () => {
 		const short = renderText(details("parallel", [result({ agent: "short", exitCode: 0 })]), false);
-		assert.doesNotMatch(short, /to expand/);
+		assert.match(short, /to expand/, "expanded metadata is available even with short output");
 
 		const calls: Array<{ color: string; text: string }> = [];
 		const recordingTheme = {
@@ -262,8 +262,8 @@ describe("foreground expansion hints and restored fallbacks", () => {
 		};
 		const longTask = result({ agent: "long", exitCode: 0, task: "x".repeat(73) });
 		const expanded = renderResult({ content: [], details: details("parallel", [longTask]) }, false, recordingTheme).render(160).join("\n");
-		assert.match(expanded, /\(Ctrl\+Shift\+X to expand\)/);
-		assert.ok(calls.some(({ color, text }) => color === "muted" && text === "(Ctrl+Shift+X to expand)"));
+		assert.match(expanded, /Ctrl\+Shift\+X to expand/);
+		assert.ok(calls.some(({ color, text }) => color === "muted" && text.includes("Ctrl+Shift+X to expand")));
 	});
 
 	test("falls back safely for malformed details without rendering wrappers, controls, or unbounded Unicode", () => {
@@ -272,7 +272,7 @@ describe("foreground expansion hints and restored fallbacks", () => {
 			content: [{ type: "text", text: raw }, { type: "text", text: "ignored after bounded source" }],
 			details: { mode: "parallel", results: "wrong type" },
 		} as any, false, theme);
-		const text = component.render(200).join("\n");
+		const text = component.render(200).join("\n").replace(/\x1b\[0m/g, "");
 		assert.match(text, /essential error:/);
 		assert.doesNotMatch(text, /\x1b|\u202e/);
 		assert.match(text, /display clipped/);
@@ -286,7 +286,7 @@ describe("foreground expansion hints and restored fallbacks", () => {
 		assert.doesNotMatch(wrapped, /Subagent output \(untrusted|JSON string/);
 
 		const absent = renderResult({ content: undefined, details: { results: [] } } as any, false, theme).render(160).join("\n").trimEnd();
-		assert.equal(absent, "(no output)");
+		assert.equal(absent, "Subagent · details unavailable\n(no output)");
 	});
 });
 
@@ -318,7 +318,7 @@ describe("parallel and chain usage rendering", () => {
 		}
 	});
 
-	test("keeps compact agent usage/model in collapsed running and terminal views", () => {
+	test("moves technical usage/model to expanded running and terminal views", () => {
 		const running = result({
 			agent: "model-only-agent",
 			exitCode: -1,
@@ -331,7 +331,9 @@ describe("parallel and chain usage rendering", () => {
 			usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 30, turns: 1 },
 		});
 
-		const runningText = renderText(details("parallel", [running, completed]), false);
+		const compact = renderText(details("parallel", [running, completed]), false);
+		assert.doesNotMatch(compact, /model-known-before-usage|ctx\(last\)|Total:/);
+		const runningText = renderText(details("parallel", [running, completed]), true);
 		assert.match(runningText, /model-only-agent[\s\S]*model-known-before-usage/);
 		assert.match(runningText, /completed-agent[\s\S]*1 turn ↑10 ↓20 ctx\(last\):30 model-completed/);
 		assert.equal(totalLine(runningText), "Total so far: 1 turn ↑10 ↓20");
@@ -339,7 +341,7 @@ describe("parallel and chain usage rendering", () => {
 		const terminalText = renderText(details("parallel", [
 			{ ...running, exitCode: 0 },
 			completed,
-		]), false);
+		]), true);
 		assert.match(terminalText, /model-only-agent[\s\S]*model-known-before-usage/);
 		assert.equal(totalLine(terminalText), "Total: 1 turn ↑10 ↓20");
 	});

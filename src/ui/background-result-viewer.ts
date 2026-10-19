@@ -1,3 +1,4 @@
+import { stateText, durationText } from "../core/ui-presentation.js";
 import { parseBackgroundResultMessage, type ParsedBackgroundResult } from "./background-result.js";
 
 const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
@@ -5,6 +6,8 @@ const BACKGROUND_RESULT_CUSTOM_TYPE = "subagent_result";
 export interface RetainedBackgroundResult {
   jobId: string;
   output: string;
+  status?: "completed" | "failed" | "cancelled";
+  elapsedMs?: number;
   /** Exact producer-derived bytes that could not be retained. */
   omittedBytes: number;
 }
@@ -41,6 +44,8 @@ export function selectRetainedBackgroundResult(entries: readonly unknown[], rawI
     });
     if (parsed) results.set(parsed.metadata.jobId, {
       jobId: parsed.metadata.jobId,
+      status: parsed.metadata.status,
+      elapsedMs: parsed.metadata.completedAt - parsed.metadata.startedAt,
       output: parsed.output,
       omittedBytes: "version" in parsed.metadata ? parsed.metadata.omittedBytes : 0,
     });
@@ -78,7 +83,7 @@ export async function showRetainedBackgroundResult(
   result: RetainedBackgroundResult,
   ui: { editor: (title: string, prefill?: string) => Promise<string | undefined> },
 ): Promise<void> {
-  const title = `Subagent result ${result.jobId} (retained display only; edits discarded)`;
+  const title = `job ${result.jobId}${result.status ? ` · ${stateText(result.status)}` : ""}${result.elapsedMs !== undefined ? ` · Job elapsed: ${durationText(result.elapsedMs)}` : ""} (retained display only; edits discarded)`;
   // Empty output with a producer omission count is a zero-retention record;
   // preserve that factual distinction from historical genuinely empty output.
   const prefill = result.output.length > 0

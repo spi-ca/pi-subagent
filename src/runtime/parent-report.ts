@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext, TurnEndEvent, TurnEndEventResult }
 import { Type } from "@earendil-works/pi-ai";
 import type { LifecycleEventClient } from "./lifecycle-socket.js";
 import { isStableSemverAtLeast } from "./version-policy.mjs";
+import { renderParentReportCall, renderParentReportResult } from "../ui/child-report-render.js";
 import { ParentReportMemo } from "./parent-report-memo.js";
 
 export const PARENT_REPORT_ENV = "PI_SUBAGENT_PARENT_REPORT";
@@ -219,10 +220,9 @@ export class ParentReportAdmission {
         if (kind === "progress") {
           if (replaced) this.pending[this.pending.indexOf(replaced)] = report;
           else this.pending.push(report);
-          const agent = displayReportName(identity.agent).slice(0, 96);
-          const child = displayReportName(identity.childId).slice(0, 64);
+          const agent = (identity.stageLabel ? `${displayReportName(identity.stageLabel)} (${displayReportName(identity.agent)})` : displayReportName(identity.agent)).slice(0, 128);
           const summary = displayReportName(message).slice(0, 192);
-          this.setStatus(`Progress (untrusted) ${agent} [${child}]: ${summary}`);
+          this.setStatus(`${agent} · progress report · ${summary}`);
         } else {
           // Charge before native handoff. A synchronous throw may occur after
           // enqueue; retain the charge until commit or generation reset.
@@ -288,6 +288,8 @@ export function registerParentReportTool(
       }),
       kind: Type.Optional(Type.Union([Type.Literal("progress"), Type.Literal("finding"), Type.Literal("question"), Type.Literal("blocked")])),
     }, { additionalProperties: false }),
+    renderCall: renderParentReportCall,
+    renderResult: renderParentReportResult,
     prepareArguments: prepareParentReportArguments,
     async execute(id, params, signal, _update, ctx) {
       const { message, kind = "progress" } = prepareParentReportArguments(params);

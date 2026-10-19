@@ -139,10 +139,13 @@ describe("SubagentUxRegistry", () => {
       [cancelled.id, "cancelled"],
     ]);
     const list = formatSubagentUxList([cancelled, completed, running, cancelling, failed].map((job) => registry.get(job.id)!));
-    assert.ok(list.indexOf(failed.id) < list.indexOf(cancelling.id));
-    assert.ok(list.indexOf(cancelling.id) < list.indexOf(running.id));
-    assert.ok(list.indexOf(running.id) < list.indexOf(completed.id));
-    assert.ok(list.indexOf(completed.id) < list.indexOf(cancelled.id));
+    assert.ok(list.indexOf("- failed") < list.indexOf("- cancelling"));
+    assert.ok(list.indexOf("- cancelling") < list.indexOf("- running"));
+    assert.ok(list.indexOf("- running") < list.indexOf("- completed"));
+    assert.match(list, /- cancelled · – cancelled/);
+    assert.doesNotMatch(list, /omitted/);
+    for (const job of [cancelled, completed, running, cancelling, failed]) assert.ok(list.includes(`id: ${job.id} ·`));
+    assert.match(list, /id: job-/, "explicit diagnostic lists expose exact command targets");
   });
 
   test("bounds recent history, emits immutable observer state, and fences a reset generation", () => {
@@ -198,16 +201,26 @@ describe("subagents command and status formatting", () => {
     const detail = formatSubagentUxDetail(job);
 
     for (const text of [compact, list, detail]) assert.doesNotMatch(text, /\x1b|\r|[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
-    assert.match(compact, /job-1 \[● running\] foreground agent/);
+    assert.match(compact, /agent · ● running · foreground/);
     assert.match(list, /^- /);
-    assert.match(detail, /^Subagent job-1/m);
-    assert.match(detail, /status: ● running/);
+    assert.match(detail, /^agent · ● running/m);
+    assert.match(detail, /id: job-1/);
     assert.equal(formatSubagentUxList([]), "No subagents.");
     assert.equal(
       formatSubagentUxFooter({ generation: 0, active: [job], recent: [] }, 3),
-      "subagents: ●1 ◷3 ◌0 ✓0 ✕0 –0",
+      "subagents: ●1 running · ◷3 queued",
     );
     assert.equal(formatSubagentUxFooter({ generation: 0, active: [], recent: [] }), undefined);
+    assert.equal(formatSubagentUxFooter({ generation: 0, active: [], recent: [] }, 2), "subagents: ◷2 queued");
+    for (const status of ["running", "cancelling", "completed", "failed", "cancelled"] as const) {
+      const footer = formatSubagentUxFooter({ generation: 0, active: [], recent: [{ ...job, status }] })!;
+      assert.ok(footer.endsWith(`1 ${status}`));
+      assert.doesNotMatch(footer, /0 (running|queued|cancelling|completed|failed|cancelled)/);
+    }
+    const many = Array.from({ length: 70 }, (_, i) => ({ ...job, id: `long-exact-id-${i}` }));
+    const listing = formatSubagentUxList(many);
+    assert.equal(listing.split("\n").length, 70);
+    for (const item of many) assert.ok(listing.includes(`id: ${item.id} ·`));
     assert.throws(() => formatSubagentUxFooter({ generation: 0, active: [], recent: [] }, -1), /schedulerQueued/);
     assert.equal(subagentUxTerminalNotification("failed"), "warning");
     for (const status of ["running", "cancelling", "completed", "cancelled"] as const) {

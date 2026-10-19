@@ -190,6 +190,22 @@ bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 
 `session-tools-host.test.ts`는 exact installed Pi `1.3.0`의 CLI parser와 native SDK/session manager를 연결해 raw fork snapshot과 재개 파일의 active tools를 검증합니다. 명시적 역할 allowlist가 복원보다 우선하고, 목록 생략 시 system tool delta·retain-none compaction checkpoint를 복원하며, `+/-`는 현재 host 기본값이 아닌 복원된 목록에 적용되는지 확인합니다. 빈 transcript loadout과 `--no-tools`, managed의 modifier 거부도 검사합니다. extension provenance로 수집한 `grep` override와 목록 생략 fork는 `runAgent`의 launch 이전 호환성 검사에서 거부하고, `grep` 없는 명시 목록과 spawn은 다음 shutdown fence까지 통과하는지 확인합니다. 복원 목록을 prelaunch에서 확정하지 않으므로 이 거부는 보수적이며 실제 목록에 override가 포함되는지 재해석하지 않습니다. project 내부 temporary workspace·agent/session 파일, in-memory 설정과 static model catalog를 사용하며 global 설정·credential 조회 및 network/provider 호출 없이 실행합니다. package/bridge extension 실행이나 실제 CLI subprocess·TUI acceptance를 증명하지는 않습니다.
 
+## Native UI 일관성 집중 회귀 검증
+
+다음 검사는 provider/live terminal 없이 실제 Pi TUI component로 호출 형태, inline/pane의 partial·최종·복원 결과, background 관리·자동 메시지, 보고 종류·batch, widget, child `report_to_parent` 표시를 확인합니다. 각 파일은 file-global mock 격리를 위해 별도 Bun process에서 실행합니다.
+
+```bash
+bun test --max-concurrency 1 test/ui/native-ui-consistency.test.ts
+bun test --max-concurrency 1 test/entrypoint/subagents-ui.test.ts
+bun test --max-concurrency 1 test/ui/render.test.ts
+bun test --max-concurrency 1 test/ui/inline-presentation.test.ts
+bun test --max-concurrency 1 test/ui/background-result.test.ts
+bun test --max-concurrency 1 test/ui/parent-report-render.test.ts
+bun test --max-concurrency 1 test/ui/background-result-viewer.test.ts
+```
+
+공통 4항목/16행 집계, 숨겨진 실패·누락 수, 한글·emoji·combining 문자와 1–160열 폭, 헤더-only 로컬 클릭·전역 펼침 전환·body 선택/scroll 비소유, dark/light 테마 재렌더링, partial의 execute 시간 생략, request/accepted/cancelling/submitted의 의미, legacy fallback·정화·원본 content/details 불변성을 검사합니다. `/subagents` 선택·details·취소 확인/알림과 기존 doctor 집중 테스트는 UI가 실행/취소/승인 권한을 만들지 않는지도 확인합니다. 이 범위는 실제 terminal 마우스/키 입력, provider 응답, live multiplexer acceptance 또는 전체 CI를 대신하지 않습니다. 필수 최종 gate는 여전히 `bun run ci`입니다.
+
 ## 개발 의존성
 
 클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.3.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.

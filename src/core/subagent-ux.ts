@@ -1,3 +1,4 @@
+import { durationText, stateText, STATE_STYLE } from "./ui-presentation.js";
 export type SubagentUxStatus = "running" | "cancelling" | "completed" | "failed" | "cancelled";
 export type SubagentUxKind = "foreground" | "background";
 
@@ -131,8 +132,8 @@ function freezeSnapshot(record: MutableSubagentUxRecord): SubagentUxSnapshot {
 }
 
 const STATUS_PRESENTATION: Readonly<Record<SubagentUxStatus, { readonly icon: string; readonly label: string; readonly attention: number }>> = Object.freeze({
-  failed: { icon: "✕", label: "failed", attention: 0 },
-  cancelling: { icon: "◌", label: "cancelling", attention: 1 },
+  failed: { icon: "✗", label: "failed", attention: 0 },
+  cancelling: { icon: "–", label: "cancelling", attention: 1 },
   running: { icon: "●", label: "running", attention: 2 },
   completed: { icon: "✓", label: "completed", attention: 3 },
   cancelled: { icon: "–", label: "cancelled", attention: 4 },
@@ -364,9 +365,9 @@ function validCommandId(id: string): boolean {
   return !UNSAFE_ID_CHARACTERS.test(id);
 }
 
-export function formatSubagentUxStatus(status: SubagentUxStatus): string {
-  const presentation = STATUS_PRESENTATION[status];
-  return `${presentation.icon} ${presentation.label}`;
+type StateFg = (color: "success" | "error" | "warning" | "accent" | "muted", text: string) => string;
+export function formatSubagentUxStatus(status: SubagentUxStatus, fg?: StateFg): string {
+  return fg ? fg(STATE_STYLE[status].color, stateText(status)) : stateText(status);
 }
 
 /** Success/cancellation are already visible through tool results, steer, and status. */
@@ -374,8 +375,8 @@ export function subagentUxTerminalNotification(status: SubagentUxStatus): "warni
   return status === "failed" ? "warning" : null;
 }
 
-export function formatSubagentUxCompactStatus(job: SubagentUxSnapshot): string {
-  return `${displayId(job.id)} [${formatSubagentUxStatus(job.status)}] ${job.kind} ${sanitizeSubagentAgentLabel(job.agent)}`;
+export function formatSubagentUxCompactStatus(job: SubagentUxSnapshot, fg?: StateFg): string {
+  return `${sanitizeSubagentAgentLabel(job.agent)} · ${formatSubagentUxStatus(job.status, fg)} · ${job.kind}${job.preview ? ` · ${sanitizeSubagentPreview(job.preview, 96)}` : ""}`;
 }
 
 /**
@@ -388,25 +389,31 @@ export function formatSubagentUxFooter(snapshot: SubagentUxRegistrySnapshot, sch
   const jobs = [...snapshot.active, ...snapshot.recent];
   const counts = (status: SubagentUxStatus) => jobs.filter((job) => job.status === status).length;
   if (jobs.length === 0 && schedulerQueued === 0) return undefined;
-  return `subagents: ●${counts("running")} ◷${schedulerQueued} ◌${counts("cancelling")} ✓${counts("completed")} ✕${counts("failed")} –${counts("cancelled")}`;
+  const parts: string[] = [];
+  for (const status of ["running", "cancelling", "completed", "failed", "cancelled"] as const) {
+    const count = counts(status);
+    if (count > 0) parts.push(`${STATE_STYLE[status].icon}${count} ${status}`);
+    if (status === "running" && schedulerQueued > 0) parts.push(`◷${schedulerQueued} queued`);
+  }
+  return `subagents: ${parts.join(" · ")}`;
 }
 
-export function formatSubagentUxList(jobs: Iterable<SubagentUxSnapshot>): string {
-  const entries = Array.from(jobs).sort(compareAttentionFirst).map((job) => {
-    const completed = job.completedAt === undefined ? "" : `, completed ${job.completedAt}`;
-    return `- ${formatSubagentUxCompactStatus(job)}, started ${job.startedAt}${completed}`;
-  });
+export function formatSubagentUxList(jobs: Iterable<SubagentUxSnapshot>, fg?: StateFg): string {
+  const all = Array.from(jobs).sort(compareAttentionFirst);
+  // Explicit diagnostic output is the escape hatch for the compact selector:
+  // every retained target needs its exact actionable ID, without a row cap.
+  const entries = all.map(job => `- ${formatSubagentUxCompactStatus(job, fg)} · id: ${displayId(job.id)} · ${durationText((job.completedAt ?? Date.now()) - job.startedAt)}`);
   return entries.length ? entries.join("\n") : "No subagents.";
 }
 
-export function formatSubagentUxDetail(job: SubagentUxSnapshot): string {
+export function formatSubagentUxDetail(job: SubagentUxSnapshot, fg?: StateFg): string {
   const lines = [
-    `Subagent ${displayId(job.id)}`,
-    `- status: ${formatSubagentUxStatus(job.status)}`,
+    `${sanitizeSubagentAgentLabel(job.agent)} · ${formatSubagentUxStatus(job.status, fg)}`,
+    `- id: ${displayId(job.id)}`,
     `- kind: ${job.kind}`,
     `- agent: ${sanitizeSubagentAgentLabel(job.agent)}`,
     `- startedAt: ${job.startedAt}`,
-    `- elapsedMs: ${Math.max(0, (job.completedAt ?? Date.now()) - job.startedAt)}`,
+    `- Job elapsed: ${durationText((job.completedAt ?? Date.now()) - job.startedAt)}`,
   ];
   if (job.completedAt !== undefined) lines.push(`- completedAt: ${job.completedAt}`);
   if (job.preview !== undefined) lines.push(`- preview: ${sanitizeSubagentPreview(job.preview, 256) ?? "unavailable"}`);

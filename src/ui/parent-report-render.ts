@@ -2,6 +2,7 @@ import {
   formatParentReport, isParentReportKind, isParentReportMessage, MAX_PARENT_REPORT_BATCH, MAX_PARENT_REPORT_MESSAGE_BYTES,
   type ParentReportKind, type ParentReportSender,
 } from "../runtime/parent-report.js";
+import { COMPACT_ITEM_LIMIT, COMPACT_ROW_LIMIT } from "./native-ui.js";
 import { configuredExpandHint } from "./expand-hint.js";
 import { createMessageDisplayRenderer, type MessageDisplayRendererOptions, type MessageDisplayTheme, type RenderMessage, type RenderLines } from "./custom-message-display.js";
 
@@ -100,7 +101,7 @@ function readableReports(details: unknown, content: unknown): ReadableReport[] |
 }
 function name(sender: Report, limit: number): string {
   const agent = safeText(sender.agent, limit);
-  if (sender.stageLabel !== undefined) return `${safeText(sender.stageLabel, limit)}(${agent})`;
+  if (sender.stageLabel !== undefined) return `${safeText(sender.stageLabel, limit)} (${agent})`;
   return agent;
 }
 
@@ -110,14 +111,13 @@ function buildRenderLines(message: RenderMessage, expanded: boolean, theme: Mess
   let title = "Subagent reports (legacy/unknown)";
   if (reports) {
     const first = reports[0]!.sender;
-    title = `${first.reportKind} ${reports.length === 1 ? "report" : "reports"} (${reports.length}) · ${name(first, 128)}`;
-    if (reports.length > 1) title += ` +${reports.length - 1}`;
-    else title += ` · job ${safeText(first.jobId, 12)}`;
+    title = `${name(first, 128)} · ${first.reportKind} ${reports.length === 1 ? "report" : `reports (${reports.length})`}`;
   }
-  const header = theme.fg(reports ? "accent" : "warning", theme.bold(title)) + theme.fg("dim", " · untrusted");
+  const kind = reports?.[0]?.sender.reportKind;
+  const header = theme.fg(!reports || kind === "blocked" || kind === "question" ? "warning" : "accent", theme.bold(title));
   let bodies: string;
   if (reports) {
-    bodies = reports.map(({ sender, body }) => {
+    bodies = (expanded ? reports : reports.slice(0, COMPACT_ITEM_LIMIT)).map(({ sender, body }) => {
       const attribution = reports.length > 1 ? `${sender.reportKind} · ${name(sender, 128)}\n` : "";
       return attribution + safeText(body, MAX_RENDER_CHARS, true);
     }).join("\n");
@@ -125,17 +125,22 @@ function buildRenderLines(message: RenderMessage, expanded: boolean, theme: Mess
     bodies = `Stored content (sender/body not verified)\n${safeText(storedContent(message.content), MAX_RENDER_CHARS - 1024, true)}`;
   }
   if (!expanded) {
+    const rowBudget = reports && reports.length > 1 ? Math.min(previewLines, COMPACT_ROW_LIMIT - 4) : previewLines;
     const bounded = bodies.slice(0, MAX_COMPACT_CHARS).replace(/\p{Surrogate}/gu, "�");
     const allLines = bounded.split("\n");
     return {
-      lines: [header, ...allLines.slice(0, previewLines).map(line => theme.fg("toolOutput", line))],
+      compactMaxRows: reports && reports.length > 1 ? COMPACT_ROW_LIMIT : undefined,
+      lines: [header, ...allLines.slice(0, rowBudget).map(line => theme.fg("toolOutput", line))],
       compactBody: {
-        firstLineIndex: 1, previewLines,
+        firstLineIndex: 1, previewLines: rowBudget,
         totalLines: bodies.split("\n").length,
         partialLastLine: bodies.length > bounded.length,
         formatNotice: () => theme.fg("muted", `[display clipped] · ${configuredExpandHint()}`),
       },
-      footers: [],
+      footers: [
+        ...(reports && reports.length > COMPACT_ITEM_LIMIT ? [{ text: theme.fg("muted", `… ${reports.length - COMPACT_ITEM_LIMIT} reports omitted`), compactText: "… reports omitted" }] : []),
+        { text: theme.fg("dim", "Report ≠ approval · submitted ≠ delivered/read"), compactText: "report ≠ approval" },
+      ],
     };
   }
 

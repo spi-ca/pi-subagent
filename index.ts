@@ -53,6 +53,8 @@ import { IncrementalResultSlots } from "./src/core/incremental-result-slots.js";
 import { MAX_SUBAGENT_TASKS, resolveSubagentLimits, resolveSubagentLimitsForSession, type SubagentLimits } from "./src/core/subagent-limits.js";
 import { SubagentUxRegistry, formatSubagentUxDetail, formatSubagentUxFooter, formatSubagentUxList, formatSubagentUxStatus, parseSubagentsCommand, subagentUxTerminalNotification } from "./src/core/subagent-ux.js";
 import { ReaperDiagnosticUx } from "./src/core/reaper-diagnostic-ux.js";
+import { durationText } from "./src/core/ui-presentation.js";
+import { oneLine } from "./src/ui/native-ui.js";
 import { renderCall, renderResult } from "./src/ui/render.js";
 import { InlinePresentationRegistry } from "./src/ui/inline-presentation.js";
 import { InlinePresentationWidget } from "./src/ui/inline-presentation-widget.js";
@@ -167,15 +169,6 @@ function formatInteractiveOwnershipForUx(ownership: InteractiveRunUxSnapshot["ow
 /** Detached surfaces are user-owned, so presence must not aggregate their work. */
 function listPresenceInteractiveRunSnapshots(): readonly InteractiveRunUxSnapshot[] {
   return listInteractiveRunUxSnapshots().filter((run) => run.ownership !== "detached");
-}
-
-function formatSubagentElapsedForUx(elapsedMs: number): string {
-  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m${seconds % 60}s`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h${minutes % 60}m`;
 }
 
 // CONFIG_DIR_NAME is public in current Pi hosts. Retain the documented default
@@ -820,7 +813,7 @@ export default function (pi: ExtensionAPI) {
           // bounded category, never Herdr identities or socket paths.
           const readiness = await probeHerdrReadiness();
           lines[3] = `herdr readiness: ${readiness.ready ? "ready" : `not-ready (${readiness.category})`}`;
-          ctx.ui.notify(lines.join("\n"), "info");
+          ctx.ui.notify(`Subagents · session-local diagnostics\n${lines.join("\n")}`, "info");
           return;
         }
         if (command.kind === "cancel") {
@@ -833,24 +826,24 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify(`Subagent ${command.id} is ${snapshot.status}.`, "warning");
             return;
           }
-          if (ctx.hasUI && !await ctx.ui.confirm("Cancel subagent?", `${snapshot.agent} (${snapshot.id})`)) return;
+          if (ctx.hasUI && !await ctx.ui.confirm("Cancel subagent?", `${snapshot.agent} · ${formatSubagentUxStatus(snapshot.status)}\n${snapshot.id}\nRequest cancellation; wait for terminal status to confirm it.`)) return;
           const cancelled = uxRegistry.cancel(command.id, snapshot.generation);
-          ctx.ui.notify(cancelled.changed ? `Cancelling subagent ${command.id}.` : `Subagent ${command.id} was not cancelled.`, cancelled.changed ? "info" : "warning");
+          ctx.ui.notify(cancelled.changed ? `Subagent ${command.id} · – cancelling (requested; not yet cancelled).` : `Subagent ${command.id} was not cancelled.`, cancelled.changed ? "info" : "warning");
           return;
         }
         if (command.kind === "details") {
           const invocation = uxRegistry.get(command.id);
-          if (invocation) { ctx.ui.notify(formatSubagentUxDetail(invocation), "info"); return; }
+          if (invocation) { ctx.ui.notify(formatSubagentUxDetail(invocation, ctx.ui.theme?.fg.bind(ctx.ui.theme)), "info"); return; }
           const run = await inspectInteractiveRunForUx(command.id);
           if (!run) { ctx.ui.notify(`Unknown interactive run id: ${command.id}`, "error"); return; }
           const elapsed = Math.max(0, Date.now() - run.startedAt);
           ctx.ui.notify([
-            `Interactive subagent ${run.runId}`,
-            `- agent: ${run.agent}`,
+            `${run.agent} · interactive · ${formatInteractiveOwnershipForUx(run.ownership)}`,
+            `- run: ${run.runId}`,
             `- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}`,
             `- ownership: ${run.ownership}`,
             `- depth: ${run.depth}`,
-            `- elapsedMs: ${elapsed}`,
+            `- Job elapsed: ${durationText(elapsed)}`,
             `- target: ${run.exists === undefined ? "unknown" : run.exists ? run.exited ? "exited" : "present" : "absent"}`,
             ...(run.herdr ? [`- herdr transport: ${run.herdr.transport}`, `- herdr target: ${run.herdr.target}`, `- herdr orphan-risk: ${run.herdr.orphanRisk}`] : []),
             `- focus: ${run.focusSupported ? "supported" : "unsupported"}`,
@@ -902,26 +895,26 @@ export default function (pi: ExtensionAPI) {
         if (rawArgs.trim() === "" && commandMode === "tui" && jobs.length + interactive.length > 0) {
           const jobAttention: Record<(typeof jobs)[number]["status"], number> = { failed: 0, cancelling: 1, running: 2, completed: 3, cancelled: 4 };
           const entries = [
-            ...jobs.map((job) => ({
+            ...jobs.map((job, index) => ({
               rank: jobAttention[job.status], startedAt: job.startedAt, id: job.id,
-              label: `${job.agent} · ${formatSubagentUxStatus(job.status)} · ${formatSubagentElapsedForUx((job.completedAt ?? Date.now()) - job.startedAt)} · ${job.id}${job.preview ? ` · ${job.preview}` : ""}`,
-              detail: formatSubagentUxDetail(job), focusRunId: undefined as string | undefined,
+              label: `${index + 1}. ${job.agent} · ${formatSubagentUxStatus(job.status, ctx.ui.theme?.fg.bind(ctx.ui.theme))}${job.preview ? ` · ${oneLine(job.preview, 96)}` : ""}`,
+              detail: formatSubagentUxDetail(job, ctx.ui.theme?.fg.bind(ctx.ui.theme)), focusRunId: undefined as string | undefined,
             })),
-            ...interactive.map((run) => ({
+            ...interactive.map((run, index) => ({
               rank: INTERACTIVE_OWNERSHIP_PRESENTATION[run.ownership].attention, startedAt: run.startedAt, id: run.runId,
-              label: `${run.agent} · interactive/${formatInteractiveOwnershipForUx(run.ownership)} · d${run.depth} · ${formatSubagentElapsedForUx(Date.now() - run.startedAt)} · ${run.runId}${run.herdr ? ` · herdr ${run.herdr.transport}/${run.herdr.target}` : ""}${run.preview ? ` · ${run.preview}` : ""}`,
+              label: `${jobs.length + index + 1}. ${run.agent} · ${formatInteractiveOwnershipForUx(run.ownership)} · interactive${run.preview ? ` · ${oneLine(run.preview, 96)}` : ""}`,
               detail: `Interactive ${run.runId}\n- backend: ${run.backend}${run.placement ? `/${run.placement}` : ""}\n- depth: ${run.depth}${run.herdr ? `\n- herdr transport: ${run.herdr.transport}\n- herdr target: ${run.herdr.target}\n- herdr orphan-risk: ${run.herdr.orphanRisk}` : ""}${run.preview ? `\n- preview: ${run.preview}` : ""}\nUse /subagents details ${run.runId} for an exact live diagnostic.`,
               focusRunId: run.runId,
             })),
           ].sort((left, right) => left.rank - right.rank || left.startedAt - right.startedAt || left.id.localeCompare(right.id)).slice(0, SUBAGENT_UX_SELECTOR_LIMIT);
-          const selected = await ctx.ui.select("Subagents", entries.map((entry) => entry.label));
+          const selected = await ctx.ui.select(`Subagents${jobs.length + interactive.length > SUBAGENT_UX_SELECTOR_LIMIT ? ` (${jobs.length + interactive.length - SUBAGENT_UX_SELECTOR_LIMIT} omitted)` : ""}`, entries.map((entry) => entry.label));
           const entry = entries.find((candidate) => candidate.label === selected);
           if (entry?.focusRunId && await focusInteractiveRun(entry.focusRunId)) return;
           if (entry) ctx.ui.notify(entry.detail, "info");
           return;
         }
-        const invocationText = formatSubagentUxList(jobs);
-        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.runId} [${formatInteractiveOwnershipForUx(run.ownership)}] interactive ${run.backend}${run.placement ? `/${run.placement}` : ""} ${run.agent}${run.herdr ? ` · herdr ${run.herdr.transport}/${run.herdr.target} orphan-risk:${run.herdr.orphanRisk}` : ""}${run.preview ? ` — ${run.preview}` : ""}`).join("\n") : "No interactive surfaces.";
+        const invocationText = formatSubagentUxList(jobs, ctx.ui.theme?.fg.bind(ctx.ui.theme));
+        const interactiveText = interactive.length ? interactive.map((run) => `- ${run.agent} · ${formatInteractiveOwnershipForUx(run.ownership)} · interactive · id: ${run.runId}${run.preview ? ` · ${oneLine(run.preview)}` : ""}`).join("\n") : "No interactive surfaces.";
         ctx.ui.notify(`${invocationText}\n${interactiveText}`, "info");
       },
     });
@@ -1217,7 +1210,7 @@ export default function (pi: ExtensionAPI) {
               notifiedTerminalIds.delete(oldest);
             }
             try {
-              ctx.ui.notify(`Subagent ${item.agent} (${item.id}) failed.`, notification);
+              ctx.ui.notify(`${item.agent} · ✗ failed · /subagents details ${item.id}`, notification);
             } catch { /* Pi TUI notifications are non-authoritative. */ }
           }
         }

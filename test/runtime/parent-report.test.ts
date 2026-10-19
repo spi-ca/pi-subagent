@@ -883,7 +883,7 @@ test("kind-aware admission routes important reports and updates only a bounded s
   assert.equal(sent.length, 3, "progress never uses native queue");
   const [key, status] = statuses.at(-1)!;
   assert.equal(key, "pi-subagent-reports"); assert.ok(status && status.length < 400);
-  assert.match(status, /Progress \(untrusted\)/); assert.match(status, /leaf-job/);
+  assert.match(status, /· progress report ·/); assert.doesNotMatch(status, /leaf-job|untrusted/);
   assert.equal(/[\x00-\x1f\x7f-\x9f\u202e\u2066]/u.test(status), false);
   assert.equal(notifications, 0);
   assert.equal(submit("secret", "bad" as never), false);

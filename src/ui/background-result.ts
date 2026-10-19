@@ -1,4 +1,5 @@
 import { MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES } from "../core/subagent-limits.js";
+import { durationText, stateText } from "./native-ui.js";
 import { configuredExpandHint } from "./expand-hint.js";
 import { createMessageDisplayRenderer, type MessageDisplayRenderer, type MessageDisplayRendererOptions, type MessageDisplayTheme, type RenderMessage, type RenderLines, type RenderFooter } from "./custom-message-display.js";
 
@@ -224,13 +225,7 @@ function firstMeaningfulLine(text: string): string | undefined {
 }
 
 function formatDuration(startedAt: number, completedAt: number): string {
-  const milliseconds = Math.max(0, completedAt - startedAt);
-  if (milliseconds < 1_000) return `${milliseconds}ms`;
-  const seconds = Math.floor(milliseconds / 1_000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+  return durationText(completedAt - startedAt);
 }
 
 function compactJobId(jobId: string): string {
@@ -264,7 +259,7 @@ function expandedLines(
     compactText: "…",
   });
   if (omittedBytes > 0) {
-    footers.push({ text: theme.fg("muted", `... (${omittedBytes} B not retained)`), compactText: "…" });
+    footers.push({ text: theme.fg("warning", `... (${omittedBytes} B not retained)`), compactText: "…" });
   }
   return { hasClippingFooter: display.clipped, clippingHint, lines: [heading, ...(label === undefined ? [] : [theme.fg("muted", label)]), ...display.lines.map((line) => theme.fg("dim", line))], footers };
 }
@@ -284,7 +279,7 @@ function compactLines(
   const partialLastLine = display.clipped && sanitizedBody.startsWith(shownBody)
     && sanitizedBody.length > shownBody.length && sanitizedBody[shownBody.length] !== "\n";
   const footers: RenderFooter[] = omittedBytes > 0
-    ? [{ text: theme.fg("muted", `... (${omittedBytes} B not retained)`), compactText: "…" }]
+    ? [{ text: theme.fg("warning", `... (${omittedBytes} B not retained)`), compactText: "…" }]
     : [];
   return {
     lines: [heading, ...display.lines.map((line) => theme.fg("toolOutput", line))],
@@ -309,13 +304,13 @@ function buildRenderLines(
     const display = expanded ? fallbackDisplay(message) : undefined;
     const preview = expanded ? undefined : firstMeaningfulLine(readBoundedContent(message.content, MAX_PREVIEW_SOURCE_CODE_UNITS).text);
     return expanded
-      ? expandedLines(heading, "Untrusted message content:", display!, theme)
+      ? expandedLines(heading, "Stored content (unrecognized envelope):", display!, theme)
       : {
         lines: [
           heading,
-          theme.fg("muted", "Untrusted message preview:"),
+          theme.fg("muted", "Stored preview:"),
           theme.fg("dim", preview ?? "(no preview)"),
-          theme.fg("muted", `Untrusted content is omitted in this view (${expandHint}).`),
+          theme.fg("muted", `Unrecognized envelope; details unavailable (${expandHint}).`),
         ],
         footers: [],
       };
@@ -328,7 +323,7 @@ function buildRenderLines(
   const omittedBytes = "version" in metadata ? metadata.omittedBytes : 0;
   const header = theme.fg(
     statusColor(metadata.status),
-    theme.bold(`${metadata.status} · job ${expanded ? metadata.jobId : compactJobId(metadata.jobId)} · ${formatDuration(metadata.startedAt, metadata.completedAt)}`),
+    theme.bold(`job ${expanded ? metadata.jobId : compactJobId(metadata.jobId)} · ${stateText(metadata.status)} · Job elapsed: ${formatDuration(metadata.startedAt, metadata.completedAt)}`),
   );
   return currentOutput.body === ""
     ? {
@@ -337,7 +332,7 @@ function buildRenderLines(
         theme.fg("dim", "(no output)"),
       ],
       footers: omittedBytes > 0
-        ? [{ text: theme.fg("muted", `... (${omittedBytes} B not retained)`), compactText: "…" }]
+        ? [{ text: theme.fg("warning", `... (${omittedBytes} B not retained)`), compactText: "…" }]
         : [],
     }
     : expanded

@@ -182,7 +182,7 @@ for (const active of [false, true]) for (const codemode of [false, true]) for (c
       assert.equal(parent.requests.length, active ? 1 : 0); // zero extra parent streams
       const progressStatuses = parent.statuses.filter(([key, text]) => key === "pi-subagent-reports" && text !== undefined);
       assert.equal(progressStatuses.length, identities.length, "progress UI is immediate, not deferred until model consumption");
-      assert.ok(progressStatuses.every(([, text]) => text!.length < 400 && /Progress \(untrusted\)/.test(text!)));
+      assert.ok(progressStatuses.every(([, text]) => text!.length < 400 && /· progress report ·/.test(text!)));
       assert.deepEqual(parent.notifications, [], "no notify spam");
       resume.release(); await parentRun;
       assert.equal(parent.requests.length, active ? 1 : 0);

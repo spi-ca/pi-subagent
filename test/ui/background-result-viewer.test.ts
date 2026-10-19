@@ -62,7 +62,7 @@ describe("retained background result viewer", () => {
       const selected = selectRetainedBackgroundResult(entries, jobId);
       assert.deepEqual(selected, {
         kind: "selected",
-        result: { jobId, output: "\n\n[Background output truncated: 2 bytes omitted.]", omittedBytes: 2 },
+        result: { jobId, output: "\n\n[Background output truncated: 2 bytes omitted.]", omittedBytes: 2, status: jobId === firstId ? "completed" : "failed", elapsedMs: jobId === firstId ? 1 : error.completedAt! - error.startedAt },
       });
       if (selected.kind !== "selected") throw new Error("expected the suffix-only result");
       let prefill: string | undefined;
@@ -74,7 +74,7 @@ describe("retained background result viewer", () => {
     }
 
     const selected = selectRetainedBackgroundResult(entries, zeroId);
-    assert.deepEqual(selected, { kind: "selected", result: { jobId: zeroId, output: "", omittedBytes: 2 } });
+    assert.deepEqual(selected, { kind: "selected", result: { jobId: zeroId, output: "", omittedBytes: 2, status: "completed", elapsedMs: 1 } });
     if (selected.kind !== "selected") throw new Error("expected the zero-retention result");
     let prefill: string | undefined;
     await showRetainedBackgroundResult(selected.result, { editor: async (_title, value) => {
@@ -92,7 +92,7 @@ describe("retained background result viewer", () => {
       { type: "custom_message", customType: "other", content: "ignored", details: {} },
       entry(firstId, "newest"),
     ], firstId.slice(0, 16));
-    assert.deepEqual(selection, { kind: "selected", result: { jobId: firstId, output: "newest", omittedBytes: 0 } });
+    assert.deepEqual(selection, { kind: "selected", result: { jobId: firstId, output: "newest", omittedBytes: 0, status: "completed", elapsedMs: 1 } });
   });
 
   test("gives useful empty, unknown, and ambiguous-ID outcomes", () => {
@@ -142,7 +142,7 @@ describe("retained background result viewer", () => {
     assert.match(calls[0]!.prefill ?? "", /link/);
     assert.match(calls[0]!.prefill ?? "", /\[Background output truncated: 4 bytes omitted\.\]/);
     assert.doesNotMatch(calls[0]!.prefill ?? "", /\x1b/);
-    assert.equal(calls[1]!.title, `Subagent result ${secondId} (retained display only; edits discarded)`);
+    assert.equal(calls[1]!.title, `job ${secondId} (retained display only; edits discarded)`);
     assert.equal(calls[1]!.prefill, "No text to display.");
 
     await showRetainedBackgroundResult({ jobId: firstId, output: "", omittedBytes: 2 }, {

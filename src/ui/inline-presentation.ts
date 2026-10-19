@@ -19,8 +19,12 @@ export interface InlineCardPresentation {
   lastAssistantText: string;
   lastAssistantTextClipped: boolean;
   activities: InlineActivityPresentation[];
-  status: "running" | "completed" | "cancelled" | "failed";
+  status: "pending" | "running" | "completed" | "cancelled" | "failed";
   error?: string;
+  task?: string;
+  taskClipped?: boolean;
+  usage?: string;
+  diagnostics?: string;
 }
 
 export interface InlineCardState {
@@ -35,6 +39,11 @@ type InlineResultLike = {
   stopReason?: unknown;
   errorMessage?: unknown;
   messages?: unknown;
+  task?: unknown;
+  model?: unknown;
+  usage?: unknown;
+  agentSource?: unknown;
+  stderr?: unknown;
 };
 
 type InlineDetailsLike = { terminalMode?: unknown; results?: unknown };
@@ -91,10 +100,24 @@ function resultIdentity(results: unknown[], index: number): { identity: string; 
   return { identity: `${stageLabel ?? ""}\u0000${agent}\u0000${ordinal}`, agent, ordinal, ...(stageLabel ? { stageLabel } : {}) };
 }
 
-function terminalStatus(candidate: InlineResultLike): InlineCardPresentation["status"] {
+/** Display-only evidence; -1 alone includes pre-dispatch scheduler placeholders. */
+export function resultDisplayStatus(candidate: InlineResultLike): InlineCardPresentation["status"] {
   if (candidate.stopReason === "aborted") return "cancelled";
-  if (candidate.exitCode === -1) return "running";
+  if (candidate.exitCode === -1) {
+    const observed = getInlinePresentation(candidate);
+    const hasMessages = Array.isArray(candidate.messages) && candidate.messages.length > 0;
+    const hasActivity = observed && (observed.revision > 0 || observed.lastAssistantText || observed.activities.length > 0);
+    return hasMessages || hasActivity ? "running" : "pending";
+  }
   return candidate.exitCode === 0 && candidate.stopReason !== "error" ? "completed" : "failed";
+}
+
+/** Nonzero attention-state counts, including children hidden by compact limits. */
+export function inlineStateCounts(states: readonly InlineCardPresentation["status"][]): string {
+  return (["failed", "pending", "running", "cancelled"] as const).flatMap(status => {
+    const count = states.filter(state => state === status).length;
+    return count > 0 ? [`${count} ${status}`] : [];
+  }).join(" · ") || "0 failed";
 }
 
 /**
@@ -142,13 +165,18 @@ export class InlinePresentationRegistry {
           return [{ name: truncateUtf8(sanitizeTerminalText(activity.name), 128) || "tool", status: status as InlineActivityPresentation["status"] }];
         })
         : [];
-      const error = terminalStatus(result) === "failed" || terminalStatus(result) === "cancelled"
-        ? safeLabel(result.errorMessage, terminalStatus(result) === "cancelled" ? "cancelled" : "failed")
+      const status = resultDisplayStatus(result);
+      const error = status === "failed" || status === "cancelled"
+        ? safeLabel(result.errorMessage, status === "cancelled" ? "cancelled" : "failed")
         : undefined;
       const assistantSnapshot = typeof presentation?.lastAssistantText === "string"
         ? truncateUtf8WithStatus(sanitizeTerminalText(presentation.lastAssistantText), MAX_ASSISTANT_BYTES)
         : { text: "", clipped: false };
-      const status = terminalStatus(result);
+      const taskSnapshot = typeof result.task === "string" ? truncateUtf8WithStatus(sanitizeTerminalText(result.task), MAX_ASSISTANT_BYTES) : undefined;
+      const usage = result.usage && typeof result.usage === "object" ? result.usage as Record<string, unknown> : {};
+      const usageText = ["turns", "input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens"]
+        .filter(key => typeof usage[key] === "number" && Number.isFinite(usage[key]) && usage[key] !== 0)
+        .map(key => `${key}: ${usage[key]}`).join(" · ");
       cards.set(identity.identity, {
         ...identity,
         lastAssistantText: assistantSnapshot.text,
@@ -157,9 +185,12 @@ export class InlinePresentationRegistry {
         lastAssistantTextClipped: assistantSnapshot.clipped || presentation?.lastAssistantTextClipped === true,
         activities,
         status,
+        ...(taskSnapshot ? { task: taskSnapshot.text, taskClipped: taskSnapshot.clipped } : {}),
+        ...(usageText ? { usage: usageText } : {}),
+        diagnostics: [result.agentSource, result.model].filter(value => typeof value === "string").map(value => safeLabel(value, "unknown")).join(" · "),
         ...(error ? { error } : {}),
       });
-      if (options.retainAuthoritativeResults === true && status !== "running") terminalResults.set(identity.identity, result);
+      if (options.retainAuthoritativeResults === true && status !== "running" && status !== "pending") terminalResults.set(identity.identity, result);
     }
     if (cards.size === 0) return false;
     this.replaceInvocation(toolCallId, cards, terminalResults);
@@ -179,6 +210,12 @@ export class InlinePresentationRegistry {
 
   all(): Array<{ toolCallId: string; card: InlineCardPresentation }> {
     return [...this.cards.entries()].flatMap(([toolCallId, cards]) => [...cards.values()].map((card) => ({ toolCallId, card })));
+  }
+
+  /** Existing foreground reference only; never persisted or passed to the model. */
+  authoritativeDetail(toolCallId: string, identity: string, field: "task" | "errorMessage" | "stderr"): string | undefined {
+    const value = this.terminalResults.get(toolCallId)?.get(identity)?.[field];
+    return typeof value === "string" ? value : undefined;
   }
 
   /** Returns the existing terminal message array without copying it. */
@@ -241,10 +278,11 @@ export class InlinePresentationRegistry {
     for (const [identity, card] of incomingCards) {
       candidates.push({ toolCallId, identity, card, terminalResult: incomingTerminalResults.get(identity), order: order++ });
     }
-    const priority = (card: InlineCardPresentation): number => card.status === "running" ? 0 : card.status === "failed" || card.status === "cancelled" ? 1 : 2;
+    const priority = (card: InlineCardPresentation): number => card.status === "running" || card.status === "pending" ? 0 : card.status === "failed" || card.status === "cancelled" ? 1 : 2;
     const retained = candidates
       .sort((left, right) => priority(left.card) - priority(right.card) || left.order - right.order)
-      .slice(0, MAX_CARDS);
+      .slice(0, MAX_CARDS)
+      .sort((left, right) => left.order - right.order);
     const retainedKeys = new Set(retained.map((candidate) => `${candidate.toolCallId}\u0000${candidate.identity}`));
     for (const key of this.states.keys()) {
       if (!retainedKeys.has(key)) this.states.delete(key);

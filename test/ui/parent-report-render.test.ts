@@ -73,10 +73,10 @@ test("each report kind has compact sender and readable body, not lifecycle statu
   for (const kind of kinds) {
     const message = single(kind);
     const compact = render(message).join("\n");
-    assert.ok(compact.includes(`${kind} report (1) · worker · job job-full-ide… · untrusted`));
-    assert.ok(compact.includes(`${kind} report (1) · worker`));
+    assert.doesNotMatch(compact, /· untrusted|job-full-ide/);
+    assert.ok(compact.includes(`worker · ${kind} report`));
     assert.ok(compact.includes("Readable report body\n한글 😀"));
-    assert.equal(render(message).length, 3);
+    assert.equal(render(message).length, 4);
     for (const hidden of ["Report ID:", "child-full-identity", "receivedAtMs", "JSON string", "Diagnostics", "✓", "▸", "▾"]) {
       assert.equal(compact.includes(hidden), false, hidden);
     }
@@ -88,11 +88,11 @@ test("progress batch retains count, label(agent), each sender/body preview and i
   const before = structuredClone(message);
   const compact = render(message).join("\n");
   assert.match(compact, /progress reports \(3\)/);
-  assert.match(compact, /progress · 단계\(검토😀é-0\)/);
+  assert.match(compact, /progress · 단계 \(검토😀é-0\)/);
   assert.equal((compact.match(/progress ·/g) ?? []).length, 3);
   for (let i = 0; i < 2; i++) assert.ok(compact.includes(`full report body ${i}\n한글 😀`));
   assert.match(compact, /\[display clipped\]/);
-  assert.equal(render(message).length, 10);
+  assert.equal(render(message).length, 11);
   const expanded = render(message, true, 1000).join("\n");
   assert.ok(expanded.includes(`Batch: ${message.details.batchToken}`));
   for (let i = 0; i < 3; i++) assert.equal(expanded.split(`full report body ${i}`).length - 1, 1, "body appears only once");
@@ -107,7 +107,7 @@ test("expanded body precedes full identifier and dated UTC diagnostics, with pre
     assert.ok(text.includes("First line\nSecond line with literal [link](https://example.test)"));
     assert.ok(text.indexOf("Second line") < text.indexOf("─── Diagnostics ───"));
     for (const field of ["reportId", "jobId", "childId"]) assert.ok(text.includes(message.details[field]), `full ${field}`);
-    assert.ok(text.includes("Sender: Review(worker)"));
+    assert.ok(text.includes("Sender: Review (worker)"));
     assert.match(text, /chain stage 3 task 2/);
     assert.match(text, /Received \(UTC\): 2027-01-15T08:00:00\.000Z/);
     const submitted = new Date(message.details.submittedAtMs).toISOString();
@@ -145,7 +145,7 @@ test("host-configured expansion hint and existing theme roles, without inline-ca
     assert.equal(/[▸▾]/u.test(text), false);
     const compact = component(message, false, styled);
     const expanded = component(message, true, styled);
-    for (const role of ["muted", "dim", "accent", "toolOutput"]) assert.ok(roles.includes(role), role);
+    for (const role of ["muted", "dim", "warning", "toolOutput"]) assert.ok(roles.includes(role), role);
     for (const width of [1, 2, 4, 17, 80]) for (const view of [compact, expanded]) {
       for (const line of view.render(width)) assert.ok(visibleWidth(line) <= width);
     }
@@ -266,8 +266,8 @@ test("result/report parity: actual background, bold heading, padding and configu
       }
     }
     assert.ok(backgrounds.every(color => color === "customMessageBg"));
-    assert.ok(headings.some(heading => heading.startsWith("finding report (1) · worker")));
-    assert.ok(headings.some(heading => heading.startsWith("completed · job")));
+    assert.ok(headings.some(heading => heading.startsWith("worker · finding report")));
+    assert.ok(headings.some(heading => heading.startsWith("job ")));
   }
 });
 
@@ -282,7 +282,7 @@ test("local click expansion, unchanged-global retention, global transitions, per
     assert.equal(card.handleMouse({ type, button: "left" }), undefined, "preserve native selection and scroll");
   }
   for (const button of ["right", "middle", undefined]) assert.equal(card.handleMouse({ type: "click", button }), undefined);
-  assert.deepEqual(card.handleMouse({ type: "click", button: "left", x: 4, y: 3, screenX: 24, screenY: 13, width: 120, height: 10 }), {
+  assert.deepEqual(card.handleMouse({ type: "click", button: "left", x: 4, y: 0, screenX: 24, screenY: 10, width: 120, height: 10 }), {
     handled: true, target: { component: card, originX: 20, originY: 10, width: 120, height: 10 },
   });
   assert.match(card.render(120).join("\n"), /third/);

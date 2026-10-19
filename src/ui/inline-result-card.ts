@@ -1,5 +1,6 @@
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, truncateToWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { CompactText, oneLine, stateText, STATE_STYLE } from "./native-ui.js";
 import { configuredExpandHint } from "./expand-hint.js";
 import type { InlineCardPresentation, InlineCardState } from "./inline-presentation.js";
 
@@ -34,6 +35,9 @@ type TargetBearingMouseResult = {
 export interface InlineResultCardOptions {
   /** Full terminal result supplied only by the foreground result renderer. */
   authoritativeAssistantText?: string;
+  authoritativeTask?: string;
+  authoritativeError?: string;
+  authoritativeDiagnostics?: string;
   /** Widgets have no host app.tools.expand state to describe. */
   showExpandHint?: boolean;
   /** Widget headers must reserve one real rendered row per prioritized card. */
@@ -60,7 +64,7 @@ function preview(text: string): string {
 }
 
 function statusText(status: InlineCardPresentation["activities"][number]["status"]): string {
-  return status === "completed" ? "done" : status === "failed" ? "failed" : "running";
+  return stateText(status);
 }
 
 function safeMarkdownTheme(): MarkdownTheme {
@@ -105,7 +109,7 @@ export class InlineResultCard extends Box {
     private theme: CardTheme,
     private options: InlineResultCardOptions = {},
   ) {
-    super(0, 0, (text) => this.theme.bg?.("customMessageBg", text) ?? text);
+    super(0, 0);
     this.rebuild();
   }
 
@@ -162,19 +166,18 @@ export class InlineResultCard extends Box {
     const label = this.presentation.stageLabel
       ? `${this.presentation.stageLabel} (${this.presentation.agent}${duplicate})`
       : `${this.presentation.agent}${duplicate}`;
-    const statusColor = this.presentation.status === "completed" ? "success"
-      : this.presentation.status === "failed" ? "error"
-        : this.presentation.status === "cancelled" ? "warning" : "accent";
+    const statusColor = STATE_STYLE[this.presentation.status].color;
     const arrow = this.state.expanded ? "▾" : "▸";
     let header = this.theme.fg("toolTitle", this.theme.bold(`${arrow} ${label}`))
-      + this.theme.fg(statusColor, ` · ${this.presentation.status}`);
-    const authoritative = this.presentation.status === "running" ? undefined : this.options.authoritativeAssistantText;
+      + this.theme.fg(statusColor, ` · ${stateText(this.presentation.status)}`);
+    const active = this.presentation.status === "running" || this.presentation.status === "pending";
+    const authoritative = active ? undefined : this.options.authoritativeAssistantText;
     const hasExtraDetail = Boolean(authoritative)
       || this.presentation.lastAssistantTextClipped
       || this.presentation.lastAssistantText.includes("\n")
       || this.presentation.lastAssistantText.length > 240
       || this.presentation.activities.length > 0
-      || Boolean(this.presentation.error);
+      || Boolean(this.presentation.error) || Boolean(this.presentation.task) || Boolean(this.presentation.usage);
     // The host key toggles global expansion, not this card-local state. Only
     // show its hint while collapsed and when opening can reveal more content.
     if (!this.state.expanded && this.options.showExpandHint !== false && hasExtraDetail) {
@@ -183,7 +186,19 @@ export class InlineResultCard extends Box {
     if (this.options.compactHeader && this.renderedWidth !== undefined) {
       header = truncateToWidth(header, this.renderedWidth);
     }
-    this.addChild(new Text(header, 0, 0));
+    this.addChild(this.state.expanded ? new Text(header, 0, 0) : new CompactText(header));
+    if (this.presentation.task) this.addChild(this.state.expanded
+      ? new Text(this.theme.fg("dim", `Task: ${sanitizeTerminalText(this.options.authoritativeTask ?? this.presentation.task)}`), 0, 0)
+      : new CompactText(this.theme.fg("dim", `Task${this.presentation.taskClipped ? " [clipped]" : ""}: ${oneLine(this.presentation.task)}`)));
+    if (!this.state.expanded) {
+      const current = this.presentation.activities.at(-1);
+      const detail = this.presentation.error
+        ? this.presentation.error
+        : this.presentation.lastAssistantText || (current ? `${current.name} · ${statusText(current.status)}` : "(no completed assistant response)");
+      const clipped = this.presentation.lastAssistantTextClipped ? "[display clipped] " : "";
+      this.addChild(new CompactText(this.theme.fg(this.presentation.error || current?.status === "failed" ? "error" : "toolOutput", clipped + oneLine(preview(detail)))));
+      return;
+    }
 
     if (this.state.expanded && authoritative) {
       // The registry deliberately retains only a bounded snapshot. A terminal
@@ -191,25 +206,22 @@ export class InlineResultCard extends Box {
       this.addChild(new Markdown(sanitizeTerminalText(authoritative), 0, 0, safeMarkdownTheme()));
     } else if (this.presentation.lastAssistantText) {
       const clipped = this.presentation.lastAssistantTextClipped;
-      const labelText = this.state.expanded
-        ? clipped ? "Response preview (clipped):" : "Completed response:"
-        : clipped ? "Response preview (clipped):" : "Response preview:";
-      const text = this.state.expanded ? this.presentation.lastAssistantText : preview(this.presentation.lastAssistantText);
+      const labelText = clipped ? "Response preview (clipped):" : active ? "Response so far:" : "Completed response:";
+      const text = this.presentation.lastAssistantText;
       this.addChild(new Text(this.theme.fg("muted", labelText) + `\n${this.theme.fg("toolOutput", text)}`, 0, 0));
-    } else if (!this.state.expanded) {
-      const current = this.presentation.activities.at(-1);
-      const detail = current
-        ? `${current.name} · ${statusText(current.status)}`
-        : this.presentation.error ?? "(no completed assistant response)";
-      this.addChild(new Text(this.theme.fg(current?.status === "failed" ? "error" : "dim", detail), 0, 0));
-    } else if (this.presentation.status !== "running") {
+    } else if (!active) {
       // A thrown error after reload has no authoritative result reference.
       // State that limitation; never invent a recoverable completed response.
       this.addChild(new Text(this.theme.fg("dim", "(no completed assistant response available)"), 0, 0));
     }
 
     if (this.state.expanded) {
-      if (this.presentation.error) this.addChild(new Text(this.theme.fg(statusColor === "success" ? "error" : statusColor, this.presentation.error), 0, 0));
+      if (this.presentation.taskClipped && !this.options.authoritativeTask) this.addChild(new Text(this.theme.fg("warning", "Task preview clipped; full task unavailable in this snapshot."), 0, 0));
+      if (this.options.authoritativeDiagnostics) this.addChild(new Text(this.theme.fg("dim", `Diagnostics: ${sanitizeTerminalText(this.options.authoritativeDiagnostics)}`), 0, 0));
+      if (this.presentation.usage) this.addChild(new Text(this.theme.fg("dim", `Usage: ${this.presentation.usage}`), 0, 0));
+      if (this.presentation.diagnostics) this.addChild(new Text(this.theme.fg("dim", this.presentation.diagnostics), 0, 0));
+      if (this.presentation.lastAssistantTextClipped && !authoritative) this.addChild(new Text(this.theme.fg("warning", "[display clipped] · full output unavailable in this snapshot"), 0, 0));
+      if (this.presentation.error) this.addChild(new Text(this.theme.fg(statusColor === "success" ? "error" : statusColor, sanitizeTerminalText(this.options.authoritativeError ?? this.presentation.error)), 0, 0));
       for (const item of this.presentation.activities) {
         const color = item.status === "completed" ? "success" : item.status === "failed" ? "error" : "warning";
         this.addChild(new Text(this.theme.fg(color, `${item.name} · ${statusText(item.status)}`), 0, 0));

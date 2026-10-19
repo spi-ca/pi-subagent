@@ -1,4 +1,5 @@
 import { Container, type Component, type TUI } from "@earendil-works/pi-tui";
+import { CompactText } from "./native-ui.js";
 import { InlineResultCard } from "./inline-result-card.js";
 import { type InlinePresentationRegistry } from "./inline-presentation.js";
 
@@ -9,7 +10,7 @@ type WidgetTheme = {
 };
 
 const MAX_WIDGET_CARDS = 4;
-const MAX_WIDGET_LINES = 12;
+const MAX_WIDGET_LINES = 14;
 
 /**
  * Keeps the Container's rendered layout and mouse layout identical. Limiting
@@ -87,12 +88,12 @@ export class InlinePresentationWidget extends Container implements Component {
 
   private rebuild(): void {
     this.clear();
-    const visible = this.registry.all()
-      .filter(({ card }) => card.status === "running")
-      .slice(0, MAX_WIDGET_CARDS);
+    const active = this.registry.all().filter(({ card }) => card.status === "running" || card.status === "pending");
+    const visible = active.slice(0, MAX_WIDGET_CARDS);
+    const omitted = active.length - visible.length;
     // Reserve one (single-line) header for every prioritized card before
     // allocating body rows. An expanded first card can never hide later work.
-    const detailRows = Math.max(0, MAX_WIDGET_LINES - visible.length);
+    const detailRows = Math.max(0, MAX_WIDGET_LINES - visible.length - (omitted > 0 ? 1 : 0));
     const extraRows = visible.length === 0 ? 0 : Math.floor(detailRows / visible.length);
     this.slots = visible.map(({ toolCallId, card }) => {
       // The widget has no authoritative app.tools.expand state. Header clicks
@@ -107,5 +108,11 @@ export class InlinePresentationWidget extends Container implements Component {
       this.addChild(slot);
       return slot;
     });
+    if (omitted > 0) {
+      const pending = active.filter(({ card }) => card.status === "pending").length;
+      const running = active.length - pending;
+      const counts = [running ? `${running} running` : "", pending ? `${pending} pending` : ""].filter(Boolean).join(" · ");
+      this.addChild(new CompactText(this.theme.fg("muted", `… ${omitted} ${pending ? "active" : "running"} cards omitted · ${counts}`)));
+    }
   }
 }

@@ -10,7 +10,7 @@
 
 ## 준비 사항
 
-- `package.json`의 `packageManager` 필드와 맞는 Bun
+- 기본 개발 환경은 최신 stable Bun이며, `package.json`의 `engines.bun` 최소 요구 사항(`>=1.4.2`)을 만족해야 한다
 
 <a id="명령"></a>
 ## 기본 개발 절차
@@ -30,7 +30,7 @@ bun run ci
 | 전체 기본 검증 | `bun run ci` | 타입 검사 뒤 core와 세 heavy stage를 각각 독립 external process로 순서대로 실행 |
 | 배포 파일 목록 확인 | `bun pm pack --dry-run` | `src/runtime/pane-launch-broker.mjs`, 두 public schema가 포함되어야 함 |
 
-`bun run ci`는 축약 별칭이 아니다. repository root 아래의 Bun filename form (`.test`, `_test`, `.spec`, `_spec` + `js`/`jsx`/`ts`/`tsx`)은 inventory에서 정확히 한 stage에 배정한다. session-tail stage는 cache eviction과 exact disk-index reverse replay를 4,096개 ID로 검증하지만, 100,000개 unique ID workload는 기본 CI에서 더 이상 실행하거나 동일하게 검증됐다고 주장하지 않는다. core가 제외하는 파일은 `test/acceptance/performance-phase0.test.ts`, `test/acceptance/reaper-performance.test.ts`, `test/runtime/reaper-coordinator-heavy.test.ts`, `test/runtime/session-tail-heavy.test.ts`뿐이다. 각 stage는 coordinator가 inventory의 각 파일을 `--max-concurrency 1 --bail=1` Bun process 하나에서 순차 실행한다. `--isolate` 대신 OS process 경계가 file-global Bun mock과 process global을 격리한다. coordinator는 각 bounded JUnit 결과를 합산해 하나의 final report만 남기며 empty reporter outcome을 실패로 처리한다. 세 heavy stage는 skipped reporter outcome도 실패로 처리한다; core의 명시적 opt-in skip은 유지한다. Linux hosted CI는 명시적 `--strict-linux`으로 Python 3 `/proc` supervisor를 사용한다. supervisor는 Bun이 전달한 original parent PID를 `PDEATHSIG` 직후 재확인하고, bootstrap 중 취소를 관찰하면 `Popen` 전 abort하므로 **관찰된** parent 부재·pre-spawn 취소에서는 workload를 launch하지 않는다. 이 확인과 OS spawn은 원자적이지 않다. 확인 직후 동시 signal/parent death와 OS spawn이 겹치면 이미 생성된 workload는 bounded TERM/KILL과 reaping으로 정리하며, 임의 parent death 뒤에 부작용이 전혀 없다고 주장하지 않는다. workload가 살아 있는 동안에는 direct `Popen` child PID를 제외한 adopted child만 selective `waitpid(pid, WNOHANG)`로 reap한다. process group뿐 아니라 관찰한 PID/start-time/session descendant를 bounded TERM/KILL과 reaping으로 정리한다. `setsid` escape가 원래 group에 남는다고 주장하지 않는다. supervisor record가 사라지면 outer Bun은 관찰한 exact PID/start-time만 best-effort로 정리하지만 결과를 `cleanup_incomplete`로 fail-closed한다. macOS 등 local platform은 같은 inventory/JUnit 규칙과 direct-child bounded cleanup을 사용하되 detached descendant 보장을 제공하지 않는다. PID identity 재확인은 same-UID·non-adversarial local runner의 잔여 위험을 줄일 뿐 Node API만으로 same-UID PID TOCTOU를 완전히 제거한다고 주장하지 않는다. stage timeout은 blanket `--timeout`이 아니므로 각 test의 원래 timeout과 workload는 바꾸지 않는다. JUnit flags는 현재 Bun 1.4.2에서 확인했으며, public Bun 1.3.14 lane은 CI에서 별도로 검증한다; 이 문서는 1.3.14의 local 실행을 주장하지 않는다.
+`bun run ci`는 축약 별칭이 아니다. repository root 아래의 Bun filename form (`.test`, `_test`, `.spec`, `_spec` + `js`/`jsx`/`ts`/`tsx`)은 inventory에서 정확히 한 stage에 배정한다. session-tail stage는 cache eviction과 exact disk-index reverse replay를 4,096개 ID로 검증하지만, 100,000개 unique ID workload는 기본 CI에서 더 이상 실행하거나 동일하게 검증됐다고 주장하지 않는다. core가 제외하는 파일은 `test/acceptance/performance-phase0.test.ts`, `test/acceptance/reaper-performance.test.ts`, `test/runtime/reaper-coordinator-heavy.test.ts`, `test/runtime/session-tail-heavy.test.ts`뿐이다. 각 stage는 coordinator가 inventory의 각 파일을 `--max-concurrency 1 --bail=1` Bun process 하나에서 순차 실행한다. `--isolate` 대신 OS process 경계가 file-global Bun mock과 process global을 격리한다. coordinator는 각 bounded JUnit 결과를 합산해 하나의 final report만 남기며 empty reporter outcome을 실패로 처리한다. 세 heavy stage는 skipped reporter outcome도 실패로 처리한다; core의 명시적 opt-in skip은 유지한다. Linux hosted CI는 명시적 `--strict-linux`으로 Python 3 `/proc` supervisor를 사용한다. supervisor는 Bun이 전달한 original parent PID를 `PDEATHSIG` 직후 재확인하고, bootstrap 중 취소를 관찰하면 `Popen` 전 abort하므로 **관찰된** parent 부재·pre-spawn 취소에서는 workload를 launch하지 않는다. 이 확인과 OS spawn은 원자적이지 않다. 확인 직후 동시 signal/parent death와 OS spawn이 겹치면 이미 생성된 workload는 bounded TERM/KILL과 reaping으로 정리하며, 임의 parent death 뒤에 부작용이 전혀 없다고 주장하지 않는다. workload가 살아 있는 동안에는 direct `Popen` child PID를 제외한 adopted child만 selective `waitpid(pid, WNOHANG)`로 reap한다. process group뿐 아니라 관찰한 PID/start-time/session descendant를 bounded TERM/KILL과 reaping으로 정리한다. `setsid` escape가 원래 group에 남는다고 주장하지 않는다. supervisor record가 사라지면 outer Bun은 관찰한 exact PID/start-time만 best-effort로 정리하지만 결과를 `cleanup_incomplete`로 fail-closed한다. macOS 등 local platform은 같은 inventory/JUnit 규칙과 direct-child bounded cleanup을 사용하되 detached descendant 보장을 제공하지 않는다. PID identity 재확인은 same-UID·non-adversarial local runner의 잔여 위험을 줄일 뿐 Node API만으로 same-UID PID TOCTOU를 완전히 제거한다고 주장하지 않는다. stage timeout은 blanket `--timeout`이 아니므로 각 test의 원래 timeout과 workload는 바꾸지 않는다. JUnit flags는 Bun 1.4.2에서 확인했으며, CI의 모든 Bun lane은 최신 stable을 선택하고 `engines.bun`의 최소 요구 사항을 별도로 검사한다.
 
 ## 승인된 opt-in acceptance와 benchmark
 
@@ -190,6 +190,22 @@ bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 
 `session-tools-host.test.ts`는 exact installed Pi `1.3.0`의 CLI parser와 native SDK/session manager를 연결해 raw fork snapshot과 재개 파일의 active tools를 검증합니다. 명시적 역할 allowlist가 복원보다 우선하고, 목록 생략 시 system tool delta·retain-none compaction checkpoint를 복원하며, `+/-`는 현재 host 기본값이 아닌 복원된 목록에 적용되는지 확인합니다. 빈 transcript loadout과 `--no-tools`, managed의 modifier 거부도 검사합니다. extension provenance로 수집한 `grep` override와 목록 생략 fork는 `runAgent`의 launch 이전 호환성 검사에서 거부하고, `grep` 없는 명시 목록과 spawn은 다음 shutdown fence까지 통과하는지 확인합니다. 복원 목록을 prelaunch에서 확정하지 않으므로 이 거부는 보수적이며 실제 목록에 override가 포함되는지 재해석하지 않습니다. project 내부 temporary workspace·agent/session 파일, in-memory 설정과 static model catalog를 사용하며 global 설정·credential 조회 및 network/provider 호출 없이 실행합니다. package/bridge extension 실행이나 실제 CLI subprocess·TUI acceptance를 증명하지는 않습니다.
 
+## Native UI 일관성 집중 회귀 검증
+
+다음 검사는 provider/live terminal 없이 실제 Pi TUI component로 호출 형태, inline/pane의 partial·최종·복원 결과, background 관리·자동 메시지, 보고 종류·batch, widget, child `report_to_parent` 표시를 확인합니다. 각 파일은 file-global mock 격리를 위해 별도 Bun process에서 실행합니다.
+
+```bash
+bun test --max-concurrency 1 test/ui/native-ui-consistency.test.ts
+bun test --max-concurrency 1 test/entrypoint/subagents-ui.test.ts
+bun test --max-concurrency 1 test/ui/render.test.ts
+bun test --max-concurrency 1 test/ui/inline-presentation.test.ts
+bun test --max-concurrency 1 test/ui/background-result.test.ts
+bun test --max-concurrency 1 test/ui/parent-report-render.test.ts
+bun test --max-concurrency 1 test/ui/background-result-viewer.test.ts
+```
+
+공통 4항목/16행 집계, 숨겨진 실패·누락 수, 한글·emoji·combining 문자와 1–160열 폭, 헤더-only 로컬 클릭·전역 펼침 전환·body 선택/scroll 비소유, dark/light 테마 재렌더링, partial의 execute 시간 생략, request/accepted/cancelling/submitted의 의미, legacy fallback·정화·원본 content/details 불변성을 검사합니다. `/subagents` 선택·details·취소 확인/알림과 기존 doctor 집중 테스트는 UI가 실행/취소/승인 권한을 만들지 않는지도 확인합니다. 이 범위는 실제 terminal 마우스/키 입력, provider 응답, live multiplexer acceptance 또는 전체 CI를 대신하지 않습니다. 필수 최종 gate는 여전히 `bun run ci`입니다.
+
 ## 개발 의존성
 
 클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.3.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.
@@ -276,9 +292,9 @@ push와 pull request의 일반 CI는 provider 인증 정보, provider 요청, li
 
 | lane | Bun | Pi development graph | install |
 | --- | --- | --- | --- |
-| locked baseline | 1.3.14 (`packageManager`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.3.0 lockfile 해석 | `bun install --frozen-lockfile` |
-| current compatibility | 1.4.2 | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.3.0로 맞춘 임시 graph | `bun install --no-save` |
+| locked baseline | 최신 stable (`>=1.4.2`) | 선언된 모든 `@earendil-works/pi-*` devDependency의 1.3.0 lockfile 해석 | `bun install --frozen-lockfile` |
+| current compatibility | 최신 stable (`>=1.4.2`) | 선언된 모든 `@earendil-works/pi-*` devDependency를 정확히 1.3.0로 맞춘 임시 graph | `bun install --no-save` |
 
-각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.3.0`, compatibility mapping은 `1.3.0`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 Pi 패키지만 포함하며 Pi 1.2 runtime에서 제거된 `@earendil-works/chord`와 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.3.0`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane 모두 선택된 Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
+각 lane의 repository 설치 graph verifier는 Bun hoisted link와 `.bun` store의 nested symlink를 재귀 순회해 설치된 모든 `@earendil-works/pi-*`를 이름별 exact mapping과 대조한다. locked baseline mapping은 `1.3.0`, compatibility mapping은 `1.3.0`이며, 두 mapping은 실제 발행된 `agent-core`, `ai`, `codemode`, `coding-agent`, `mcp`, `telemetry`, `tui` 일곱 Pi 패키지만 포함하며 Pi 1.2 runtime에서 제거된 `@earendil-works/chord`와 obsolete `client`/`protocol`을 요구하지 않는다. 선택된 mapping의 모든 package는 정확한 버전으로 설치되어야 한다. 별도로 tarball smoke의 격리 consumer는 wildcard 또는 transitive drift를 막는 결정적 호환성 harness로서 선택된 전체 exact Pi graph와 선언된 non-Pi peer를 의도적으로 주입한다. 이는 최소 peer 설치를 증명하는 검사가 아니다. compatibility lane은 optional peer의 `*`를 해석에 맡기지 않고 임시 `package.json`에서 선언된 Pi 개발 패키지를 모두 exact `1.3.0`로 바꾼 뒤 manifest와 lockfile이 바뀌지 않았음을 검사한다. 두 lane은 현재 같은 Pi graph를 사용하지만 frozen lockfile 설치와 임시 selected-graph 설치를 각각 검증하므로 둘 다 유지한다. 두 lane 모두 실제 Bun 버전을 `setup-bun`이 출력한 해석된 버전과 대조하고 최소 `1.4.2` gate를 통과한 뒤, Bun 버전과 `cc`의 위치·버전을 로그로 확인한다. 수동 live acceptance의 Bun 설정도 최신 stable과 같은 최소 버전 gate를 사용한다. 이 매트릭스는 hosted CI에서 구성되는 자동 검증이며, 여기서 로컬 재설치·다운로드나 provider/live acceptance를 실행한 증거는 아니다.
 
 retained Phase 0/7 fixture의 strict current-source verifier는 의도적으로 일반 CI에 포함하지 않는다. unit CI는 synthetic evidence로 source-binding 비교 로직만 다룬다. `benchmark:phase0:live:verify`와 `benchmark:phase7:verify`는 opt-in strict evidence gate로 남으며, source 변경 뒤 historical fixture hash를 자동 갱신하지 않는다. 따라서 retained fixture는 현재 worktree의 새 성능 측정 증거가 아니다.

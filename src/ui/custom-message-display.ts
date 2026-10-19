@@ -1,4 +1,4 @@
-import { Box, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Box, visibleWidth, wrapTextWithAnsi, truncateToWidth } from "@earendil-works/pi-tui";
 import { normalizeToolDisplayPreviewLines } from "./tool-display-config.js";
 
 /** Shared display-only layout/state for native custom messages, not tool cards. */
@@ -29,6 +29,8 @@ export interface RenderLines {
     partialLastLine: boolean;
   };
   lines: string[];
+  /** Aggregate compact messages share the native result row budget. */
+  compactMaxRows?: number;
   /** Report diagnostics: reserve actual visual rows before budgeting the preceding body. */
   reservedSection?: {
     lines: string[];
@@ -101,6 +103,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
   return {
     render: (width) => {
       if (cachedWidth === width && cachedLines) return cachedLines;
+      const maxRows = renderLines.compactMaxRows ?? MAX_DISPLAY_RENDERED_ROWS;
       const safeWidth = Math.max(1, width);
       const padding = Math.min(outputPad, Math.max(0, Math.floor((safeWidth - 1) / 2)));
       const contentWidth = Math.max(1, safeWidth - padding);
@@ -112,12 +115,14 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
         ? (contentWidth >= 8 ? renderLines.clippingHint : undefined) ?? statusMarker("clipped", contentWidth)
         : compactNotice(renderLines.compactBody.totalLines), contentWidth).rows;
       const substitutedMarker = wrapDisplayRows(statusMarker("substituted", contentWidth), contentWidth).rows;
-      const footerRows = renderLines.footers.map((footer) => wrapDisplayRows(
+      const footerLayout = (text: string) => renderLines.compactMaxRows === undefined
+        ? wrapDisplayRows(text, contentWidth)
+        : { rows: [truncateToWidth(text, contentWidth, "…")], substituted: false };
+      const footerRows = renderLines.footers.map((footer) => footerLayout(
         contentWidth < 8 && footer.compactText !== undefined ? footer.compactText : footer.text,
-        contentWidth,
       ));
       const reservedRows = clippedMarker.length + substitutedMarker.length + footerRows.reduce((count, footer) => count + footer.rows.length, 0);
-      const normalRowLimit = Math.max(0, MAX_DISPLAY_RENDERED_ROWS - reservedRows);
+      const normalRowLimit = Math.max(0, maxRows - reservedRows);
       const sectionRows: string[] = [];
       let sectionSubstituted = false;
       if (renderLines.reservedSection) {
@@ -137,7 +142,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
       const bodyRowLimit = normalRowLimit - sectionRows.length;
       const rendered: string[] = [];
       const appendRows = (rows: string[]) => {
-        const remaining = MAX_DISPLAY_RENDERED_ROWS - rendered.length;
+        const remaining = maxRows - rendered.length;
         if (remaining > 0) rendered.push(...rows.slice(0, remaining));
       };
       let overflowed = false;
@@ -162,7 +167,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
         let bodyRows = 0;
         let bodyPartiallyVisible = false;
         for (let index = 0; index < renderLines.lines.length; index += 1) {
-          const wrapped = wrapDisplayRows(renderLines.lines[index]!, contentWidth);
+          const wrapped = index === 0 ? { rows: [truncateToWidth(renderLines.lines[index]!, contentWidth, "…")], substituted: false } : wrapDisplayRows(renderLines.lines[index]!, contentWidth);
           substituted ||= wrapped.substituted;
           if (index < compactBody.firstLineIndex) {
             for (const row of wrapped.rows) {
@@ -195,7 +200,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
         // a byte-partial final source line both remain hidden logical content.
         const bytePartial = compactBody.partialLastLine && visibleBodyLines === renderLines.lines.length - compactBody.firstLineIndex;
         const omitted = Math.max(0, compactBody.totalLines - visibleBodyLines + (bytePartial ? 1 : 0));
-        if (omitted > 0 || bodyPartiallyVisible) appendRows(wrapDisplayRows(compactNotice(Math.max(1, omitted)), contentWidth).rows);
+        if (omitted > 0 || bodyPartiallyVisible) appendRows(footerLayout(compactNotice(Math.max(1, omitted))).rows);
       }
       if (renderLines.reservedSection) appendRows(sectionRows);
       if (renderLines.compactBody === undefined && overflowed && !renderLines.hasClippingFooter) appendRows(clippedMarker);
@@ -258,7 +263,7 @@ class MessageDisplayComponent extends Box {
   }): MessageDisplayMouseDispatchResult | undefined {
     // Do not claim presses, drags, releases, wheels, or secondary clicks: the
     // fullscreen transcript must retain its native selection and scroll paths.
-    if (event.type !== "click" || event.button !== "left") return undefined;
+    if (event.type !== "click" || event.button !== "left" || (event.y !== undefined && event.y !== 0)) return undefined;
     this.state.expanded = !this.state.expanded;
     this.rebuild();
     const x = finiteMouseCoordinate(event.x);

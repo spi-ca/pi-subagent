@@ -9,10 +9,10 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const PI_CORE_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "1.3.0",
-  "@earendil-works/pi-ai": "1.3.0",
-  "@earendil-works/pi-coding-agent": "1.3.0",
-  "@earendil-works/pi-tui": "1.3.0",
+  "@earendil-works/pi-agent-core": "1.4.0",
+  "@earendil-works/pi-ai": "1.4.0",
+  "@earendil-works/pi-coding-agent": "1.4.0",
+  "@earendil-works/pi-tui": "1.4.0",
 } as const;
 const PI_GRAPH_PACKAGE_NAME = /^@earendil-works\/(?:pi-[a-z0-9][a-z0-9._-]*|chord)$/;
 const EXACT_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -142,22 +142,22 @@ describe("release packaging and live acceptance workflow", () => {
     assert.throws(() => selectedPiCoreDependencies("not-json"), /PI_GRAPH_EXPECTED must be a JSON package\/version map/);
     assert.throws(() => selectedPiCoreDependencies("{}"), /must provide an exact version for @earendil-works\/pi-agent-core/);
     assert.throws(
-      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.3.0","@earendil-works/pi-ai":"1.3.0","@earendil-works/pi-coding-agent":"1.3.0","@earendil-works/pi-tui":"latest"}'),
+      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.4.0","@earendil-works/pi-ai":"1.4.0","@earendil-works/pi-coding-agent":"1.4.0","@earendil-works/pi-tui":"latest"}'),
       /invalid Pi graph entry/,
     );
   });
 
-  test("CI selects the seven-package 1.3.0 runtime graph without chord or obsolete client/protocol", () => {
+  test("CI selects the seven-package 1.4.0 runtime graph without chord or obsolete client/protocol", () => {
     const names = ["agent-core", "ai", "codemode", "coding-agent", "mcp", "telemetry", "tui"].map((name) => `@earendil-works/pi-${name}`).sort();
     const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
     const graphs = [...workflow.matchAll(/pi-graph: '([^']+)'/g)].map((match) => JSON.parse(match[1]!));
     assert.equal(graphs.length, 8);
     for (const graph of graphs) {
       assert.deepEqual(Object.keys(graph).sort(), names);
-      assert.ok(Object.values(graph).every((version) => version === "1.3.0"));
+      assert.ok(Object.values(graph).every((version) => version === "1.4.0"));
     }
     const lockfile = fs.readFileSync(path.join(ROOT, "bun.lock"), "utf8");
-    for (const name of names) assert.ok(lockfile.includes(`"${name}@1.3.0"`), `${name} must be resolved in the published graph`);
+    for (const name of names) assert.ok(lockfile.includes(`"${name}@1.4.0"`), `${name} must be resolved in the published graph`);
     assert.equal(workflow.includes('"@earendil-works/chord":'), false);
     assert.equal(lockfile.includes('"@earendil-works/chord": ['), false);
     for (const suffix of ["client", "protocol"]) {

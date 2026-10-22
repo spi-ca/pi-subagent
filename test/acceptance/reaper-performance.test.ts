@@ -2,6 +2,7 @@ import { describe, test } from "bun:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { assertSafeRunArtifactPaths, RUN_DIRECTORY_MARKER_NAME } from "../../src/runtime/run-protocol";
 import {
 	CREDENTIAL_CANARY,
 	DEFAULT_RUN_DIRECTORIES,
@@ -15,6 +16,7 @@ import {
 	configuredRunDirectories,
 	main,
 	parseArgs,
+	populateRunDirectories,
 	preflightReaperPerformance,
 	recordLocalBenchmark,
 	validateReaperPerformanceEvidence,
@@ -41,6 +43,32 @@ describe("reaper Phase 7 local performance benchmark", () => {
 			assert.equal((await fs.promises.stat(root)).mode & 0o777, 0o700);
 			assert.equal((await fs.promises.stat(path.join(root, "state-root-marker.json"))).mode & 0o777, 0o600);
 			assert.equal((await fs.promises.stat(path.join(root, seedRunId, "run-directory-marker.json"))).mode & 0o777, 0o600);
+		} finally {
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("populates private benchmark fixtures equivalent to the production-initialized seed", async () => {
+		const { root, seedRunId } = await createPrivateMarkedStateRoot();
+		try {
+			const seedDir = path.join(root, seedRunId);
+			const seedEntries = (await fs.promises.readdir(seedDir)).sort();
+			const seedMarker = JSON.parse(await fs.promises.readFile(path.join(seedDir, RUN_DIRECTORY_MARKER_NAME), "utf8"));
+			await populateRunDirectories(root, seedRunId, 4);
+			const entries = (await fs.promises.readdir(root)).sort();
+			assert.deepEqual(entries, ["run-000000", "run-000001", "run-000002", "run-000003", "state-root-marker.json"]);
+			for (const runId of entries.filter(entry => entry.startsWith("run-"))) {
+				const runDir = path.join(root, runId);
+				await assertSafeRunArtifactPaths({ rootDir: root, runDir });
+				assert.deepEqual((await fs.promises.readdir(runDir)).sort(), seedEntries);
+				assert.equal((await fs.promises.stat(runDir)).mode & 0o777, 0o700);
+				const markerPath = path.join(runDir, RUN_DIRECTORY_MARKER_NAME);
+				assert.equal((await fs.promises.stat(markerPath)).mode & 0o777, 0o600);
+				assert.equal(await fs.promises.readFile(markerPath, "utf8"), `${JSON.stringify({ ...seedMarker, runId })}\n`);
+				const shellHome = path.join(runDir, "shell-home");
+				assert.equal((await fs.promises.stat(shellHome)).mode & 0o777, 0o700);
+				assert.deepEqual(await fs.promises.readdir(shellHome), []);
+			}
 		} finally {
 			await fs.promises.rm(root, { recursive: true, force: true });
 		}

@@ -2,6 +2,10 @@
 
 ## 미출시
 
+- Pi 개발 의존성·lockfile의 7개 Pi 패키지·8개 CI stage graph를 exact `1.4.0`으로 동기화했다. peer 범위·shared `@pi/presence` pin·managed 복원/override guard와 실행 동시성 정책은 유지한다.
+- 실제 설치 host의 offline 회귀로 resume/tree의 신규·지연 등록 extension 도구 활성화와 명시 제거·allowlist·no-tools 우선, codemode 기본 두 worker의 FIFO 대기·기한 만료·취소를 검증한다. provider/auth·실제 terminal/multiplexer와 중첩 dialog smoke는 실행 범위가 아니다.
+- reaper benchmark의 TEST-only 임시 fixture 준비에서 run마다 반복하던 production 초기화·동기화를 줄였다. 같은 로컬 256개 directory 준비는 약 6.23초에서 0.13초로 줄었으며, 실제 10,000-directory 분류·100,000-node graph·기존 assertion/timeout과 production durability는 유지한다. production 성능 개선을 주장하지 않는다.
+
 - Codemode에서 여러 subagent 결과를 집계·선별하는 짧은 모델 지침과 사용 예시를 보강했다. 중요한 발견·agent 식별·실패·상태·clipping/누락 표시를 보존하고, 의미적 요약은 child에게 요청한다. 도구 schema·노출·기본 도구 선택과 background 전달 정책은 바꾸지 않는다.
 - Herdr protocol `22`의 호환성 설명을 `v0.9.5`까지 갱신했다. 설치된 `v0.9.3`–`v0.9.5`의 전체 bundled API schema가 동일하며 기존 protocol 허용 목록·호출 계약은 바꾸지 않는다. 실제 `v0.9.5` 서버에서의 interactive 동작 통과를 주장하지 않는다.
 

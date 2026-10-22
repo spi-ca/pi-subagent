@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { GENERATED_BENCHMARK_EVIDENCE_FIXTURES, currentWorktreeSourceIdentity, type WorktreeSourceIdentity } from "./worktree-source-identity";
 import { MAX_REAPER_RUN_DIRECTORIES, acquireReaperRootLock, enumerateRunDirectories, planUnifiedReaperGraph } from "../../src/runtime/reaper-coordinator";
 import { startStaleInteractiveReaper } from "../../src/runtime/runner";
-import { prepareRunArtifactPaths } from "../../src/runtime/run-protocol";
+import { prepareRunArtifactPaths, RUN_DIRECTORY_MARKER_NAME } from "../../src/runtime/run-protocol";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 export const FIXTURE_PATH = path.join(ROOT, "test/fixtures/reaper-performance-baseline.json");
@@ -230,10 +230,21 @@ export async function writePrivateEvidence(root: string, evidence: ReaperPerform
 	return file;
 }
 
-async function populateRunDirectories(root: string, seedRunId: string, count: number): Promise<void> {
+/** Populate ephemeral benchmark inputs, not crash-durable production launches.
+ * The root and seed still use production initialization. Remaining runs have the
+ * same private directories and exact markers, but need no repeated ancestor
+ * checks or durable publication before the measured enumeration/classification.
+ */
+export async function populateRunDirectories(root: string, seedRunId: string, count: number): Promise<void> {
 	for (let index = 0; index < count; index += 1) {
 		const runId = `run-${String(index).padStart(6, "0")}`;
-		if (runId !== seedRunId) await prepareRunArtifactPaths({ rootDir: root, runId });
+		if (runId === seedRunId) continue;
+		const runDir = path.join(root, runId);
+		await fs.promises.mkdir(runDir, { mode: 0o700 });
+		await fs.promises.writeFile(path.join(runDir, RUN_DIRECTORY_MARKER_NAME),
+			`${JSON.stringify({ version: 1, kind: "pi-subagent-run-directory", runId })}\n`,
+			{ flag: "wx", mode: 0o600 });
+		await fs.promises.mkdir(path.join(runDir, "shell-home"), { mode: 0o700 });
 	}
 }
 

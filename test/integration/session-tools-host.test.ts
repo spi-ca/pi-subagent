@@ -164,3 +164,80 @@ for (const checkpoint of [false, true]) {
     }
   });
 }
+
+// Newly installed extension tools were never declared by the old branch. Use
+// the real loader/session lifecycle, not a local replay of Pi's restore logic.
+test(`Pi ${SELECTED_PI_VERSION} resume/tree activate new and late extension tools without overriding removals or explicit selection`, { timeout: 20_000 }, async () => {
+  assertSelectedPiHost();
+  const previousOffline = process.env.PI_OFFLINE, originalFetch = globalThis.fetch;
+  let forbiddenCalls = 0;
+  const forbidden = (): never => { forbiddenCalls++; throw new Error("No auth, network or provider calls in late-tool restoration test"); };
+  process.env.PI_OFFLINE = "1";
+  globalThis.fetch = forbidden as unknown as typeof fetch;
+  await fs.mkdir(path.join(process.cwd(), ".bun-tmp"), { recursive: true });
+  const root = await fs.mkdtemp(path.join(process.cwd(), ".bun-tmp/late-session-tools-"));
+  const sessions: Awaited<ReturnType<typeof createAgentSession>>["session"][] = [];
+  try {
+    const agentDir = path.join(root, "agent"), cwd = path.join(root, "workspace");
+    await fs.mkdir(agentDir); await fs.mkdir(cwd);
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
+      credentials: { read: forbidden, list: forbidden, modify: forbidden, delete: forbidden } });
+    const model = modelRuntime.getModels()[0]; assert.ok(model);
+    modelRuntime.stream = forbidden; modelRuntime.streamSimple = forbidden; modelRuntime.getAuth = forbidden;
+    modelRuntime.checkAuth = forbidden; modelRuntime.classify = forbidden; modelRuntime.generateImages = forbidden;
+    for (const argv of [[], ["--tools", "read"], ["--no-tools"]]) {
+      const settingsManager = SettingsManager.inMemory({ extensions: [], packages: [], defaultTools: ["read"], cacheWarming: "off" });
+      const tool = (name: string, defaultActive = true) => ({ name, label: name, description: `Offline ${name}`,
+        parameters: { type: "object" as const, properties: {} }, defaultActive,
+        async execute() { return { content: [{ type: "text" as const, text: name }], details: undefined }; } });
+      const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager,
+        noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [pi => {
+          pi.registerTool(tool("fresh"));
+          pi.registerTool(tool("inactive", false));
+          pi.registerTool(tool("removed"));
+          pi.on("session_start", () => { pi.registerTool(tool("late", false)); });
+        }],
+      });
+      await resourceLoader.reload({ resolveProjectTrust: async () => false });
+      assert.deepEqual(resourceLoader.getExtensions().errors, []);
+      const manager = SessionManager.inMemory(cwd);
+      const declaration = (name: string) => { const { description, parameters } = tool(name); return { name, description, parameters }; };
+      manager.appendMessage({ role: "system", content: "", toolsAdded: ["read", "late", "removed"].map(declaration), timestamp: 1 });
+      const treeTarget = manager.appendMessage({ role: "system", content: "", toolsRemoved: [{ name: "removed" }], timestamp: 2 });
+      manager.appendCustomEntry("offline-tree-leaf", {});
+      // Exercise actual JSONL open, as on resume, not just an in-memory manager.
+      const sessionPath = path.join(root, `resume-${argv.length}.jsonl`);
+      await fs.writeFile(sessionPath, buildInteractiveChildSessionJsonl({ cwd, parentSessionFile: "/never-open.jsonl", forkSessionSnapshotJsonl: buildForkBranchSourceJsonl(manager)! }));
+      const parsed = parseArgs(argv);
+      const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader, modelRuntime, model,
+        thinkingLevel: "off", sessionManager: SessionManager.open(sessionPath, root),
+        tools: parsed.tools, noTools: parsed.noTools ? "all" : undefined });
+      sessions.push(session);
+      let expected = ["fresh", "late", "read"];
+      if (parsed.noTools) expected = [];
+      else if (parsed.tools) expected = ["read"];
+      const errors: unknown[] = [];
+      await session.bindExtensions({ onError: error => { errors.push(error); } });
+      assert.deepEqual(session.getActiveToolNames().sort(), expected, `resume ${argv}`);
+      assert.equal(session.getActiveToolNames().includes("removed"), false);
+      assert.equal(session.getActiveToolNames().includes("inactive"), false);
+      // Tree restoration must reconsider newly installed tools even after the
+      // current loadout deactivated them; explicit CLI choices remain a ceiling.
+      session.setActiveToolsByName(parsed.noTools ? [] : ["read"]);
+      const navigation = await session.navigateTree(treeTarget, { summarize: false });
+      assert.equal(navigation.cancelled, false);
+      assert.equal(session.sessionManager.getLeafId(), treeTarget);
+      assert.deepEqual(session.getActiveToolNames().sort(), expected, `tree ${argv}`);
+      assert.deepEqual(errors, []);
+      session.dispose();
+    }
+    assert.equal(forbiddenCalls, 0);
+  } finally {
+    for (const session of sessions) session.dispose();
+    globalThis.fetch = originalFetch;
+    if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+    else process.env.PI_OFFLINE = previousOffline;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

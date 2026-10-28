@@ -3,10 +3,139 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { runAgent, beginInteractiveShutdownForSession, getInteractiveShutdownGenerationForTest, resetInteractiveShutdownForSession } from "../../src/runtime/runner";
+import * as ts from "typescript";
+import { runAgent, beginInteractiveShutdownForSession, canStartInteractiveRun, getInteractiveShutdownGenerationForTest, resetInteractiveShutdownForSession } from "../../src/runtime/runner";
 import { LifecycleEventServer } from "../../src/runtime/lifecycle-socket";
 import { getFinalOutput } from "../../src/core/types";
 import type { SteeringHandle, SteeringOutcome } from "../../src/core/subagent-steering";
+
+// Execute the actual lexical handle-registration statements without launching a
+// broker, provider or UI. AST selection avoids duplicating the authority guards
+// and keeps production free of a test-only public factory/export.
+async function runnerSteeringBoundary(kind: "inline" | "interactive", bindings: Record<string, unknown>) {
+  const source = await fs.readFile(new URL("../../src/runtime/runner.ts", import.meta.url), "utf8");
+  const file = ts.createSourceFile("runner.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let statements: readonly ts.Statement[] | undefined;
+  const visit = (node: ts.Node): void => {
+    if (ts.isBlock(node)) {
+      const ready = node.statements.at(-1);
+      if (ready && ts.isExpressionStatement(ready) && ts.isCallExpression(ready.expression)
+        && ts.isPropertyAccessExpression(ready.expression.expression)
+        && ready.expression.expression.name.text === "onSteeringReady"
+        && ready.expression.expression.expression.getText(file) === (kind === "inline" ? "opts" : "options")) {
+        const start = node.statements.findIndex(statement => ts.isVariableStatement(statement)
+          && statement.declarationList.declarations.some(declaration => declaration.name.getText(file) === "available"));
+        if (start >= 0) { assert.equal(statements, undefined, "one production boundary"); statements = node.statements.slice(start); }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(statements, "production steering boundary must exist");
+  const code = ts.transpileModule(`
+    let completionFenced = false;
+    let handle;
+    options.onSteeringReady = opts.onSteeringReady = value => { handle = value; };
+    ${statements.map(statement => statement.getText(file)).join("\n")}
+    return { handle, complete: () => { completionFenced = true; } };
+  `, { compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.None } }).outputText;
+  return new Function(...Object.keys(bindings), code)(...Object.values(bindings)) as { handle: SteeringHandle; complete: () => void };
+}
+
+for (const ack of ["submitted", "rejected"] as const) {
+  for (const race of ["promotion", "completion", "durable-completion", "completion-read-failure", "shutdown", "generation", "signal", "availability", "eligibility-exception"] as const) {
+    test(`interactive deferred ${ack} ACK is unknown after ${race} revokes live authority`, async () => {
+      await resetInteractiveShutdownForSession();
+      const generation = getInteractiveShutdownGenerationForTest();
+      const controller = new AbortController();
+      const run = { ownership: "managed" };
+      let available = true, durableCompletion = false, readFailure = false, eligible = true;
+      let admit!: () => void, settle!: (outcome: SteeringOutcome) => void;
+      const admitted = new Promise<void>(resolve => { admit = resolve; });
+      let requests = 0;
+      const server = { isSteeringAvailable: () => available, requestSteer: () => {
+        requests++; admit(); return new Promise<SteeringOutcome>(resolve => { settle = resolve; });
+      } };
+      const { handle, complete } = await runnerSteeringBoundary("interactive", {
+        server, controlRunId: "exact-run", options: { signal: controller.signal, interactiveShutdownGeneration: generation }, opts: {},
+        canStartInteractiveRun,
+        activeInteractiveRuns: new Map([["exact-run", run]]), paths: {}, completionFenceNonce: "nonce",
+        readVerifiedCompletionFence: async () => { if (readFailure) throw Error("private I/O failure"); return durableCompletion; },
+      });
+      const pending = handle("message", () => { if (!eligible) throw Error("private eligibility failure"); return true; });
+      await admitted;
+      if (race === "promotion") run.ownership = "transferring"; // promoteInteractiveRun's revocation point, before durable ACK
+      if (race === "completion") complete();
+      if (race === "durable-completion") durableCompletion = true;
+      if (race === "completion-read-failure") readFailure = true;
+      if (race === "shutdown") await beginInteractiveShutdownForSession();
+      if (race === "generation") await resetInteractiveShutdownForSession();
+      if (race === "signal") controller.abort();
+      if (race === "availability") available = false;
+      if (race === "eligibility-exception") eligible = false;
+      settle(ack);
+      assert.equal(await pending, "unknown");
+      assert.equal(requests, 1, "possible delivery is never retried");
+    });
+  }
+}
+
+for (const kind of ["inline", "interactive"] as const) {
+  test(`${kind} ACK fence preserves valid ACKs and known unsent outcomes`, async () => {
+    for (const outcome of ["submitted", "rejected", "unavailable", "busy", "queue-full", "unknown"] as const) {
+      let reads = 0, available = true;
+      const boundary = await runnerSteeringBoundary(kind, {
+        server: { isSteeringAvailable: () => available, requestSteer: async () => {
+          if (outcome !== "submitted" && outcome !== "rejected") available = false;
+          return outcome;
+        } }, controlRunId: "exact-run", runId: "exact-run", options: {}, opts: {}, signal: undefined,
+        interactiveShutdownGeneration: 0, canStartInteractiveRun: () => true,
+        activeInteractiveRuns: new Map([["exact-run", { ownership: "kept" }]]), paths: {}, completionFenceNonce: "nonce",
+        readVerifiedCompletionFence: async () => { reads++; return false; },
+      });
+      assert.equal(await boundary.handle("message"), outcome);
+      assert.equal(reads, kind === "inline" ? 0 : outcome === "submitted" || outcome === "rejected" ? 2 : 1);
+    }
+  });
+}
+
+test("interactive deferred completion validation rechecks live authority after its await", async () => {
+  let reads = 0, settle!: (value: boolean) => void, enter!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const run = { ownership: "managed" };
+  const boundary = await runnerSteeringBoundary("interactive", {
+    server: { isSteeringAvailable: () => true, requestSteer: async () => "submitted" },
+    controlRunId: "exact-run", options: {}, opts: {}, canStartInteractiveRun: () => true,
+    activeInteractiveRuns: new Map([["exact-run", run]]), paths: {}, completionFenceNonce: "nonce",
+    readVerifiedCompletionFence: async () => {
+      if (++reads === 1) return false;
+      enter(); return new Promise<boolean>(resolve => { settle = resolve; });
+    },
+  });
+  const pending = boundary.handle("message");
+  assert.equal(await Promise.race([entered.then(() => true), pending.then(() => false)]), true,
+    "ACK must not settle before durable completion is revalidated");
+  run.ownership = "transferring";
+  settle(false);
+  assert.equal(await pending, "unknown");
+});
+
+for (const kind of ["inline", "interactive"] as const) {
+  test(`${kind} deferred ACK fails closed on availability observation exceptions`, async () => {
+    let broken = false, settle!: (outcome: SteeringOutcome) => void, admit!: () => void;
+    const admitted = new Promise<void>(resolve => { admit = resolve; });
+    const boundary = await runnerSteeringBoundary(kind, {
+      server: { isSteeringAvailable: () => { if (broken) throw Error("private authority error"); return true; },
+        requestSteer: () => { admit(); return new Promise<SteeringOutcome>(resolve => { settle = resolve; }); } },
+      controlRunId: "exact-run", runId: "exact-run", options: {}, opts: {}, signal: undefined, interactiveShutdownGeneration: 0,
+      canStartInteractiveRun: () => true, activeInteractiveRuns: new Map([["exact-run", { ownership: "managed" }]]),
+      paths: {}, completionFenceNonce: "nonce", readVerifiedCompletionFence: async () => false,
+    });
+    const pending = boundary.handle("message");
+    await admitted; broken = true; settle("submitted");
+    assert.equal(await pending, "unknown");
+  });
+}
 
 test("inline runner retains one-shot JSON/stdin, loads bridge only on opt-in and cleans terminal transport", async () => {
   if (process.platform === "win32") return;

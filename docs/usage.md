@@ -28,7 +28,7 @@ Pi `1.0.2`의 `registerToolRenderer()`로 호출·결과 표시를 실행 도구
 
 Pi `1.0.2`의 `outputSchema`/`structuredContent`를 지원한다. single/parallel/chain은 producer의 실제 결과에서 `results`(agent, exitCode, 최종 output 등)를, background 접수/status/cancel/steer는 실제 registry details에서 `jobs`(jobId, status, 시간, 보존된 output/error 등)를 만든다. 사람용 `content`를 파싱하지 않는다. envelope는 `kind: "subagent.result"`, `version: 1`, `operation`과 omission/clipping 정보를 포함한다. codemode 호출은 이 데이터를 받으며 출력은 계속 비신뢰 데이터다.
 
-각 배열은 최대 32행, 문자열은 최대 2048 UTF-16 code unit, JSON-escaped 전체 machine data는 최대 64 KiB다. 잘린 문자열/행은 `clipped`, `omittedResults`, `omittedJobs`로 표시한다. 원본 human text, TUI details, usage와 thrown 실패/취소 의미는 그대로 유지하며, 예외를 성공 data로 바꾸지 않는다. machine projection은 전체 transcript 또는 원본 출력 복구를 약속하지 않는다.
+각 배열은 최대 32행, 문자열은 최대 2048 UTF-16 code unit, JSON-escaped 전체 machine data는 최대 64 KiB다. 잘린 문자열/행은 `clipped`, `omittedResults`, `omittedJobs`로 표시한다. background `jobs[].liveLeaves`에는 현재 leaf의 `childId`, agent, 선택적 stage/task 위치와 관찰된 `steerable`이 포함됩니다. leaf도 job당 최대 32행이며 같은 전체 64 KiB 예산을 공유합니다. snapshot·byte 예산으로 생략된 leaf는 `jobs[].omittedLeaves`, 잘린 metadata는 leaf/job의 `clipped`로 표시합니다. 함수·controller·transport는 포함하지 않으며, 이 관찰값은 전송 권한이나 성공 ACK가 아닙니다. 원본 human text, TUI details, usage와 thrown 실패/취소 의미는 그대로 유지하며, 예외를 성공 data로 바꾸지 않는다. machine projection은 전체 transcript 또는 원본 출력 복구를 약속하지 않는다.
 
 ### Codemode에서 사용
 
@@ -171,13 +171,21 @@ Pi TUI에서는 종료된 자동 결과를 간결하게 표시합니다. 접힌 
 
 전체 화면 TUI에서는 결과 카드의 첫 헤더 행을 왼쪽 클릭해 그 카드만 펼치거나 접을 수 있습니다. 짧은 결과도 클릭하면 전체 job ID를 확인할 수 있습니다. `app.tools.expand` keybinding의 현재 host 설정이 모든 카드의 공통 hint로 표시되며, 설정을 읽을 수 없으면 기본 `Ctrl+O`를 사용합니다. 그 전역 상태가 바뀌면 모든 카드에 authoritative이며 기존 카드별 선택을 덮어씁니다. 펼친 카드는 full job ID와 별도 제목 없는 결과 본문을 보이며, 본문 head는 최대 12 KiB(인식할 수 없는 메시지 fallback은 4 KiB), 최대 64 logical line, ANSI-aware 폭 줄바꿈 뒤 최대 96 row입니다. 표시 상한에 닿으면 `[display clipped]`만 clipping 표식으로 사용하며, 접힌 보기에서는 현재 펼치기 단축키를, 펼친 결과에서는 `/subagent-result <job-id>`를 함께 표시합니다. 이 표식은 UI가 잘랐다는 뜻이며, producer가 보존하지 않은 바이트를 나타내는 별도 `... (N B not retained)` footer와 구별됩니다. current producer의 suffix는 검증 후 이 보존 바이트 footer로 표시하고, legacy envelope 안의 suffix는 일반 비신뢰 본문으로만 표시합니다. `/subagent-result <job-id 또는 고유 prefix>`는 현재 branch에 보존된 결과만 display-only editor로 열며 편집·취소한 내용은 버립니다. 어느 표기도 전체 원문의 보존·복구를 약속하지 않으며, 이 TUI 표시 처리는 세션 컨텍스트와 steer 원본 메시지를 바꾸지 않습니다.
 
-## 실행 중인 단일 child에 추가 지시 보내기
+<a id="실행-중인-단일-child에-추가-지시-보내기"></a>
+## 실행 중인 child에 추가 지시 보내기
 
 ```js
+// 단일 background는 기존 id-only 호출을 유지합니다.
 subagent({ action: "steer", id: "<접수 결과의 정확한 전체 jobId>", message: "현재 컨텍스트를 유지하고 테스트에 집중하세요." })
+// 병렬·체인은 status의 현재 leaf childId를 명시합니다. 단일에도 지정할 수 있습니다.
+subagent({ action: "steer", id: "<정확한 전체 jobId>", childId: "<정확한 현재 leaf childId>", message: "이 작업의 테스트만 확인하세요." })
 ```
 
-현재 세션의 `background: true` **단일 에이전트** 작업만 지원합니다. `id` prefix·생략, 병렬·체인 broadcast, foreground steering은 지원하지 않습니다. `message`는 공백만이 아닌 최대 **512 UTF-8 바이트**의 문자열이며, child의 **최대 8개 메시지를 보관하는 FIFO inbox**에 접수합니다. Pi **stable >=1.1.0**의 다음 안전한 awaited `turn_end`에서 현재 접수된 메시지를 도착 순서대로 각각 literal `custom_message`로 기존 draft 뒤에 추가하고 **한 번의 continuation**을 요청합니다. 병합·교체하지 않습니다. `agent_before_settle`에서는 전달하지 않습니다. history 재전송·새 prompt 시작·child 재시작·LLM ACK 요청·자동 재시도는 없고, 메시지는 명령/skill/template으로 확장하지 않습니다. native input handler를 통과하는 user input이 아니라 context message이며, Pi가 모델 요청에서는 그 내용을 user role로 변환합니다.
+현재 세션의 `background: true` 작업에서 **정확히 한 현재 leaf**만 지원합니다. 단일 작업은 `childId`를 생략할 수 있지만, 병렬·체인은 명시해야 하며 현재 leaf가 하나여도 추론하지 않습니다. `childId`는 `action: "steer"`에서만 허용합니다. `subagent({ action: "status", id })`의 `liveLeaves` 또는 `/subagents details <full-id>`에서 확인하며, leaf별 보고의 `childId`와 같은 부모 생성 identity입니다. 보고 history·라벨·agent 이름은 권한 조회에 사용하지 않습니다. job/child ID prefix·생략 추측, 다른 job의 child, 이전·미래·건너뛴 단계, 병렬·체인 broadcast, foreground steering은 지원하지 않습니다. 현재 handle이 제거·교체되거나 취소·세션 교체되면 대기 전송도 다른 leaf로 넘기지 않습니다.
+
+상태의 leaf 목록은 최대 32개와 `omittedLeaves`로 제한하며 agent/단계 문자열은 최대 2048 code unit, clipping 표시는 명시합니다. `steerable`은 인증된 현재 activity·ownership에 대한 관찰일 뿐이며, 선택 이후 전송 직전과 ACK 대기 뒤에도 job/leaf/handle·세션·abort fence를 재확인합니다. 아직 startup이거나 idle인 handle은 `steerable: false`, queued·종료 leaf는 목록에 없으며 보존된 보고가 종료 leaf를 다시 활성화하지 않습니다.
+
+`message`는 공백만이 아닌 최대 **512 UTF-8 바이트**의 문자열이며, child의 **최대 8개 메시지를 보관하는 FIFO inbox**에 접수합니다. Pi **stable >=1.1.0**의 다음 안전한 awaited `turn_end`에서 현재 접수된 메시지를 도착 순서대로 각각 literal `custom_message`로 기존 draft 뒤에 추가하고 **한 번의 continuation**을 요청합니다. 병합·교체하지 않습니다. `agent_before_settle`에서는 전달하지 않습니다. history 재전송·새 prompt 시작·child 재시작·LLM ACK 요청·자동 재시도는 없고, 메시지는 명령/skill/template으로 확장하지 않습니다. native input handler를 통과하는 user input이 아니라 context message이며, Pi가 모델 요청에서는 그 내용을 user role로 변환합니다.
 
 Linux/macOS inline CLI JSON 실행은 필요한 작업에만 경량 bridge를 로드하고 기존 인증 lifecycle socket을 사용합니다. stdin/JSON stdout과 foreground 동작은 유지하며, steering용 주기 polling·monitor timer는 추가하지 않습니다. cmux/tmux/Herdr는 기존 interactive child bridge와 같은 inbox/socket을 사용합니다. Pi 1.1 boundary API가 없는 구형 child는 성공 ACK를 반환하지 않지만, 패키지 전체의 기존 backend 최소 버전 **>=0.80.10**은 변경하지 않습니다. Windows, socket이 없는 실행, 아직 queued/startup인 child, idle·settled·취소 중·종료·세션 교체된 작업은 거부합니다. 접수와 소비 모두 현재 low-level 실행의 `ctx.signal`이 존재하고 abort되지 않아야 합니다. `isIdle()`이 false여도 signal이 없으면 안전을 확인할 수 없어 거부합니다(fail-closed). low-level `agent_end` 뒤부터 다음 정상 retry/continuation의 `agent_start` 전까지는 접수하지 않으며, pre-settle steering은 지원하지 않습니다. interactive ownership이 이전되거나 completion fence가 관찰된 작업도 거부합니다.
 
@@ -192,7 +200,7 @@ report_to_parent({ message: "API 변경은 끝났고 집중 테스트를 확인 
 report_to_parent({ kind: "finding", message: "기존 호출자가 새 응답 형식을 처리하지 못합니다." })
 ```
 
-현재 실행 중인 child에서 **정확한 direct parent 세션**으로만 전달합니다. child가 parent/job ID를 선택하거나 형제·조상에게 보내는 기능은 없습니다. Linux/macOS inline·cmux/tmux/Herdr의 기존 인증 lifecycle socket을 재사용하며, stable Pi `>=1.1.0`이 필요합니다. Windows·구형 host·socket이 없는 실행·foreground는 지원하지 않습니다. 보고 지원과 달리 부모에서 child로 보내는 `action: "steer"`는 여전히 단일 background 작업만 지원합니다. 미지원 환경이나 인증 socket 준비 실패 시 자동 보고만 생략하고 일반 작업은 계속합니다. 명시 allowlist에는 보고 도구만 추가하고, 도구 선택 생략 시 Pi 기본값과 fork의 복원된 도구를 그대로 보존합니다. 유효한 no-tools 선택은 도구 없이 유지합니다(역할의 명시 목록은 부모 CLI fallback보다 우선). `subagent`·MCP·codemode 등 다른 도구를 자동 활성화하지 않으며 inherited 도구 제외도 유지합니다. managed profile에서도 임의 extension 도구 허용은 그대로 금지합니다. 자세한 선택 규칙은 [에이전트 도구](./agents.md#실행-중-direct-parent에-짧게-보고하기)를 참고하세요.
+현재 실행 중인 child에서 **정확한 direct parent 세션**으로만 전달합니다. child가 parent/job ID를 선택하거나 형제·조상에게 보내는 기능은 없습니다. Linux/macOS inline·cmux/tmux/Herdr의 기존 인증 lifecycle socket을 재사용하며, stable Pi `>=1.1.0`이 필요합니다. Windows·구형 host·socket이 없는 실행·foreground는 지원하지 않습니다. 부모에서 child로 보내는 `action: "steer"`도 현재 leaf를 정확히 지정하면 단일·병렬·체인 background에서 지원하며, 병렬·체인에는 `childId`가 필수입니다. 미지원 환경이나 인증 socket 준비 실패 시 자동 보고만 생략하고 일반 작업은 계속합니다. 명시 allowlist에는 보고 도구만 추가하고, 도구 선택 생략 시 Pi 기본값과 fork의 복원된 도구를 그대로 보존합니다. 유효한 no-tools 선택은 도구 없이 유지합니다(역할의 명시 목록은 부모 CLI fallback보다 우선). `subagent`·MCP·codemode 등 다른 도구를 자동 활성화하지 않으며 inherited 도구 제외도 유지합니다. managed profile에서도 임의 extension 도구 허용은 그대로 금지합니다. 자세한 선택 규칙은 [에이전트 도구](./agents.md#실행-중-direct-parent에-짧게-보고하기)를 참고하세요.
 
 알림에는 부모가 고정한 `jobId`, leaf별 고유 `childId`, 정확한 `agent`, 호출 형태 `mode`가 포함됩니다. 체인은 `stageIndex`/`stageLabel`, 병렬 작업은 `taskIndex`도 포함하며, metadata 인덱스는 **0부터**, 사람용 단계/작업 번호는 **1부터** 시작합니다. 같은 에이전트나 표시 라벨이어도 leaf identity로 구분합니다. sender details는 `kind: "subagent.parent-report"`, `version: 3`이며, 부모가 생성한 UUID `reportId`, 부모 접수 시각 `receivedAtMs`, 최초 native handoff 또는 progress draft 시각 `submittedAtMs`를 추가합니다. 시각은 부모 wall clock의 epoch 밀리초이며 모델용 content와 details 양쪽에 포함됩니다. `submittedAtMs`는 **제출/draft 제안 시각일 뿐 commit·전달·모델 읽음 시각이 아닙니다**. 같은 미확정 draft를 다시 제안해도 ID와 두 시각은 바뀌지 않으며, pending progress를 새 보고로 교체하면 새 ID를 받습니다. 이전 버전 저장 메시지는 migration 없이 안전한 본문 보기로 fallback하며 sender/시각을 추정하지 않습니다. 이름·라벨은 제한된 길이의 escaped 비신뢰 문자열로 표시하고, task·cwd·model·history를 보고 metadata에 포함하지 않습니다. child API는 `{message, kind?}`뿐이며 identity를 선택할 수 없습니다. 선택적 `kind`는 `progress`(기본값), `finding`, `question`, `blocked`만 허용하며, 알 수 없는 값·추가 필드는 거부합니다. 메시지 details의 `reportKind`는 이 분류이며, envelope discriminator인 `kind: "subagent.parent-report"`와 별개입니다. 건너뛴/시작하지 않은 leaf나 완료된 이전 단계는 보고할 수 없습니다.
 
@@ -248,7 +256,7 @@ root parent에서는 도구 schema를 늘리지 않는 관리 명령도 제공�
 /subagents promote <run-id>
 ```
 
-`cancel`과 `details`는 exact full ID만 받으며 prefix를 추측하지 않습니다. `doctor`는 사람이 읽는 session-local 진단이고, scheduler의 고정 크기 집계도 표시합니다. 인수 없는 TUI 명령은 식별·상태·미리보기 중심의 최대 32항목 선택기를 엽니다. 명시적 `list`와 비-TUI 목록은 이 상한이나 공통 4항목 상한을 적용하지 않고 보존된 invocation·interactive surface를 모두 정확한 전체 ID와 함께 표시합니다. 선택기에서 생략된 대상도 이 목록의 ID로 details·cancel·focus·keep·promote를 요청할 수 있으며, 실제 지원·권한 검사는 기존 명령이 수행합니다. 시각·추가 기술 정보는 details나 선택기의 상세 알림에서 확인합니다. session footer는 0이 아닌 상태·scheduler 대기 건수만 표시합니다. 취소 확인창과 후속 알림은 요청과 실제 terminal 종료를 구분합니다. interactive의 managed/kept/detached 등은 **ownership** 표시이지 실행·완료 증거가 아닙니다. interactive target의 focus·keep·promote와 recovery/ownership 경계는 [설정](./configuration.md)을 따르며, machine-readable tool 결과 계약을 바꾸지 않습니다.
+`cancel`과 `details`는 exact full ID만 받으며 prefix를 추측하지 않습니다. `doctor`는 사람이 읽는 session-local 진단이고, scheduler의 고정 크기 집계도 표시합니다. 인수 없는 TUI 명령은 식별·상태·미리보기 중심의 최대 32항목 선택기를 엽니다. 명시적 `list`와 비-TUI 목록은 이 상한이나 공통 4항목 상한을 적용하지 않고 보존된 invocation·interactive surface를 모두 정확한 전체 ID와 함께 표시합니다. 실행 중 background job을 고르면 `Details` 또는 `Steer running child`를 선택할 수 있습니다. steering은 현재 관찰된 실행 leaf 선택 → 최대 512 UTF-8 바이트 메시지 입력 순서이며 단일 job은 leaf 선택을 생략합니다. native TUI에서만 이 흐름을 열고 RPC·JSON·print는 기존 목록 동작을 유지합니다. 각 선택창/입력을 취소하면 전송하지 않으며, 입력 중 완료·취소·세션/handle 교체가 발생하면 fresh 검증으로 거부합니다. 성공 알림도 child inbox 접수만 뜻합니다. 선택기에서 생략된 대상도 이 목록의 ID로 details·cancel·focus·keep·promote를 요청할 수 있으며, 실제 지원·권한 검사는 기존 명령이 수행합니다. 시각·추가 기술 정보는 details나 선택기의 상세 알림에서 확인합니다. session footer는 0이 아닌 상태·scheduler 대기 건수만 표시합니다. 취소 확인창과 후속 알림은 요청과 실제 terminal 종료를 구분합니다. interactive의 managed/kept/detached 등은 **ownership** 표시이지 실행·완료 증거가 아닙니다. interactive target의 focus·keep·promote와 recovery/ownership 경계는 [설정](./configuration.md)을 따르며, machine-readable tool 결과 계약을 바꾸지 않습니다.
 
 ## 권장 패턴
 

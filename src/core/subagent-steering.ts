@@ -3,7 +3,10 @@ export const MAX_STEERING_MESSAGE_BYTES = 512;
 /** "submitted" is remote inbox admission, not local waiting or model application.
  * "queue-full" is local only; remote boolean rejection stays generic. */
 export type SteeringOutcome = "submitted" | "rejected" | "unavailable" | "busy" | "queue-full" | "unknown";
-export type SteeringHandle = (message: string, eligible?: () => boolean) => Promise<SteeringOutcome>;
+export type SteeringHandle = ((message: string, eligible?: () => boolean) => Promise<SteeringOutcome>) & {
+  /** Observation only; dispatch still revalidates authenticated transport/ownership. */
+  isAvailable?: () => boolean;
+};
 export function isSteeringMessage(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
     && value.length <= MAX_STEERING_MESSAGE_BYTES

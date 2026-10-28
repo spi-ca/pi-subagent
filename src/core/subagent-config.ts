@@ -29,7 +29,7 @@ export function formatSubagentToolDescription(): string {
     SUBAGENT_INVOCATION_SHAPES_GUIDANCE,
     MODEL_OVERRIDE_DESCRIPTION,
     "status without id lists background jobs; cancel without id cancels all running background jobs. Cancel ACK is not terminal.",
-    "steer: full single background id+message (512 UTF-8 bytes); inbox admission ACK only.",
+    "steer: full background id+message (512 UTF-8 bytes); chain/parallel require current childId from status. Inbox admission ACK only.",
     "Chain labels unique; defaults to on_success; recovery requires continueOnError on failed stage.",
     `mode: spawn default; fork adds parent context. ${BACKGROUND_BEHAVIOR_GUIDANCE}`,
   ].join("\n");
@@ -61,6 +61,23 @@ export interface BackgroundJobToolResult {
   isError?: boolean;
 }
 
+export interface BackgroundLeafSnapshot {
+  childId: string;
+  agent: string;
+  stageIndex?: number;
+  stageLabel?: string;
+  taskIndex?: number;
+  /** Transport observation, not an admission guarantee. Revalidated at submission. */
+  steerable: boolean;
+  clipped?: boolean;
+}
+
+export interface BackgroundLeafRecord {
+  metadata: Omit<BackgroundLeafSnapshot, "steerable">;
+  steer: SteeringHandle;
+}
+export const MAX_BACKGROUND_LEAF_SNAPSHOTS = 32;
+
 export interface BackgroundJobRecord {
   id: string;
   mode: InvocationMode;
@@ -71,6 +88,8 @@ export interface BackgroundJobRecord {
   controller?: AbortController;
   /** Active-only transport; never serialized or retained in terminal history. */
   steer?: SteeringHandle;
+  /** Exact active leaf authorities. Never serialize this map or its callbacks. */
+  activeLeaves?: Map<string, BackgroundLeafRecord>;
   result?: BackgroundJobToolResult;
   error?: string;
   /** Producer-derived byte count not retained in compacted `error`. */
@@ -81,7 +100,10 @@ export interface BackgroundJobRecord {
   chainStageCount?: number;
 }
 
-export type BackgroundJobSnapshot = Omit<BackgroundJobRecord, "controller" | "steer">;
+export type BackgroundJobSnapshot = Omit<BackgroundJobRecord, "controller" | "steer" | "activeLeaves"> & {
+  liveLeaves?: BackgroundLeafSnapshot[];
+  omittedLeaves?: number;
+};
 
 export function parseBackgroundAction(raw: unknown): BackgroundJobAction | null {
   if (raw === undefined) return null;
@@ -101,10 +123,11 @@ export interface SubagentInvocationValidationError {
   message: string;
 }
 
+const FULL_CHILD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const VALID_ACTIONS = ["status", "cancel", "steer"] as const;
 const VALID_MODES = ["spawn", "fork"] as const;
 const VALID_CONDITIONS = ["always", "on_success", "on_error", "on_completed_with_errors"] as const;
-const TOP_LEVEL_FIELDS = ["action", "id", "message", "background", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
+const TOP_LEVEL_FIELDS = ["action", "id", "childId", "message", "background", "agent", "task", "model", "tasks", "chain", "mode", "cwd"] as const;
 const TASK_ITEM_FIELDS = ["agent", "task", "cwd", "model"] as const;
 const CHAIN_TASK_STAGE_FIELDS = ["type", "label", "agent", "task", "cwd", "model", "condition", "continueOnError"] as const;
 const CHAIN_PARALLEL_STAGE_FIELDS = ["type", "label", "tasks", "condition", "continueOnError"] as const;
@@ -183,6 +206,8 @@ export function validateSubagentInvocation(raw: unknown): SubagentInvocationVali
   if (raw.message !== undefined && !isSteeringMessage(raw.message)) return validationError("input-type", "message must be non-blank and at most 512 UTF-8 bytes.");
   if (raw.action === "steer" && (!isNonBlankString(raw.id) || raw.message === undefined)) return validationError("invocation-shape", "steer requires an exact full background job id and message.");
   if (raw.action !== "steer" && raw.message !== undefined) return validationError("option-combination", "message can only be used with action steer.");
+  if (raw.childId !== undefined && (typeof raw.childId !== "string" || !FULL_CHILD_ID.test(raw.childId))) return validationError("input-type", "childId must be an exact full child UUID.");
+  if (raw.action !== "steer" && raw.childId !== undefined) return validationError("option-combination", "childId can only be used with action steer.");
   if (raw.id !== undefined && !isNonBlankString(raw.id)) return validationError("input-type", "id must be a non-blank string.");
   if (raw.background !== undefined && typeof raw.background !== "boolean") return validationError("input-type", "background must be a boolean.");
   if (raw.mode !== undefined && !isStringEnum(raw.mode, VALID_MODES)) return validationError("input-type", "mode is invalid.");
@@ -578,8 +603,18 @@ export function createBackgroundJobRecord(options: {
 export function snapshotBackgroundJob(
   job: BackgroundJobRecord,
 ): BackgroundJobSnapshot {
-  const { controller: _controller, steer: _steer, ...snapshot } = job;
-  return { ...snapshot };
+  const { controller: _controller, steer: _steer, activeLeaves, ...snapshot } = job;
+  if (!activeLeaves || job.status !== "running" || job.controller?.signal.aborted) return { ...snapshot };
+  const liveLeaves: BackgroundLeafSnapshot[] = [];
+  for (const leaf of activeLeaves.values()) {
+    if (liveLeaves.length >= MAX_BACKGROUND_LEAF_SNAPSHOTS) break;
+    const { agent, stageLabel } = leaf.metadata;
+    const clipped = agent.length > 2048 || (stageLabel?.length ?? 0) > 2048;
+    const prefix = (text: string) => text.slice(0, 2048).replace(/[\ud800-\udbff]$/, "");
+    liveLeaves.push({ ...leaf.metadata, agent: prefix(agent), ...(stageLabel === undefined ? {} : { stageLabel: prefix(stageLabel) }),
+      steerable: leaf.steer.isAvailable?.() ?? true, ...(clipped ? { clipped: true } : {}) });
+  }
+  return { ...snapshot, liveLeaves, omittedLeaves: activeLeaves.size - liveLeaves.length };
 }
 
 export function listBackgroundJobSnapshots(
@@ -625,17 +660,40 @@ export function releaseBackgroundJobReservation(
 
 /** Exact lookup and session/job fences on both sides of the transport await. */
 export async function steerBackgroundJob(
-  registry: Map<string, BackgroundJobRecord>, id: string, message: string, isCurrent: () => boolean,
+  registry: Map<string, BackgroundJobRecord>, id: string, message: string, isCurrent: () => boolean, childId?: string,
 ): Promise<SteeringOutcome | "not-found" | "unsupported"> {
-  if (!isCurrent()) return "unavailable";
+  const current = () => { try { return isCurrent(); } catch { return false; } };
+  if (!current()) return "unavailable";
   const job = registry.get(id);
   if (!job) return "not-found";
-  if (job.mode !== "single") return "unsupported";
-  if (!isSteeringMessage(message) || job.status !== "running" || job.controller?.signal.aborted || !job.steer) return "unavailable";
-  const eligible = () => isCurrent() && registry.get(id) === job && job.status === "running" && !job.controller?.signal.aborted;
-  const outcome = await job.steer(message, eligible).catch(() => "unknown" as const);
+  if (childId === undefined && job.mode !== "single") return "unsupported";
+  // Explicit child IDs NEVER fall back to another leaf, a single handle, or history.
+  const leaf = childId === undefined ? undefined : job.activeLeaves?.get(childId);
+  const handle = childId === undefined ? job.steer : leaf?.steer;
+  const eligible = () => {
+    try {
+      return current() && registry.get(id) === job && job.status === "running" && !job.controller?.signal.aborted
+        && (childId === undefined ? job.steer === handle : job.activeLeaves?.get(childId) === leaf && leaf?.steer === handle)
+        && handle?.isAvailable?.() !== false;
+    } catch { return false; }
+  };
+  if (!isSteeringMessage(message) || !handle || !eligible()) return "unavailable";
+  let outcome: SteeringOutcome;
+  try { outcome = await handle(message, eligible); } catch { return "unknown"; }
+  // Revalidate ACKs after possible delivery; preserve proven-unsent results.
   if (!eligible() && (outcome === "submitted" || outcome === "rejected")) return "unknown";
   return outcome;
+}
+
+export function formatSteeringOutcome(outcome: SteeringOutcome | "not-found" | "unsupported"): string {
+  return outcome === "submitted" ? "Child admitted steering to its bounded inbox. This is not native queue or model application confirmation; do not retry automatically."
+    : outcome === "not-found" ? "Background subagent job was not found (exact full id required)."
+    : outcome === "unsupported" ? "Chain/parallel steering requires an exact current childId from status (no broadcast)."
+    : outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically."
+    : outcome === "queue-full" ? "Local steering waiting queue is full; this message was not sent."
+    : outcome === "busy" ? "Steering transport is busy; this message was not sent."
+    : outcome === "unavailable" ? "Steering is unavailable for this run; this message was not sent."
+    : "Child rejected steering inbox admission (full, idle, or ineligible).";
 }
 
 export function cancelBackgroundJobs(
@@ -660,6 +718,8 @@ export function cancelBackgroundJobs(
     if (job.status === "running" || job.status === "cancelling") {
       job.status = "cancelling";
       delete job.steer;
+      job.activeLeaves?.clear();
+      delete job.activeLeaves;
       job.controller?.abort();
       registry.set(job.id, job);
       cancelled.push(snapshotBackgroundJob(job));
@@ -721,6 +781,10 @@ export function formatBackgroundJobStatusText(job: BackgroundJobSnapshot, _maxBy
   if (job.taskCount) lines.push(`- taskCount: ${job.taskCount}`);
   if (job.chainStageCount) lines.push(`- chainStageCount: ${job.chainStageCount}`);
   if (job.task) lines.push(`- task: ${job.task}`);
+  for (const leaf of job.liveLeaves ?? []) {
+    lines.push(`- live childId: ${leaf.childId} — ${JSON.stringify(leaf.agent)}${leaf.stageIndex === undefined ? "" : `, stageIndex: ${leaf.stageIndex}`}${leaf.stageLabel === undefined ? "" : `, stageLabel: ${JSON.stringify(leaf.stageLabel)}`}${leaf.taskIndex === undefined ? "" : `, taskIndex: ${leaf.taskIndex}`}, steerable: ${leaf.steerable}${leaf.clipped ? ", metadata clipped" : ""}`);
+  }
+  if (job.omittedLeaves) lines.push(`- live leaves omitted: ${job.omittedLeaves}`);
   if (job.error) lines.push(`- error: ${formatStoredBackgroundToolText(job.error)}`);
   const resultText = extractToolText(job.result);
   if (resultText) lines.push(`- result:\n${formatStoredBackgroundToolText(resultText)}`);
@@ -783,6 +847,8 @@ export function finalizeBackgroundJobForSession(options: {
   // Do not retain a live signal (and its listeners) in completed history.
   delete job.controller;
   delete job.steer;
+  job.activeLeaves?.clear();
+  delete job.activeLeaves;
   job.result = status === "cancelled" ? undefined : compactBackgroundJobResult(result, options.outputMaxBytes);
   if (status === "cancelled" || !fallbackError) {
     job.error = undefined;
@@ -848,6 +914,7 @@ export const SubagentParams = Type.Object({
   action: Type.Optional(StringEnum(["status", "cancel", "steer"])),
   message: Type.Optional(Type.String({ minLength: 1, maxLength: MAX_STEERING_MESSAGE_BYTES })),
   id: Type.Optional(Type.String({ minLength: 1 })),
+  childId: Type.Optional(Type.String({ minLength: 36, maxLength: 36 })),
   background: Type.Optional(Type.Boolean()),
   agent: Type.Optional(Type.String({ minLength: 1 })),
   task: Type.Optional(Type.String({ minLength: 1 })),

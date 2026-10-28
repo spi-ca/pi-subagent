@@ -1,4 +1,4 @@
-import { extractToolText, formatStoredBackgroundToolText, type BackgroundJobSnapshot, type BackgroundJobStatus } from "./subagent-config.js";
+import { extractToolText, formatStoredBackgroundToolText, type BackgroundJobSnapshot, type BackgroundJobStatus, type BackgroundLeafSnapshot } from "./subagent-config.js";
 
 /** Versioned display-only details for background tool actions. */
 export const BACKGROUND_JOB_DETAILS_KIND = "subagent.background-job";
@@ -26,6 +26,8 @@ export interface BackgroundJobDetailSummary {
   /** UI-only truncation of the selected detail; distinct from producer omission provenance. */
   outputClipped?: boolean;
   omittedBytes: number;
+  liveLeaves?: BackgroundLeafSnapshot[];
+  omittedLeaves?: number;
 }
 
 export interface BackgroundJobActionDetails {
@@ -125,6 +127,10 @@ export function buildBackgroundJobDetailSummary(job: BackgroundJobSnapshot): Bac
     ...(output === undefined ? {} : { output }),
     ...(outputClipped ? { outputClipped: true } : {}),
     omittedBytes: body?.omittedBytes ?? 0,
+    ...(job.liveLeaves === undefined ? {} : { liveLeaves: job.liveLeaves.map(leaf => ({ ...leaf,
+      agent: backgroundJobActionDisplayDetail(leaf.agent).text,
+      ...(leaf.stageLabel === undefined ? {} : { stageLabel: backgroundJobActionDisplayDetail(leaf.stageLabel).text }),
+    })), omittedLeaves: job.omittedLeaves ?? 0 }),
   };
 }
 
@@ -185,6 +191,16 @@ function isSafeDisplayText(value: unknown): value is string {
     && !/[\p{Surrogate}\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value);
 }
 
+function isLeafSummary(value: unknown): value is BackgroundLeafSnapshot {
+  if (!isRecord(value)) return false;
+  const optional = ["stageIndex", "stageLabel", "taskIndex", "clipped"].filter(key => value[key] !== undefined);
+  return hasOnlyKeys(value, ["childId", "agent", "steerable", ...optional])
+    && typeof value.childId === "string" && JOB_ID.test(value.childId) && isSafeDisplayText(value.agent)
+    && typeof value.steerable === "boolean" && (value.clipped === undefined || typeof value.clipped === "boolean")
+    && (value.stageLabel === undefined || isSafeDisplayText(value.stageLabel))
+    && [value.stageIndex, value.taskIndex].every(index => index === undefined || isSafeOmittedBytes(index));
+}
+
 function parseSummary(value: unknown): BackgroundJobDetailSummary | undefined {
   if (!isRecord(value)) return undefined;
   const allowed = [
@@ -193,6 +209,8 @@ function parseSummary(value: unknown): BackgroundJobDetailSummary | undefined {
     ...(value.errorReason === undefined ? [] : ["errorReason"]),
     ...(value.output === undefined ? [] : ["output"]),
     ...(value.outputClipped === undefined ? [] : ["outputClipped"]),
+    ...(value.liveLeaves === undefined ? [] : ["liveLeaves"]),
+    ...(value.omittedLeaves === undefined ? [] : ["omittedLeaves"]),
   ];
   if (!hasOnlyKeys(value, allowed)) return undefined;
   if (typeof value.jobId !== "string" || !JOB_ID.test(value.jobId)) return undefined;
@@ -203,6 +221,9 @@ function parseSummary(value: unknown): BackgroundJobDetailSummary | undefined {
   if (value.output !== undefined && !isSafeDisplayText(value.output)) return undefined;
   if (value.outputClipped !== undefined && typeof value.outputClipped !== "boolean") return undefined;
   if (!isSafeOmittedBytes(value.omittedBytes)) return undefined;
+  if (value.omittedLeaves !== undefined && !isSafeOmittedBytes(value.omittedLeaves)) return undefined;
+  if (value.liveLeaves !== undefined && (!Array.isArray(value.liveLeaves) || value.liveLeaves.length > 32
+    || !value.liveLeaves.every(isLeafSummary))) return undefined;
   return {
     jobId: value.jobId,
     status: value.status as BackgroundJobStatus,
@@ -212,6 +233,8 @@ function parseSummary(value: unknown): BackgroundJobDetailSummary | undefined {
     ...(value.output === undefined ? {} : { output: value.output }),
     ...(value.outputClipped === undefined ? {} : { outputClipped: value.outputClipped }),
     omittedBytes: value.omittedBytes,
+    ...(value.liveLeaves === undefined ? {} : { liveLeaves: value.liveLeaves as BackgroundLeafSnapshot[] }),
+    ...(value.omittedLeaves === undefined ? {} : { omittedLeaves: value.omittedLeaves as number }),
   };
 }
 

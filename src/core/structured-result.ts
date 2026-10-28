@@ -7,9 +7,14 @@ export const STRUCTURED_RESULT_MAX_BYTES = 64 * 1024;
 const MAX_STRING = 2048;
 const text = () => Type.String({ maxLength: MAX_STRING });
 const count = () => Type.Integer({ minimum: 0 });
+const LeafSchema = Type.Object({
+  childId: text(), agent: text(), stageIndex: Type.Optional(count()), stageLabel: Type.Optional(text()), taskIndex: Type.Optional(count()),
+  steerable: Type.Boolean(), clipped: Type.Boolean(),
+}, { additionalProperties: false });
 const JobSchema = Type.Object({
   jobId: text(), status: text(), startedAt: Type.Number(), completedAt: Type.Optional(Type.Number()),
   output: Type.Optional(text()), errorReason: Type.Optional(text()), omittedBytes: count(), clipped: Type.Boolean(),
+  liveLeaves: Type.Optional(Type.Array(LeafSchema, { maxItems: STRUCTURED_RESULT_MAX_ROWS })), omittedLeaves: Type.Optional(count()),
 }, { additionalProperties: false });
 const ResultSchema = Type.Object({
   agent: text(), agentSource: text(), exitCode: Type.Integer(), output: text(),
@@ -62,15 +67,30 @@ function projectResult(result: SingleResult) {
   return { ...raw, ...Object.fromEntries(Object.entries(raw).filter(([, value]) => typeof value === "string").map(([key, value]) => [key, bounded(value as string)])),
     clipped: clipped || Object.values(raw).some((value) => typeof value === "string" && bounded(value) !== value) };
 }
-function projectJob(job: BackgroundJobDetailSummary) {
-  return {
+function projectJob(job: BackgroundJobDetailSummary, maxBytes: number) {
+  const row = {
     jobId: bounded(job.jobId), status: job.status, startedAt: job.startedAt,
     ...(job.completedAt === undefined ? {} : { completedAt: job.completedAt }),
     ...(job.output === undefined ? {} : { output: bounded(job.output) }),
     ...(job.errorReason === undefined ? {} : { errorReason: bounded(job.errorReason) }),
     omittedBytes: job.omittedBytes,
     clipped: Boolean(job.outputClipped || job.omittedBytes > 0 || (job.output?.length ?? 0) > MAX_STRING || (job.errorReason?.length ?? 0) > MAX_STRING),
+    ...(job.liveLeaves === undefined ? {} : { liveLeaves: [] as Array<{
+      childId: string; agent: string; stageLabel?: string; stageIndex?: number; taskIndex?: number; steerable: boolean; clipped: boolean;
+    }>, omittedLeaves: (job.omittedLeaves ?? 0) + job.liveLeaves.length }),
   };
+  for (const leaf of (job.liveLeaves ?? []).slice(0, STRUCTURED_RESULT_MAX_ROWS)) {
+    const projected = { childId: bounded(leaf.childId), agent: bounded(leaf.agent), steerable: leaf.steerable,
+      ...(leaf.stageLabel === undefined ? {} : { stageLabel: bounded(leaf.stageLabel) }),
+      ...(leaf.stageIndex === undefined ? {} : { stageIndex: leaf.stageIndex }),
+      ...(leaf.taskIndex === undefined ? {} : { taskIndex: leaf.taskIndex }),
+      clipped: Boolean(leaf.clipped || leaf.agent.length > MAX_STRING || (leaf.stageLabel?.length ?? 0) > MAX_STRING) };
+    row.liveLeaves!.push(projected);
+    if (Buffer.byteLength(JSON.stringify(row)) + 64 > maxBytes) { row.liveLeaves!.pop(); break; }
+    row.omittedLeaves! -= 1;
+  }
+  row.clipped ||= Boolean(row.omittedLeaves || row.liveLeaves?.some(leaf => leaf.clipped));
+  return row;
 }
 
 /** Only producer data is read. Human content is never parsed or used as authority. */
@@ -106,7 +126,7 @@ export function withSubagentStructuredContent<T extends { details: unknown }>(re
     remaining -= bytes; data.results.push(row);
   }
   for (const source of jobs.slice(0, STRUCTURED_RESULT_MAX_ROWS)) {
-    const row = projectJob(source), bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
+    const row = projectJob(source, remaining), bytes = Buffer.byteLength(JSON.stringify(row)) + 1;
     if (bytes > remaining) break;
     remaining -= bytes; data.jobs.push(row);
   }

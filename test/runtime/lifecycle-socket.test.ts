@@ -61,6 +61,25 @@ async function expectStartupFailureWithCleanup(install: (originals: Record<strin
 }
 
 describe("private lifecycle socket", () => {
+	test("steering availability observes authenticated activity, not startup/idle/abort/terminal", async () => {
+		const fixture = await setup("steer-observation");
+		assert.equal(fixture.server.isSteeringAvailable(fixture.runId), false);
+		const client = await LifecycleEventClient.connectFromEnvironment(process.env, fixture.statePath);
+		assert.ok(client);
+		try {
+			assert.equal(fixture.server.isSteeringAvailable(fixture.runId), false, "connected is not running");
+			for (const event of ["agent-started", "agent-ended", "agent-started"] as const) {
+				const observed = fixture.server.waitForEvent(fixture.runId, 1000);
+				client.send(event); await observed;
+				assert.equal(fixture.server.isSteeringAvailable(fixture.runId), event === "agent-started");
+			}
+			assert.equal(fixture.server.requestAbort(fixture.runId), true);
+			assert.equal(fixture.server.isSteeringAvailable(fixture.runId), false, "abort closes steering immediately");
+			fixture.server.terminalRun(fixture.runId);
+			assert.equal(fixture.server.isSteeringAvailable(fixture.runId), false);
+		} finally { client.close(); }
+	});
+
 	test("steering requires connected activated active run and yields only inbox admission ACK", async () => {
 		const fixture = await setup("steer-run", false);
 		assert.equal(await fixture.server.requestSteer(fixture.runId, "change direction"), "unavailable");

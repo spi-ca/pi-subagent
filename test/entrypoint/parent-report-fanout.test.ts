@@ -18,7 +18,9 @@ mock.module("../../src/runtime/tree-permit-authority", () => ({
 const runner = await import("../../src/runtime/runner");
 type Options = Parameters<typeof runner.runAgent>[0];
 const leaves: Array<{ options: Options; finish: () => void }> = [];
+const steering: Options[] = [];
 mock.module("../../src/runtime/runner", () => ({ ...runner, runAgent: async (options: Options) => {
+  options.onSteeringReady?.(async () => { steering.push(options); return "submitted"; });
   await new Promise<void>(finish => { leaves.push({ options, finish }); });
   return { agent: options.agentName, agentSource: "user", task: options.task, exitCode: 0, messages: [], stderr: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } };
@@ -99,7 +101,12 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const ai = checkReport(a!, { mode: "parallel", taskIndex: 0 }, "question");
     const bi = checkReport(b!, { mode: "parallel", taskIndex: 1 });
     assert.equal(ai.jobId, bi.jobId); assert.notEqual(ai.childId, bi.childId);
-    assert.equal(a!.options.onSteeringReady, undefined); assert.equal(b!.options.onSteeringReady, undefined);
+    assert.equal(typeof a!.options.onSteeringReady, "function"); assert.equal(typeof b!.options.onSteeringReady, "function");
+    const status = await invoke({ action: "status", id: ai.jobId });
+    assert.deepEqual(status.structuredContent.jobs[0].liveLeaves.map((leaf: any) => leaf.childId), [ai.childId, bi.childId]);
+    await assert.rejects(() => invoke({ action: "steer", id: ai.jobId, message: "missing child" }), /exact current childId/);
+    await invoke({ action: "steer", id: ai.jobId, childId: bi.childId, message: "only b" });
+    assert.deepEqual(steering, [b!.options], "same-agent siblings route only by the report/status leaf ID");
     a!.finish(); await new Promise(r => setTimeout(r, 0));
     assert.equal(a!.options.onParentReport!("completed sibling"), false);
     checkReport(b!, { childId: bi.childId }); b!.finish();
@@ -122,7 +129,11 @@ test("production background leaf binding: single, same-agent parallel, chain pos
     const pi = checkReport(leaves[4]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 0 }, "blocked");
     const qi = checkReport(leaves[5]!, { stageIndex: 2, stageLabel: "step-1", taskIndex: 1 });
     assert.equal(fi.jobId, pi.jobId); assert.equal(pi.jobId, qi.jobId);
-    for (const leaf of leaves.slice(3, 6)) assert.equal(leaf.options.onSteeringReady, undefined);
+    for (const leaf of leaves.slice(3, 6)) assert.equal(typeof leaf.options.onSteeringReady, "function");
+    await assert.rejects(() => invoke({ action: "steer", id: fi.jobId, childId: fi.childId, message: "stale stage" }), /unavailable/);
+    await invoke({ action: "steer", id: pi.jobId, childId: qi.childId, message: "only q" });
+    assert.equal(steering.at(-1), leaves[5]!.options);
+    assert.equal(steering.length, 2);
     assert.match(leaves[4]!.options.task, /Current task:\nstage-a$/);
     assert.match(leaves[5]!.options.task, /Current task:\nstage-b$/);
     leaves[4]!.finish(); leaves[5]!.finish(); await until(() => leaves.length === 7);

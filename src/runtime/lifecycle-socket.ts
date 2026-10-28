@@ -326,6 +326,13 @@ export class LifecycleEventServer {
 		run.steerPending?.resolve("unknown");
 	}
 
+	/** Observation only. Uses the same authenticated activity guards as admission. */
+	isSteeringAvailable(runId: string): boolean {
+		const run = this.runs.get(runId);
+		return Boolean(!this.closed && run?.active && !run.terminal && !run.steerClosed && run.steerRunning
+			&& run.socket && !run.socket.destroyed);
+	}
+
 	/** No retries. Local waiting is not ACK; only remote inbox admission is submitted. */
 	async requestSteer(runId: string, message: string, eligible: () => boolean = () => true): Promise<SteeringOutcome> {
 		const run = this.runs.get(runId);

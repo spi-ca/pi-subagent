@@ -47,6 +47,12 @@ export type OwnedStageOptions = {
 	testOutcomeLoader?: () => Promise<TestOutcome>;
 	/** Hosted CI opts into Linux's subreaper boundary explicitly. */
 	strictLinux?: boolean;
+	/** Opt-in development callers can supply a clean environment, persistent combined log, and cancellation. */
+	env?: NodeJS.ProcessEnv;
+	outputFd?: number;
+	/** Forward a distinct diagnostics root only when the workload itself is the complete CI command. */
+	workloadDiagnosticsDirectory?: string;
+	abortSignal?: AbortSignal;
 	/** Test-only pre-PDEATHSIG barrier; never inherited by the workload. */
 	testBootstrapBarrierPath?: string;
 	/** Test-only parent-death result marker; never inherited by the workload. */
@@ -456,7 +462,10 @@ try:
     if stopping: raise SafeAbort("cancelled-before-workload-spawn")
     # Reserve standard stdout for the bounded terminal record. Workload output
     # remains visible on inherited stderr, without an extra Bun stdio pipe.
-    child = subprocess.Popen(sys.argv[1:], stdout=sys.stderr, stderr=sys.stderr, env={key: value for key, value in os.environ.items() if key != "CI_STAGE_DIAGNOSTICS_DIR"})
+    workload_diagnostics = os.environ.pop("CI_STAGE_WORKLOAD_DIAGNOSTICS_DIR", "")
+    workload_env = {key: value for key, value in os.environ.items() if key != "CI_STAGE_DIAGNOSTICS_DIR"}
+    if workload_diagnostics: workload_env["CI_STAGE_DIAGNOSTICS_DIR"] = workload_diagnostics
+    child = subprocess.Popen(sys.argv[1:], stdout=sys.stderr, stderr=sys.stderr, env=workload_env)
     while child.poll() is None and not stopping:
         after_direct_poll_test_barrier()
         table = observe(); reap_adopted(table); time.sleep(.02)
@@ -629,10 +638,11 @@ export function validateTestOutcomePolicy(stage: CiStage, outcome: TestOutcome):
 async function runPortableStage(options: OwnedStageOptions): Promise<OwnedStageResult> {
 	if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) throw new Error("stage timeout must be a positive safe integer");
 	if (options.command.length === 0) throw new Error("stage command must not be empty");
+	if (options.abortSignal?.aborted) throw new Error("stage spawn cancelled by signal");
 	const cwd = options.cwd ?? process.cwd(), diagnostics = options.diagnosticsDirectory ? await secureDiagnosticDirectory(options.diagnosticsDirectory) : undefined;
 	const started = performance.now();
 	let timedOut = false, spawnError = false, termination: Promise<void> | undefined;
-	const child = spawn(options.command[0]!, options.command.slice(1), { cwd, stdio: "inherit", env: { ...process.env, CI_STAGE_DIAGNOSTICS_DIR: undefined } });
+	const child = spawn(options.command[0]!, options.command.slice(1), { cwd, stdio: options.outputFd === undefined ? "inherit" : ["ignore", options.outputFd, options.outputFd], env: { ...(options.env ?? process.env), CI_STAGE_DIAGNOSTICS_DIR: options.workloadDiagnosticsDirectory, CI_STAGE_WORKLOAD_DIAGNOSTICS_DIR: undefined } });
 	let closeCode: number | null = null, closeSignal: NodeJS.Signals | null = null;
 	const closed = new Promise<void>((resolve) => child.once("close", (code, signal) => { closeCode = code; closeSignal = signal; resolve(); }));
 	child.once("error", () => { spawnError = true; });
@@ -643,13 +653,18 @@ async function runPortableStage(options: OwnedStageOptions): Promise<OwnedStageR
 			await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, TERMINATION_KILL_MS))]);
 		}
 	})();
+	const onAbort = () => { void terminate(); };
+	options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+	if (options.abortSignal?.aborted) onAbort();
 	let signalDiagnostic: Promise<string> | undefined;
 	activeStageAbort = async () => { await terminate(); if (diagnostics) signalDiagnostic ??= writeDiagnostic(diagnostics, options.stage, "signaled", performance.now() - started, unavailableResource(), cwd, undefined, ["portable-direct-child-cleanup-no-descendant-guarantee"]); await signalDiagnostic; };
 	const timer = setTimeout(() => { timedOut = true; void terminate(); }, options.timeoutMs);
 	await closed; clearTimeout(timer);
+	if (termination) await termination;
+	options.abortSignal?.removeEventListener("abort", onAbort);
 	let testOutcome = options.testOutcome, outcomeError: string | undefined;
 	if (options.testOutcomeLoader) try { testOutcome = await options.testOutcomeLoader(); } catch (error) { outcomeError = `junit-outcome:${error instanceof Error ? error.message.slice(0, 96) : "invalid"}`; }
-	const status: StageStatus = spawnError ? "spawn_error" : timedOut ? "timed_out" : closeSignal ? "signaled" : closeCode === 0 && !outcomeError ? "success" : "failure";
+	const status: StageStatus = spawnError ? "spawn_error" : timedOut ? "timed_out" : options.abortSignal?.aborted || closeSignal ? "signaled" : closeCode === 0 && !outcomeError ? "success" : "failure";
 	const output: OwnedStageResult = { status, exitCode: closeCode, signal: closeSignal, timedOut };
 	if (diagnostics) output.diagnosticPath = signalDiagnostic ? await signalDiagnostic : await writeDiagnostic(diagnostics, options.stage, status, performance.now() - started, unavailableResource(), cwd, testOutcome, ["portable-direct-child-cleanup-no-descendant-guarantee", ...(outcomeError ? [outcomeError] : [])]);
 	activeStageAbort = undefined;
@@ -667,18 +682,19 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	const cwd = options.cwd ?? process.cwd();
 	const diagnostics = options.diagnosticsDirectory ? await secureDiagnosticDirectory(options.diagnosticsDirectory) : undefined;
 	const started = performance.now();
-	if (shutdownRequested) throw new Error("stage spawn cancelled by signal");
+	if (shutdownRequested || options.abortSignal?.aborted) throw new Error("stage spawn cancelled by signal");
 	let timedOut = false, spawnError = false, termination: Promise<{ complete: boolean; errors: string[] }> | undefined;
 	// The detached Python process remains the session/group leader until it has observed and cleaned its workload group.
 	if (options.testBootstrapBarrierPath !== undefined && !path.isAbsolute(options.testBootstrapBarrierPath)) throw new Error("test bootstrap barrier path must be absolute");
 	if (options.testBootstrapResultPath !== undefined && !path.isAbsolute(options.testBootstrapResultPath)) throw new Error("test bootstrap result path must be absolute");
 	const supervisorStdio: import("node:child_process").StdioOptions = options.testSupervisorHooks?.afterDirectPollBeforeReap
-		? ["ignore", "pipe", "inherit", "ignore", "pipe"]
-		: ["ignore", "pipe", "inherit"];
+		? ["ignore", "pipe", options.outputFd ?? "inherit", "ignore", "pipe"]
+		: ["ignore", "pipe", options.outputFd ?? "inherit"];
 	const child = spawn("python3", ["-c", PYTHON_SUPERVISOR, ...options.command], {
 		cwd, stdio: supervisorStdio, detached: true,
 		env: {
-			...process.env, CI_STAGE_DIAGNOSTICS_DIR: undefined,
+			...(options.env ?? process.env), CI_STAGE_DIAGNOSTICS_DIR: undefined,
+			CI_STAGE_WORKLOAD_DIAGNOSTICS_DIR: options.workloadDiagnosticsDirectory,
 			CI_STAGE_EXPECTED_PARENT_PID: String(process.pid),
 			CI_STAGE_TEST_BOOTSTRAP_BARRIER: options.testBootstrapBarrierPath,
 			CI_STAGE_TEST_BOOTSTRAP_RESULT: options.testBootstrapResultPath,
@@ -709,6 +725,10 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 		if (diagnostics) earlySignalDiagnostic ??= writeDiagnostic(diagnostics, options.stage, "signaled", performance.now() - started, unavailableResource(), cwd, undefined, ["signal-before-supervisor-identity"]);
 		await earlySignalDiagnostic;
 	};
+	let abortOwned = () => { try { child.kill("SIGTERM"); } catch { /* close decides */ } };
+	const onAbort = () => abortOwned();
+	options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+	if (options.abortSignal?.aborted) onAbort();
 	const leaderStart = await processStartTicks(child.pid ?? -1);
 	if (!child.pid || leaderStart === null) throw new Error("unable to establish Linux supervisor identity before ownership");
 	const tracked = new Map<number, ProcessIdentity>();
@@ -720,6 +740,8 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	await observeDescendants();
 	let resource = await ownedProcessResource(child.pid);
 	const beginTermination = () => termination ??= terminateOwnedSupervisor(child, leaderStart, closed, tracked);
+	abortOwned = () => { void beginTermination(); };
+	if (options.abortSignal?.aborted) abortOwned();
 	let signalDiagnostic: Promise<string> | undefined;
 	activeStageAbort = async () => {
 		const terminated = await beginTermination();
@@ -734,6 +756,7 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 	await afterDirectPollHook;
 	clearTimeout(timer); clearInterval(sampler); clearInterval(descendantSampler);
 	const terminationResult = termination ? await termination : undefined;
+	options.abortSignal?.removeEventListener("abort", onAbort);
 	await sample();
 	const supervisor = parseSupervisorRecord((await recordText).trim());
 	// If the supervisor was forcibly lost, do not report a green result. We can
@@ -750,7 +773,7 @@ export async function runOwnedStage(options: OwnedStageOptions): Promise<OwnedSt
 		try { testOutcome = await options.testOutcomeLoader(); }
 		catch (error) { outcomeError = `junit-outcome:${error instanceof Error ? error.message.slice(0, 96) : "invalid"}`; }
 	}
-	const status: StageStatus = spawnError || supervisor?.spawnError ? "spawn_error" : !cleanupComplete ? "cleanup_incomplete" : timedOut ? "timed_out" : resultSignal ? "signaled" : resultExitCode === 0 && !outcomeError ? "success" : "failure";
+	const status: StageStatus = spawnError || supervisor?.spawnError ? "spawn_error" : !cleanupComplete ? "cleanup_incomplete" : timedOut ? "timed_out" : options.abortSignal?.aborted || resultSignal ? "signaled" : resultExitCode === 0 && !outcomeError ? "success" : "failure";
 	const output: OwnedStageResult = { status, exitCode: resultExitCode, signal: resultSignal, timedOut };
 	if (diagnostics) output.diagnosticPath = signalDiagnostic ? await signalDiagnostic : earlySignalDiagnostic ? await earlySignalDiagnostic : await writeDiagnostic(diagnostics, options.stage, status, performance.now() - started, resource, cwd, testOutcome, [...cleanupErrors, ...(outcomeError ? [outcomeError] : [])]);
 	activeStageAbort = undefined;
@@ -837,6 +860,13 @@ export async function runCiStage(stage: CiStage, root = process.cwd(), strictLin
 	}
 }
 
+/** Read one bounded stage report using the same schema/filename validation as hosted CI. */
+export async function readValidatedDiagnostic(report: string): Promise<Record<string, unknown>> {
+	const parsed = JSON.parse(await readBoundedFile(report, DIAGNOSTIC_MAX_BYTES));
+	if (!validDiagnostic(parsed) || path.basename(report) !== `${safeStageName((parsed as { stage: string }).stage)}.json`) throw new Error("diagnostic artifact violates schema, manifest, or size bound");
+	return parsed as Record<string, unknown>;
+}
+
 export async function validateDiagnosticDirectory(root: string): Promise<string> {
 	const base = await fs.promises.lstat(root);
 	if (!base.isDirectory() || base.isSymbolicLink()) throw new Error("diagnostics root must be a non-symlink directory");
@@ -846,8 +876,7 @@ export async function validateDiagnosticDirectory(root: string): Promise<string>
 	const files = await fs.promises.readdir(directory, { withFileTypes: true });
 	if (files.length !== 1 || !files[0]!.isFile() || files[0]!.isSymbolicLink() || !/^[A-Za-z0-9_-]{1,64}\.json$/.test(files[0]!.name)) throw new Error("report directory must contain exactly one regular JSON manifest entry");
 	const report = path.join(directory, files[0]!.name);
-	const parsed = JSON.parse(await readBoundedFile(report, DIAGNOSTIC_MAX_BYTES));
-	if (!validDiagnostic(parsed) || files[0]!.name !== `${safeStageName((parsed as { stage: string }).stage)}.json`) throw new Error("diagnostic artifact violates schema, manifest, or size bound");
+	await readValidatedDiagnostic(report);
 	return path.resolve(report);
 }
 

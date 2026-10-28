@@ -86,6 +86,10 @@ Pi에서 첫 작업을 위임합니다.
 
 기본 보호 장치는 최대 위임 깊이 `5`, 순환 위임 방지, 호출 크기·동시성·백그라운드 한계입니다. 프로젝트 에이전트와 프로젝트 `pi-subagent.json`은 신뢰된 프로젝트에서만 읽습니다. 정확한 우선순위와 제한값은 [설정](docs/configuration.md)을 참고하세요.
 
+## 개발 검증
+
+원본 작업 공간을 건드리지 않는 opt-in 검증은 `bun run verify:isolated --commit HEAD --output /absolute/new-receipts`로 실행합니다. 기본 설치는 offline이며, 필요한 경우에만 명시한 Bun cache를 복사해서 사용합니다. 비표준 C compiler는 선택적 `--cc /absolute/toolchain/bin/cc`로 지정하며, 검증한 실행 경로와 그 directory만 private `CC`/`PATH`에 추가합니다(compiler symlink의 호출 basename 유지). tracked 변경 선택, cache 준비와 격리 한계는 [개발 문서](docs/development.md#격리-검증)를 참고하세요. 필수 검증 명령은 그대로 `bun run ci`입니다.
+
 ## 문서
 
 | 목적 | 문서 |

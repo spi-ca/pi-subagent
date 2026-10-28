@@ -91,6 +91,7 @@ import {
   createBackgroundJobRecord,
   snapshotBackgroundJob,
   steerBackgroundJob,
+  formatSteeringOutcome,
   extractToolText,
   finalizeBackgroundJobForSession,
   formatBackgroundJobListEntry,
@@ -108,6 +109,7 @@ import {
   pruneBackgroundJobs,
   releaseBackgroundJobReservation,
   reserveBackgroundJob,
+  type BackgroundLeafRecord,
   type BackgroundJobRecord,
   type BackgroundJobSnapshot,
   type BackgroundJobToolResult,
@@ -833,7 +835,13 @@ export default function (pi: ExtensionAPI) {
         }
         if (command.kind === "details") {
           const invocation = uxRegistry.get(command.id);
-          if (invocation) { ctx.ui.notify(formatSubagentUxDetail(invocation, ctx.ui.theme?.fg.bind(ctx.ui.theme)), "info"); return; }
+          if (invocation) {
+            const live = getBackgroundJobSnapshot(command.id, backgroundJobs);
+            const leafDetails = (live?.liveLeaves ?? []).map(leaf => `- childId: ${leaf.childId} · ${oneLine(leaf.stageLabel ? `${leaf.stageLabel} (${leaf.agent})` : leaf.agent, 96)}${leaf.taskIndex === undefined ? "" : ` · task ${leaf.taskIndex + 1}`} · steering: ${leaf.steerable ? "available" : "unavailable"}${leaf.clipped ? " · metadata clipped" : ""}`);
+            if (live?.omittedLeaves) leafDetails.push(`- ${live.omittedLeaves} live leaves omitted`);
+            ctx.ui.notify([formatSubagentUxDetail(invocation, ctx.ui.theme?.fg.bind(ctx.ui.theme)), ...leafDetails].join("\n"), "info");
+            return;
+          }
           const run = await inspectInteractiveRunForUx(command.id);
           if (!run) { ctx.ui.notify(`Unknown interactive run id: ${command.id}`, "error"); return; }
           const elapsed = Math.max(0, Date.now() - run.startedAt);
@@ -907,9 +915,43 @@ export default function (pi: ExtensionAPI) {
               focusRunId: run.runId,
             })),
           ].sort((left, right) => left.rank - right.rank || left.startedAt - right.startedAt || left.id.localeCompare(right.id)).slice(0, SUBAGENT_UX_SELECTOR_LIMIT);
+          const pickerSession = backgroundSessionFence.capture();
           const selected = await ctx.ui.select(`Subagents${jobs.length + interactive.length > SUBAGENT_UX_SELECTOR_LIMIT ? ` (${jobs.length + interactive.length - SUBAGENT_UX_SELECTOR_LIMIT} omitted)` : ""}`, entries.map((entry) => entry.label));
           const entry = entries.find((candidate) => candidate.label === selected);
+          if (!backgroundSessionFence.isCurrent(pickerSession)) return;
           if (entry?.focusRunId && await focusInteractiveRun(entry.focusRunId)) return;
+          const job = entry && backgroundJobs.get(entry.id);
+          if (entry && job?.status === "running") {
+            const action = await ctx.ui.select("Subagent action", ["Details", "Steer running child"]);
+            if (action === undefined) return;
+            if (action === "Steer running child") {
+              const current = () => !sessionShuttingDown && backgroundSessionFence.isCurrent(pickerSession)
+                && backgroundJobs.get(job.id) === job;
+              if (!current()) return;
+              const snapshot = snapshotBackgroundJob(job);
+              const authorities = new Map(job.activeLeaves);
+              const leaves = (snapshot.liveLeaves ?? []).filter(leaf => leaf.steerable);
+              let leaf = job.mode === "single" ? leaves[0] : undefined;
+              if (job.mode !== "single" && leaves.length) {
+                const choices = leaves.map((child, index) => ({ child, label: `${index + 1}. ${oneLine(child.stageLabel ? `${child.stageLabel} (${child.agent})` : child.agent, 96)}${child.taskIndex === undefined ? "" : ` · task ${child.taskIndex + 1}`} · ${child.childId}` }));
+                const selectedLeaf = await ctx.ui.select(`Currently running leaves${snapshot.omittedLeaves ? ` (${snapshot.omittedLeaves} omitted; use status)` : ""}`, choices.map(choice => choice.label));
+                leaf = choices.find(choice => choice.label === selectedLeaf)?.child;
+                if (!leaf) return;
+              }
+              if (!leaf) { ctx.ui.notify(formatSteeringOutcome("unavailable"), "warning"); return; }
+              // Snapshot IDs are selectors, never authority. The common handler
+              // checks the exact live leaf/handle again after every dialog await.
+              const selectedAuthority = authorities.get(leaf.childId);
+              const stillSelected = () => current() && selectedAuthority !== undefined && job.activeLeaves?.get(leaf.childId) === selectedAuthority;
+              const message = await ctx.ui.input("Steer child (max 512 UTF-8 bytes)");
+              if (message === undefined) return;
+              const invalid = validateSubagentInvocation({ action: "steer", id: job.id, childId: leaf.childId, message });
+              if (invalid) { ctx.ui.notify(formatSubagentInvocationValidationError(invalid), "error"); return; }
+              const outcome = await steerBackgroundJob(backgroundJobs, job.id, message, stillSelected, leaf.childId);
+              ctx.ui.notify(formatSteeringOutcome(outcome), outcome === "submitted" ? "info" : "warning");
+              return;
+            }
+          }
           if (entry) ctx.ui.notify(entry.detail, "info");
           return;
         }
@@ -1021,21 +1063,29 @@ export default function (pi: ExtensionAPI) {
             const available = () => childRunning && !options.signal?.aborted
               && backgroundJobs.get(backgroundJob.id) === backgroundJob && backgroundSessionFence.isCurrent(reportSession)
               && backgroundJob.status === "running" && !backgroundJob.controller?.signal.aborted;
+            const childId = crypto.randomUUID();
             childOptions.onParentReport = parentReports.bind({
               jobId: backgroundJob.id,
-              childId: crypto.randomUUID(),
+              childId,
               agent: options.agentName,
               mode: backgroundJob.mode,
               ...options.reportPosition,
             }, available);
-            // Reporting is per leaf. Steering remains an exact SINGLE job handle.
-            if (backgroundJob.mode === "single") {
-              childOptions.onSteeringReady = (handle: BackgroundJobRecord["steer"]) => {
-                if (!available()) return;
-                if (handle) backgroundJob.steer = handle;
-                else delete backgroundJob.steer;
-              };
-            }
+            let installed: BackgroundLeafRecord | undefined;
+            childOptions.onSteeringReady = (handle) => {
+              if (!handle) {
+                if (installed && backgroundJob.activeLeaves?.get(childId) === installed) backgroundJob.activeLeaves.delete(childId);
+                if (installed && backgroundJob.steer === installed.steer) delete backgroundJob.steer;
+                installed = undefined;
+                return;
+              }
+              // Do not replace an active authority. A late callback cannot revive
+              // an ended/cancelled leaf or mutate a new session's job.
+              if (!available() || installed) return;
+              installed = { metadata: { childId, agent: options.agentName, ...options.reportPosition }, steer: handle };
+              (backgroundJob.activeLeaves ??= new Map()).set(childId, installed);
+              if (backgroundJob.mode === "single") backgroundJob.steer = handle;
+            };
           }
           try {
             return await runAgent({ ...childOptions,
@@ -1044,6 +1094,7 @@ export default function (pi: ExtensionAPI) {
             // A completed leaf cannot report during later chain stages or while
             // siblings still run, even if a transport retains its old callback.
             childRunning = false;
+            childOptions.onSteeringReady?.(undefined);
           }
         } finally {
           if (treePermitLease) {
@@ -1478,15 +1529,8 @@ export default function (pi: ExtensionAPI) {
             // Map lookup is exact: no trimming, prefix guessing, history replay, or broadcast.
             const sessionToken = backgroundSessionFence.capture();
             const outcome = await steerBackgroundJob(backgroundJobs, params.id!, params.message!,
-              () => backgroundSessionFence.isCurrent(sessionToken) && canStartInvocation());
-            if (outcome === "not-found") return failOperational("runtime-policy", "Background subagent job was not found (exact full id required).");
-            if (outcome === "unsupported") return failOperational("runtime-policy", "Steering supports single-agent background jobs only.");
-            if (outcome !== "submitted") return failOperational("runtime-policy",
-              outcome === "unknown" ? "Steering outcome is unknown after timeout, cancellation, completion, or session replacement; do not retry automatically."
-                : outcome === "queue-full" ? "Local steering waiting queue is full; this message was not sent."
-                : outcome === "busy" ? "Steering transport is busy; this message was not sent."
-                : outcome === "unavailable" ? "Steering is unavailable for this run; this message was not sent."
-                : "Child rejected steering inbox admission (full, idle, or ineligible).");
+              () => backgroundSessionFence.isCurrent(sessionToken) && canStartInvocation(), params.childId);
+            if (outcome !== "submitted") return failOperational("runtime-policy", formatSteeringOutcome(outcome));
             const job = backgroundJobs.get(params.id!);
             if (!job || job.status !== "running" || job.controller?.signal.aborted || !backgroundSessionFence.isCurrent(sessionToken)) {
               return failOperational("runtime-policy", "Steering outcome is unknown after completion or session replacement; do not retry automatically.");

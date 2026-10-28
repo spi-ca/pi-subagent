@@ -327,6 +327,11 @@ function renderBackgroundJobSummary(
 	if (job.output !== undefined) text += `\n${theme.fg("toolOutput", expanded ? job.output : oneLine(job.output))}`;
 	if (job.outputClipped) text += `\n${theme.fg("warning", `... (output clipped • /subagent-result ${job.jobId})`)}`;
 	if (job.omittedBytes > 0) text += `\n${theme.fg("warning", `... (${job.omittedBytes} B not retained)`)}`;
+	if (job.liveLeaves?.length) {
+		text += `\n${theme.fg("muted", `${job.liveLeaves.filter(leaf => leaf.steerable).length} observed steering target(s); revalidated on send`)}`;
+		if (expanded) for (const leaf of job.liveLeaves) text += `\n${theme.fg("dim", `${leaf.stageLabel ? `${oneLine(leaf.stageLabel, 96)} (${oneLine(leaf.agent, 96)})` : oneLine(leaf.agent, 96)}${leaf.taskIndex === undefined ? "" : ` · task ${leaf.taskIndex + 1}`} · childId: ${leaf.childId} · ${leaf.steerable ? "available" : "unavailable"}${leaf.clipped ? " · metadata clipped" : ""}`)}`;
+	}
+	if (job.omittedLeaves) text += `\n${theme.fg("warning", `${job.omittedLeaves} live leaves omitted`)}`;
 	return text;
 }
 

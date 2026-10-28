@@ -4918,7 +4918,7 @@ export interface RunAgentOptions {
   managedOverriddenBuiltinTools?: string[];
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
-  /** Private active-only steering transport for background single calls. */
+  /** Private active-only steering transport for one background leaf. */
   onSteeringReady?: (handle: SteeringHandle | undefined) => void;
   /** Only the exact current background parent supplies this leaf binding. */
   onParentReport?: ParentReportSubmit;
@@ -5263,8 +5263,19 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         }
         piArgs.splice(piArgs.length - 1, 0, "--extension", inlineBridgePath);
         const server = inlineLifecycleServer, runId = inlineLifecycleRunId;
-        opts.onSteeringReady?.((message, eligible) => server.requestSteer(runId, message,
-          () => !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration) && (eligible?.() ?? true)));
+        const available = () => !signal?.aborted && canStartInteractiveRun(interactiveShutdownGeneration)
+          && server.isSteeringAvailable(runId);
+        const steer: SteeringHandle = async (message, eligible) => {
+          const current = () => { try { return available() && (eligible?.() ?? true); } catch { return false; } };
+          if (!current()) return "unavailable";
+          try {
+            const outcome = await server.requestSteer(runId, message, current);
+            if ((outcome === "submitted" || outcome === "rejected") && !current()) return "unknown";
+            return outcome;
+          } catch { return "unknown"; }
+        };
+        steer.isAvailable = available;
+        opts.onSteeringReady?.(steer);
       }
     }
     if (signal?.aborted || !canStartInteractiveRun(interactiveShutdownGeneration)) {
@@ -7136,15 +7147,25 @@ async function runAgentInInteractivePane(options: RunAgentInInteractivePaneOptio
     }
     if (lifecycleRunId && options.onSteeringReady) {
       const server = lifecycleEventServer!, controlRunId = lifecycleRunId;
-      options.onSteeringReady(async (message, eligible) => {
-        const available = () => (eligible?.() ?? true) && !options.signal?.aborted && !completionFenced
-          && canStartInteractiveRun(options.interactiveShutdownGeneration)
-          && (activeInteractiveRuns.get(controlRunId)?.ownership === "managed" || activeInteractiveRuns.get(controlRunId)?.ownership === "kept");
-        if (!available() || !paths) return "unavailable";
+      const available = () => !options.signal?.aborted && !completionFenced
+        && canStartInteractiveRun(options.interactiveShutdownGeneration) && server.isSteeringAvailable(controlRunId)
+        && (activeInteractiveRuns.get(controlRunId)?.ownership === "managed" || activeInteractiveRuns.get(controlRunId)?.ownership === "kept");
+      const steer: SteeringHandle = async (message, eligible) => {
+        const current = () => { try { return available() && (eligible?.() ?? true); } catch { return false; } };
+        if (!current() || !paths) return "unavailable";
         const fence = await readVerifiedCompletionFence(paths, controlRunId, completionFenceNonce).catch(() => true);
-        if (fence || !available()) return "unavailable";
-        return server.requestSteer(controlRunId, message, available);
-      });
+        if (fence || !current()) return "unavailable";
+        try {
+          const outcome = await server.requestSteer(controlRunId, message, current);
+          // Ownership/completion can revoke authority while an ACK is in flight.
+          // Delivery is then ambiguous, never a known-unsent unavailable result.
+          if ((outcome === "submitted" || outcome === "rejected") && (!current()
+            || await readVerifiedCompletionFence(paths, controlRunId, completionFenceNonce) || !current())) return "unknown";
+          return outcome;
+        } catch { return "unknown"; }
+      };
+      steer.isAvailable = available;
+      options.onSteeringReady(steer);
     }
     if (backend.mode === "tmux-pane" && !options.treePermitLease) {
       const startupDeadline = Date.now() + 10_000;

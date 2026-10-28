@@ -208,6 +208,21 @@ bun test --max-concurrency 1 test/ui/background-result-viewer.test.ts
 
 공통 4항목/16행 집계, 숨겨진 실패·누락 수, 한글·emoji·combining 문자와 1–160열 폭, 헤더-only 로컬 클릭·전역 펼침 전환·body 선택/scroll 비소유, dark/light 테마 재렌더링, partial의 execute 시간 생략, request/accepted/cancelling/submitted의 의미, legacy fallback·정화·원본 content/details 불변성을 검사합니다. `/subagents` 선택·details·취소 확인/알림과 기존 doctor 집중 테스트는 UI가 실행/취소/승인 권한을 만들지 않는지도 확인합니다. 이 범위는 실제 terminal 마우스/키 입력, provider 응답, live multiplexer acceptance 또는 전체 CI를 대신하지 않습니다. Pi 1.4의 중첩 `select`/`confirm`/`input`/`editor` 및 inline `custom()` dialog stack 복구는 host 소유 UI이므로 별도 구현이나 중복 fake 검사를 추가하지 않습니다. 실제 TUI에서 두 dialog를 겹쳐 열고 위 dialog를 닫았을 때 이전 dialog·focus가 복원되고 양쪽 promise가 완료되는 smoke는 수동 검증 범위이며, 이 offline 회귀에서 실행했다고 주장하지 않습니다. 필수 최종 gate는 여전히 `bun run ci`입니다.
 
+### Exact leaf steering 집중 검증
+
+부모가 생성한 같은 leaf ID를 report/status/steer에서 공유하며, 병렬·체인은 명시적 현재 `childId` 없이 전송하지 않습니다. 다음 검사는 기존 인증 socket의 activity/abort 경계, exact leaf/handle 교체·종료·세션 race, 32행/64 KiB projection omission과 native picker의 single/parallel 입력·취소·fresh 검증을 확인합니다. 각 파일은 별도 process에서 실행합니다.
+
+```bash
+bun test --max-concurrency 1 test/core/subagent-steering.test.ts
+bun test --max-concurrency 1 test/runtime/lifecycle-socket.test.ts
+bun test --max-concurrency 1 test/runtime/inline-steering-bridge.test.ts
+bun test --max-concurrency 1 test/integration/steering-boundary-host.test.ts
+bun test --max-concurrency 1 test/entrypoint/parent-report-fanout.test.ts
+bun test --max-concurrency 1 test/entrypoint/subagents-ui.test.ts
+```
+
+이는 provider/live terminal·실제 multiplexer 검증이 아니며, native TUI key/focus smoke는 실행했다고 주장하지 않습니다. 필수 최종 검증은 clean source sandbox의 `bun run ci`입니다.
+
 ## 개발 의존성
 
 클린 체크아웃에서도 `bun install --frozen-lockfile`만으로 타입 체크에 필요한 Pi API 패키지와 `typebox`를 설치합니다. Pi 개발 의존성은 exact `1.4.0`이고 lockfile이 실제 설치 버전을 고정하며, `typebox`는 exact pin합니다. `tsconfig.json`은 형제 Pi 설치 경로에 의존하지 않습니다.

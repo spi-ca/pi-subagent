@@ -589,6 +589,7 @@ describe("subagent tool schema", () => {
         action: { type: "string", enum: ["status", "cancel", "steer"] },
         message: { type: "string", minLength: 1, maxLength: 512 },
         id: { type: "string", minLength: 1 },
+        childId: { type: "string", minLength: 36, maxLength: 36 },
         background: { type: "boolean" },
         agent: { type: "string", minLength: 1 },
         task: { type: "string", minLength: 1 },
@@ -746,7 +747,7 @@ describe("subagent tool schema", () => {
     assert.match(description, /status without id lists background jobs/);
     assert.match(description, /cancel without id cancels all running background jobs/);
     assert.match(description, /cancel ACK is not terminal/i);
-    assert.match(description, /steer: full single background id.*inbox admission ACK only/i);
+    assert.match(description, /steer: full background id.*chain\/parallel require current childId from status.*inbox admission ACK only/i);
     assert.match(description, /chain labels.*unique/i);
     assert.match(description, /defaults to on_success/i);
     assert.match(description, /recovery.*continueOnError.*failed stage/is);
@@ -767,7 +768,8 @@ describe("subagent tool schema", () => {
 
   test("keeps the serialized schema and description within the compact budget", () => {
     const staticChars = JSON.stringify(SubagentParams).length + formatSubagentToolDescription().length;
-    assert.ok(staticChars <= 2_550, `static schema and description are ${staticChars} characters`);
+    // Optional exact-leaf selector + concise routing guidance; no feature2 tooling.
+    assert.ok(staticChars <= 2_700, `static schema and description are ${staticChars} characters`);
   });
 
 

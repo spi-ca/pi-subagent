@@ -1,6 +1,6 @@
-import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { CompactText, HeaderExpander, expansionState, oneLine, safeUiText } from "./native-ui.js";
+import { CompactText, HeaderExpander, expansionState, oneLine, safeUiText, truncateUiRow } from "./native-ui.js";
 
 const kinds = new Set(["progress", "finding", "question", "blocked"]);
 const MAX_REPORT_SOURCE = 8192;
@@ -20,7 +20,7 @@ class ExpandedReportText extends Text {
     const clipped = this.clipped || rows.length > available;
     const body = clipped ? rows.slice(0, Math.max(0, available - 1)) : rows;
     return [...header, ...body, ...(clipped ? ["[display clipped]"] : []), ...footer]
-      .map(row => truncateToWidth(row, width, "…"));
+      .map(row => truncateUiRow(row, width));
   }
 }
 type Context = { state?: Record<string, unknown>; expanded?: boolean; invalidate?: () => void; isPartial?: boolean };

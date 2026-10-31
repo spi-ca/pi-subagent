@@ -8,8 +8,28 @@ export function safeUiText(text: string): string {
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b/g, "")
     .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "");
 }
+/**
+ * Pi owns width/graphemes and OSC8 closure, but its truncator resets all SGR
+ * before/after the suffix. Our rows own foreground/decorations, not the host
+ * shell background: keep the suffix in the retained text's style, then close
+ * those local styles specifically. Never remove resets from the source text.
+ */
+export function truncateUiRow(text: string, columns: number): string {
+  const truncated = truncateToWidth(text, columns, "…");
+  const suffix = "\x1b[0m…\x1b[0m";
+  if (!truncated.endsWith(suffix) || truncated === text) return truncated;
+  const prefix = truncated.slice(0, -suffix.length);
+  // A sanitized source stays plain, including after source-preview clipping.
+  if (!text.includes("\x1b")) return `${prefix}…`;
+  // With no retained grapheme (one column, or an overwide first grapheme),
+  // Pi omits pending ANSI too. Inherit the first cell's SGR, but not its link.
+  const leading = prefix ? "" : (text.match(/^(?:\x1b\[[\d;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\))*/)?.[0]
+    .match(/\x1b\[[\d;]*m/g)?.join("") ?? "");
+  return `${prefix}${leading}…\x1b[22;23;24;25;27;28;29;39m`;
+}
+
 export function oneLine(text: string, columns = 100): string {
-  return truncateToWidth(safeUiText(text.slice(0, 8192)).replace(/\s+/g, " ").trim(), columns, "…");
+  return truncateUiRow(safeUiText(text.slice(0, 8192)).replace(/\s+/g, " ").trim(), columns);
 }
 
 /** A compact logical row is also one visual row, including at narrow widths. */
@@ -18,7 +38,7 @@ export class CompactText extends Text {
   override setText(text: string): void { this.rows = text; super.setText(text); }
   override render(width: number): string[] {
     if (width < 1) return [];
-    return this.rows.split("\n").map(row => truncateToWidth(row, width, "…"));
+    return this.rows.split("\n").map(row => truncateUiRow(row, width));
   }
 }
 
@@ -28,7 +48,7 @@ export class LimitedText extends Text {
   override render(width: number): string[] {
     if (width < 1) return [];
     const rows = super.render(width);
-    return rows.length <= this.maxRows ? rows : [...rows.slice(0, this.maxRows - 1), truncateToWidth("[display clipped]", width, "…")];
+    return rows.length <= this.maxRows ? rows : [...rows.slice(0, this.maxRows - 1), truncateUiRow("[display clipped]", width)];
   }
 }
 

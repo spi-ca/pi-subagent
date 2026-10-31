@@ -1,6 +1,6 @@
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Box, Markdown, Text, truncateToWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
-import { CompactText, oneLine, stateText, STATE_STYLE } from "./native-ui.js";
+import { Box, Markdown, Text, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { CompactText, oneLine, stateText, STATE_STYLE, truncateUiRow } from "./native-ui.js";
 import { configuredExpandHint } from "./expand-hint.js";
 import type { InlineCardPresentation, InlineCardState } from "./inline-presentation.js";
 
@@ -184,7 +184,7 @@ export class InlineResultCard extends Box {
       header += this.theme.fg("dim", ` (${configuredExpandHint()})`);
     }
     if (this.options.compactHeader && this.renderedWidth !== undefined) {
-      header = truncateToWidth(header, this.renderedWidth);
+      header = truncateUiRow(header, this.renderedWidth);
     }
     this.addChild(this.state.expanded ? new Text(header, 0, 0) : new CompactText(header));
     if (this.presentation.task) this.addChild(this.state.expanded

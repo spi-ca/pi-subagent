@@ -2,6 +2,7 @@
 
 ## 미출시
 
+- 호출·결과 카드와 보고·widget의 말줄임표(`…`)가 앞선 글자의 색상·장식을 유지하고, 뒤쪽 여백에서 Pi 소유 배경색이 끊기지 않도록 공통 UI 잘림 처리를 보정했다. 셸·padding·클릭/펼침과 실행 상태·원본 결과는 바꾸지 않는다.
 - Pi 개발 의존성·lockfile의 7개 Pi 패키지·8개 CI stage graph를 exact `1.4.0`으로 동기화했다. peer 범위·shared `@pi/presence` pin·managed 복원/override guard와 실행 동시성 정책은 유지한다.
 - 실제 설치 host의 offline 회귀로 resume/tree의 신규·지연 등록 extension 도구 활성화와 명시 제거·allowlist·no-tools 우선, codemode 기본 두 worker의 FIFO 대기·기한 만료·취소를 검증한다. provider/auth·실제 terminal/multiplexer와 중첩 dialog smoke는 실행 범위가 아니다.
 - reaper benchmark의 TEST-only 임시 fixture 준비에서 run마다 반복하던 production 초기화·동기화를 줄였다. 같은 로컬 256개 directory 준비는 약 6.23초에서 0.13초로 줄었으며, 실제 10,000-directory 분류·100,000-node graph·기존 assertion/timeout과 production durability는 유지한다. production 성능 개선을 주장하지 않는다.

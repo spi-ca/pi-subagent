@@ -2,12 +2,12 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { ToolExecutionComponent } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { initTheme, theme as activeTheme } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
+import { initTheme, theme as activeTheme, Theme, getResolvedThemeColors, setThemeInstance } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { emptyUsage, type SingleResult, type SubagentDetails } from "../../src/core/types";
 import { ensureInlinePresentation } from "../../src/core/runner-events";
 import { formatParentReport } from "../../src/runtime/parent-report";
 import { renderCall, renderResult } from "../../src/ui/render";
-import { COMPACT_ITEM_LIMIT, COMPACT_ROW_LIMIT, expansionState, durationText, stateText } from "../../src/ui/native-ui";
+import { COMPACT_ITEM_LIMIT, COMPACT_ROW_LIMIT, CompactText, oneLine, expansionState, durationText, stateText } from "../../src/ui/native-ui";
 import { InlinePresentationRegistry } from "../../src/ui/inline-presentation";
 import { InlinePresentationWidget } from "../../src/ui/inline-presentation-widget";
 import { createParentReportRenderer } from "../../src/ui/parent-report-render";
@@ -39,6 +39,187 @@ function bounded(component: { render: (width: number) => string[] }, max = COMPA
     assert.doesNotMatch(plain(rows.join("\n")), /\p{Surrogate}|\u202e/u);
   }
 }
+
+/** Small assertion helper, not a terminal emulator: SGR/OSC8 state at each native-width cell. */
+function ansiCells(row: string) {
+  let fg = "default", bg = "default", link = "";
+  const attributes = new Set<number>();
+  const cells: Array<{ text: string; fg: string; bg: string; attributes: number[]; link: string }> = [];
+  for (const token of row.matchAll(/\x1b\[[\d;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)|[^\x1b]+/g)) {
+    const value = token[0];
+    if (value.startsWith("\x1b]8;")) { link = value.replace(/^\x1b\]8;[^;]*;/, "").replace(/\x07$|\x1b\\$/, ""); continue; }
+    if (value.startsWith("\x1b[")) {
+      const codes = value.slice(2, -1).split(";").map(Number);
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i]!;
+        if (code === 0) { fg = bg = "default"; attributes.clear(); }
+        else if (code === 38 || code === 48) {
+          const count = codes[i + 1] === 2 ? 4 : 2;
+          const color = codes.slice(i, i + count + 1).join(";");
+          if (code === 38) fg = color; else bg = color;
+          i += count;
+        } else if (code === 39) fg = "default";
+        else if (code === 49) bg = "default";
+        else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) fg = String(code);
+        else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) bg = String(code);
+        else if (code >= 1 && code <= 9) attributes.add(code);
+        else if (code === 22) { attributes.delete(1); attributes.delete(2); }
+        else if (code >= 23 && code <= 25) attributes.delete(code - 20);
+        else if (code >= 27 && code <= 29) attributes.delete(code - 20);
+      }
+      continue;
+    }
+    for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value)) {
+      for (let column = 0; column < visibleWidth(segment); column++) cells.push({ text: segment, fg, bg, attributes: [...attributes].sort(), link });
+    }
+  }
+  return cells;
+}
+
+test("native shell ellipsis keeps per-cell host backgrounds in dark/light pending/success/error", () => {
+  for (const appearance of ["dark", "light"] as const) for (const status of ["pending", "success", "error"] as const) {
+    initTheme(appearance, false);
+    const theme = activeTheme;
+    const token = status === "pending" ? "toolPendingBg" : status === "error" ? "toolErrorBg" : "toolSuccessBg";
+    const expectedBg = ansiCells(theme.bg(token, "x"))[0]!.bg;
+    for (const source of ["x".repeat(130), "한글👩‍💻é".repeat(70)]) for (const kind of ["background", "pane", "inline"] as const) {
+      const registry = new InlinePresentationRegistry();
+      const item = result(0);
+      item.agent = "worker"; delete item.stageLabel;
+      item.task = source;
+      item.exitCode = status === "pending" ? -1 : status === "error" ? 1 : 0;
+      item.messages = [{ role: "assistant", content: [{ type: "text", text: source }], stopReason: "stop" }] as SingleResult["messages"];
+      if (status === "error") item.errorMessage = source;
+      Object.assign(ensureInlinePresentation(item)!, { lastAssistantText: source, lastAssistantTextClipped: false, activities: [] });
+      const value: SubagentDetails = { ...details(), mode: "single", results: [item], terminalMode: kind === "pane" ? "tmux-pane" : "inline" };
+      if (kind === "inline") registry.capture("ellipsis", value, { retainAuthoritativeResults: true });
+      const host = new ToolExecutionComponent("subagent", "ellipsis", { agent: "worker", task: source }, { outputPad: 1 }, {
+        renderCall: (args, theme, context) => renderCall(args as any, theme, context),
+        renderResult: (result, { expanded }, theme, context) => renderResult(result, expanded, theme, context, registry),
+      }, { requestRender() {} } as never, process.cwd());
+      host.updateResult({ content: [], details: kind === "background" ? { kind: "subagent.background-job", version: 1, event: "status", job: { jobId: id, status: status === "error" ? "failed" : "completed", startedAt: 1, completedAt: 2, ...(status === "error" ? { errorReason: source } : { output: source }), omittedBytes: 0 } } : value, isError: status === "error" }, status === "pending");
+      for (const width of [1, 2, 24, 80, 160]) {
+        const rows = host.render(width);
+        let ellipses = 0;
+        for (const row of rows) {
+          const cells = ansiCells(row);
+          for (const [index, cell] of cells.entries()) {
+            assert.equal(cell.bg, expectedBg, `${appearance}/${status}/${width} cell ${index} ${JSON.stringify(row)}`);
+            if (cell.text === "…") {
+              ellipses++;
+              // Ellipsis belongs to the same foreground/decorations as retained text.
+              if (index > 1 && cells[index - 1]!.text !== " ") {
+                assert.equal(cell.fg, cells[index - 1]!.fg);
+                assert.deepEqual(cell.attributes, cells[index - 1]!.attributes);
+              }
+            }
+          }
+        }
+        assert.ok(ellipses > 0, `${appearance}/${status}/${width}: truncation exercised`);
+        if (width === 160) {
+          const previews = rows.filter(row => plain(row).trimStart().startsWith(source.slice(0, 1)));
+          assert.equal(previews.length, 2, `${kind}: both call and result source truncations`);
+          for (const [index, preview] of previews.entries()) {
+            const previewCells = ansiCells(preview).filter(cell => cell.text !== " ");
+            assert.equal(previewCells.at(-1)!.text, "…");
+            assert.equal(previewCells.at(-1)!.fg, ansiCells(theme.fg(index === 0 ? "dim" : status === "error" ? "error" : "toolOutput", "x"))[0]!.fg);
+            const ellipsis = ansiCells(preview).findIndex(cell => cell.text === "…");
+            for (const padding of ansiCells(preview).slice(ellipsis + 1)) {
+              assert.equal(padding.fg, "default"); assert.deepEqual(padding.attributes, []);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+test("report headers/footers, expanded warnings and widget headers preserve inherited theme backgrounds", () => {
+  for (const appearance of ["dark", "light"] as const) {
+    initTheme(appearance, false);
+    const theme = activeTheme;
+    const source = "한글👩‍💻é".repeat(100);
+    const registry = new InlinePresentationRegistry();
+    const value = details();
+    value.results.forEach(item => { item.agent = source; item.exitCode = -1; });
+    registry.capture("widget-ellipsis", value);
+    const widget = new InlinePresentationWidget({ requestRender() {} }, registry, theme);
+    const sender = { kind: "subagent.parent-report", version: 3, agent: source, jobId: id, childId: "child", mode: "single" as const, reportId: "report", reportKind: "question" as const, receivedAtMs: 1, submittedAtMs: 2 };
+    const message = { content: `Report ID: report; parent receivedAtMs: 1; first submittedAtMs: 2 (handoff/draft only, not commit, delivery or model read).\n${formatParentReport(sender, source, "question")}`, details: sender };
+    const expectedBg = ansiCells(theme.bg("customMessageBg", "x"))[0]!.bg;
+    for (const expanded of [false, true]) {
+      const parent = createParentReportRenderer()(message, { expanded, outputPad: 1 }, theme);
+      const background = createBackgroundResultRenderer()({ content: source, details: { legacy: true } }, { expanded, outputPad: 1 }, theme);
+      const childCall = renderParentReportCall({ kind: "question", message: source.repeat(20) }, theme, { expanded });
+      const childResult = renderParentReportResult({ content: [{ type: "text", text: source.repeat(20) }] }, { expanded }, theme);
+      for (const width of [1, 2, 24, 80, 160]) {
+        for (const component of [parent, background, childCall, childResult, widget]) {
+          for (const row of component.render(width)) {
+            // The shell wrapper supplies the background; padding and subsequent rows
+            // must not inherit foreground/decorations from a truncated child.
+            const ownsShell = component === parent || component === background;
+            const cells = ansiCells(ownsShell ? row : theme.bg("customMessageBg", row));
+            assert.ok(cells.every(cell => cell.bg === expectedBg), `${appearance}/${expanded}/${width}: ${JSON.stringify(row)}`);
+          }
+        }
+      }
+    }
+    widget.dispose();
+  }
+});
+
+test("native shell uses overridden host tokens, never plugin-owned background colors", () => {
+  const colors = { ...getResolvedThemeColors("dark"), toolPendingBg: "#123456", toolSuccessBg: "#654321", toolErrorBg: "#245136" };
+  const overridden = new Theme(colors as unknown as ConstructorParameters<typeof Theme>[0], colors as unknown as ConstructorParameters<typeof Theme>[1], "truecolor");
+  setThemeInstance(overridden);
+  try {
+    for (const status of ["pending", "success", "error"] as const) {
+      const host = new ToolExecutionComponent("subagent", "override", { agent: "worker", task: "x".repeat(130) }, { outputPad: 1 }, {
+        renderCall: (args, theme, context) => renderCall(args as any, theme, context),
+        renderResult: (result, { expanded }, theme, context) => renderResult(result, expanded, theme, context),
+      }, { requestRender() {} } as never, process.cwd());
+      host.updateResult({ content: [{ type: "text", text: "한글👩‍💻".repeat(100) }], isError: status === "error" }, status === "pending");
+      const token = status === "pending" ? "toolPendingBg" : status === "error" ? "toolErrorBg" : "toolSuccessBg";
+      const expectedBg = ansiCells(overridden.bg(token, "x"))[0]!.bg;
+      for (const width of [1, 2, 24, 80, 160]) for (const row of host.render(width)) {
+        assert.ok(ansiCells(row).every(cell => cell.bg === expectedBg));
+      }
+    }
+  } finally { initTheme("dark", false); }
+});
+
+test("source oneLine remains plain after native clipping and sanitization", () => {
+  const source = "한글👩‍💻é".repeat(70);
+  for (const width of [1, 2, 24, 80, 160]) {
+    const sanitized = oneLine(`\x1b[31m\x1b]8;;https://invalid.test\x07${source}\x1b]8;;\x07\x1b[0m\u202e`, width);
+    assert.doesNotMatch(sanitized, /\x1b|\u202e/);
+    assert.ok(sanitized.endsWith("…")); assert.ok(visibleWidth(sanitized) <= width);
+  }
+});
+
+test("final CompactText closes only local styles, including OSC8", () => {
+  const source = "한글👩‍💻é".repeat(70);
+  for (const color of ["38;2;17;38;59", "38;5;123", "31"]) for (const terminator of ["\x07", "\x1b\\"]) for (const width of [1, 2, 24, 80, 160]) {
+    const decorated = `\x1b[${color};1;2;3;4;5;7;8;9m\x1b]8;;https://invalid.test${terminator}${source}\x1b]8;;${terminator}\x1b[22;23;24;25;27;28;29;39m`;
+    const rows = new CompactText(`${decorated}\nplain`).render(width);
+    assert.ok(rows.every(row => visibleWidth(row) <= width));
+    const cells = ansiCells(`\x1b[48;2;12;34;56m${rows[0]}  ${rows[1]}  `);
+    const ellipsis = cells.findIndex(cell => cell.text === "…");
+    assert.ok(ellipsis >= 0);
+    assert.equal(cells[ellipsis]!.fg, color);
+    assert.deepEqual(cells[ellipsis]!.attributes, [1, 2, 3, 4, 5, 7, 8, 9]);
+    assert.equal(cells[ellipsis]!.link, "");
+    assert.ok(cells.every(cell => cell.bg === "48;2;12;34;56"));
+    for (const cell of cells.slice(ellipsis + 1)) {
+      assert.equal(cell.fg, "default"); assert.deepEqual(cell.attributes, []); assert.equal(cell.link, "");
+    }
+  }
+  // A genuine source reset must survive: only resets introduced by truncation are replaceable.
+  const row = new CompactText("\x1b[31mred\x1b[0mplain".repeat(10)).render(8)[0]!;
+  assert.ok(row.includes("\x1b[0m"));
+  assert.equal(ansiCells(row).find(cell => cell.text === "p")!.fg, "default");
+  assert.equal(ansiCells(row).find(cell => cell.text === "…")!.fg, "default");
+});
 
 test("shared lifecycle vocabulary and human durations distinguish cancellation and acceptance", () => {
   assert.equal(stateText("accepted"), "◷ accepted");

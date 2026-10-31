@@ -1,4 +1,5 @@
-import { Box, visibleWidth, wrapTextWithAnsi, truncateToWidth } from "@earendil-works/pi-tui";
+import { Box, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateUiRow } from "./native-ui.js";
 import { normalizeToolDisplayPreviewLines } from "./tool-display-config.js";
 
 /** Shared display-only layout/state for native custom messages, not tool cards. */
@@ -117,7 +118,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
       const substitutedMarker = wrapDisplayRows(statusMarker("substituted", contentWidth), contentWidth).rows;
       const footerLayout = (text: string) => renderLines.compactMaxRows === undefined
         ? wrapDisplayRows(text, contentWidth)
-        : { rows: [truncateToWidth(text, contentWidth, "…")], substituted: false };
+        : { rows: [truncateUiRow(text, contentWidth)], substituted: false };
       const footerRows = renderLines.footers.map((footer) => footerLayout(
         contentWidth < 8 && footer.compactText !== undefined ? footer.compactText : footer.text,
       ));
@@ -167,7 +168,7 @@ function createBoundedLines(renderLines: RenderLines, outputPad: number): { rend
         let bodyRows = 0;
         let bodyPartiallyVisible = false;
         for (let index = 0; index < renderLines.lines.length; index += 1) {
-          const wrapped = index === 0 ? { rows: [truncateToWidth(renderLines.lines[index]!, contentWidth, "…")], substituted: false } : wrapDisplayRows(renderLines.lines[index]!, contentWidth);
+          const wrapped = index === 0 ? { rows: [truncateUiRow(renderLines.lines[index]!, contentWidth)], substituted: false } : wrapDisplayRows(renderLines.lines[index]!, contentWidth);
           substituted ||= wrapped.substituted;
           if (index < compactBody.firstLineIndex) {
             for (const row of wrapped.rows) {

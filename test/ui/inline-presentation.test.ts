@@ -58,7 +58,7 @@ describe("inline execution presentation", () => {
     assert.doesNotMatch(text, /arguments|tool output/i);
   });
 
-  test("keeps the collapsed card to one preview line, then expands only from the header", () => {
+  test("keeps the collapsed card to one preview line, then toggles from title or body", () => {
     const registry = new InlinePresentationRegistry();
     const value = details([result("worker", "one\ntwo\nthree\nfour", Array.from({ length: 6 }, (_, index) => ({
       id: `activity-${index}`, name: `tool-${index}`, status: "completed" as const,
@@ -68,7 +68,10 @@ describe("inline execution presentation", () => {
     const collapsed = first.render(160).join("\n");
     assert.match(collapsed, /one/);
     assert.doesNotMatch(collapsed, /two|three|tool-0/);
-    assert.equal(firstCard.handleMouse({ type: "click", button: "left", x: 2, y: 1 }), undefined, "body clicks stay available for transcript selection");
+    assert.equal(firstCard.handleMouse({ type: "click", button: "left", x: 2, y: 1 })?.handled, true);
+    assert.match(first.render(160).join("\n"), /tool-0 · ✓ completed/, "body click expands locally");
+    firstCard.handleMouse({ type: "click", button: "left", x: 2, y: 2 });
+    assert.doesNotMatch(first.render(160).join("\n"), /tool-0/, "expanded body click collapses locally");
     assert.equal(firstCard.handleMouse({ type: "drag", button: "left", y: 0 }), undefined);
     assert.equal(firstCard.handleMouse({ type: "wheel", y: 0 }), undefined);
     assert.equal(firstCard.handleMouse({ type: "click", button: "right", y: 0 }), undefined);
@@ -199,7 +202,7 @@ describe("inline execution presentation", () => {
     assert.doesNotMatch(snapshotText, /error placeholder|aborted placeholder|pending placeholder|status-pending placeholder/);
   });
 
-  nestedMouseTest("uses Pi 0.87 transformed container dispatch for a header but not a card body", () => {
+  nestedMouseTest("uses native transformed container dispatch for both title and body", () => {
     const registry = new InlinePresentationRegistry();
     const value = details([result("worker", "answer", [])]);
     const rendered = component(registry, value, false);
@@ -217,10 +220,14 @@ describe("inline execution presentation", () => {
     assert.equal(header?.target.component, firstCard);
     assert.equal(header?.target.originX, 102, "target origin uses the card's transformed local x");
     assert.equal(header?.target.originY, 51, "target origin uses the card's transformed local y");
-    assert.equal(outer.handleMouse({
+    const body = outer.handleMouse({
       type: "click", button: "left", x: 3, y: 2, screenX: 103, screenY: 52,
       width: 120, height: outer.render(120).length, shift: false, alt: false, ctrl: false,
-    }), undefined, "only the card header consumes a primary click after nested dispatch");
+    });
+    assert.equal(body?.handled, true);
+    assert.equal(body?.target.component, firstCard);
+    assert.equal(body?.target.originY, 51, "body dispatch preserves the card origin");
+    assert.match(outer.render(120).join("\n"), /▸ worker/, "body click collapses that card");
   });
 
   test("keeps an individual choice through redraw, lets global expansion override it, and distinguishes duplicate slots", () => {
@@ -335,9 +342,16 @@ describe("inline execution presentation", () => {
     });
     assert.equal(dispatched?.handled, true, "the rendered second-card header receives widget dispatch");
     assert.equal((widget as any).handleMouse({
-      type: "click", button: "left", x: 0, y: 1, screenX: 0, screenY: 1,
-      width: 12, height: compact.length, shift: false, alt: false, ctrl: false,
-    }), undefined, "a visible narrow card body remains outside the header hit target");
+      type: "click", button: "left", x: 0, y: secondHeaderRow + 1, screenX: 0, screenY: secondHeaderRow + 1,
+      width: 12, height: widget.render(12).length, shift: false, alt: false, ctrl: false,
+    })?.handled, true, "a visible narrow card body toggles the same card");
+    assert.match(widget.render(12)[secondHeaderRow]!, /▸/, "body click collapsed only the second card");
+    (widget as any).handleMouse({
+      type: "click", button: "left", x: 0, y: secondHeaderRow + 1, screenX: 0, screenY: secondHeaderRow + 1,
+      width: 12, height: widget.render(12).length, shift: false, alt: false, ctrl: false,
+    });
+    const slot = (widget as any).children[1];
+    assert.equal(slot.handleMouse({ type: "click", button: "left", y: 3 }), undefined, "clipped-away slot rows are never clickable");
     const expanded = widget.render(12);
     assert.match(expanded[secondHeaderRow]!, /▾/, "clicking the visible second header expands that card, not the hidden first body");
     assert.equal(expanded[0], firstHeader, "the first header remains visible after a later card expands");

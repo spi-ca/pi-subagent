@@ -268,15 +268,15 @@ test("partial/final/restored inline and pane aggregates share compact limits and
   }
 });
 
-test("native single/result/action header expansion preserves global transitions, selection and host theme", () => {
+test("native single/result/action card expansion preserves global transitions, selection and host theme", () => {
   const value = { ...details("parallel", "tmux-pane"), mode: "single" as const, results: [result(0)] };
   const state = {};
   let redraws = 0;
   const context = { state, invalidate: () => { redraws++; }, durationMs: 1 };
   const component = renderResult({ content: [], details: value }, false, theme, context) as any;
   const expander = component.children[0].children[0];
-  for (const event of [{ type: "click", button: "left", y: 1 }, { type: "drag", button: "left", y: 0 }, { type: "wheel", y: 0 }, { type: "click", button: "right", y: 0 }]) assert.equal(expander.handleMouse(event), undefined);
-  assert.equal(expander.handleMouse({ type: "click", button: "left", y: 0 }).handled, true);
+  for (const event of [{ type: "press", button: "left", y: 1 }, { type: "release", button: "left", y: 1 }, { type: "drag", button: "left", y: 0 }, { type: "wheel", y: 0 }, { type: "click", button: "right", y: 0 }]) assert.equal(expander.handleMouse(event), undefined);
+  assert.equal(expander.handleMouse({ type: "click", button: "left", y: 1 }).handled, true);
   assert.equal(redraws, 1); assert.match(text(component), /expanded-model/);
   assert.match(text(renderResult({ content: [], details: value }, false, theme, context)), /expanded-model/);
   renderResult({ content: [], details: value }, true, theme, context);
@@ -311,8 +311,7 @@ test("report aggregates share item/row limits, keep kind nonterminal and preserv
   assert.match(compact, /6 reports omitted/); assert.match(compact, /Report ≠ approval/);
   assert.doesNotMatch(compact, /✓|✗|completed|failed|· untrusted/);
   assert.equal((compact.match(/progress · worker-/g) ?? []).length, COMPACT_ITEM_LIMIT);
-  assert.equal(component.handleMouse({ type: "click", button: "left", y: 1 }), undefined);
-  component.handleMouse({ type: "click", button: "left", y: 0 });
+  assert.equal(component.handleMouse({ type: "click", button: "left", y: 1 })?.handled, true);
   assert.match(text(component), /Report: report-9/);
   assert.equal(JSON.stringify(message), before); assert.match(message.content, /Subagent output \(untrusted/);
 });
@@ -337,13 +336,13 @@ test("child report call/result presentation is bounded and submitted never claim
   assert.deepEqual(args, before);
 });
 
-test("legacy background fallback remains bounded, honest and header-only clickable", () => {
+test("legacy background fallback remains bounded, honest and body-clickable", () => {
   const message = { content: "legacy 한😀\u202e".repeat(10_000), details: { legacy: true } };
   const before = structuredClone(message);
   const renderer = createBackgroundResultRenderer(); const card = renderer(message, { expanded: false, outputPad: 0 }, theme);
   bounded(card, 96); assert.match(text(card), /unrecognized/);
-  assert.equal(card.handleMouse({ type: "click", button: "left", y: 2 }), undefined);
-  card.handleMouse({ type: "click", button: "left", y: 0 }); bounded(card, 96);
+  assert.equal(card.handleMouse({ type: "click", button: "left", y: 2 })?.handled, true);
+  bounded(card, 96);
   assert.match(text(card), /display clipped/); assert.deepEqual(message, before);
 });
 
@@ -362,7 +361,7 @@ test("chain partial/resumed summaries do not claim whole-chain completion or con
   assert.doesNotThrow(() => renderCall({ chain: [{ label: 123, agent: null, task: "partial" }, null] }, theme).render(40));
 });
 
-test("actual native tool shell routes action header clicks without added padding or global expansion", () => {
+test("actual native tool shell routes action body clicks without added padding or global expansion", () => {
   initTheme("dark", false);
   for (const outputPad of [0, 1]) {
     const value = { content: [], details: { kind: "subagent.background-job", version: 1, event: "status", job: { jobId: id, status: "completed", startedAt: 1, completedAt: 2, output: "first line\nexpanded tail", omittedBytes: 0 } }, durationMs: 12, isError: false };
@@ -375,7 +374,7 @@ test("actual native tool shell routes action header clicks without added padding
     const header = before.findIndex(row => row.includes("✓ completed"));
     assert.ok(header >= 0); assert.equal(before[header]!.indexOf("job"), outputPad);
     assert.doesNotMatch(before.join("\n"), new RegExp(id));
-    const handled = host.handleMouse({ type: "click", button: "left", x: outputPad + 2, y: header, screenX: 100 + outputPad + 2, screenY: 50 + header, width: 120, height: before.length, shift: false, alt: false, ctrl: false });
+    const handled = host.handleMouse({ type: "click", button: "left", x: outputPad + 2, y: header + 1, screenX: 100 + outputPad + 2, screenY: 51 + header, width: 120, height: before.length, shift: false, alt: false, ctrl: false });
     assert.equal(handled?.handled, true); assert.equal(handled?.target?.originX, 100 + outputPad);
     const after = host.render(120).map(plain).join("\n");
     assert.match(after, new RegExp(id)); assert.match(after, /expanded tail/);

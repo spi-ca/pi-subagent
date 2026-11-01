@@ -13,6 +13,7 @@ type CardTheme = {
 type MouseEventLike = {
   type?: unknown;
   button?: unknown;
+  clickCount?: number;
   x?: unknown;
   y?: unknown;
   screenX?: unknown;
@@ -133,11 +134,12 @@ export class InlineResultCard extends Box {
     return super.render(width);
   }
 
-  // Pi 0.87 carries this return target through nested component dispatch. Only
-  // the first (header) row consumes a primary click; body selection, drags,
-  // wheel scrolling, and non-primary buttons deliberately remain unhandled.
+  // OSC 8 activation takes priority, but Pi can also dispatch selection-release
+  // clicks at word/line anchors. Decline multi-clicks: even handled no-ops clear
+  // native selection. An enclosing native tool fallback remains host-owned.
+  // Ordinary clicks toggle locally; presses/drags/wheels remain native.
   handleMouse(event: MouseEventLike): TargetBearingMouseResult | undefined {
-    if (event.type !== "click" || event.button !== "left" || finiteCoordinate(event.y) !== 0) return undefined;
+    if (event.type !== "click" || event.button !== "left" || (event.clickCount ?? 1) > 1) return undefined;
     this.state.expanded = !this.state.expanded;
     this.rebuild();
     const x = finiteCoordinate(event.x);

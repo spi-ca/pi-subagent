@@ -230,6 +230,7 @@ bun test --max-concurrency 1 test/integration/parent-report-host.test.ts
 
 ```bash
 bun test --max-concurrency 1 test/ui/native-ui-consistency.test.ts
+bun test --max-concurrency 1 test/ui/card-click-routing.test.ts
 bun test --max-concurrency 1 test/entrypoint/subagents-ui.test.ts
 bun test --max-concurrency 1 test/ui/render.test.ts
 bun test --max-concurrency 1 test/ui/inline-presentation.test.ts
@@ -238,7 +239,7 @@ bun test --max-concurrency 1 test/ui/parent-report-render.test.ts
 bun test --max-concurrency 1 test/ui/background-result-viewer.test.ts
 ```
 
-공통 4항목/16행 집계, 숨겨진 실패·누락 수, 한글·emoji·combining 문자와 1–160열 폭, 헤더-only 로컬 클릭·전역 펼침 전환·body 선택/scroll 비소유, dark/light 테마 재렌더링, partial의 execute 시간 생략, request/accepted/cancelling/submitted의 의미, legacy fallback·정화·원본 content/details 불변성을 검사합니다. `/subagents` 선택·details·취소 확인/알림과 기존 doctor 집중 테스트는 UI가 실행/취소/승인 권한을 만들지 않는지도 확인합니다. 이 범위는 실제 terminal 마우스/키 입력, provider 응답, live multiplexer acceptance 또는 전체 CI를 대신하지 않습니다. Pi 1.4의 중첩 `select`/`confirm`/`input`/`editor` 및 inline `custom()` dialog stack 복구는 host 소유 UI이므로 별도 구현이나 중복 fake 검사를 추가하지 않습니다. 실제 TUI에서 두 dialog를 겹쳐 열고 위 dialog를 닫았을 때 이전 dialog·focus가 복원되고 양쪽 promise가 완료되는 smoke는 수동 검증 범위이며, 이 offline 회귀에서 실행했다고 주장하지 않습니다. 필수 최종 gate는 여전히 `bun run ci`입니다.
+공통 4항목/16행 집계, 숨겨진 실패·누락 수, 한글·emoji·combining 문자와 1–160열 폭, 제목·본문·카드 내 생략/안내 행의 로컬 클릭·전역 펼침 전환·drag 선택/scroll 비소유, dark/light 테마 재렌더링, partial의 execute 시간 생략, request/accepted/cancelling/submitted의 의미, legacy fallback·정화·원본 content/details 불변성을 검사합니다. `/subagents` 선택·details·취소 확인/알림과 기존 doctor 집중 테스트는 UI가 실행/취소/승인 권한을 만들지 않는지도 확인합니다. `card-click-routing.test.ts`는 설치된 Pi 1.4의 실제 fullscreen layout·raw SGR decoder·gesture/선택·OSC 8 우선순위·native wrapper dispatch를 사용하며 terminal I/O와 render scheduling만 대체합니다. 짧은 결과의 전체/짧은 ID 전환, 단일 클릭과 drag의 구분, custom 결과/보고·widget·독립 inline/일반 expander의 **안정된 본문 단어 시작점**(한 글자 단어 포함)에서 중간 reset 없는 raw SGR 두 번/세 번 클릭의 press/release 선택 텍스트와 펼침 상태, wheel의 ScrollView 전달, 실제 inline Markdown 링크, 인접 interactive control과 widget의 보이는 slot만 클릭되는 경계를 검사합니다. Pi 1.4는 선택 anchor에서 release하면 `clickCount > 1`인 click도 dispatch하므로 package의 세 passive expander는 이를 거부합니다. handled no-op도 host가 선택을 지우므로 사용하지 않습니다. native 도구 안에서는 enclosing `MouseRegion`의 펼침 fallback이 거부된 click을 처리하고 선택을 지울 수 있습니다. 일반 expander와 실제 foreground inline 결과를 native 셸로 감싼 테스트는 이전 제목 전용 본문 거부와 수정 후의 선택 trace가 같은지 확인합니다. 이 inherited host 제약을 package에서 고쳤거나 모든 도구 선택을 보존한다고 주장하지 않습니다. widget 밖의 전체 누락 건수 표시는 펼침 버튼으로 바꾸지 않습니다. private host 진입점을 쓰는 offline 회귀이며 실제 terminal 마우스/키 입력, provider 응답, live multiplexer acceptance 또는 전체 CI를 대신하지 않습니다. Pi 1.4의 중첩 `select`/`confirm`/`input`/`editor` 및 inline `custom()` dialog stack 복구는 host 소유 UI이므로 별도 구현이나 중복 fake 검사를 추가하지 않습니다. 실제 TUI에서 두 dialog를 겹쳐 열고 위 dialog를 닫았을 때 이전 dialog·focus가 복원되고 양쪽 promise가 완료되는 smoke는 수동 검증 범위이며, 이 offline 회귀에서 실행했다고 주장하지 않습니다. 필수 최종 gate는 여전히 `bun run ci`입니다.
 
 ### Exact leaf steering 집중 검증
 

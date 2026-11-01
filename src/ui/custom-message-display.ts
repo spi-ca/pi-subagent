@@ -251,10 +251,11 @@ class MessageDisplayComponent extends Box {
     this.rebuild();
   }
 
-  /** Handle only primary clicks, leaving native selection/scroll dispatch untouched. */
+  /** Handle only ordinary primary clicks; multi-clicks belong to native selection. */
   handleMouse(event: {
     type?: unknown;
     button?: unknown;
+    clickCount?: number;
     x?: unknown;
     y?: unknown;
     screenX?: unknown;
@@ -264,7 +265,10 @@ class MessageDisplayComponent extends Box {
   }): MessageDisplayMouseDispatchResult | undefined {
     // Do not claim presses, drags, releases, wheels, or secondary clicks: the
     // fullscreen transcript must retain its native selection and scroll paths.
-    if (event.type !== "click" || event.button !== "left" || (event.y !== undefined && event.y !== 0)) return undefined;
+    // Title, body and omission/footer rows share the same local toggle. Pi
+    // prioritizes OSC 8 activation, but can also issue a click on a word/line
+    // selection release at its anchor. A handled result would clear selection.
+    if (event.type !== "click" || event.button !== "left" || (event.clickCount ?? 1) > 1) return undefined;
     this.state.expanded = !this.state.expanded;
     this.rebuild();
     const x = finiteMouseCoordinate(event.x);

@@ -64,13 +64,15 @@ export function expansionState(store: Record<string, unknown> | undefined, globa
   return state;
 }
 
-/** No shell/padding/background; only the header owns local click expansion. */
+/** No shell/padding/background; every visible row owns local click expansion. */
 export class HeaderExpander implements Component {
   constructor(private state: ExpansionState, private build: (expanded: boolean) => Component, private redraw?: () => void) {}
   render(width: number): string[] { return this.build(this.state.expanded).render(width); }
   invalidate(): void { /* build uses the current host theme on each render */ }
-  handleMouse(event: { type?: unknown; button?: unknown; y?: unknown }): { handled: true } | undefined {
-    if (event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+  handleMouse(event: { type?: unknown; button?: unknown; clickCount?: number; y?: unknown }): { handled: true } | undefined {
+    // Do not clear word/line selection with a handled no-op. Native tool shells
+    // may still handle declined clicks via their own expansion fallback.
+    if (event.type !== "click" || event.button !== "left" || (event.clickCount ?? 1) > 1) return undefined;
     this.state.expanded = !this.state.expanded;
     try { this.redraw?.(); } catch { /* disposed host; display-only */ }
     return { handled: true };

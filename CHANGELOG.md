@@ -2,6 +2,7 @@
 
 ## 미출시
 
+- 전체 화면에서 호출·결과·보고·widget 카드의 제목뿐 아니라 본문과 카드 내 생략/안내 행을 왼쪽 클릭해 펼치거나 접도록 통일했다. 짧은 결과의 전체/짧은 job ID 전환, `Ctrl+O` 전역 펼침, native drag·wheel·OSC 8 링크 우선순위와 widget의 4카드/14행 상한은 유지한다. 세 passive expander는 multi-click을 거부하여 custom 메시지·widget·독립 카드의 본문 단어 시작점(한 글자 포함) 선택을 유지한다. Pi 1.4 native 도구 셸의 fallback은 여전히 선택을 지우거나 도구를 펼칠 수 있으며, 이전 제목 전용 처리에도 있던 host 제약은 수정하지 않는다.
 - 호출·결과 카드와 보고·widget의 말줄임표(`…`)가 앞선 글자의 색상·장식을 유지하고, 뒤쪽 여백에서 Pi 소유 배경색이 끊기지 않도록 공통 UI 잘림 처리를 보정했다. 셸·padding·클릭/펼침과 실행 상태·원본 결과는 바꾸지 않는다.
 - Pi 개발 의존성·lockfile의 7개 Pi 패키지·8개 CI stage graph를 exact `1.4.0`으로 동기화했다. peer 범위·shared `@pi/presence` pin·managed 복원/override guard와 실행 동시성 정책은 유지한다.
 - 실제 설치 host의 offline 회귀로 resume/tree의 신규·지연 등록 extension 도구 활성화와 명시 제거·allowlist·no-tools 우선, codemode 기본 두 worker의 FIFO 대기·기한 만료·취소를 검증한다. provider/auth·실제 terminal/multiplexer와 중첩 dialog smoke는 실행 범위가 아니다.

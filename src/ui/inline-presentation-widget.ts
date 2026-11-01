@@ -96,8 +96,8 @@ export class InlinePresentationWidget extends Container implements Component {
     const detailRows = Math.max(0, MAX_WIDGET_LINES - visible.length - (omitted > 0 ? 1 : 0));
     const extraRows = visible.length === 0 ? 0 : Math.floor(detailRows / visible.length);
     this.slots = visible.map(({ toolCallId, card }) => {
-      // The widget has no authoritative app.tools.expand state. Header clicks
-      // expand only its bounded snapshot and never advertise a host shortcut.
+      // The widget has no authoritative app.tools.expand state. Visible card
+      // clicks expand only its bounded snapshot, without a host shortcut hint.
       const widgetCard = new InlineResultCard(
         card,
         this.registry.state(toolCallId, card.identity, false),

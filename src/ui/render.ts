@@ -9,7 +9,7 @@ import { completedAssistantText, getResultSummaryText } from "../core/runner-eve
 import { getStageLabel } from "../core/chain-helpers.js";
 import { parseBackgroundJobActionDetails, type BackgroundJobDetailSummary } from "../core/background-job-details.js";
 import { COMPACT_ITEM_LIMIT, CompactText, LimitedText, HeaderExpander, expansionState, durationText, oneLine, safeUiText, stateText, STATE_STYLE } from "./native-ui.js";
-import { configuredExpandHint } from "./expand-hint.js";
+import { expandHintSuffix, type ExpandKeybindings } from "./expand-hint.js";
 import { InlineResultCard } from "./inline-result-card.js";
 import { INLINE_PRESENTATION_MAX_CARDS, inlineStateCounts, resultDisplayStatus, type InlinePresentationRegistry } from "./inline-presentation.js";
 import {
@@ -281,7 +281,7 @@ export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold
 		if (tasks.length) {
 			rows.push(`${title} · parallel: ${tasks.length} tasks${background} · ${requestState}${metadata}`);
 			for (const task of tasks.slice(0, open ? tasks.length : COMPACT_ITEM_LIMIT)) taskRow(task?.agent, task?.task);
-			if (!open && tasks.length > COMPACT_ITEM_LIMIT) rows.push(theme.fg("muted", `… ${tasks.length - COMPACT_ITEM_LIMIT} tasks omitted · ${configuredExpandHint()}`));
+			if (!open && tasks.length > COMPACT_ITEM_LIMIT) rows.push(theme.fg("muted", `… ${tasks.length - COMPACT_ITEM_LIMIT} tasks omitted${expandHintSuffix(context)}`));
 		} else if (chain.length) {
 			rows.push(`${title} · chain: ${chain.length} stages${background} · ${requestState}${metadata}`);
 			for (const [index, stage] of chain.slice(0, open ? chain.length : COMPACT_ITEM_LIMIT).entries()) {
@@ -294,7 +294,7 @@ export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold
 					if (open) for (const task of children) taskRow(task?.agent, task?.task);
 				} else taskRow(stage.agent, stage.task, label);
 			}
-			if (!open && chain.length > COMPACT_ITEM_LIMIT) rows.push(theme.fg("muted", `… ${chain.length - COMPACT_ITEM_LIMIT} stages omitted · ${configuredExpandHint()}`));
+			if (!open && chain.length > COMPACT_ITEM_LIMIT) rows.push(theme.fg("muted", `… ${chain.length - COMPACT_ITEM_LIMIT} stages omitted${expandHintSuffix(context)}`));
 		} else {
 			rows.push(`${title} ${theme.fg("accent", oneLine(String(args.agent ?? "…"), 64))}${background} · ${requestState}${metadata}`);
 			rows.push(theme.fg("dim", open ? safeUiText(String(args.task ?? "…")) : oneLine(String(args.task ?? "…"))));
@@ -339,6 +339,7 @@ function renderBackgroundJobAction(
 	details: NonNullable<ReturnType<typeof parseBackgroundJobActionDetails>>,
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	bindings?: ExpandKeybindings,
 ): Text {
 	const display = (text: string): Text => expanded ? new Text(text, 0, 0) : new CompactText(text);
 	if (details.event === "error") {
@@ -357,7 +358,7 @@ function renderBackgroundJobAction(
 		const hidden = jobs.length - shown.length;
 		const failed = jobs.filter(job => job.status === "failed").length;
 		const rows = shown.map(job => expanded ? renderBackgroundJobSummary(job, true, theme) : theme.fg(STATE_STYLE[job.status].color, `job ${compactBackgroundJobId(job.jobId, false)} · ${stateText(job.status)}`) + `\n${theme.fg(job.errorReason ? "error" : "toolOutput", oneLine(job.errorReason || job.output || "(no retained output)"))}` + `\n${theme.fg("warning", `${job.outputClipped ? "[display clipped] · " : ""}${job.omittedBytes} B not retained`)}`).join("\n");
-		const footer = `\n${theme.fg(failed ? "error" : "muted", `${failed} failed${details.omittedJobCount ? " in retained jobs" : ""}${hidden ? ` · ${hidden} jobs omitted` : ""} · ${configuredExpandHint()}`)}${omitted}`;
+		const footer = `\n${theme.fg(failed ? "error" : "muted", `${failed} failed${details.omittedJobCount ? " in retained jobs" : ""}${hidden ? ` · ${hidden} jobs omitted` : ""}${expandHintSuffix(bindings)}`)}${omitted}`;
 		return expanded ? new Text(rows + footer, 0, 0) : new CompactText(rows + footer);
 	}
 
@@ -392,7 +393,7 @@ function isSubagentDetails(value: unknown): value is SubagentDetails {
 		.every((key) => value[key] === undefined || isNonNegativeSafeInteger(value[key]));
 }
 
-export interface InlineResultRenderContext {
+export interface InlineResultRenderContext extends ExpandKeybindings {
 	toolCallId?: unknown;
 	/** Host-measured execute() duration; never inferred from a background job. */
 	durationMs?: unknown;
@@ -439,7 +440,7 @@ function renderResultBody(
 	inlinePresentationRegistry?: InlinePresentationRegistry,
 ): Container | Text {
 	const backgroundDetails = parseBackgroundJobActionDetails(result.details);
-	if (backgroundDetails) return renderBackgroundJobAction(backgroundDetails, expanded, theme);
+	if (backgroundDetails) return renderBackgroundJobAction(backgroundDetails, expanded, theme, context);
 	const details = isSubagentDetails(result.details) ? result.details : undefined;
 	const toolCallId = typeof context?.toolCallId === "string" ? context.toolCallId : undefined;
 	// Foreground failures and cancellation are thrown by execute(), so Pi may
@@ -447,7 +448,7 @@ function renderResultBody(
 	// UI-only terminal snapshot keyed by the existing call ID and preserves the
 	// card without changing that thrown-error contract.
 	if ((!details || details.results.length === 0) && toolCallId && inlinePresentationRegistry) {
-		const cards = renderInlineResultSnapshotCards(toolCallId, expanded, theme, inlinePresentationRegistry);
+		const cards = renderInlineResultSnapshotCards(toolCallId, expanded, theme, inlinePresentationRegistry, context);
 		if (cards) return cards;
 	}
 	if (!details || details.results.length === 0) {
@@ -465,13 +466,13 @@ function renderResultBody(
 	);
 	const terminalMode = normalizedTerminalMode === "invalid" ? DEFAULT_TERMINAL_MODE : normalizedTerminalMode;
 	if (terminalMode === "inline" && toolCallId && inlinePresentationRegistry) {
-		const cards = renderInlineResultCards(details, toolCallId, expanded, theme, inlinePresentationRegistry);
+		const cards = renderInlineResultCards(details, toolCallId, expanded, theme, inlinePresentationRegistry, context);
 		if (cards) return cards;
 	}
 	if (details.mode === "single") {
-		return renderSingleResult(details.toolLabel || SUBAGENT_TOOL_LABEL, details.results[0], delegationMode, terminalMode, expanded, theme);
+		return renderSingleResult(details.toolLabel || SUBAGENT_TOOL_LABEL, details.results[0], delegationMode, terminalMode, expanded, theme, context);
 	}
-	return renderParallelResult(details, details.toolLabel || SUBAGENT_TOOL_LABEL, delegationMode, terminalMode, expanded, theme);
+	return renderParallelResult(details, details.toolLabel || SUBAGENT_TOOL_LABEL, delegationMode, terminalMode, expanded, theme, context);
 }
 
 /**
@@ -494,6 +495,7 @@ function renderInlineResultCards(
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
 	registry: InlinePresentationRegistry,
+	bindings?: ExpandKeybindings,
 ): Container | undefined {
 	// Snapshot retention is not a limit on authoritative foreground details.
 	// If even one card is unavailable, the generic expanded path shows every
@@ -512,7 +514,7 @@ function renderInlineResultCards(
 			presentation,
 			registry.state(toolCallId, presentation.identity, expanded),
 			theme,
-			{ authoritativeAssistantText: authoritativeAssistantText || undefined, authoritativeTask: details.results[index]!.task, authoritativeError: details.results[index]!.errorMessage, authoritativeDiagnostics: details.results[index]!.stderr },
+			{ keyText: bindings?.keyText, keyHint: bindings?.keyHint, authoritativeAssistantText: authoritativeAssistantText || undefined, authoritativeTask: details.results[index]!.task, authoritativeError: details.results[index]!.errorMessage, authoritativeDiagnostics: details.results[index]!.stderr },
 		));
 		count += 1;
 	}
@@ -522,7 +524,7 @@ function renderInlineResultCards(
 		const failed = states.filter(state => state === "failed").length;
 		const chainProgress = details.mode !== "chain" ? "" : details.chainCompletedCount === undefined ? " · stage progress unavailable"
 			: ` · ${details.chainCompletedCount + (details.chainCompletedWithErrorsCount ?? 0) + (details.chainFailedCount ?? 0) + (details.chainSkippedCount ?? 0)}/${details.chainStageCount ?? details.results.length} stages resolved`;
-		container.addChild(new CompactText(theme.fg(failed ? "error" : "muted", `${details.mode} · ${inlineStateCounts(states)}${omitted ? ` · ${omitted} results omitted` : ""}${chainProgress} · ${configuredExpandHint()}`)));
+		container.addChild(new CompactText(theme.fg(failed ? "error" : "muted", `${details.mode} · ${inlineStateCounts(states)}${omitted ? ` · ${omitted} results omitted` : ""}${chainProgress}${expandHintSuffix(bindings)}`)));
 	}
 	return count > 0 ? container : undefined;
 }
@@ -532,6 +534,7 @@ function renderInlineResultSnapshotCards(
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
 	registry: InlinePresentationRegistry,
+	bindings?: ExpandKeybindings,
 ): Container | undefined {
 	const cards = registry.all().filter((entry) => entry.toolCallId === toolCallId);
 	if (cards.length === 0) return undefined;
@@ -545,7 +548,7 @@ function renderInlineResultSnapshotCards(
 			card,
 			registry.state(toolCallId, card.identity, expanded),
 			theme,
-			{ authoritativeAssistantText: authoritativeAssistantText || undefined,
+			{ keyText: bindings?.keyText, keyHint: bindings?.keyHint, authoritativeAssistantText: authoritativeAssistantText || undefined,
 				authoritativeTask: registry.authoritativeDetail(toolCallId, card.identity, "task"),
 				authoritativeError: registry.authoritativeDetail(toolCallId, card.identity, "errorMessage"),
 				authoritativeDiagnostics: registry.authoritativeDetail(toolCallId, card.identity, "stderr"),
@@ -554,7 +557,7 @@ function renderInlineResultSnapshotCards(
 	}
 	const omitted = Math.max(0, cards.length - (expanded ? INLINE_PRESENTATION_MAX_CARDS : COMPACT_ITEM_LIMIT));
 	const failed = cards.filter(({ card }) => card.status === "failed").length;
-	if (cards.length > 1) container.addChild(new CompactText(theme.fg(failed ? "error" : "muted", `${inlineStateCounts(cards.map(({ card }) => card.status))} in retained cards${omitted ? ` · ${omitted} retained cards omitted` : ""} · ${configuredExpandHint()}`)));
+	if (cards.length > 1) container.addChild(new CompactText(theme.fg(failed ? "error" : "muted", `${inlineStateCounts(cards.map(({ card }) => card.status))} in retained cards${omitted ? ` · ${omitted} retained cards omitted` : ""}${expandHintSuffix(bindings)}`)));
 	if (cards.length === INLINE_PRESENTATION_MAX_CARDS) container.addChild(new CompactText(theme.fg("warning", "Snapshot limit reached; additional results may be unavailable.")));
 	return container;
 }
@@ -570,6 +573,7 @@ function renderSingleResult(
 	terminalMode: TerminalMode,
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	bindings?: ExpandKeybindings,
 ): Container | Text {
 	const error = isResultError(r);
 	const icon = statusIcon(r, theme);
@@ -589,7 +593,7 @@ function renderSingleResult(
 			theme,
 		);
 	}
-	return renderSingleCollapsed(toolLabel, r, icon, error, theme);
+	return renderSingleCollapsed(toolLabel, r, icon, error, theme, bindings);
 }
 
 function renderSingleExpanded(
@@ -655,12 +659,14 @@ function renderSingleCollapsed(
 	icon: string,
 	error: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	bindings?: ExpandKeybindings,
 ): Text {
 	let text = `${theme.fg("toolTitle", theme.bold(oneLine(toolLabel, 64)))} ${theme.fg("accent", formatResultLabel(r))} · ${icon}`;
 	text += `\n${theme.fg("dim", `Task: ${formatTaskPreview(r.task)}`)}`;
 	const output = compactResultPreview(r);
 	text += `\n${theme.fg(error ? "error" : "toolOutput", oneLine(output))}`;
-	text += `\n${theme.fg("muted", `(${configuredExpandHint()})`)}`;
+	const hint = expandHintSuffix(bindings, "(", ")");
+	if (hint) text += `\n${theme.fg("muted", hint)}`;
 	return new CompactText(text);
 }
 
@@ -675,6 +681,7 @@ function renderParallelResult(
 	terminalMode: TerminalMode,
 	expanded: boolean,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	bindings?: ExpandKeybindings,
 ): Container | Text {
 	const states = details.results.map(resultDisplayStatus);
 	const running = states.filter(state => state === "running").length;
@@ -718,6 +725,7 @@ function renderParallelResult(
 		icon,
 		status,
 		theme,
+		bindings,
 	);
 }
 
@@ -786,6 +794,7 @@ function renderParallelCollapsed(
 	icon: string,
 	status: string,
 	theme: { fg: ThemeFg; bold: (s: string) => string },
+	bindings?: ExpandKeybindings,
 ): Text {
 	let text = `${theme.fg("toolTitle", theme.bold(formatModeTitle(toolLabel, details.mode, details.mode === "chain" ? details.chainStageCount ?? details.results.length : details.results.length)))} · ${icon} · ${status}`;
 	const states = details.results.map(resultDisplayStatus);
@@ -797,6 +806,6 @@ function renderParallelCollapsed(
 		text += `\n${theme.fg(isResultError(r) ? "error" : "toolOutput", oneLine(output))}`;
 	}
 	const omitted = Math.max(0, details.results.length - COMPACT_ITEM_LIMIT);
-	text += `\n${theme.fg(failed ? "error" : "muted", `${inlineStateCounts(states)}${omitted ? ` · ${omitted} results omitted` : ""} · ${configuredExpandHint()}`)}`;
+	text += `\n${theme.fg(failed ? "error" : "muted", `${inlineStateCounts(states)}${omitted ? ` · ${omitted} results omitted` : ""}${expandHintSuffix(bindings)}`)}`;
 	return new CompactText(text);
 }

@@ -5,6 +5,7 @@ import type { Usage } from "@earendil-works/pi-ai";
  * usage payloads without expanding the installed public Usage declaration.
  */
 export type AccountingUsage = Usage & {
+	cost: Usage["cost"] & { totalFromProvider?: boolean };
 	cacheWrite1h?: number;
 	reasoning?: number;
 };
@@ -62,9 +63,21 @@ export function addAccountingUsage(target: AccountingUsage, usage: unknown): Acc
 	for (const field of OPTIONAL_FIELDS) add(totals, field, source[field], true);
 
 	const sourceCost = source.cost;
-	if (sourceCost && typeof sourceCost === "object") {
+	const costRecord = sourceCost && typeof sourceCost === "object" ? sourceCost as UsageRecord : undefined;
+	// Untouched child/foreground accumulators are neutral, including after
+	// serialization. Explicit provenance or any usage keeps false sticky.
+	const neutral = source.totalTokens === 0
+		&& TOKEN_FIELDS.every((field) => source[field] === 0)
+		&& OPTIONAL_FIELDS.every((field) => source[field] === undefined)
+		&& costRecord?.totalFromProvider === undefined
+		&& COST_FIELDS.every((field) => costRecord?.[field] === 0);
+	if (!neutral) {
+		const providerTotal = costRecord?.totalFromProvider === true
+			&& nonNegativeFinite(costRecord.total) !== undefined;
+		target.cost.totalFromProvider = target.cost.totalFromProvider !== false && providerTotal;
+	}
+	if (costRecord) {
 		const costs = target.cost as unknown as Record<string, number | undefined>;
-		const costRecord = sourceCost as UsageRecord;
 		for (const field of COST_FIELDS) add(costs, field, costRecord[field], false);
 	}
 

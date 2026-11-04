@@ -1,7 +1,7 @@
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { CompactText, oneLine, stateText, STATE_STYLE, truncateUiRow } from "./native-ui.js";
-import { configuredExpandHint } from "./expand-hint.js";
+import { expandHintSuffix, type ExpandKeybindings } from "./expand-hint.js";
 import type { InlineCardPresentation, InlineCardState } from "./inline-presentation.js";
 
 type CardTheme = {
@@ -33,7 +33,7 @@ type TargetBearingMouseResult = {
   };
 };
 
-export interface InlineResultCardOptions {
+export interface InlineResultCardOptions extends ExpandKeybindings {
   /** Full terminal result supplied only by the foreground result renderer. */
   authoritativeAssistantText?: string;
   authoritativeTask?: string;
@@ -183,7 +183,7 @@ export class InlineResultCard extends Box {
     // The host key toggles global expansion, not this card-local state. Only
     // show its hint while collapsed and when opening can reveal more content.
     if (!this.state.expanded && this.options.showExpandHint !== false && hasExtraDetail) {
-      header += this.theme.fg("dim", ` (${configuredExpandHint()})`);
+      header += this.theme.fg("dim", expandHintSuffix(this.options, " (", ")"));
     }
     if (this.options.compactHeader && this.renderedWidth !== undefined) {
       header = truncateUiRow(header, this.renderedWidth);

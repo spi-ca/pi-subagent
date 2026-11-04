@@ -1,3 +1,4 @@
+import type { ExpandKeybindings } from "./expand-hint.js";
 import { Box, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { truncateUiRow } from "./native-ui.js";
 import { normalizeToolDisplayPreviewLines } from "./tool-display-config.js";
@@ -64,8 +65,13 @@ export interface MessageDisplayRendererOptions {
   previewLines?: number;
 }
 
+export interface MessageDisplayRenderOptions extends ExpandKeybindings {
+  expanded: boolean;
+  outputPad: number;
+}
+
 export interface MessageDisplayRenderer {
-  (message: RenderMessage, options: { expanded: boolean; outputPad: number }, theme: MessageDisplayTheme): MessageDisplayComponent;
+  (message: RenderMessage, options: MessageDisplayRenderOptions, theme: MessageDisplayTheme): MessageDisplayComponent;
   /** Drops session-owned card state before a replacement/reload rebuilds the transcript. */
   reset(): void;
 }
@@ -237,17 +243,19 @@ class MessageDisplayComponent extends Box {
     private outputPad: number,
     private theme: MessageDisplayTheme,
     private previewLines: number,
-    private buildRenderLines: (message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number) => RenderLines,
+    private bindings: ExpandKeybindings,
+    private buildRenderLines: (message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number, bindings: ExpandKeybindings) => RenderLines,
   ) {
     super(0, 0, (text) => this.theme.bg("customMessageBg", text));
     this.rebuild();
   }
 
-  update(message: RenderMessage, outputPad: number, theme: MessageDisplayTheme, previewLines: number): void {
+  update(message: RenderMessage, outputPad: number, theme: MessageDisplayTheme, previewLines: number, bindings: ExpandKeybindings): void {
     this.message = message;
     this.outputPad = outputPad;
     this.theme = theme;
     this.previewLines = previewLines;
+    this.bindings = bindings;
     this.rebuild();
   }
 
@@ -303,7 +311,7 @@ class MessageDisplayComponent extends Box {
     if (typeof box.clear === "function") box.clear();
     else if (Array.isArray(box.children)) box.children.length = 0;
     this.addChild(createBoundedLines(
-      this.buildRenderLines(this.message, this.state.expanded, this.theme, this.previewLines),
+      this.buildRenderLines(this.message, this.state.expanded, this.theme, this.previewLines, this.bindings),
       this.outputPad,
     ));
   }
@@ -320,14 +328,14 @@ function finiteMouseCoordinate(value: unknown): number {
  * local-card behavior, not a claim of host-wide expansion parity.
  */
 export function createMessageDisplayRenderer(
-  buildRenderLines: (message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number) => RenderLines,
+  buildRenderLines: (message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number, bindings: ExpandKeybindings) => RenderLines,
   { previewLines }: MessageDisplayRendererOptions = {},
 ): MessageDisplayRenderer {
   const compactPreviewLines = normalizeToolDisplayPreviewLines(previewLines);
   let states = new WeakMap<RenderMessage, MessageDisplayRenderState>();
   const renderer = (
     message: RenderMessage,
-    options: { expanded: boolean; outputPad: number },
+    options: MessageDisplayRenderOptions,
     theme: MessageDisplayTheme,
   ): MessageDisplayComponent => {
     let state = states.get(message);
@@ -340,9 +348,9 @@ export function createMessageDisplayRenderer(
     }
 
     if (!state.component) {
-      state.component = new MessageDisplayComponent(message, state, options.outputPad, theme, compactPreviewLines, buildRenderLines);
+      state.component = new MessageDisplayComponent(message, state, options.outputPad, theme, compactPreviewLines, options, buildRenderLines);
     } else {
-      state.component.update(message, options.outputPad, theme, compactPreviewLines);
+      state.component.update(message, options.outputPad, theme, compactPreviewLines, options);
     }
     return state.component;
   };

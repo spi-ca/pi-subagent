@@ -107,7 +107,7 @@ describe("runner event summaries", () => {
     assert.deepEqual(result.usage, { input: 5, output: 5, cacheRead: 5, cacheWrite: 6, cost: 2.1, contextTokens: 75, turns: 2 });
     assert.deepEqual((result as any).accountingUsage, {
       input: 5, output: 5, cacheRead: 5, cacheWrite: 6, totalTokens: 21,
-      cost: { input: 0.5, output: 0.5, cacheRead: 0.5, cacheWrite: 0.6, total: 2.1 },
+      cost: { input: 0.5, output: 0.5, cacheRead: 0.5, cacheWrite: 0.6, total: 2.1, totalFromProvider: false },
     });
     assert.equal(result.messages.length, 2);
     assert.equal((result as any).stopReason, "error");
@@ -121,7 +121,7 @@ describe("runner event summaries", () => {
     const malformed = { role: "toolResult", toolCallId: "bad", usage: { input: -1, output: NaN, cacheRead: Infinity, cacheWrite: 1.5, totalTokens: 999, cost: { input: Infinity, output: -1, cacheRead: NaN, cacheWrite: 0, total: Infinity } } };
     assert.equal(processPiEvent({ type: "message_end", message: { role: "toolResult", toolCallId: "missing" } }, result as any), false);
     assert.equal(processPiEvent({ type: "message_end", message: malformed }, result as any), false);
-    assert.deepEqual((result as any).accountingUsage, emptyAccountingUsage());
+    assert.deepEqual((result as any).accountingUsage, { ...emptyAccountingUsage(), cost: { ...emptyAccountingUsage().cost, totalFromProvider: false } });
     assert.deepEqual(result.messages, []);
   });
 
@@ -194,4 +194,27 @@ describe("runner event summaries", () => {
     assert.equal(result.messages.length, 2);
     assert.equal(getFinalOutput(result.messages as any), "B");
   });
+});
+
+test("provider cost provenance survives lifecycle dedupe and summaries, but not a mixed nested tool", () => {
+  const result = { agent: "worker", agentSource: "user" as const, task: "cost provenance", exitCode: -1,
+    messages: [], stderr: "", usage: emptyUsage(), accountingUsage: emptyAccountingUsage() };
+  const usage = { ...emptyAccountingUsage(), input: 1, totalTokens: 1,
+    cost: { ...emptyAccountingUsage().cost, input: 0.25, total: 2, totalFromProvider: true } };
+  const assistant = { role: "assistant", content: [{ type: "text", text: "reported" }], usage };
+  processPiEvent({ type: "message_end", message: assistant }, result as any);
+  processPiEvent({ type: "turn_end", message: assistant, toolResults: [] }, result as any);
+  processPiEvent({ type: "agent_end", messages: [assistant] }, result as any);
+  const compaction = { id: "provider-summary", summary: "summary", firstKeptEntryId: "kept", tokensBefore: 2, usage };
+  processPiEvent({ type: "session_compact", compactionEntry: compaction }, result as any);
+  processPiEvent({ type: "session_compact", compactionEntry: compaction }, result as any);
+  assert.equal(result.accountingUsage.cost.total, 4);
+  assert.equal(result.accountingUsage.cost.totalFromProvider, true);
+  // Legacy usage still contributes cost, and must make the aggregate estimated.
+  const toolUsage = { ...usage, cost: { ...usage.cost, totalFromProvider: undefined } };
+  processPiEvent({ type: "tool_execution_end", toolCallId: "mixed", result: { usage: toolUsage } }, result as any);
+  processPiEvent({ type: "message_end", message: { role: "toolResult", toolCallId: "mixed", usage: toolUsage } }, result as any);
+  assert.equal(result.accountingUsage.cost.total, 6);
+  assert.equal(result.accountingUsage.cost.totalFromProvider, false);
+  assert.equal(result.accountingUsage.totalTokens, 3);
 });

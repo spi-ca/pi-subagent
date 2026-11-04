@@ -1,6 +1,6 @@
 import { MAX_SUBAGENT_BACKGROUND_OUTPUT_BYTES } from "../core/subagent-limits.js";
 import { durationText, stateText } from "./native-ui.js";
-import { configuredExpandHint } from "./expand-hint.js";
+import { expandHintSuffix, type ExpandKeybindings } from "./expand-hint.js";
 import { createMessageDisplayRenderer, type MessageDisplayRenderer, type MessageDisplayRendererOptions, type MessageDisplayTheme, type RenderMessage, type RenderLines, type RenderFooter } from "./custom-message-display.js";
 
 const BACKGROUND_RESULT_HEADER = "Background subagent job ";
@@ -270,6 +270,7 @@ function compactLines(
   omittedBytes: number,
   theme: Parameters<typeof expandedLines>[3],
   previewLines: number,
+  bindings: ExpandKeybindings,
 ): RenderLines {
   const display = boundedDisplayText(body, MAX_COMPACT_BYTES, previewLines);
   const sanitizedBody = sanitizeTerminalText(body);
@@ -286,7 +287,7 @@ function compactLines(
     footers,
     compactBody: {
       firstLineIndex: 1, previewLines, totalLines, partialLastLine,
-      formatNotice: () => theme.fg("muted", `[display clipped] · ${configuredExpandHint()}`),
+      formatNotice: () => theme.fg("muted", `[display clipped]${expandHintSuffix(bindings)}`),
     },
   };
 }
@@ -296,9 +297,9 @@ function buildRenderLines(
   expanded: boolean,
   theme: BackgroundResultTheme,
   previewLines: number,
+  bindings: ExpandKeybindings,
 ): RenderLines {
   const parsed = parseBackgroundResultMessage(message);
-  const expandHint = configuredExpandHint();
   if (!parsed) {
     const heading = theme.fg("warning", "Background subagent result (unrecognized message)");
     const display = expanded ? fallbackDisplay(message) : undefined;
@@ -310,7 +311,7 @@ function buildRenderLines(
           heading,
           theme.fg("muted", "Stored preview:"),
           theme.fg("dim", preview ?? "(no preview)"),
-          theme.fg("muted", `Unrecognized envelope; details unavailable (${expandHint}).`),
+          theme.fg("muted", `Unrecognized envelope; details unavailable${expandHintSuffix(bindings, " (", ")")}.`),
         ],
         footers: [],
       };
@@ -337,7 +338,7 @@ function buildRenderLines(
     }
     : expanded
       ? expandedLines(header, undefined, boundedDisplayText(currentOutput.body, MAX_EXPANDED_BYTES), theme, metadata.jobId, omittedBytes)
-      : compactLines(header, currentOutput.body, omittedBytes, theme, previewLines);
+      : compactLines(header, currentOutput.body, omittedBytes, theme, previewLines, bindings);
 }
 
 /** Session-owned custom-message state and layout are shared with parent reports. */

@@ -37,8 +37,12 @@ function assertNoUnpairedSurrogates(text: string): void {
   assert.doesNotMatch(text, /\p{Surrogate}/u);
 }
 
+// Standalone tests have only TUI-global bindings, not Pi's app.tools.expand.
+// Supply the host helper explicitly when asserting a configured Ctrl+O hint.
+const configuredBindings = { keyText: () => "ctrl+o" };
+
 function rendered(messageValue: { content: unknown; details: unknown }, expanded: boolean, width = 100, outputPad = 0, renderTheme = theme): string[] {
-  return renderBackgroundResult(messageValue, { expanded, outputPad }, renderTheme as never).render(width);
+  return renderBackgroundResult(messageValue, { expanded, outputPad, ...configuredBindings }, renderTheme as never).render(width);
 }
 
 function freezeRecursively<T>(value: T): T {
@@ -188,6 +192,31 @@ describe("background result renderer", () => {
     assert.match(text, /row 8/);
     assert.doesNotMatch(text, /row 9/);
     assert.match(text, /\[display clipped\] · Ctrl\+O to expand/);
+  });
+
+  test("uses the host's custom expansion binding for compact and fallback results", () => {
+    const output = Array.from({ length: 9 }, (_, i) => `row ${i + 1}`).join("\n");
+    for (const value of [message(output), { content: "legacy output", details: {} }]) {
+      const keyText = (binding: string) => {
+        assert.equal(binding, "app.tools.expand");
+        return "alt+shift+x";
+      };
+      const text = renderBackgroundResult(value, { expanded: false, outputPad: 0, keyText }, theme as never).render(120).join("\n");
+      assert.match(text, /Alt\+Shift\+X to expand/);
+      assert.doesNotMatch(text, /Ctrl\+O/);
+    }
+  });
+
+  test("keeps compact clipping and fallback diagnostics without advertising an explicitly unbound key", () => {
+    const output = Array.from({ length: 9 }, (_, i) => `row ${i + 1}`).join("\n");
+    const options = { expanded: false, outputPad: 0, keyText: () => "", keyHint: () => "ctrl+o to expand" };
+    const compact = renderBackgroundResult(message(output), options, theme as never).render(120).join("\n");
+    assert.match(compact, /row 8/);
+    assert.doesNotMatch(compact, /row 9/);
+    assert.match(compact, /\[display clipped\]\s*$/);
+    const fallback = renderBackgroundResult({ content: "legacy output", details: {} }, options, theme as never).render(120).join("\n");
+    assert.match(fallback, /Unrecognized envelope; details unavailable\./);
+    for (const text of [compact, fallback]) assert.doesNotMatch(text, /to expand|Ctrl\+O| · \s*$|\(\)/m);
   });
 
   test("styles the complete compact hint as muted without nested key styling", () => {

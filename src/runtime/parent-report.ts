@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import * as PiHost from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, TurnEndEvent, TurnEndEventResult } from "@earendil-works/pi-coding-agent";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { LifecycleEventClient } from "./lifecycle-socket.js";
 import { isStableSemverAtLeast } from "./version-policy.mjs";
 import { renderParentReportCall, renderParentReportResult } from "../ui/child-report-render.js";

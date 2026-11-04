@@ -1,6 +1,6 @@
 {
   "name": "@mjakl/pi-subagent",
-  "version": "2.1.0-local.0",
+  "version": "2.1.0",
   "description": "Subagent extension for Pi coding agent. Delegate tasks to specialized agents. Local editable fork.",
   "type": "module",
   "main": "index.ts",
@@ -10,6 +10,7 @@
     "pi-subagent.schema.json",
     "pi-subagent.detached-ownership.schema.json",
     "README.md",
+    "CHANGELOG.md",
     "docs/**/*",
     "test/fixtures/*.json",
     "LICENSE",
@@ -67,10 +68,10 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "1.4.0",
-    "@earendil-works/pi-ai": "1.4.0",
-    "@earendil-works/pi-coding-agent": "1.4.0",
-    "@earendil-works/pi-tui": "1.4.0",
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@types/node": "^25.2.3",
     "typebox": "1.1.38",
     "typescript": "^5.9.3"

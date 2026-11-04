@@ -196,10 +196,10 @@ describe("production dashboard boundary", () => {
     assert.equal(typeof renderer, "function");
     const component = renderer(
       { content: "legacy", details: {} },
-      { expanded: false, outputPad: 0 },
+      { expanded: false, outputPad: 0, keyHint: (_binding: string, description: string) => `${description} (Alt+E)` },
       { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text },
     );
-    assert.match(component.children[0]!.render(100).join("\n"), /Alt\+E/, "the renderer uses the configured expansion binding rather than its fallback");
+    assert.match(component.children[0]!.render(100).join("\n"), /Alt\+E/, "the renderer uses the host-injected expansion binding rather than its own module copy");
   });
 
   test("injects the same preview config into both custom renderers and clears local report state at session start", async () => {

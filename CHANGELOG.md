@@ -1,10 +1,14 @@
 # 변경 기록
 
-## 미출시
+## [2.1.0]
+
+- 펼침 안내는 Pi host가 renderer context/options로 주입한 `keyText`·`keyHint`를 우선 사용한다. 빈 키는 미지정으로 처리하고, helper가 없는 구형 host에서만 기존 fallback을 사용한다.
+- provider가 보고한 비용 합계의 `cost.totalFromProvider`를 foreground 회계에 보존한다. 모든 기여가 provider 보고일 때만 true이며, 추정·구형 비용이 섞이면 false이다.
+- `Type` schema import를 `typebox`로 통일해 Pi loader뿐 아니라 SDK·Bun·타입 검사에서도 사용할 수 있게 하고, 배포 파일에 이 변경 기록을 포함한다.
 
 - 전체 화면에서 호출·결과·보고·widget 카드의 제목뿐 아니라 본문과 카드 내 생략/안내 행을 왼쪽 클릭해 펼치거나 접도록 통일했다. 짧은 결과의 전체/짧은 job ID 전환, `Ctrl+O` 전역 펼침, native drag·wheel·OSC 8 링크 우선순위와 widget의 4카드/14행 상한은 유지한다. 세 passive expander는 multi-click을 거부하여 custom 메시지·widget·독립 카드의 본문 단어 시작점(한 글자 포함) 선택을 유지한다. Pi 1.4 native 도구 셸의 fallback은 여전히 선택을 지우거나 도구를 펼칠 수 있으며, 이전 제목 전용 처리에도 있던 host 제약은 수정하지 않는다.
 - 호출·결과 카드와 보고·widget의 말줄임표(`…`)가 앞선 글자의 색상·장식을 유지하고, 뒤쪽 여백에서 Pi 소유 배경색이 끊기지 않도록 공통 UI 잘림 처리를 보정했다. 셸·padding·클릭/펼침과 실행 상태·원본 결과는 바꾸지 않는다.
-- Pi 개발 의존성·lockfile의 7개 Pi 패키지·8개 CI stage graph를 exact `1.4.0`으로 동기화했다. peer 범위·shared `@pi/presence` pin·managed 복원/override guard와 실행 동시성 정책은 유지한다.
+- Pi 개발 의존성·lockfile의 `pi-schema` 포함 8개 Pi 패키지·8개 CI stage graph를 exact `1.5.0`으로 동기화했다. peer 범위·shared `@pi/presence` pin·managed 복원/override guard와 실행 동시성 정책은 유지한다.
 - 실제 설치 host의 offline 회귀로 resume/tree의 신규·지연 등록 extension 도구 활성화와 명시 제거·allowlist·no-tools 우선, codemode 기본 두 worker의 FIFO 대기·기한 만료·취소를 검증한다. provider/auth·실제 terminal/multiplexer와 중첩 dialog smoke는 실행 범위가 아니다.
 - reaper benchmark의 TEST-only 임시 fixture 준비에서 run마다 반복하던 production 초기화·동기화를 줄였다. 같은 로컬 256개 directory 준비는 약 6.23초에서 0.13초로 줄었으며, 실제 10,000-directory 분류·100,000-node graph·기존 assertion/timeout과 production durability는 유지한다. production 성능 개선을 주장하지 않는다.
 

@@ -3,7 +3,7 @@ import {
   type ParentReportKind, type ParentReportSender,
 } from "../runtime/parent-report.js";
 import { COMPACT_ITEM_LIMIT, COMPACT_ROW_LIMIT } from "./native-ui.js";
-import { configuredExpandHint } from "./expand-hint.js";
+import { expandHintSuffix, type ExpandKeybindings } from "./expand-hint.js";
 import { createMessageDisplayRenderer, type MessageDisplayRendererOptions, type MessageDisplayTheme, type RenderMessage, type RenderLines } from "./custom-message-display.js";
 
 const MAX_RENDER_CHARS = 128 * 1024;
@@ -106,7 +106,7 @@ function name(sender: Report, limit: number): string {
 }
 
 /** Plain text rows only: never Markdown, executable markup or sender authority. */
-function buildRenderLines(message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number): RenderLines {
+function buildRenderLines(message: RenderMessage, expanded: boolean, theme: MessageDisplayTheme, previewLines: number, bindings: ExpandKeybindings): RenderLines {
   const reports = readableReports(message.details, message.content);
   let title = "Subagent reports (legacy/unknown)";
   if (reports) {
@@ -135,7 +135,7 @@ function buildRenderLines(message: RenderMessage, expanded: boolean, theme: Mess
         firstLineIndex: 1, previewLines: rowBudget,
         totalLines: bodies.split("\n").length,
         partialLastLine: bodies.length > bounded.length,
-        formatNotice: () => theme.fg("muted", `[display clipped] · ${configuredExpandHint()}`),
+        formatNotice: () => theme.fg("muted", `[display clipped]${expandHintSuffix(bindings)}`),
       },
       footers: [
         ...(reports && reports.length > COMPACT_ITEM_LIMIT ? [{ text: theme.fg("muted", `… ${reports.length - COMPACT_ITEM_LIMIT} reports omitted`), compactText: "… reports omitted" }] : []),

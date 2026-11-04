@@ -251,14 +251,14 @@ test("result/report parity: actual background, bold heading, padding and configu
       bg: (color: string, text: string) => { backgrounds.push(color); return `\x1b[48;5;236m${text}\x1b[0m`; },
     };
     for (const [renderer, message] of [[reportRenderer, single("finding", body)], [resultRenderer, resultMessage]] as const) {
-      const card = renderer(message, { expanded: false, outputPad: 3 }, styled);
+      const card = renderer(message, { expanded: false, outputPad: 3, keyText: () => "ctrl+o" }, styled);
       const lines = card.render(160);
       const plain = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
       assert.equal(plain.filter(line => /^   row \d+\s*$/.test(line)).length, expected);
       assert.ok(plain.every(line => line.startsWith("   ")));
       assert.ok(lines.every(line => line.includes("\x1b[48;5;236m")), "real Box applies custom-message background to every row");
       assert.ok(lines[0]!.includes("\x1b[1m"), "compact heading is bold");
-      if (expected < 12) assert.match(plain.join("\n"), /\[display clipped\] · .*to expand/);
+      if (expected < 12) assert.match(plain.join("\n"), /\[display clipped\] · Ctrl\+O to expand/);
       for (const width of [1, 2, 3, 8, 17, 40, 160]) {
         const rows = card.render(width);
         assert.ok(rows.length <= 96);

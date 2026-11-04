@@ -7,7 +7,7 @@ import { captureSelection, cleanupOwned, cloneSource, copyCache, git, literalPat
 export type VerificationOptions = { commit?: string; base?: string; paths: string[]; output: string; cacheFrom?: string; cc?: string; allowNetwork: boolean };
 const STAGES: CiStage[] = ["core", "phase0", "reaper", "sessionTail"];
 // Same locked baseline as the mandatory CI matrix, not a claim about every Pi API.
-export const EXPECTED_PI_GRAPH = Object.fromEntries(["agent-core", "ai", "codemode", "coding-agent", "mcp", "telemetry", "tui"].map((name) => [`@earendil-works/pi-${name}`, "1.4.0"]));
+export const EXPECTED_PI_GRAPH = Object.fromEntries(["agent-core", "ai", "codemode", "coding-agent", "mcp", "schema", "telemetry", "tui"].map((name) => [`@earendil-works/pi-${name}`, "1.5.0"]));
 
 export function parseOptions(args: string[]): VerificationOptions {
 	const options: VerificationOptions = { paths: [], output: "", allowNetwork: false };

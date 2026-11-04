@@ -1,56 +1,62 @@
-/**
- * Compatibility-safe expansion-key formatting for renderers loaded against
- * Pi 0.84 declarations and newer host runtimes.
- */
-
+/** Compatibility-safe expansion hints, preferring the rendering host's bindings. */
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 
 const EXPAND_BINDING = "app.tools.expand";
 const DEFAULT_EXPAND_KEY = "Ctrl+O";
 
+/** Structural shape also accepted by older hosts without injected helpers. */
+export interface ExpandKeybindings {
+	keyText?: (binding: typeof EXPAND_BINDING) => unknown;
+	keyHint?: (binding: typeof EXPAND_BINDING, description: string) => unknown;
+}
+
 function stripTerminalControls(text: string): string {
-	return text
+	return text.slice(0, 1024)
 		.replace(/\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)/g, "")
 		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-		.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+		.replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+		.replace(/\p{Surrogate}/gu, "�");
 }
 
 function formatKey(text: string): string {
 	return text.trim().replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
 }
 
-/**
- * Returns the host-configured expand binding without assuming a particular Pi
- * export set. Newer hosts expose keyText; older/minimal hosts can still yield
- * a binding through keyHint, and the historical default remains the last
- * resort for test-only or non-TUI rendering.
- */
-export function configuredExpandKey(): string {
+/** Empty means explicitly unbound. Only absent helpers permit legacy fallback. */
+export function configuredExpandKey(injected?: ExpandKeybindings): string {
+	const hasHelper = (bindings: ExpandKeybindings | undefined) =>
+		typeof bindings?.keyText === "function" || typeof bindings?.keyHint === "function";
+	const bindings = hasHelper(injected) ? injected! : piCodingAgent as ExpandKeybindings;
+	if (!hasHelper(bindings)) return DEFAULT_EXPAND_KEY;
 	try {
-		const bindings = piCodingAgent as unknown as {
-			keyText?: (binding: string) => unknown;
-			keyHint?: (binding: string, description: string) => unknown;
-		};
-		const raw = bindings.keyText?.(EXPAND_BINDING);
-		if (typeof raw === "string" && raw.trim()) return formatKey(stripTerminalControls(raw));
-
+		if (typeof bindings.keyText === "function") {
+			const raw = bindings.keyText(EXPAND_BINDING);
+			return typeof raw === "string" ? formatKey(stripTerminalControls(raw)) : "";
+		}
 		const description = "to expand";
-		const hinted = bindings.keyHint?.(EXPAND_BINDING, description);
-		if (typeof hinted !== "string") return DEFAULT_EXPAND_KEY;
+		const hinted = bindings.keyHint!(EXPAND_BINDING, description);
+		if (typeof hinted !== "string") return "";
 		const plain = stripTerminalControls(hinted).trim();
 		const descriptionIndex = plain.indexOf(description);
-		if (descriptionIndex === -1) return DEFAULT_EXPAND_KEY;
+		if (descriptionIndex === -1) return "";
 		const beforeDescription = plain.slice(0, descriptionIndex).trim();
 		if (beforeDescription) return formatKey(beforeDescription.replace(/[([\s]+$/g, ""));
 		const parenthesized = /\(([^()]+)\)\s*$/.exec(plain.slice(descriptionIndex + description.length));
-		if (parenthesized?.[1]?.trim()) return formatKey(parenthesized[1]);
+		return parenthesized?.[1] ? formatKey(parenthesized[1]) : "";
 	} catch {
-		// Rendering must remain available when keybinding/theme state is absent.
+		// A present but unavailable helper must not advertise an invented binding.
+		return "";
 	}
-	return DEFAULT_EXPAND_KEY;
 }
 
 /** A plain full hint so callers can apply one muted tool-display style. */
-export function configuredExpandHint(description = "to expand"): string {
-	return `${configuredExpandKey()} ${description}`;
+export function configuredExpandHint(bindings?: ExpandKeybindings, description = "to expand"): string {
+	const key = configuredExpandKey(bindings);
+	return key ? `${key} ${description}` : "";
+}
+
+/** Include punctuation only when the host actually has an expansion binding. */
+export function expandHintSuffix(bindings?: ExpandKeybindings, prefix = " · ", suffix = ""): string {
+	const hint = configuredExpandHint(bindings);
+	return hint ? `${prefix}${hint}${suffix}` : "";
 }

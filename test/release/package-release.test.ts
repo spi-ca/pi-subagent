@@ -65,10 +65,10 @@ function packedPaths(): string[] {
 describe("release packaging and live acceptance workflow", () => {
   test("publishes a matching stable package changelog heading", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
-    assert.equal(manifest.version, "2.1.0");
+    assert.equal(manifest.version, "2026.1104.2");
     assert.ok(manifest.files.includes("CHANGELOG.md"));
     const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
-    assert.match(changelog, /^## \[2\.1\.0\]$/m);
+    assert.match(changelog, /^## \[2026\.1104\.2\]$/m);
     assert.doesNotMatch(changelog, /^## 미출시$/m);
   });
 

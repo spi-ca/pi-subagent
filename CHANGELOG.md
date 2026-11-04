@@ -1,5 +1,10 @@
 # 변경 기록
 
+## [2026.1104.2]
+
+- 패키지 버전을 하이픈 없는 날짜 기반 SemVer `2026.1104.2`로 정규화했다. 대응하는 GitHub release tag는 `v20261104-2`로 예정하며, 기존 `2.1.0` 변경 이력은 보존한다.
+- 이번 변경은 배포 메타데이터에 한정하며 runtime 동작·Pi host 개발 의존성·shared `@pi/presence` pin은 바꾸지 않는다.
+
 ## [2.1.0]
 
 - 펼침 안내는 Pi host가 renderer context/options로 주입한 `keyText`·`keyHint`를 우선 사용한다. 빈 키는 미지정으로 처리하고, helper가 없는 구형 host에서만 기존 fallback을 사용한다.

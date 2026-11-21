@@ -10,10 +10,10 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const PI_CORE_DEPENDENCIES = {
-  "@earendil-works/pi-agent-core": "1.5.0",
-  "@earendil-works/pi-ai": "1.5.0",
-  "@earendil-works/pi-coding-agent": "1.5.0",
-  "@earendil-works/pi-tui": "1.5.0",
+  "@earendil-works/pi-agent-core": "1.5.1",
+  "@earendil-works/pi-ai": "1.5.1",
+  "@earendil-works/pi-coding-agent": "1.5.1",
+  "@earendil-works/pi-tui": "1.5.1",
 } as const;
 const PI_GRAPH_PACKAGE_NAME = /^@earendil-works\/(?:pi-[a-z0-9][a-z0-9._-]*|chord)$/;
 const EXACT_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -65,10 +65,10 @@ function packedPaths(): string[] {
 describe("release packaging and live acceptance workflow", () => {
   test("publishes a matching stable package changelog heading", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
-    assert.equal(manifest.version, "2026.1104.2");
+    assert.equal(manifest.version, "2026.1121.1");
     assert.ok(manifest.files.includes("CHANGELOG.md"));
     const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
-    assert.match(changelog, /^## \[2026\.1104\.2\]$/m);
+    assert.match(changelog, /^## \[2026\.1121\.1\]$/m);
     assert.doesNotMatch(changelog, /^## 미출시$/m);
   });
 
@@ -152,23 +152,35 @@ describe("release packaging and live acceptance workflow", () => {
     assert.throws(() => selectedPiCoreDependencies("not-json"), /PI_GRAPH_EXPECTED must be a JSON package\/version map/);
     assert.throws(() => selectedPiCoreDependencies("{}"), /must provide an exact version for @earendil-works\/pi-agent-core/);
     assert.throws(
-      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.5.0","@earendil-works/pi-ai":"1.5.0","@earendil-works/pi-coding-agent":"1.5.0","@earendil-works/pi-tui":"latest"}'),
+      () => selectedPiCoreDependencies('{"@earendil-works/pi-agent-core":"1.5.1","@earendil-works/pi-ai":"1.5.1","@earendil-works/pi-coding-agent":"1.5.1","@earendil-works/pi-tui":"latest"}'),
       /invalid Pi graph entry/,
     );
   });
 
-  test("CI selects the eight-package 1.5.0 runtime graph without chord or obsolete client/protocol", () => {
-    const names = ["agent-core", "ai", "codemode", "coding-agent", "mcp", "schema", "telemetry", "tui"].map((name) => `@earendil-works/pi-${name}`).sort();
+  test("CI selects exact eight-package graphs for the locked 1.5.1 and compatibility 1.6.0 lanes", () => {
+    const names = ["agent-core", "ai", "codemode", "coding-agent", "mcp", "schema", "telemetry", "tui"].map((name) => `@earendil-works/pi-${name}`);
+    const lockedGraph = Object.fromEntries(names.map((name) => [name, "1.5.1"]));
+    const compatibilityGraph = Object.fromEntries(names.map((name) => [name, "1.6.0"]));
+    assert.deepEqual(EXPECTED_PI_GRAPH, lockedGraph, "isolated verification must use the locked CI graph");
+
     const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
-    const graphs = [...workflow.matchAll(/pi-graph: '([^']+)'/g)].map((match) => JSON.parse(match[1]!));
-    assert.equal(graphs.length, 8);
-    assert.deepEqual(EXPECTED_PI_GRAPH, graphs[0], "isolated verification must use the same full graph as CI");
-    for (const graph of graphs) {
-      assert.deepEqual(Object.keys(graph).sort(), names);
-      assert.ok(Object.values(graph).every((version) => version === "1.5.0"));
+    const cells = [...workflow.matchAll(/^ +- lane: (.+)\n +stage: (\S+)\n +bun-version: latest\n +pi-version: (\S+)\n +pi-graph: '([^']+)'$/gm)];
+    assert.equal(cells.length, 8);
+    for (const [lane, selector, expectedGraph] of [
+      ["locked baseline", '""', lockedGraph],
+      ["current compatibility", "1.6.0", compatibilityGraph],
+    ] as const) {
+      const stages = cells.filter(([, name]) => name === lane);
+      assert.deepEqual(stages.map(([, , stage]) => stage).sort(), ["core", "phase0", "reaper", "sessionTail"], lane);
+      for (const [, , stage, piVersion, graph] of stages) {
+        assert.equal(piVersion, selector, `${lane} / ${stage} selector`);
+        assert.deepEqual(JSON.parse(graph!), expectedGraph, `${lane} / ${stage} graph`);
+      }
     }
     const lockfile = fs.readFileSync(path.join(ROOT, "bun.lock"), "utf8");
-    for (const name of names) assert.ok(lockfile.includes(`"${name}@1.5.0"`), `${name} must be resolved in the published graph`);
+    for (const [name, version] of Object.entries(lockedGraph)) {
+      assert.ok(lockfile.includes(`"${name}@${version}"`), `${name} must be resolved in the locked graph`);
+    }
     assert.equal(workflow.includes('"@earendil-works/chord":'), false);
     assert.equal(lockfile.includes('"@earendil-works/chord": ['), false);
     for (const suffix of ["client", "protocol"]) {
@@ -179,7 +191,7 @@ describe("release packaging and live acceptance workflow", () => {
 
   test("CI compatibility install removes obsolete chord/client/protocol development entries", () => {
     const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/ci.yml"), "utf8");
-    const graph = workflow.match(/pi-graph: '([^']+)'/)?.[1];
+    const graph = workflow.match(/^ +pi-version: 1\.6\.0\n +pi-graph: '([^']+)'$/m)?.[1];
     const script = workflow.match(/          bun -e '\n([\s\S]*?)\n          '/)?.[1];
     assert.ok(graph && script, "CI compatibility graph and install script must be present");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-release-install-"));

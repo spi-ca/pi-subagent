@@ -17,7 +17,7 @@ import { renderParentReportCall, renderParentReportResult } from "../../src/ui/c
 initTheme("dark", false);
 const theme = activeTheme;
 const plain = (text: string) => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-const text = (component: { render: (width: number) => string[] }, width = 160) => plain(component.render(width).join("\n")).replace(/ +$/gm, "");
+const text = (component: { render: (width: number) => readonly string[] }, width = 160) => plain(component.render(width).join("\n")).replace(/ +$/gm, "");
 const id = "12345678-1234-4123-8123-123456789abc";
 function result(index: number): SingleResult {
   const item: SingleResult = {
@@ -31,7 +31,7 @@ function result(index: number): SingleResult {
 function details(mode: "parallel" | "chain" = "parallel", terminalMode: SubagentDetails["terminalMode"] = "inline"): SubagentDetails {
   return { mode, toolLabel: "Subagent", delegationMode: "spawn", terminalMode, projectAgentsDir: null, results: Array.from({ length: 9 }, (_, i) => result(i)), ...(mode === "chain" ? { chainStageCount: 9, chainCompletedCount: 8, chainFailedCount: 1 } : {}) };
 }
-function bounded(component: { render: (width: number) => string[] }, max = COMPACT_ROW_LIMIT) {
+function bounded(component: { render: (width: number) => readonly string[] }, max = COMPACT_ROW_LIMIT) {
   for (const width of [1, 2, 4, 12, 40, 80, 160, 12]) {
     const rows = component.render(width);
     assert.ok(rows.length <= max, `${rows.length} rows at width ${width}`);

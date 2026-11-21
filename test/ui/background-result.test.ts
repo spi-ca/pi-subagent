@@ -41,7 +41,7 @@ function assertNoUnpairedSurrogates(text: string): void {
 // Supply the host helper explicitly when asserting a configured Ctrl+O hint.
 const configuredBindings = { keyText: () => "ctrl+o" };
 
-function rendered(messageValue: { content: unknown; details: unknown }, expanded: boolean, width = 100, outputPad = 0, renderTheme = theme): string[] {
+function rendered(messageValue: { content: unknown; details: unknown }, expanded: boolean, width = 100, outputPad = 0, renderTheme = theme): readonly string[] {
   return renderBackgroundResult(messageValue, { expanded, outputPad, ...configuredBindings }, renderTheme as never).render(width);
 }
 

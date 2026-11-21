@@ -22,9 +22,8 @@ const jobId = "12345678-1234-4123-8123-123456789abc";
 const plain = (value: string) => value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)/g, "");
 
 /**
- * Installed Pi 1.4's real fullscreen layout, raw SGR decoder, gesture/selection,
- * OSC 8 and component dispatch, with only terminal I/O/render scheduling stubbed.
- * Private entry points avoid starting a real terminal or touching stdin/config.
+ * Pi's real fullscreen layout, raw SGR decoder, gesture/selection, OSC 8 and
+ * component dispatch, without starting a terminal or touching stdin/config.
  */
 function viewport(component: Component, rows = 40) {
   const opened: string[] = [];
@@ -36,7 +35,9 @@ function viewport(component: Component, rows = 40) {
   native.altScreenActive = true;
   const scroll = new ScrollView(component, { primary: true, follow: "none", scrollbar: "hidden" });
   tui.setLayoutRoot(scroll);
-  const paint = () => { native.doRender(); return tui.getScreenLines().map(plain); };
+  // Use the host's synchronous content repaint; its internal draw alone can
+  // reuse the previous layout when the fixture has stubbed requestRender().
+  const paint = () => { tui.renderNow(); return tui.getScreenLines().map(plain); };
   const raw = (button: number, x: number, y: number, release = false) => {
     assert.deepEqual(native.handleViewportInput(`\x1b[<${button};${x + 1};${y + 1}${release ? "m" : "M"}`), { consume: true });
   };

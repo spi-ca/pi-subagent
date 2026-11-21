@@ -45,7 +45,7 @@ export class CompactText extends Text {
 /** Restored/unknown data has a visual cap as well as a source-byte cap. */
 export class LimitedText extends Text {
   constructor(text: string, private maxRows = 96) { super(text, 0, 0); }
-  override render(width: number): string[] {
+  override render(width: number): ReturnType<Text["render"]> {
     if (width < 1) return [];
     const rows = super.render(width);
     return rows.length <= this.maxRows ? rows : [...rows.slice(0, this.maxRows - 1), truncateUiRow("[display clipped]", width)];
@@ -67,7 +67,7 @@ export function expansionState(store: Record<string, unknown> | undefined, globa
 /** No shell/padding/background; every visible row owns local click expansion. */
 export class HeaderExpander implements Component {
   constructor(private state: ExpansionState, private build: (expanded: boolean) => Component, private redraw?: () => void) {}
-  render(width: number): string[] { return this.build(this.state.expanded).render(width); }
+  render(width: number): ReturnType<Component["render"]> { return this.build(this.state.expanded).render(width); }
   invalidate(): void { /* build uses the current host theme on each render */ }
   handleMouse(event: { type?: unknown; button?: unknown; clickCount?: number; y?: unknown }): { handled: true } | undefined {
     // Do not clear word/line selection with a handled no-op. Native tool shells

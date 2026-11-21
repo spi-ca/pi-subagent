@@ -293,7 +293,7 @@ class MessageDisplayComponent extends Box {
     };
   }
 
-  override render(width: number): string[] {
+  override render(width: number): ReturnType<Box["render"]> {
     return width < 1 ? [] : super.render(width);
   }
 

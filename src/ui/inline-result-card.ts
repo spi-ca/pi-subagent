@@ -126,7 +126,7 @@ export class InlineResultCard extends Box {
     this.rebuild();
   }
 
-  override render(width: number): string[] {
+  override render(width: number): ReturnType<Box["render"]> {
     if (this.options.compactHeader && this.renderedWidth !== width) {
       this.renderedWidth = width;
       this.rebuild();

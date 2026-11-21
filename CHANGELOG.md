@@ -1,5 +1,11 @@
 # 변경 기록
 
+## [2026.1121.1]
+
+- 패키지 버전을 날짜 기반 SemVer `2026.1121.1`로 지정했다. 대응하는 GitHub release tag는 `v20261121-1`로 예정한다.
+- Pi 개발 의존성과 lockfile baseline은 exact `1.5.1`로 맞추고, 네 compatibility CI stage는 여덟 Pi 패키지의 exact `1.6.0` graph를 임시 manifest로 설치한다. peer 범위·`typebox`·shared `@pi/presence` pin은 유지한다.
+- 카드 renderer의 반환 타입을 Pi의 readonly render 계약과 맞췄다. 클릭 회귀는 viewport를 동기적으로 다시 그려 변경된 카드 상태를 검사한다.
+
 ## [2026.1104.2]
 
 - 패키지 버전을 하이픈 없는 날짜 기반 SemVer `2026.1104.2`로 정규화했다. 대응하는 GitHub release tag는 `v20261104-2`로 예정하며, 기존 `2.1.0` 변경 이력은 보존한다.

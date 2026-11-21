@@ -67,10 +67,10 @@ export class InlinePresentationWidget extends Container implements Component {
     this.publish();
   }
 
-  override render(width: number): string[] {
+  override render(width: number): ReturnType<Container["render"]> {
     // Pi 0.87's Container records WidgetCardSlot's capped child heights for
     // mouse dispatch. Older compatible hosts have no Container.render().
-    const containerRender = (Container.prototype as unknown as { render?: (width: number) => string[] }).render;
+    const containerRender = (Container.prototype as { render?: Container["render"] }).render;
     return typeof containerRender === "function"
       ? containerRender.call(this, width)
       : this.slots.flatMap((slot) => slot.render(width));
